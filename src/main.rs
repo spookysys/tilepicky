@@ -9,18 +9,21 @@ mod sidecar;
 mod tree;
 
 use eframe::egui::{self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle, Vec2};
-use index::{Derived, Index, Names, Progress};
+use index::Index;
 use sheet::{Block, Sel, Sheet};
 use sidecar::Animation;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 use std::time::Duration;
-use tree::Node;
+use tree::{Node, TreeAction};
 
-const NEW_COLS: u32 = 16;
-const NEW_ROWS: u32 = 16;
+/// A new tilemap starts with this many cells.
+/// The sizes the tile field steps through when dragged. Typing allows any
+/// size, so the list stays short.
+const TILE_SIZES: [u32; 12] = [4, 8, 10, 12, 16, 24, 32, 48, 64, 128, 256, 512];
+
+/// A new tilemap starts near this size, rounded to whole tiles.
+const NEW_PX: u32 = 512;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
@@ -32,8 +35,11 @@ enum Panel {
 struct Drag {
     block: Block,
     from: Panel,
-    /// The selection the block was lifted from.
+    /// The cells the block was lifted from.
     origin: Sel,
+    /// Whether the lift took the panel's own selection, which then follows
+    /// the block; a lone tile leaves every selection untouched.
+    from_selection: bool,
     /// The grabbed cell, relative to the block.
     grab: (u32, u32),
     ghost: TextureHandle,
@@ -47,8 +53,34 @@ enum Pending {
     Close,
 }
 
+/// What the name prompt is for.
+#[derive(Clone, PartialEq)]
+enum NameFor {
+    SaveAs,
+    RenameFile(String),
+    DuplicateFile(String),
+    NewFolder(String),
+    RenameFolder(String),
+}
+
+struct NamePrompt {
+    title: String,
+    value: String,
+    what: NameFor,
+    focus: bool,
+}
+
 struct App {
     drag: Option<Drag>,
+    prompt: Option<NamePrompt>,
+    /// Files marked with Ctrl+click in MY TILEMAPS.
+    marked: HashSet<usize>,
+    /// The last plainly clicked file, for shift ranges.
+    tree_anchor: Option<usize>,
+    /// Where the MINE pane sat last frame, for drops onto the empty pane.
+    mine_rect: Rect,
+    /// A pending deletion, waiting for the user's yes.
+    confirm: Option<(String, Vec<String>)>,
     /// An action that waits for the save dialog.
     pending: Option<Pending>,
     src: Index,
@@ -66,12 +98,11 @@ struct App {
     active: Panel,
     clip: Option<Block>,
     new_name: String,
-    indexing: Option<(Arc<Progress>, Receiver<Derived>)>,
     status: String,
     /// Set when the query changes, so that the trees expand once to show the matches.
     open_trees: bool,
-    /// Frames drawn so far; the split is set during the first few, once the window has its size.
-    frames: u32,
+    /// Where the split between the source and your tilemap sits, as a fraction of the height.
+    split: f32,
     /// The status as last shown, and when it changed; it fades after a while.
     shown_status: String,
     status_at: std::time::Instant,
@@ -85,26 +116,20 @@ fn dst_id() -> Id {
 }
 
 impl App {
-    fn new(src_root: PathBuf, dst_root: PathBuf) -> Self {
-        let src = Index::scan(&src_root);
-        let mut dst = Index::scan(&dst_root);
+    fn new(src_root: PathBuf, dst_root: PathBuf, tile: [u32; 2]) -> Self {
+        let src = Index::scan(&src_root, tile);
+        let mut dst = Index::scan(&dst_root, tile);
         migrate_sidecars(&mut dst);
-
-        let progress = Arc::new(Progress { done: 0.into(), total: 0.into() });
-        let (tx, rx) = std::sync::mpsc::channel();
-        let rels: Vec<String> = src.entries.iter().map(|e| e.rel.clone()).collect();
-        let cache = index::cache_path(&src_root);
-        let p = progress.clone();
-        let root = src_root.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(index::derive(root, rels, cache, p));
-        });
-
         Self {
             drag: None,
+            prompt: None,
+            marked: HashSet::new(),
+            tree_anchor: None,
+            mine_rect: Rect::NOTHING,
+            confirm: None,
             pending: None,
-            src_tree: Node::build(&src.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>()),
-            dst_tree: Node::build(&dst.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>()),
+            src_tree: Node::build(&src.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &src.dirs),
+            dst_tree: Node::build(&dst.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &dst.dirs),
             status: format!("{} files", src.entries.len()),
             src,
             dst,
@@ -119,56 +144,34 @@ impl App {
             active: Panel::Source,
             clip: None,
             new_name: String::new(),
-            indexing: Some((progress, rx)),
             open_trees: false,
-            frames: 0,
+            split: 0.5,
             shown_status: String::new(),
             status_at: std::time::Instant::now(),
         }
     }
 
-    fn poll_index(&mut self, ctx: &egui::Context) {
-        let Some((progress, rx)) = &self.indexing else { return };
-        match rx.try_recv() {
-            Ok(derived) => {
-                for e in &mut self.src.entries {
-                    if let Some(names) = derived.get(&e.rel) {
-                        e.names = names.clone();
-                    }
-                }
-                self.status = format!("{} files, {} sheets with named cells", self.src.entries.len(), derived.len());
-                self.indexing = None;
-                if let (Some(sheet), Some(i)) = (&mut self.src_sheet, self.src_sel) {
-                    sheet.names = self.src.entries[i].names.clone();
-                }
-                self.refresh_query();
-            }
-            Err(_) => {
-                let (done, total) = (progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed));
-                self.status = format!("naming cells: {done}/{total} sheets");
-                ctx.request_repaint_after(Duration::from_millis(200));
-            }
-        }
-    }
-
     fn refresh_query(&mut self) {
         self.qwords = index::query_words(&self.query);
-        self.open_trees = !self.qwords.is_empty();
+        self.open_trees = true;
         self.src_visible = self.src.visible(&self.qwords);
         self.dst_visible = self.dst.visible(&self.qwords);
-        if let Some(s) = &mut self.src_sheet {
-            s.compute_hits(&self.qwords);
-        }
-        if let Some(s) = &mut self.dst_sheet {
-            s.compute_hits(&self.qwords);
-        }
+    }
+
+    /// The grid to assume for a sheet whose entry names none: the sheet now
+    /// open in the same panel, else the run's default.
+    fn inherited_grid(&self, panel: Panel) -> ([u32; 2], u32, u32) {
+        let (sheet, default) = match panel {
+            Panel::Source => (&self.src_sheet, self.src.tile),
+            Panel::Mine => (&self.dst_sheet, self.dst.tile),
+        };
+        sheet.as_ref().map_or((default, 0, 0), |s| (s.tile, s.gap, s.offset))
     }
 
     fn open_source(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.src.entries[i];
-        match Sheet::open(ctx, &self.src.root, &e.rel, e.side.clone(), e.names.clone(), e.words.clone()) {
+        match Sheet::open(ctx, &self.src.root, &e.rel, self.inherited_grid(Panel::Source), e.side.clone()) {
             Ok(mut s) => {
-                s.compute_hits(&self.qwords);
                 if let Some(prev) = &self.src_sheet {
                     s.zoom = prev.zoom;
                 }
@@ -182,9 +185,8 @@ impl App {
 
     fn open_mine(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.dst.entries[i];
-        match Sheet::open(ctx, &self.dst.root, &e.rel, e.side.clone(), Names::new(), e.words.clone()) {
+        match Sheet::open(ctx, &self.dst.root, &e.rel, self.inherited_grid(Panel::Mine), e.side.clone()) {
             Ok(mut s) => {
-                s.compute_hits(&self.qwords);
                 if let Some(prev) = &self.dst_sheet {
                     s.zoom = prev.zoom;
                 }
@@ -202,23 +204,234 @@ impl App {
             return;
         }
         let rel = format!("{name}.png");
-        let mut sheet = Sheet::new_empty(ctx, &self.dst.root, &rel, NEW_COLS, NEW_ROWS);
+        let tile = self.inherited_grid(Panel::Mine).0;
+        let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
+        let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
+        let mut sheet = Sheet::new_empty(ctx, &self.dst.root, &rel, tile, cols, rows);
         if let Err(e) = sheet.save() {
             self.status = e;
             return;
         }
         self.new_name.clear();
-        self.dst = Index::scan(&self.dst.root);
-        self.dst_tree = Node::build(&self.dst.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>());
+        self.rescan_mine();
         if let Some(i) = self.dst.position(&rel) {
             self.open_mine(ctx, i);
         }
     }
 
+    fn rescan_source(&mut self) {
+        self.src = Index::scan(&self.src.root, self.src.tile);
+        self.src_tree = Node::build(&self.src.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.src.dirs);
+        self.src_visible = self.src.visible(&self.qwords);
+        self.src_sel = self.src_sheet.as_ref().and_then(|s| self.src.position(&s.rel));
+        self.status = format!("{} source files", self.src.entries.len());
+    }
+
+    fn rescan_mine(&mut self) {
+        self.marked.clear();
+        self.dst = Index::scan(&self.dst.root, self.dst.tile);
+        self.dst_tree = Node::build(&self.dst.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.dst.dirs);
+        self.dst_visible = self.dst.visible(&self.qwords);
+        if let Some(rel) = self.dst_sheet.as_ref().map(|s| s.rel.clone()) {
+            self.dst_sel = self.dst.position(&rel);
+        }
+    }
+
+    /// A clean relative path from a typed name; `ext` is added when missing.
+    fn normalize_name(name: &str, ext: Option<&str>) -> Option<String> {
+        let name = name.trim().trim_matches('/');
+        if name.is_empty() || name.split('/').any(|p| p.trim().is_empty() || p == "." || p == "..") {
+            return None;
+        }
+        let mut rel = name.to_string();
+        if let Some(ext) = ext {
+            if !rel.to_ascii_lowercase().ends_with(ext) {
+                rel.push_str(ext);
+            }
+        }
+        Some(rel)
+    }
+
+    /// The name prompt for Save As, renames, duplicates, and new folders.
+    fn name_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &mut self.prompt else { return };
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Modal::new(Id::new("name dialog")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading(&prompt.title);
+            let r = ui.add(egui::TextEdit::singleline(&mut prompt.value).desired_width(f32::INFINITY));
+            if prompt.focus {
+                r.request_focus();
+                prompt.focus = false;
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                apply = true;
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Ok").clicked() {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.prompt = None;
+        } else if apply {
+            let p = self.prompt.take().unwrap();
+            if let Err(e) = self.apply_name(ctx, &p.what, &p.value) {
+                self.status = e;
+            }
+        }
+    }
+
+    /// Deletes files (and, through their paths, whole folders), with their
+    /// book entries. Runs only after the confirm dialog.
+    fn delete_paths(&mut self, rels: &[String]) -> Result<(), String> {
+        let root = self.dst.root.clone();
+        let mut book = sidecar::load_book(&root);
+        for rel in rels {
+            let path = root.join(rel);
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+                book.retain(|k, _| k != rel && !k.starts_with(&format!("{rel}/")));
+                if let Some(sheet) = &self.dst_sheet {
+                    if sheet.rel.starts_with(&format!("{rel}/")) {
+                        self.dst_sheet = None;
+                    }
+                }
+            } else {
+                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                book.remove(rel);
+                if self.dst_sheet.as_ref().is_some_and(|s| s.rel == *rel) {
+                    self.dst_sheet = None;
+                }
+            }
+        }
+        let json = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
+        std::fs::write(root.join(sidecar::BOOK), json).map_err(|e| e.to_string())?;
+        self.status = format!("deleted {}", rels.join(", "));
+        self.rescan_mine();
+        Ok(())
+    }
+
+    fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some((message, _)) = &self.confirm else { return };
+        let message = message.clone();
+        let mut choice = None;
+        egui::Modal::new(Id::new("confirm dialog")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Delete");
+            ui.label(&message);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Delete").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    choice = Some(false);
+                }
+            });
+        });
+        match choice {
+            Some(true) => {
+                let (_, rels) = self.confirm.take().unwrap();
+                if let Err(e) = self.delete_paths(&rels) {
+                    self.status = e;
+                }
+            }
+            Some(false) => self.confirm = None,
+            None => {}
+        }
+    }
+
+    fn apply_name(&mut self, ctx: &egui::Context, what: &NameFor, name: &str) -> Result<(), String> {
+        let root = self.dst.root.clone();
+        match what {
+            NameFor::NewFolder(parent) => {
+                let rel = Self::normalize_name(name, None).ok_or("that is not a usable name")?;
+                let dir = if parent.is_empty() { rel } else { format!("{parent}/{rel}") };
+                std::fs::create_dir_all(root.join(&dir)).map_err(|e| e.to_string())?;
+                self.rescan_mine();
+            }
+            NameFor::RenameFolder(old) => {
+                let rel = Self::normalize_name(name, None).ok_or("that is not a usable name")?;
+                let new = match old.rsplit_once('/') {
+                    Some((parent, _)) => format!("{parent}/{rel}"),
+                    None => rel,
+                };
+                if new != *old {
+                    if root.join(&new).exists() {
+                        return Err(format!("{new} exists"));
+                    }
+                    std::fs::rename(root.join(old), root.join(&new)).map_err(|e| e.to_string())?;
+                    sidecar::move_prefix(&root, old, &new)?;
+                    if let Some(sheet) = &mut self.dst_sheet {
+                        if let Some(rest) = sheet.rel.strip_prefix(&format!("{old}/")) {
+                            sheet.rel = format!("{new}/{rest}");
+                        }
+                    }
+                    self.rescan_mine();
+                }
+            }
+            NameFor::SaveAs => {
+                let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
+                if root.join(&rel).exists() {
+                    return Err(format!("{rel} exists"));
+                }
+                let Some(sheet) = &mut self.dst_sheet else { return Ok(()) };
+                if let Some(parent) = root.join(&rel).parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                sheet.rel = rel.clone();
+                sheet.save()?;
+                self.status = format!("saved as {rel}");
+                self.rescan_mine();
+            }
+            NameFor::RenameFile(old) => {
+                let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
+                if rel != *old {
+                    if root.join(&rel).exists() {
+                        return Err(format!("{rel} exists"));
+                    }
+                    if let Some(parent) = root.join(&rel).parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    std::fs::rename(root.join(old), root.join(&rel)).map_err(|e| e.to_string())?;
+                    sidecar::move_entry(&root, old, &rel, false)?;
+                    if let Some(sheet) = &mut self.dst_sheet {
+                        if sheet.rel == *old {
+                            sheet.rel = rel.clone();
+                        }
+                    }
+                    self.rescan_mine();
+                }
+            }
+            NameFor::DuplicateFile(old) => {
+                let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
+                if root.join(&rel).exists() {
+                    return Err(format!("{rel} exists"));
+                }
+                if let Some(parent) = root.join(&rel).parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::copy(root.join(old), root.join(&rel)).map_err(|e| e.to_string())?;
+                sidecar::move_entry(&root, old, &rel, true)?;
+                self.rescan_mine();
+                if let Some(i) = self.dst.position(&rel) {
+                    self.open_mine(ctx, i);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Keeps search in step with an edit. Saving is explicit: Ctrl+S.
     fn after_edit(&mut self) {
         let Some(sheet) = &mut self.dst_sheet else { return };
-        sheet.compute_hits(&self.qwords);
         if let Some(i) = self.dst_sel {
             self.dst.entries[i].side = sheet.side.clone();
         }
@@ -226,11 +439,14 @@ impl App {
     }
 
     fn save(&mut self) {
-        if let Some(sheet) = &mut self.dst_sheet {
-            match sheet.save() {
-                Ok(()) => self.status = format!("saved {}", sheet.rel),
-                Err(e) => self.status = e,
-            }
+        let Some(sheet) = &mut self.dst_sheet else { return };
+        if sheet.rel.is_empty() {
+            self.prompt = Some(NamePrompt { title: "Save as".into(), value: String::new(), what: NameFor::SaveAs, focus: true });
+            return;
+        }
+        match sheet.save() {
+            Ok(()) => self.status = format!("saved {}", sheet.rel),
+            Err(e) => self.status = e,
         }
     }
 
@@ -293,6 +509,12 @@ impl App {
             });
         });
         if let Some(save) = choice {
+            if save && self.dst_sheet.as_ref().is_some_and(|s| s.rel.is_empty()) {
+                // No name yet: ask for one; the interrupted action is dropped.
+                self.pending = None;
+                self.save();
+                return;
+            }
             if save {
                 self.save();
             }
@@ -305,21 +527,32 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
+        let cmd = Modifiers::COMMAND;
+        // Saving works no matter what has focus; a swallowed Ctrl+S loses work.
+        if key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
+            if let Some(sheet) = &self.dst_sheet {
+                self.prompt = Some(NamePrompt { title: "Save as".into(), value: sheet.rel.clone(), what: NameFor::SaveAs, focus: true });
+            }
+        }
+        if key(cmd, Key::S) {
+            self.save();
+        }
         let focus = ctx.memory(|m| m.focused());
         if !focus.is_none_or(|id| id == src_id() || id == dst_id()) {
             return;
         }
-        let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-        let cmd = Modifiers::COMMAND;
         // The window layer turns Ctrl+C into a Copy event, and Ctrl+V into a Paste
         // event that only exists when the system clipboard holds text.
-        let (copy, paste) = ctx.input(|i| {
+        let (copy, cut, paste) = ctx.input(|i| {
             let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            let cut = i.events.iter().any(|e| matches!(e, egui::Event::Cut));
             let paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
-            (copy, paste)
+            (copy, cut, paste)
         });
+        let cut = cut || key(cmd, Key::X);
 
-        if copy || key(cmd, Key::C) {
+        if copy || cut || key(cmd, Key::C) {
             let from = match self.active {
                 Panel::Source => &self.src_sheet,
                 Panel::Mine => &self.dst_sheet,
@@ -329,6 +562,13 @@ impl App {
                 // A note in the system clipboard, so that Ctrl+V reaches us as a Paste event.
                 ctx.copy_text(b.note());
                 self.clip = Some(b);
+                // A cut clears the cells; only your tilemap is editable.
+                if cut && self.active == Panel::Mine {
+                    if let Some(sheet) = &mut self.dst_sheet {
+                        sheet.clear_selection(ctx);
+                        self.after_edit();
+                    }
+                }
             }
         }
         if paste || key(cmd, Key::V) {
@@ -338,9 +578,6 @@ impl App {
                 self.active = Panel::Mine;
                 self.after_edit();
             }
-        }
-        if key(cmd, Key::S) {
-            self.save();
         }
         if key(cmd, Key::T) {
             self.trim(ctx);
@@ -387,18 +624,22 @@ impl App {
         }
     }
 
-    fn start_drag(&mut self, ctx: &egui::Context, from: Panel, grab: (u32, u32)) {
+    fn start_drag(&mut self, ctx: &egui::Context, from: Panel, cell: (u32, u32)) {
         let sheet = match from {
             Panel::Source => self.src_sheet.as_ref(),
             Panel::Mine => self.dst_sheet.as_ref(),
         };
-        let Some((block, origin)) = sheet.and_then(|s| Some((s.copy()?, s.sel.clone()))) else { return };
+        let Some(sheet_ref) = sheet else { return };
+        let from_selection = sheet_ref.sel.contains(cell);
+        let origin = if from_selection { sheet_ref.sel.clone() } else { Sel::rect(cell, cell) };
+        let grab = origin.origin().map(|o| (cell.0 - o.0, cell.1 - o.1)).unwrap_or((0, 0));
+        let Some(block) = sheet_ref.copy_sel(&origin) else { return };
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [block.img.width() as usize, block.img.height() as usize],
             block.img.as_raw(),
         );
         let ghost = ctx.load_texture("drag ghost", image, egui::TextureOptions::NEAREST);
-        self.drag = Some(Drag { block, from, origin, grab, ghost });
+        self.drag = Some(Drag { block, from, origin, from_selection, grab, ghost });
         self.active = from;
     }
 
@@ -409,21 +650,28 @@ impl App {
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
 
         // Over the tilemap the ghost snaps to the grid; elsewhere it floats at the pointer.
-        let target = self.dst_sheet.as_ref().and_then(|d| {
+        let mut target = self.dst_sheet.as_ref().and_then(|d| {
             let c = d.cell_at(p)?;
             Some((c.0.saturating_sub(drag.grab.0), c.1.saturating_sub(drag.grab.1)))
         });
-        let (min, cell_px) = match (target, &self.dst_sheet) {
-            (Some(t), Some(d)) => (d.screen.min + Vec2::new(t.0 as f32, t.1 as f32) * d.cell_px(), d.cell_px()),
+        // The ghost is drawn at the zoom of the panel it is over, in pixels
+        // of the block, since the tile sizes may differ.
+        let block_px = Vec2::new(drag.block.img.width() as f32, drag.block.img.height() as f32);
+        let src_cell = Vec2::new(drag.block.tile[0] as f32, drag.block.tile[1] as f32);
+        let (min, zoom) = match (target, &self.dst_sheet) {
+            (Some(t), Some(d)) => {
+                let c = d.cell_px();
+                (d.screen.min + Vec2::new(t.0 as f32 * c.x, t.1 as f32 * c.y), d.zoom.level)
+            }
             _ => {
                 let z = match drag.from {
-                    Panel::Source => self.src_sheet.as_ref().map_or(2.0, |s| s.cell_px()),
-                    Panel::Mine => self.dst_sheet.as_ref().map_or(2.0, |s| s.cell_px()),
+                    Panel::Source => self.src_sheet.as_ref().map_or(2.0, |s| s.zoom.level),
+                    Panel::Mine => self.dst_sheet.as_ref().map_or(2.0, |s| s.zoom.level),
                 };
-                (p - Vec2::new(drag.grab.0 as f32 + 0.5, drag.grab.1 as f32 + 0.5) * z, z)
+                (p - Vec2::new((drag.grab.0 as f32 + 0.5) * src_cell.x, (drag.grab.1 as f32 + 0.5) * src_cell.y) * z, z)
             }
         };
-        let size = Vec2::new(drag.block.cols as f32, drag.block.rows as f32) * cell_px;
+        let size = block_px * zoom;
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("drag ghost")));
         let rect = Rect::from_min_size(min, size);
         painter.image(drag.ghost.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha(160));
@@ -437,8 +685,20 @@ impl App {
             return;
         }
         let drag = self.drag.take().unwrap();
+        // A drop on the empty pane starts a fresh, unnamed tilemap; its name
+        // is asked for at the first save.
+        if target.is_none() && self.dst_sheet.is_none() && self.mine_rect.contains(p) {
+            let tile = self.inherited_grid(Panel::Mine).0;
+            let (cols, rows) = (((NEW_PX + tile[0] / 2) / tile[0]).max(1), ((NEW_PX + tile[1] / 2) / tile[1]).max(1));
+            self.dst_sheet = Some(Sheet::new_empty(ctx, &self.dst.root, "", tile, cols, rows));
+            self.dst_sel = None;
+            target = Some((0, 0));
+        }
         let (Some(at), Some(sheet)) = (target, &mut self.dst_sheet) else { return };
         let copy = drag.from == Panel::Source || ctx.input(|i| i.modifiers.command);
+        // A lone lifted tile leaves the selections as they were; only a
+        // dragged selection keeps following its block.
+        let keep = (!drag.from_selection || drag.from == Panel::Source).then(|| sheet.sel.clone());
         if copy {
             sheet.paste(ctx, at, &drag.block);
         } else if Some(at) != drag.origin.origin() {
@@ -446,11 +706,64 @@ impl App {
         } else {
             return;
         }
+        if let Some(prev) = keep {
+            sheet.sel = prev;
+        }
         self.active = Panel::Mine;
         self.after_edit();
     }
 
-    fn sheet_header(ui: &mut egui::Ui, title: &str, active: bool, sheet: Option<&Sheet>) {
+    /// The tile size field: dragging steps through the usual sizes and
+    /// applies on release; a click turns it into a text field for any size.
+    fn tile_field(ui: &mut egui::Ui, s: &mut Sheet) -> Option<[u32; 2]> {
+        if let Some(buf) = &mut s.tile_text {
+            let r = ui.add(egui::TextEdit::singleline(buf).desired_width(56.0));
+            if s.tile_text_focus {
+                r.request_focus();
+                s.tile_text_focus = false;
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                s.tile_text = None;
+                return None;
+            }
+            if r.lost_focus() {
+                let v = parse_tile(buf);
+                s.tile_text = None;
+                return v.filter(|t| *t != s.tile);
+            }
+            return None;
+        }
+        let r = ui.add(egui::Button::new(format!("{} px", show_tile(s.tile_edit))).small().sense(egui::Sense::click_and_drag()));
+        let r = r.on_hover_text("drag: step through the usual square sizes   click: type any size, 48 or 32x48");
+        if r.dragged() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+            s.tile_acc += r.drag_delta().x;
+            let steps = (s.tile_acc / 20.0).trunc() as i32;
+            s.tile_acc -= steps as f32 * 20.0;
+            if steps != 0 {
+                let last = TILE_SIZES.len() as i32 - 1;
+                let idx = TILE_SIZES.iter().position(|&t| t >= s.tile_edit[0]).unwrap_or(TILE_SIZES.len() - 1) as i32;
+                let n = TILE_SIZES[(idx + steps).clamp(0, last) as usize];
+                s.tile_edit = [n, n];
+            }
+        }
+        if r.drag_stopped() {
+            s.tile_acc = 0.0;
+            if s.tile_edit != s.tile {
+                return Some(s.tile_edit);
+            }
+        }
+        if r.clicked() {
+            s.tile_text = Some(show_tile(s.tile));
+            s.tile_text_focus = true;
+        }
+        None
+    }
+
+    /// Returns the new grid when the user finished editing a field:
+    /// (tile, gap, offset).
+    fn sheet_header(ui: &mut egui::Ui, title: &str, active: bool, source: bool, sheet: Option<&mut Sheet>) -> Option<([u32; 2], u32, u32)> {
+        let mut new_grid = None;
         ui.horizontal(|ui| {
             let color = if active { egui::Color32::from_rgb(80, 160, 255) } else { ui.visuals().weak_text_color() };
             ui.colored_label(color, egui::RichText::new(title).strong());
@@ -458,18 +771,40 @@ impl App {
                 ui.weak("nothing open");
                 return;
             };
-            ui.label(if s.dirty { format!("{} *", s.rel) } else { s.rel.clone() });
+            let name = if s.rel.is_empty() { "(unnamed)" } else { s.rel.as_str() };
+            ui.label(if s.dirty { format!("{name} *") } else { name.to_string() });
             ui.weak(format!("{}x{} cells", s.cols(), s.rows()));
+            ui.label("tile");
+            if let Some(t) = Self::tile_field(ui, s) {
+                new_grid = Some((t, s.gap, s.offset));
+            }
+            if source {
+                // Sheets drawn with gaps between the tiles, and a border
+                // before the first one. The edit fields live on the sheet so
+                // that a drag accumulates across frames.
+                ui.label("gap");
+                let g = ui.add(egui::DragValue::new(&mut s.gap_edit).range(0..=64).speed(0.05));
+                ui.label("offset");
+                let o = ui.add(egui::DragValue::new(&mut s.offset_edit).range(0..=64).speed(0.05));
+                if (g.drag_stopped() || g.lost_focus() || o.drag_stopped() || o.lost_focus())
+                    && (s.gap_edit, s.offset_edit) != (s.gap, s.offset)
+                {
+                    new_grid = Some((s.tile, s.gap_edit, s.offset_edit));
+                }
+            }
             ui.weak(format!("{}x", s.zoom.level));
             if let Some(b) = s.sel.bounds() {
                 ui.weak(format!("sel {} cells, {}x{} at {},{}", s.sel.len(), b.cols(), b.rows(), b.x0, b.y0));
             }
             if let Some((x, y)) = s.hover {
-                let tags = s.cell_tags(x, y).join(" ");
-                let from = s.side.get(x, y).and_then(|c| c.src.as_ref()).map(|p| format!(" <- {p}")).unwrap_or_default();
-                ui.weak(format!("cell {x},{y}: {tags}{from}"));
+                let from = s.cell_source(x, y).map(|f| format!("<- {f}")).unwrap_or_default();
+                // Truncated, so a long path can never widen the row and push
+                // the panes around.
+                let text = egui::RichText::new(format!("cell {x},{y} {from}")).weak();
+                ui.add(egui::Label::new(text).truncate());
             }
         });
+        new_grid
     }
 
     /// `A` opens the animation panel for the selection; once it is open, `A`
@@ -501,6 +836,28 @@ impl App {
         };
         let s = self.sheet_mut(panel)?;
         Some(if s.preview_hovered { &mut s.preview_zoom } else { &mut s.zoom })
+    }
+
+    /// Applies a new grid (tile, gap, offset) to a sheet. Your tilemap keeps
+    /// it as an unsaved edit; a source sheet stores it at once.
+    fn change_grid(&mut self, ctx: &egui::Context, panel: Panel, (t, gap, offset): ([u32; 2], u32, u32)) {
+        let Some(sheet) = self.sheet_mut(panel) else { return };
+        sheet.set_tile(ctx, t);
+        sheet.set_gap_offset(ctx, gap, offset);
+        self.status = format!("grid: {} px tiles, {gap} px gap, {offset} px offset", show_tile(t));
+        match panel {
+            Panel::Mine => self.after_edit(),
+            Panel::Source => {
+                if let Some(sheet) = &mut self.src_sheet {
+                    if let Err(e) = sheet.save_entry() {
+                        self.status = e;
+                    }
+                }
+                if let (Some(i), Some(sheet)) = (self.src_sel, &self.src_sheet) {
+                    self.src.entries[i].side = sheet.side.clone();
+                }
+            }
+        }
     }
 
     fn sheet_mut(&mut self, panel: Panel) -> Option<&mut Sheet> {
@@ -543,18 +900,19 @@ impl App {
             Some(a) => (a.frames, a.ms),
             None => sheet.draft().map(|d| (d.frames, d.ms)).unwrap_or((b.cols(), 100)),
         };
+        let sel_width_px = b.cols() * sheet.tile[0];
         // The status line: zoom, and what the fields describe.
         ui.horizontal(|ui| {
             ui.weak(format!("{}x", sheet.preview_zoom.level));
             match &stored {
-                Some(a) => ui.weak(format!("stored: {} frames of {}x{}", a.frames, a.w, a.h)),
-                None if b.cols() % frames != 0 => {
-                    ui.colored_label(egui::Color32::from_rgb(200, 60, 40), format!("{frames} does not divide {} columns", b.cols()))
+                Some(a) => ui.weak(format!("stored: {} frames of {}x{} px", a.frames, a.frame[0], a.frame[1])),
+                None if sel_width_px % frames != 0 => {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 40), format!("{frames} does not divide {sel_width_px} px"))
                 }
-                None => ui.weak(format!("draft: {frames} frames of {}x{}", b.cols() / frames, b.rows())),
+                None => ui.weak(format!("draft: {frames} frames of {}x{} px", sel_width_px / frames, b.rows() * sheet.tile[1])),
             };
         });
-        let width = stored.as_ref().map_or(b.cols(), |a| a.w * a.frames);
+        let width = stored.as_ref().map_or(sel_width_px, |a| a.frame[0] * a.frames);
         let mut changed = false;
         egui::Grid::new("animation fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("frames");
@@ -588,9 +946,10 @@ impl App {
             });
         });
         // The strip to play: the stored one, or the draft when it divides.
+        let tile = sheet.tile;
         let anim = stored.clone().or_else(|| {
             let d = sheet.draft()?;
-            (d.area.cols() % d.frames == 0).then(|| d.animation())
+            (d.area.cols() * tile[0] % d.frames == 0).then(|| d.animation(tile))
         });
         if let Some(a) = anim {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -606,22 +965,17 @@ impl App {
     fn play(ui: &mut egui::Ui, sheet: &mut Sheet, a: &Animation) {
         let t = ui.input(|i| i.time);
         let frame = (((t * 1000.0) as u64 / a.ms.max(1) as u64) % a.frames as u64) as u32;
-        let cell = 32.0 * sheet.preview_zoom.level;
+        let zoom = sheet.preview_zoom.level;
         ui.add_space(6.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(a.w as f32, a.h as f32) * cell, egui::Sense::hover());
+        let size = Vec2::new(a.frame[0] as f32, a.frame[1] as f32) * zoom;
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
         sheet.preview_hovered = resp.hovered();
         if resp.hovered() {
             sheet.preview_zoom.wheel(ui);
         }
         ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(225));
-        for cy in 0..a.h {
-            for cx in 0..a.w {
-                if let Some((tex, uv)) = sheet.cell_uv(a.x + frame * a.w + cx, a.y + cy) {
-                    let r = Rect::from_min_size(rect.min + Vec2::new(cx as f32, cy as f32) * cell, Vec2::splat(cell));
-                    ui.painter().image(tex, r, uv, egui::Color32::WHITE);
-                }
-            }
-        }
+        let origin = Pos2::new((a.px[0] + frame * a.frame[0]) as f32, a.px[1] as f32);
+        sheet.draw_px_rect(ui.painter(), Rect::from_min_size(origin, Vec2::new(a.frame[0] as f32, a.frame[1] as f32)), rect.min, zoom);
         ui.weak(format!("frame {}/{}", frame + 1, a.frames));
         ui.ctx().request_repaint_after(Duration::from_millis(a.ms.max(16) as u64));
     }
@@ -630,7 +984,6 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        self.poll_index(ctx);
         self.handle_keys(ctx);
         // The preview sets this flag while drawing; clear it first, so that
         // a closed preview does not keep it.
@@ -638,11 +991,89 @@ impl eframe::App for App {
             s.preview_hovered = false;
         }
 
-        let mut open_src = None;
-        let mut open_dst = None;
+        let mut src_action = None;
+        let mut dst_action = None;
+        let mut dst_order: Vec<usize> = Vec::new();
+        let mut delete_in_mine = false;
         let mut create = false;
-        // The status line, across the whole window, text at the right. It
-        // disappears ten seconds after it last changed.
+        egui::Panel::left("left").resizable(true).default_size(340.0).size_range(240.0..=800.0).show(ui, |ui| {
+            ui.add_space(4.0);
+            let search = egui::TextEdit::singleline(&mut self.query).hint_text("search: rock wall").desired_width(f32::INFINITY);
+            if ui.add(search).changed() {
+                self.refresh_query();
+            }
+            ui.add_space(4.0);
+            egui::Panel::bottom("legend").show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
+                ui.weak("click / drag: select   long click and drag: move   ctrl+a: select all   shift+click: rectangle from the last click   ctrl+click: add or remove a cell   ctrl+shift+click: add a rectangle   right click: clear selection / inside it: delete content   (drop with ctrl held: copy)   ctrl+c / ctrl+x / ctrl+v   delete   a: animation panel / store   ctrl+z   ctrl+s: save   ctrl+shift+s: save as   ctrl+t: trim   drag the canvas edge: resize   ctrl+wheel or + / -: zoom the view under the pointer");
+            });
+            egui::Panel::top("source tree")
+                .resizable(true)
+                .default_size(ui.available_height() * 0.6)
+                .size_range(80.0..=f32::INFINITY)
+                .show(ui, |ui| {
+                    ui.strong("SOURCE");
+                    egui::ScrollArea::vertical().id_salt("source scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        src_action = self
+                            .src_tree
+                            .show(ui, self.src_visible.as_deref(), self.src_sel, None, &self.qwords, self.open_trees, false, "", &mut Vec::new(), &mut Vec::new());
+                        let rest = ui.available_size_before_wrap();
+                        let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(ui.available_width(), rest.y.max(24.0)), egui::Sense::hover());
+                        let bg = ui.interact(rect, Id::new("source free space"), egui::Sense::click());
+                        bg.context_menu(|ui| {
+                            if ui.button("Refresh").clicked() {
+                                src_action = Some(TreeAction::Refresh);
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+            egui::CentralPanel::default().show(ui, |ui| {
+                let heading = ui.add(egui::Label::new(egui::RichText::new("MY TILEMAPS").strong()).sense(egui::Sense::click()));
+                heading.context_menu(|ui| {
+                    if ui.button("New folder…").clicked() {
+                        self.prompt = Some(NamePrompt {
+                            title: "New folder".into(),
+                            value: String::new(),
+                            what: NameFor::NewFolder(String::new()),
+                            focus: true,
+                        });
+                        ui.close();
+                    }
+                });
+                // The button first, at the right; the field takes what is left. One row high.
+                let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("New").clicked() {
+                        create = true;
+                    }
+                    let field = egui::TextEdit::singleline(&mut self.new_name).hint_text("new tilemap name").desired_width(ui.available_width());
+                    let r = ui.add(field);
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        create = true;
+                    }
+                });
+                egui::ScrollArea::vertical().id_salt("mine scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    dst_action = self.dst_tree.show(ui, self.dst_visible.as_deref(), self.dst_sel, Some(&self.marked), &self.qwords, self.open_trees, true, "", &mut Vec::new(), &mut dst_order);
+                    // The empty space below the tree offers the folder menu too.
+                    let rest = ui.available_size_before_wrap();
+                    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(ui.available_width(), rest.y.max(24.0)), egui::Sense::hover());
+                    let bg = ui.interact(rect, Id::new("tilemaps free space"), egui::Sense::click());
+                    bg.context_menu(|ui| {
+                        if ui.button("New folder…").clicked() {
+                            self.prompt = Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(String::new()), focus: true });
+                            ui.close();
+                        }
+                        if ui.button("Refresh").clicked() {
+                            dst_action = Some(TreeAction::Refresh);
+                            ui.close();
+                        }
+                    });
+                });
+            });
+        });
+        // The status line, under the two sheet panels, text at the right.
+        // It disappears ten seconds after it last changed.
         const STATUS_SECS: u64 = 10;
         if self.status != self.shown_status {
             self.shown_status = self.status.clone();
@@ -659,52 +1090,70 @@ impl eframe::App for App {
                 }
             });
         });
-        egui::Panel::left("left").resizable(true).default_size(340.0).size_range(240.0..=800.0).show(ui, |ui| {
-            ui.add_space(4.0);
-            let search = egui::TextEdit::singleline(&mut self.query).hint_text("search: rock wall").desired_width(f32::INFINITY);
-            if ui.add(search).changed() {
-                self.refresh_query();
-            }
-            ui.add_space(4.0);
-            egui::Panel::top("source tree")
-                .resizable(true)
-                .default_size(ui.available_height() * 0.6)
-                .show(ui, |ui| {
-                    ui.strong("SOURCE");
-                    egui::ScrollArea::vertical().id_salt("source scroll").auto_shrink([false, false]).show(ui, |ui| {
-                        open_src = self.src_tree.show(ui, self.src_visible.as_deref(), self.src_sel, self.open_trees, "src");
-                    });
-                });
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.strong("MY TILEMAPS");
-                // The button first, at the right; the field takes what is left. One row high.
-                let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
-                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("New").clicked() {
-                        create = true;
-                    }
-                    let field = egui::TextEdit::singleline(&mut self.new_name).hint_text("new tilemap name").desired_width(ui.available_width());
-                    let r = ui.add(field);
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        create = true;
-                    }
-                });
-                egui::Panel::bottom("legend").show(ui, |ui| {
-                    ui.set_max_width(ui.available_width());
-                    ui.weak("click / drag: select   ctrl+a: select all   shift+click: rectangle from the last click   ctrl+click: add or remove a cell   ctrl+shift+click: add a rectangle   right click: clear   drag a selection: move (ctrl: copy)   ctrl+c / ctrl+v   delete   a: animation panel / store   ctrl+z   ctrl+s: save   ctrl+t: trim empty edges   drag the canvas edge: resize   ctrl+wheel or + / -: zoom the view under the pointer");
-                });
-                egui::ScrollArea::vertical().id_salt("mine scroll").auto_shrink([false, false]).show(ui, |ui| {
-                    open_dst = self.dst_tree.show(ui, self.dst_visible.as_deref(), self.dst_sel, self.open_trees, "dst");
-                });
-            });
-        });
         self.open_trees = false;
-        if let Some(i) = open_src {
-            self.open_source(ctx, i);
+        match src_action {
+            Some(TreeAction::Open(i)) => self.open_source(ctx, i),
+            Some(TreeAction::Refresh) => self.rescan_source(),
+            _ => {}
         }
-        if let Some(i) = open_dst {
-            self.request(ctx, Pending::Open(i));
+        match dst_action {
+            Some(TreeAction::Open(i)) => {
+                // The plainly clicked file is the start of any group.
+                self.marked.clear();
+                self.marked.insert(i);
+                self.tree_anchor = Some(i);
+                self.request(ctx, Pending::Open(i));
+            }
+            Some(TreeAction::Toggle(i)) => {
+                if !self.marked.remove(&i) {
+                    self.marked.insert(i);
+                }
+                self.tree_anchor = Some(i);
+            }
+            Some(TreeAction::Range(i, additive)) => {
+                let a = self.tree_anchor.unwrap_or(i);
+                let (pa, pi) = (dst_order.iter().position(|&x| x == a), dst_order.iter().position(|&x| x == i));
+                if let (Some(pa), Some(pi)) = (pa, pi) {
+                    if !additive {
+                        self.marked.clear();
+                    }
+                    for &e in &dst_order[pa.min(pi)..=pa.max(pi)] {
+                        self.marked.insert(e);
+                    }
+                }
+            }
+            Some(TreeAction::DeleteFile(i)) => {
+                let rel = self.dst.entries[i].rel.clone();
+                self.confirm = Some((format!("Delete {rel}? There is no undo."), vec![rel]));
+            }
+            Some(TreeAction::DeleteMarked) => {
+                let rels: Vec<String> = self.marked.iter().map(|&i| self.dst.entries[i].rel.clone()).collect();
+                self.confirm = Some((format!("Delete {} files? There is no undo.", rels.len()), rels));
+            }
+            Some(TreeAction::Refresh) => self.rescan_mine(),
+            Some(TreeAction::DeleteFolder(dir)) => {
+                self.confirm = Some((format!("Delete the folder {dir} and everything in it? There is no undo."), vec![dir]));
+            }
+            Some(TreeAction::RenameFile(i)) => {
+                let rel = self.dst.entries[i].rel.clone();
+                self.prompt = Some(NamePrompt { title: "Rename".into(), value: rel.clone(), what: NameFor::RenameFile(rel), focus: true });
+            }
+            Some(TreeAction::DuplicateFile(i)) => {
+                let rel = self.dst.entries[i].rel.clone();
+                let suggestion = format!("{} copy", rel.trim_end_matches(".png"));
+                self.prompt = Some(NamePrompt { title: "Duplicate".into(), value: suggestion, what: NameFor::DuplicateFile(rel), focus: true });
+            }
+            Some(TreeAction::NewFolder(dir)) => {
+                self.prompt = Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(dir), focus: true });
+            }
+            Some(TreeAction::RenameFolder(dir)) => {
+                let name = dir.rsplit_once('/').map(|(_, n)| n).unwrap_or(&dir).to_string();
+                self.prompt = Some(NamePrompt { title: "Rename folder".into(), value: name, what: NameFor::RenameFolder(dir), focus: true });
+            }
+            None => {}
         }
+        self.name_dialog(ctx);
+        self.confirm_dialog(ctx);
         if create {
             self.request(ctx, Pending::Create);
         }
@@ -718,19 +1167,20 @@ impl eframe::App for App {
         let mut drag_from = None;
         let mut anim_changed = Ok(false);
         let mut src_anim = Ok(false);
+        let mut src_tile = None;
+        let mut dst_tile = None;
         let mut resized = false;
-        // The window gets its final size after the first frames; put the
-        // split in the middle once that is known.
-        if self.frames < 5 {
-            self.frames += 1;
-            let h = ui.available_height() * 0.5;
-            let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), h));
-            ctx.data_mut(|d| d.insert_persisted(Id::new("source panel"), egui::PanelState { outer_rect: rect }));
-        }
+        // The split is kept as a fraction of the height, so that it stays in
+        // place when the window changes size. The panel state is written from
+        // it each frame and read back after the user drags the divider.
+        let total = ui.available_height();
+        let panel_id = Id::new("source panel");
+        let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
+        ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
         egui::Panel::top("source panel")
             .resizable(true)
             .show(ui, |ui| {
-                Self::sheet_header(ui, "SOURCE", self.active == Panel::Source, self.src_sheet.as_ref());
+                src_tile = Self::sheet_header(ui, "SOURCE", self.active == Panel::Source, true, self.src_sheet.as_mut());
                 if let Some(s) = &mut self.src_sheet {
                     if s.show_anim_panel() {
                         egui::Panel::right("source animation").resizable(true).default_size(220.0).show(ui, |ui| {
@@ -744,10 +1194,21 @@ impl eframe::App for App {
                     if let Some(grab) = ev.drag_block {
                         drag_from = Some((Panel::Source, grab));
                     }
+                } else {
+                    // Fill the panel, so that it keeps its height and can be dragged.
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.weak("Open a sheet on the left, or type a search.");
+                    });
                 }
             });
+        if let Some(state) = egui::PanelState::load(ctx, panel_id) {
+            if total > 0.0 {
+                self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
+            }
+        }
         egui::CentralPanel::default().show(ui, |ui| {
-            Self::sheet_header(ui, "MINE", self.active == Panel::Mine, self.dst_sheet.as_ref());
+            self.mine_rect = ui.max_rect();
+            dst_tile = Self::sheet_header(ui, "MINE", self.active == Panel::Mine, false, self.dst_sheet.as_mut());
             if let Some(s) = &mut self.dst_sheet {
                 if s.show_anim_panel() {
                     egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
@@ -764,6 +1225,10 @@ impl eframe::App for App {
                 if let Some(grab) = ev.drag_block {
                     drag_from = Some((Panel::Mine, grab));
                 }
+                if ev.delete {
+                    s.clear_selection(ctx);
+                    delete_in_mine = true;
+                }
             } else {
                 ui.weak("Create or open a tilemap on the left. Then select cells in the source, Ctrl+C, click a cell here, Ctrl+V.");
             }
@@ -772,6 +1237,15 @@ impl eframe::App for App {
             Ok(true) => self.after_animation_edit(Panel::Mine),
             Ok(false) => {}
             Err(e) => self.status = e,
+        }
+        if let Some(g) = src_tile {
+            self.change_grid(ctx, Panel::Source, g);
+        }
+        if let Some(g) = dst_tile {
+            self.change_grid(ctx, Panel::Mine, g);
+        }
+        if delete_in_mine {
+            self.after_edit();
         }
         if resized {
             if let Some(s) = &self.dst_sheet {
@@ -808,14 +1282,44 @@ fn migrate_sidecars(dst: &mut Index) {
     }
 }
 
+/// "32" or "32x48", in pixels.
+fn parse_tile(text: &str) -> Option<[u32; 2]> {
+    let text = text.trim().trim_end_matches("px").trim();
+    let ok = |n: u32| (1..=1024).contains(&n);
+    if let Some((w, h)) = text.split_once(['x', 'X']) {
+        let (w, h) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+        (ok(w) && ok(h)).then_some([w, h])
+    } else {
+        let n = text.parse().ok()?;
+        ok(n).then_some([n, n])
+    }
+}
+
+/// "32" for square tiles, "32x48" otherwise.
+fn show_tile(t: [u32; 2]) -> String {
+    if t[0] == t[1] { format!("{}", t[0]) } else { format!("{}x{}", t[0], t[1]) }
+}
+
 fn main() -> eframe::Result {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: tilepick <source dir> <destination dir>");
+    let mut tile: [u32; 2] = [32, 32];
+    let mut dirs: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--tile" {
+            tile = args.next().as_deref().and_then(parse_tile).unwrap_or_else(|| {
+                eprintln!("--tile needs a pixel size like 32 or 32x48, between 1 and 1024");
+                std::process::exit(2);
+            });
+        } else {
+            dirs.push(a);
+        }
+    }
+    if dirs.len() != 2 {
+        eprintln!("usage: tilepick [--tile N|WxH] <source dir> <destination dir>");
         std::process::exit(2);
     }
-    let src = PathBuf::from(&args[1]);
-    let dst = PathBuf::from(&args[2]);
+    let src = PathBuf::from(&dirs[0]);
+    let dst = PathBuf::from(&dirs[1]);
     if let Err(e) = std::fs::create_dir_all(&dst) {
         eprintln!("cannot create {}: {e}", dst.display());
         std::process::exit(1);
@@ -835,7 +1339,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(App::new(src, dst)))
+            Ok(Box::new(App::new(src, dst, tile)))
         }),
     )
 }

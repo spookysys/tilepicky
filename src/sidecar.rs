@@ -1,101 +1,96 @@
 //! `tilepick.json`: one file per directory that describes the sheets in it.
-//! Each entry holds tags, the origin of cells, and animations. The source
-//! directory and the directory of your own tilemaps use the same format.
+//! Each entry holds the sheet's grid, the origin of cells, and animations.
+//! The source directory and your tilemap directory use the same format.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Every sheet is on a 32 px grid.
-pub const TILE: u32 = 32;
 pub const BOOK: &str = "tilepick.json";
 
-/// One cell: its origin and the words that describe it.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct Cell {
-    /// Path of the original sheet, relative to the source root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub src: Option<String>,
-    /// Cell position `[x, y]` in the original sheet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub at: Option<[u32; 2]>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
+/// The regions of this sheet that came from one source file, as pixel
+/// rectangles `[x, y, w, h]`. Where in the source they came from is not
+/// recorded: the source file itself answers that.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Provenance {
+    pub source: String,
+    pub rects: Vec<[u32; 4]>,
 }
 
-/// A strip of frames, left to right. Each frame is `w` x `h` cells; the strip
-/// starts at cell `(x, y)`.
+/// A strip of frames, left to right: a place on the bitmap, in pixels.
+/// The grid plays no part in it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Animation {
-    pub x: u32,
-    #[serde(alias = "row")]
-    pub y: u32,
-    #[serde(default = "one")]
-    pub w: u32,
-    #[serde(default = "one")]
-    pub h: u32,
+    /// Top-left corner of the strip.
+    pub px: [u32; 2],
+    /// Size of one frame.
+    pub frame: [u32; 2],
     pub frames: u32,
     pub ms: u32,
 }
 
-fn one() -> u32 {
-    1
+impl Animation {
+    /// The strip in pixels: x0, y0, and one past x1, y1.
+    pub fn px_rect(&self) -> (u32, u32, u32, u32) {
+        (self.px[0], self.px[1], self.px[0] + self.frame[0] * self.frames, self.px[1] + self.frame[1])
+    }
+    pub fn px_overlaps(&self, other: (u32, u32, u32, u32)) -> bool {
+        let a = self.px_rect();
+        a.0 < other.2 && other.0 < a.2 && a.1 < other.3 && other.1 < a.3
+    }
+    /// The strip moved by a pixel offset.
+    pub fn shifted(&self, dx: i64, dy: i64) -> Animation {
+        let px = [(self.px[0] as i64 + dx) as u32, (self.px[1] as i64 + dy) as u32];
+        Animation { px, ..self.clone() }
+    }
 }
 
-impl Animation {
-    pub fn contains(&self, x: u32, y: u32) -> bool {
-        x >= self.x && x < self.x + self.w * self.frames && y >= self.y && y < self.y + self.h
+/// A tile size: one number for square tiles, `[w, h]` otherwise.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum TileSize {
+    Square(u32),
+    Wh([u32; 2]),
+}
+
+impl TileSize {
+    pub fn wh(self) -> [u32; 2] {
+        match self {
+            TileSize::Square(n) => [n, n],
+            TileSize::Wh(a) => a,
+        }
     }
-    /// Cells of the strip, as a rectangle: x0, y0, x1, y1 inclusive.
-    pub fn area(&self) -> (u32, u32, u32, u32) {
-        (self.x, self.y, self.x + self.w * self.frames - 1, self.y + self.h - 1)
+    pub fn of(wh: [u32; 2]) -> Self {
+        if wh[0] == wh[1] { TileSize::Square(wh[0]) } else { TileSize::Wh(wh) }
     }
 }
 
 /// What the book says about one sheet.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Sidecar {
-    /// Words that describe the whole sheet.
+    /// The sheet's tile size. Absent: the run's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile: Option<TileSize>,
+    /// Pixels between neighbouring tiles on this sheet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<u32>,
+    /// Pixels before the first tile, on both axes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    /// Where the regions of this sheet came from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-    /// Keyed by `"x,y"` so that the file stays readable.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub cells: BTreeMap<String, Cell>,
+    pub provenance: Vec<Provenance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animations: Vec<Animation>,
 }
 
 impl Sidecar {
-    pub fn key(x: u32, y: u32) -> String {
-        format!("{x},{y}")
-    }
-
     pub fn is_empty(&self) -> bool {
-        self.tags.is_empty() && self.cells.is_empty() && self.animations.is_empty()
+        self.tile.is_none() && self.gap.is_none() && self.offset.is_none() && self.provenance.is_empty() && self.animations.is_empty()
     }
 
-    pub fn get(&self, x: u32, y: u32) -> Option<&Cell> {
-        self.cells.get(&Self::key(x, y))
-    }
 
-    pub fn set(&mut self, x: u32, y: u32, cell: Option<Cell>) {
-        match cell {
-            Some(c) => {
-                self.cells.insert(Self::key(x, y), c);
-            }
-            None => {
-                self.cells.remove(&Self::key(x, y));
-            }
-        }
-    }
 
-    pub fn animation_at(&self, x: u32, y: u32) -> Option<&Animation> {
-        self.animations.iter().find(|a| a.contains(x, y))
-    }
-
-    pub fn animation_at_mut(&mut self, x: u32, y: u32) -> Option<&mut Animation> {
-        self.animations.iter_mut().find(|a| a.contains(x, y))
-    }
 }
 
 pub type Book = BTreeMap<String, Sidecar>;
@@ -105,6 +100,35 @@ pub fn load_book(dir: &Path) -> Book {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Moves or copies one entry to a new path, for a renamed or duplicated
+/// sheet.
+pub fn move_entry(dir: &Path, old: &str, new: &str, keep_old: bool) -> Result<(), String> {
+    let mut book = load_book(dir);
+    if let Some(e) = book.get(old).cloned() {
+        if !keep_old {
+            book.remove(old);
+        }
+        book.insert(new.to_string(), e);
+        let json = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Re-keys every entry under a renamed folder.
+pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
+    let book = load_book(dir);
+    let moved: Book = book
+        .into_iter()
+        .map(|(k, v)| match k.strip_prefix(&format!("{old}/")) {
+            Some(rest) => (format!("{new}/{rest}"), v),
+            None => (k, v),
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&moved).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())
 }
 
 /// Writes one entry. The book is read again first, so that entries changed
@@ -118,4 +142,18 @@ pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> 
     }
     let json = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
     std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_strip_is_a_pixel_rectangle() {
+        let a = Animation { px: [128, 64], frame: [64, 96], frames: 6, ms: 100 };
+        assert_eq!(a.px_rect(), (128, 64, 128 + 6 * 64, 64 + 96));
+        assert!(a.px_overlaps((0, 0, 129, 65)));
+        assert!(!a.px_overlaps((0, 0, 128, 64)));
+        assert_eq!(a.shifted(-128, 32).px_rect(), (0, 96, 6 * 64, 96 + 96));
+    }
 }

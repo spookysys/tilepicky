@@ -1,8 +1,7 @@
 //! One sheet on screen: an image on a 32 px grid with a selection. The source
 //! panel and your own tilemap are the same thing; only the edits differ.
 
-use crate::index::{matches, path_words, Names};
-use crate::sidecar::{self, Animation, Cell, Sidecar, TILE};
+use crate::sidecar::{self, Animation, Provenance, Sidecar, TileSize};
 use eframe::egui::{self, Color32, Id, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use image::{Rgba, RgbaImage};
 use std::collections::BTreeSet;
@@ -105,6 +104,18 @@ impl Sel {
             self.cells.insert(c);
         }
     }
+    /// Adds (`on`) or removes the cells of a rectangle.
+    pub fn set_rect(&mut self, cols: std::ops::RangeInclusive<u32>, rows: std::ops::RangeInclusive<u32>, on: bool) {
+        for y in rows {
+            for x in cols.clone() {
+                if on {
+                    self.cells.insert((x, y));
+                } else {
+                    self.cells.remove(&(x, y));
+                }
+            }
+        }
+    }
     pub fn union(mut self, other: &Sel) -> Self {
         self.cells.extend(other.cells.iter().copied());
         self
@@ -134,9 +145,111 @@ pub struct Draft {
 }
 
 impl Draft {
-    pub fn animation(&self) -> Animation {
+    pub fn animation(&self, tile: [u32; 2]) -> Animation {
         let b = self.area;
-        Animation { x: b.x0, y: b.y0, w: b.cols() / self.frames, h: b.rows(), frames: self.frames, ms: self.ms }
+        Animation {
+            px: [b.x0 * tile[0], b.y0 * tile[1]],
+            frame: [b.cols() * tile[0] / self.frames, b.rows() * tile[1]],
+            frames: self.frames,
+            ms: self.ms,
+        }
+    }
+}
+
+/// One straight piece of the selection's boundary: a grid line, the run of
+/// cells along it, and which way is out of the selection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Edge {
+    pub line: u32,
+    /// Outward means increasing x (or y).
+    pub far: bool,
+    pub extent: std::ops::RangeInclusive<u32>,
+}
+
+/// An edge of the selection being dragged. An edit rectangle spans from the
+/// clicked edge line to the pointer, across the edge's extent. Dragged
+/// outward it adds its cells; dragged inward it removes them.
+#[derive(Clone, Debug)]
+struct EdgeDrag {
+    base: Sel,
+    /// A vertical edge (a run of cells in a column), if one was grabbed.
+    ex: Option<Edge>,
+    /// A horizontal edge (a run of cells in a row), if one was grabbed.
+    ey: Option<Edge>,
+}
+
+impl EdgeDrag {
+    /// The selection with the edit rectangle applied, for the pointer at grid
+    /// lines `lx`, `ly`.
+    fn apply(&self, lx: u32, ly: u32) -> Sel {
+        let mut sel = self.base.clone();
+        let span = |e: &Edge, at: u32| {
+            let outward = (at > e.line) == e.far;
+            (e.line.min(at)..=e.line.max(at) - 1, outward)
+        };
+        let cols = self.ex.as_ref().filter(|e| lx != e.line).map(|e| span(e, lx));
+        let rows = self.ey.as_ref().filter(|e| ly != e.line).map(|e| span(e, ly));
+        if let (Some((cols, outward)), Some(e)) = (&cols, &self.ex) {
+            sel.set_rect(cols.clone(), e.extent.clone(), *outward);
+        }
+        if let (Some((rows, outward)), Some(e)) = (&rows, &self.ey) {
+            sel.set_rect(e.extent.clone(), rows.clone(), *outward);
+        }
+        // A corner dragged outward on both axes also adds the corner block.
+        if let (Some((cols, true)), Some((rows, true))) = (cols, rows) {
+            sel.set_rect(cols, rows, true);
+        }
+        sel
+    }
+}
+
+impl Sel {
+    /// The vertical boundary edge on grid line `line` that passes row `y`:
+    /// selected on one side, not on the other, extended up and down while
+    /// that holds.
+    fn vertical_edge(&self, line: u32, y: u32) -> Option<Edge> {
+        let side = |yy: u32| {
+            let left = line > 0 && self.contains((line - 1, yy));
+            let right = self.contains((line, yy));
+            match (left, right) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            }
+        };
+        let far = side(y)?;
+        let mut y0 = y;
+        while y0 > 0 && side(y0 - 1) == Some(far) {
+            y0 -= 1;
+        }
+        let mut y1 = y;
+        while side(y1 + 1) == Some(far) {
+            y1 += 1;
+        }
+        Some(Edge { line, far, extent: y0..=y1 })
+    }
+
+    /// The horizontal boundary edge on grid line `line` that passes column `x`.
+    fn horizontal_edge(&self, line: u32, x: u32) -> Option<Edge> {
+        let side = |xx: u32| {
+            let above = line > 0 && self.contains((xx, line - 1));
+            let below = self.contains((xx, line));
+            match (above, below) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            }
+        };
+        let far = side(x)?;
+        let mut x0 = x;
+        while x0 > 0 && side(x0 - 1) == Some(far) {
+            x0 -= 1;
+        }
+        let mut x1 = x;
+        while side(x1 + 1) == Some(far) {
+            x1 += 1;
+        }
+        Some(Edge { line, far, extent: x0..=x1 })
     }
 }
 
@@ -144,18 +257,143 @@ impl Draft {
 #[derive(Default)]
 pub struct ViewEvent {
     pub interacted: bool,
-    /// A block drag began; the value is the grabbed cell, relative to the selection.
+    /// A block drag began by holding on this cell.
     pub drag_block: Option<(u32, u32)>,
     /// A canvas resize drag ended.
     pub resized: bool,
+    /// Right click inside the selection: delete its content, keep the selection.
+    pub delete: bool,
+}
+
+/// Which source file each pixel came from: an index into `sources`, or -1.
+/// The working model of provenance; the rectangles in the book are only its
+/// saved form.
+#[derive(Clone, Default)]
+pub struct ProvMap {
+    pub sources: Vec<String>,
+    idx: Vec<i32>,
+    w: u32,
+    h: u32,
+}
+
+impl ProvMap {
+    pub fn new(w: u32, h: u32) -> Self {
+        Self { sources: Vec::new(), idx: vec![-1; (w * h) as usize], w, h }
+    }
+
+    /// Paints the book's rectangles; later entries win where they overlap.
+    pub fn from_side(w: u32, h: u32, provenance: &[Provenance]) -> Self {
+        let mut m = Self::new(w, h);
+        for p in provenance {
+            let v = m.intern(&p.source);
+            for r in &p.rects {
+                m.fill(r[0], r[1], r[2], r[3], v);
+            }
+        }
+        m
+    }
+
+    pub fn intern(&mut self, name: &str) -> i32 {
+        match self.sources.iter().position(|s| s == name) {
+            Some(i) => i as i32,
+            None => {
+                self.sources.push(name.to_string());
+                self.sources.len() as i32 - 1
+            }
+        }
+    }
+
+    pub fn get(&self, x: u32, y: u32) -> Option<&str> {
+        if x >= self.w || y >= self.h {
+            return None;
+        }
+        let v = self.idx[(y * self.w + x) as usize];
+        (v >= 0).then(|| self.sources[v as usize].as_str())
+    }
+
+    /// The raw index at a pixel, for mapping between tables.
+    pub fn index_at(&self, x: u32, y: u32) -> Option<usize> {
+        if x >= self.w || y >= self.h {
+            return None;
+        }
+        let v = self.idx[(y * self.w + x) as usize];
+        (v >= 0).then_some(v as usize)
+    }
+
+    pub fn set(&mut self, x: u32, y: u32, v: i32) {
+        if x < self.w && y < self.h {
+            self.idx[(y * self.w + x) as usize] = v;
+        }
+    }
+
+    pub fn fill(&mut self, x: u32, y: u32, w: u32, h: u32, v: i32) {
+        for yy in y..(y + h).min(self.h) {
+            for xx in x..(x + w).min(self.w) {
+                self.idx[(yy * self.w + xx) as usize] = v;
+            }
+        }
+    }
+
+    pub fn any_in(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
+        (y0..y1.min(self.h)).any(|y| (x0..x1.min(self.w)).any(|x| self.idx[(y * self.w + x) as usize] >= 0))
+    }
+
+    /// The same map on a resized canvas; cut or extended with empty.
+    pub fn resized(&self, w: u32, h: u32) -> Self {
+        let mut m = Self { sources: self.sources.clone(), idx: vec![-1; (w * h) as usize], w, h };
+        for y in 0..h.min(self.h) {
+            for x in 0..w.min(self.w) {
+                m.idx[(y * w + x) as usize] = self.idx[(y * self.w + x) as usize];
+            }
+        }
+        m
+    }
+
+    /// Greedy meshing back to rectangles, grouped by source, for the book.
+    pub fn extract(&self) -> Vec<Provenance> {
+        let mut scratch = self.idx.clone();
+        let mut by_source: std::collections::BTreeMap<&str, Vec<[u32; 4]>> = std::collections::BTreeMap::new();
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let v = scratch[(y * self.w + x) as usize];
+                if v < 0 {
+                    continue;
+                }
+                // The run of `v` to the right, then as many equal rows below.
+                let mut w = 1;
+                while x + w < self.w && scratch[(y * self.w + x + w) as usize] == v {
+                    w += 1;
+                }
+                let mut h = 1;
+                'rows: while y + h < self.h {
+                    for xx in x..x + w {
+                        if scratch[((y + h) * self.w + xx) as usize] != v {
+                            break 'rows;
+                        }
+                    }
+                    h += 1;
+                }
+                for yy in y..y + h {
+                    for xx in x..x + w {
+                        scratch[(yy * self.w + xx) as usize] = -1;
+                    }
+                }
+                by_source.entry(self.sources[v as usize].as_str()).or_default().push([x, y, w, h]);
+            }
+        }
+        by_source.into_iter().map(|(source, rects)| Provenance { source: source.to_string(), rects }).collect()
+    }
 }
 
 /// What Ctrl+C carries: pixels plus the origin of every cell.
 pub struct Block {
+    /// The tile size of the sheet the block was copied from.
+    pub tile: [u32; 2],
     pub cols: u32,
     pub rows: u32,
     pub img: RgbaImage,
-    pub cells: Vec<Option<Cell>>,
+    /// Which source file each pixel came from.
+    pub prov: ProvMap,
     /// Which cells of the bounding area belong to the block.
     pub mask: Vec<bool>,
     /// Stored animations that lie inside the block, relative to its top-left.
@@ -165,9 +403,8 @@ pub struct Block {
 impl Block {
     /// One line that says what the block is, for the system clipboard.
     pub fn note(&self) -> String {
-        let mut from: Vec<&str> = self.cells.iter().flatten().filter_map(|c| c.src.as_deref()).collect();
+        let mut from: Vec<&str> = self.prov.sources.iter().map(String::as_str).collect();
         from.sort_unstable();
-        from.dedup();
         format!("tilepick: {}x{} cells from {}", self.cols, self.rows, from.join(", "))
     }
 }
@@ -176,23 +413,37 @@ pub struct Sheet {
     pub rel: String,
     /// The directory whose book describes this sheet.
     pub dir: PathBuf,
+    /// The sheet's tile size in pixels: the grid drawn over the bitmap.
+    pub tile: [u32; 2],
+    /// Pixels between neighbouring tiles, and before the first one.
+    pub gap: u32,
+    pub offset: u32,
+    /// The values in the header's grid fields, applied when the drag ends.
+    pub tile_edit: [u32; 2],
+    pub gap_edit: u32,
+    pub offset_edit: u32,
+    /// Typing in the tile field: the text, and whether it still needs focus.
+    pub tile_text: Option<String>,
+    pub tile_text_focus: bool,
+    /// Drag distance collected by the tile field between steps.
+    pub tile_acc: f32,
+    /// The last click, for the double-click-and-drag lift shortcut: its
+    /// time, its cell, and the selection it replaced.
+    last_click: Option<(f64, (u32, u32), Sel)>,
     pub img: RgbaImage,
-    /// The book entry: tags, origins, animations. Saved with the sheet.
+    /// The book entry: grid, origins, animations. Saved with the sheet.
     pub side: Sidecar,
-    /// Derived names of cells from the indexer. Read only.
-    pub names: Names,
-    pub words: Vec<String>,
     chunks: Vec<(Rect, TextureHandle)>,
     pub sel: Sel,
     anchor: Option<(u32, u32)>,
     /// The selection when a range drag began; the dragged rectangle is added to it.
     base: Sel,
-    /// An edge drag in progress: the fixed x and y of the bounding area, if that axis moves.
-    resize: Option<(Option<u32>, Option<u32>)>,
+    /// An edge drag in progress: the selection and its bounds at the start,
+    /// and the fixed x and y of the bounds, for the axes that move.
+    resize: Option<EdgeDrag>,
     /// A canvas edge drag in progress: which of width and height follow the pointer.
     canvas_resize: Option<(bool, bool)>,
     pub zoom: Zoom,
-    pub hits: Vec<bool>,
     pub hover: Option<(u32, u32)>,
     scroll_to: Option<Vec2>,
     /// Where the sheet was drawn last frame, in screen space, and its visible part.
@@ -207,28 +458,55 @@ pub struct Sheet {
     pub preview_zoom: Zoom,
     /// The pointer was over the animation preview last frame.
     pub preview_hovered: bool,
-    undo: Vec<(RgbaImage, Sidecar)>,
+    /// Which source file each pixel came from, in image coordinates.
+    pub prov: ProvMap,
+    /// The frames of an animated GIF; empty for still images.
+    frames: Vec<RgbaImage>,
+    frame_ms: u32,
+    cur_frame: usize,
+    undo: Vec<(RgbaImage, Sidecar, ProvMap)>,
 }
 
 impl Sheet {
-    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, side: Sidecar, names: Names, words: Vec<String>) -> Result<Self, String> {
-        let img = image::open(dir.join(rel)).map_err(|e| format!("{rel}: {e}"))?.to_rgba8();
-        Ok(Self::from_image(ctx, dir, rel, img, side, names, words))
+    /// `inherit` is the grid (tile, gap, offset) to assume for whatever the
+    /// entry does not name: the settings of the sheet that was open before.
+    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, u32), side: Sidecar) -> Result<Self, String> {
+        let path = dir.join(rel);
+        let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
+        let img = match frames.first() {
+            Some(f) => f.clone(),
+            None => image::open(&path).map_err(|e| format!("{rel}: {e}"))?.to_rgba8(),
+        };
+        let mut sheet = Self::from_image(ctx, dir, rel, inherit, img, side);
+        sheet.frames = frames;
+        sheet.frame_ms = frame_ms;
+        Ok(sheet)
     }
 
-    pub fn new_empty(ctx: &egui::Context, dir: &Path, rel: &str, cols: u32, rows: u32) -> Self {
-        let img = RgbaImage::new(cols * TILE, rows * TILE);
-        Self::from_image(ctx, dir, rel, img, Sidecar::default(), Names::new(), path_words(rel))
+    pub fn new_empty(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], cols: u32, rows: u32) -> Self {
+        let img = RgbaImage::new(cols * tile[0], rows * tile[1]);
+        Self::from_image(ctx, dir, rel, (tile, 0, 0), img, Sidecar::default())
     }
 
-    fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, img: RgbaImage, side: Sidecar, names: Names, words: Vec<String>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, u32), img: RgbaImage, side: Sidecar) -> Self {
+        let tile = side.tile.map(TileSize::wh).unwrap_or(inherit.0);
+        let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
             rel: rel.to_string(),
             dir: dir.to_path_buf(),
+            tile,
+            gap: side.gap.unwrap_or(inherit.1),
+            offset: side.offset.unwrap_or(inherit.2),
+            tile_edit: tile,
+            gap_edit: side.gap.unwrap_or(inherit.1),
+            offset_edit: side.offset.unwrap_or(inherit.2),
+            tile_text: None,
+            tile_text_focus: false,
+            tile_acc: 0.0,
+            last_click: None,
             img,
             side,
-            names,
-            words,
             chunks: Vec::new(),
             sel: Sel::default(),
             anchor: None,
@@ -236,7 +514,6 @@ impl Sheet {
             resize: None,
             canvas_resize: None,
             zoom: Zoom::new(2.0),
-            hits: Vec::new(),
             hover: None,
             scroll_to: None,
             screen: Rect::NOTHING,
@@ -246,22 +523,58 @@ impl Sheet {
             anim_panel: false,
             preview_zoom: Zoom::new(2.0),
             preview_hovered: false,
+            prov,
+            frames: Vec::new(),
+            frame_ms: 0,
+            cur_frame: 0,
             undo: Vec::new(),
         };
         s.upload(ctx);
         s
     }
 
+    /// Distance from one tile's origin to the next, per axis, on the image.
+    pub fn pitch(&self) -> [u32; 2] {
+        [self.tile[0] + self.gap, self.tile[1] + self.gap]
+    }
     pub fn cols(&self) -> u32 {
-        self.img.width().div_ceil(TILE)
+        (self.img.width().saturating_sub(self.offset) + self.gap).div_ceil(self.pitch()[0]).max(1)
     }
     pub fn rows(&self) -> u32 {
-        self.img.height().div_ceil(TILE)
+        (self.img.height().saturating_sub(self.offset) + self.gap).div_ceil(self.pitch()[1]).max(1)
+    }
+    /// Where a cell's pixels sit on the image: x0, y0, one past x1, y1.
+    fn cell_img_rect(&self, x: u32, y: u32) -> (u32, u32, u32, u32) {
+        let p = self.pitch();
+        let (ox, oy) = (self.offset + x * p[0], self.offset + y * p[1]);
+        (ox, oy, ox + self.tile[0], oy + self.tile[1])
+    }
+
+    /// Re-uploads only the pixels inside an image rectangle (x0, y0, one
+    /// past x1, y1), into the chunks it touches. Cheap for small edits on a
+    /// large canvas.
+    fn upload_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
+        let (w, h) = self.img.dimensions();
+        let (x1, y1) = (x1.min(w), y1.min(h));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        for (rect, tex) in &mut self.chunks {
+            let (cx0, cy0) = (rect.min.x as u32, rect.min.y as u32);
+            let (cx1, cy1) = (cx0 + rect.width() as u32, cy0 + rect.height() as u32);
+            let (ix0, iy0, ix1, iy1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
+            if ix0 >= ix1 || iy0 >= iy1 {
+                continue;
+            }
+            let sub = image::imageops::crop_imm(&self.img, ix0, iy0, ix1 - ix0, iy1 - iy0).to_image();
+            let color = egui::ColorImage::from_rgba_unmultiplied([(ix1 - ix0) as usize, (iy1 - iy0) as usize], sub.as_raw());
+            tex.set_partial([(ix0 - cx0) as usize, (iy0 - cy0) as usize], color, TextureOptions::NEAREST);
+        }
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
         let (w, h) = self.img.dimensions();
-        let side = CHUNK.min(ctx.input(|i| i.max_texture_side) as u32).max(TILE);
+        let side = CHUNK.min(ctx.input(|i| i.max_texture_side) as u32).max(64);
         self.chunks.clear();
         let mut y = 0;
         while y < h {
@@ -280,44 +593,32 @@ impl Sheet {
         }
     }
 
-    /// Marks the cells that match the query. Empty query: no marks.
-    pub fn compute_hits(&mut self, query: &[String]) {
-        let n = (self.cols() * self.rows()) as usize;
-        if query.is_empty() {
-            self.hits = vec![false; n];
-            return;
-        }
-        let cols = self.cols();
-        self.hits = (0..n)
-            .map(|i| {
-                let (x, y) = (i as u32 % cols, i as u32 / cols);
-                let cell = self.side.get(x, y);
-                let names = self.names.get(&Sidecar::key(x, y));
-                matches(query, |q| {
-                    self.words.iter().any(|w| w.starts_with(q))
-                        || names.is_some_and(|ws| ws.iter().any(|w| w.starts_with(q)))
-                        || cell.is_some_and(|c| {
-                            c.tags.iter().any(|t| t.starts_with(q))
-                                || c.src.as_deref().is_some_and(|s| path_words(s).iter().any(|w| w.starts_with(q)))
-                        })
-                })
-            })
-            .collect();
+    /// The source file a view cell's pixels came from, if one is recorded.
+    pub fn cell_source(&self, x: u32, y: u32) -> Option<&str> {
+        let (ix0, iy0, ix1, iy1) = self.cell_img_rect(x, y);
+        self.prov.get(ix0, iy0).or_else(|| {
+            (iy0..iy1).flat_map(|iy| (ix0..ix1).map(move |ix| (ix, iy))).find_map(|(ix, iy)| self.prov.get(ix, iy))
+        })
     }
 
-    /// All words known for one cell: the book's tags and the derived names.
-    pub fn cell_tags(&self, x: u32, y: u32) -> Vec<String> {
-        let mut out: Vec<String> = self.side.get(x, y).map(|c| c.tags.clone()).unwrap_or_default();
-        for w in self.names.get(&Sidecar::key(x, y)).into_iter().flatten() {
-            if !out.contains(w) {
-                out.push(w.clone());
-            }
-        }
-        out
+    /// One cell's screen size, per axis.
+    pub fn cell_px(&self) -> Vec2 {
+        let p = self.pitch();
+        Vec2::new(p[0] as f32, p[1] as f32) * self.zoom.level
     }
 
-    pub fn cell_px(&self) -> f32 {
-        TILE as f32 * self.zoom.level
+    /// The strip that covers a cell, if one does.
+    pub fn animation_at(&self, x: u32, y: u32) -> Option<Animation> {
+        let r = self.cell_px_rect(x, y);
+        self.side.animations.iter().find(|a| a.px_overlaps(r)).cloned()
+    }
+
+    /// The logical pixel rectangle of one cell, as if the sheet were packed:
+    /// the coordinate space of cell records and animations. On a sheet
+    /// without gaps it equals the image rectangle.
+    fn cell_px_rect(&self, x: u32, y: u32) -> (u32, u32, u32, u32) {
+        let [tw, th] = self.tile;
+        (x * tw, y * th, (x + 1) * tw, (y + 1) * th)
     }
 
     /// The cell under a screen position. Positions past the right or bottom
@@ -327,19 +628,34 @@ impl Sheet {
         if !self.clip.contains(p) || p.x < self.screen.min.x || p.y < self.screen.min.y {
             return None;
         }
-        let d = (p - self.screen.min) / self.cell_px();
-        Some((d.x as u32, d.y as u32))
+        let c = self.cell_px();
+        let d = p - self.screen.min - Vec2::splat(self.offset as f32 * self.zoom.level);
+        Some(((d.x / c.x).max(0.0) as u32, (d.y / c.y).max(0.0) as u32))
     }
 
     /// Draws the sheet and handles pointer input. While a block drag is in
     /// progress (`dragging`), the sheet only draws.
     pub fn view(&mut self, ui: &mut Ui, id: Id, dragging: bool, editable: bool) -> ViewEvent {
         let mut event = ViewEvent::default();
+        // An animated GIF plays in place.
+        if self.frames.len() > 1 {
+            let ms = self.frame_ms.max(20) as u64;
+            let k = ((ui.input(|i| i.time) * 1000.0) as u64 / ms) as usize % self.frames.len();
+            if k != self.cur_frame {
+                self.cur_frame = k;
+                self.img = self.frames[k].clone();
+                let (w, h) = self.img.dimensions();
+                self.upload_region(0, 0, w, h);
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
+        }
         let zoom = self.zoom.level;
-        let cell_px = TILE as f32 * zoom;
+        let cell_px = self.cell_px();
+        let tile_px = Vec2::new(self.tile[0] as f32, self.tile[1] as f32) * zoom;
+        let off_px = self.offset as f32 * zoom;
         /// Room past the right and bottom edges, where the canvas handles sit.
         const MARGIN: f32 = 12.0;
-        let size = Vec2::new(self.cols() as f32 * cell_px, self.rows() as f32 * cell_px);
+        let size = Vec2::new(self.cols() as f32 * cell_px.x, self.rows() as f32 * cell_px.y);
         let mut area = egui::ScrollArea::both().id_salt((id, "scroll")).auto_shrink([false, false]);
         if let Some(offset) = self.scroll_to.take() {
             area = area.scroll_offset(offset);
@@ -360,40 +676,44 @@ impl Sheet {
                 painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             }
             let cell_rect = |x: u32, y: u32| {
-                Rect::from_min_size(rect.min + Vec2::new(x as f32, y as f32) * cell_px, Vec2::splat(cell_px))
+                Rect::from_min_size(rect.min + Vec2::splat(off_px) + Vec2::new(x as f32 * cell_px.x, y as f32 * cell_px.y), tile_px)
             };
-            if cell_px >= 16.0 {
+            if tile_px.min_elem() >= 16.0 {
                 let grid = Stroke::new(1.0, Color32::from_black_alpha(40));
-                for x in 0..=self.cols() {
-                    let sx = rect.min.x + x as f32 * cell_px;
-                    painter.line_segment([Pos2::new(sx, rect.min.y), Pos2::new(sx, rect.max.y)], grid);
-                }
-                for y in 0..=self.rows() {
-                    let sy = rect.min.y + y as f32 * cell_px;
-                    painter.line_segment([Pos2::new(rect.min.x, sy), Pos2::new(rect.max.x, sy)], grid);
-                }
-            }
-            let cols = self.cols();
-            for (i, hit) in self.hits.iter().enumerate() {
-                if *hit {
-                    let r = cell_rect(i as u32 % cols, i as u32 / cols);
-                    painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(255, 220, 0, 70));
-                    painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(255, 220, 0)), egui::StrokeKind::Inside);
+                if self.gap == 0 && self.offset == 0 {
+                    for x in 0..=self.cols() {
+                        let sx = rect.min.x + x as f32 * cell_px.x;
+                        painter.line_segment([Pos2::new(sx, rect.min.y), Pos2::new(sx, rect.max.y)], grid);
+                    }
+                    for y in 0..=self.rows() {
+                        let sy = rect.min.y + y as f32 * cell_px.y;
+                        painter.line_segment([Pos2::new(rect.min.x, sy), Pos2::new(rect.max.x, sy)], grid);
+                    }
+                } else {
+                    // With gaps the grid is not a set of lines; frame each tile.
+                    for y in 0..self.rows() {
+                        for x in 0..self.cols() {
+                            painter.rect_stroke(cell_rect(x, y), 0.0, grid, egui::StrokeKind::Outside);
+                        }
+                    }
                 }
             }
             let orange = Color32::from_rgb(255, 140, 0);
             for a in &self.side.animations {
-                let (x0, y0, x1, y1) = a.area();
-                let r = cell_rect(x0, y0).union(cell_rect(x1, y1));
+                let (x0, y0, x1, y1) = a.px_rect();
+                let r = Rect::from_min_max(
+                    rect.min + Vec2::new(x0 as f32, y0 as f32) * zoom,
+                    rect.min + Vec2::new(x1 as f32, y1 as f32) * zoom,
+                );
                 painter.rect_stroke(r, 0.0, Stroke::new(2.0, orange), egui::StrokeKind::Inside);
                 for f in 1..a.frames {
-                    let sx = rect.min.x + (a.x + f * a.w) as f32 * cell_px;
+                    let sx = rect.min.x + (a.px[0] + f * a.frame[0]) as f32 * zoom;
                     painter.line_segment([Pos2::new(sx, r.min.y), Pos2::new(sx, r.max.y)], Stroke::new(1.0, orange));
                 }
                 painter.text(
                     r.left_bottom() + Vec2::new(3.0, -2.0),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("{} frames of {}x{}", a.frames, a.w, a.h),
+                    format!("{} frames of {}x{} px", a.frames, a.frame[0], a.frame[1]),
                     egui::FontId::proportional(11.0),
                     orange,
                 );
@@ -420,29 +740,26 @@ impl Sheet {
 
             let (cols, rows) = (self.cols(), self.rows());
             let to_cell = move |p: Pos2| {
-                let d = (p - rect.min) / cell_px;
-                ((d.x.max(0.0) as u32).min(cols - 1), (d.y.max(0.0) as u32).min(rows - 1))
+                let d = p - rect.min - Vec2::splat(off_px);
+                (((d.x / cell_px.x).max(0.0) as u32).min(cols - 1), ((d.y / cell_px.y).max(0.0) as u32).min(rows - 1))
             };
             self.hover = resp.hover_pos().map(to_cell);
             let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
             if dragging {
                 return;
             }
-            // Near an edge of the selection the pointer becomes a resize handle.
-            let bounds_rect = self.sel.bounds().map(|b| cell_rect(b.x0, b.y0).union(cell_rect(b.x1, b.y1)));
-            let edges_at = |p: Pos2| -> Option<(bool, bool, bool, bool)> {
+            // Near a boundary of the selection the pointer becomes a handle.
+            // Both the vertical and the horizontal boundary are looked up.
+            let edges_at = |sel: &Sel, p: Pos2| -> Option<(Option<Edge>, Option<Edge>)> {
                 const GRIP: f32 = 6.0;
-                let r = bounds_rect?;
-                if !r.expand(GRIP).contains(p) {
-                    return None;
-                }
-                let e = (
-                    (p.x - r.min.x).abs() <= GRIP,
-                    (p.x - r.max.x).abs() <= GRIP,
-                    (p.y - r.min.y).abs() <= GRIP,
-                    (p.y - r.max.y).abs() <= GRIP,
-                );
-                (e.0 || e.1 || e.2 || e.3).then_some(e)
+                let (fx, fy) = ((p.x - rect.min.x - off_px) / cell_px.x, (p.y - rect.min.y - off_px) / cell_px.y);
+                let (lx, ly) = (fx.round(), fy.round());
+                let c = to_cell(p);
+                let near_x = (fx - lx).abs() * cell_px.x <= GRIP && lx >= 0.0 && lx <= cols as f32;
+                let near_y = (fy - ly).abs() * cell_px.y <= GRIP && ly >= 0.0 && ly <= rows as f32;
+                let ex = near_x.then(|| sel.vertical_edge(lx as u32, c.1)).flatten();
+                let ey = near_y.then(|| sel.horizontal_edge(ly as u32, c.0)).flatten();
+                (ex.is_some() || ey.is_some()).then_some((ex, ey))
             };
             // The right and bottom edges of the canvas are handles too.
             let canvas_edge_at = |p: Pos2| -> Option<(bool, bool)> {
@@ -460,13 +777,13 @@ impl Sheet {
                 _ => egui::CursorIcon::ResizeVertical,
             };
             if let Some(p) = resp.hover_pos() {
-                if let Some((w, h)) = canvas_edge_at(p).filter(|_| edges_at(p).is_none()) {
+                if let Some((w, h)) = canvas_edge_at(p).filter(|_| edges_at(&self.sel, p).is_none()) {
                     ui.output_mut(|o| o.cursor_icon = resize_icon(w, h));
-                } else if let Some((l, r, t, b)) = edges_at(p) {
-                    let icon = match (l || r, t || b) {
-                        (true, true) if (l && t) || (r && b) => egui::CursorIcon::ResizeNwSe,
-                        (true, true) => egui::CursorIcon::ResizeNeSw,
-                        (true, false) => egui::CursorIcon::ResizeHorizontal,
+                } else if let Some((ex, ey)) = edges_at(&self.sel, p) {
+                    let icon = match (&ex, &ey) {
+                        (Some(x), Some(y)) if x.far == y.far => egui::CursorIcon::ResizeNwSe,
+                        (Some(_), Some(_)) => egui::CursorIcon::ResizeNeSw,
+                        (Some(_), None) => egui::CursorIcon::ResizeHorizontal,
                         _ => egui::CursorIcon::ResizeVertical,
                     };
                     ui.output_mut(|o| o.cursor_icon = icon);
@@ -475,26 +792,57 @@ impl Sheet {
                 }
             }
             if resp.secondary_clicked() {
-                self.sel = Sel::default();
+                let inside = resp.interact_pointer_pos().is_some_and(|p| self.sel.contains(to_cell(p)));
+                if inside && editable {
+                    // Delete what is selected; the selection itself stays.
+                    event.delete = true;
+                } else {
+                    self.sel = Sel::default();
+                }
                 event.interacted = true;
+            }
+            // Holding still on a tile lifts it: the whole selection when the
+            // press is inside it, else the pressed tile alone. A drag that
+            // moves before the hold ends is a selection instead.
+            if resp.is_pointer_button_down_on() && !resp.dragged() && self.resize.is_none() && self.canvas_resize.is_none() {
+                const HOLD_S: f64 = 0.25;
+                const STILL_PX: f32 = 4.0;
+                let (origin, t0, now, at) = ui.input(|i| (i.pointer.press_origin(), i.pointer.press_start_time(), i.time, i.pointer.latest_pos()));
+                if let (Some(o), Some(t0), Some(at)) = (origin, t0, at) {
+                    let still = (at - o).length() <= STILL_PX;
+                    let plain = edges_at(&self.sel, o).is_none() && canvas_edge_at(o).is_none() && rect.contains(o);
+                    // A quick second press on the same cell lifts at once.
+                    let double = self
+                        .last_click
+                        .as_ref()
+                        .is_some_and(|(t_click, cell, _)| t0 > *t_click && t0 - t_click < 0.35 && *cell == to_cell(o));
+                    if plain && (double || (still && now - t0 >= HOLD_S)) {
+                        if double {
+                            // The first click replaced the selection; put it
+                            // back so the lift takes what was really selected.
+                            if let Some((_, _, prev)) = self.last_click.take() {
+                                self.sel = prev;
+                            }
+                        }
+                        self.last_click = None;
+                        event.drag_block = Some(to_cell(o));
+                        event.interacted = true;
+                    } else if still && plain {
+                        // Keep painting while the hold ripens, even without motion.
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
+                    }
+                }
             }
             if resp.drag_started() {
                 let press = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
                 if let Some(p) = press {
                     let c = to_cell(p);
-                    let edges = edges_at(p);
+                    let edges = edges_at(&self.sel, p);
                     if let Some(wh) = canvas_edge_at(p).filter(|_| edges.is_none()) {
                         self.canvas_resize = Some(wh);
                         self.snapshot();
-                    } else if let (Some((l, r, t, b)), Some(area)) = (edges, self.sel.bounds()) {
-                        // The opposite edge stays; the grabbed edge follows the pointer.
-                        let fx = if l { Some(area.x1) } else if r { Some(area.x0) } else { None };
-                        let fy = if t { Some(area.y1) } else if b { Some(area.y0) } else { None };
-                        self.resize = Some((fx, fy));
-                    } else if self.sel.contains(c) {
-                        // A drag that starts on the selection carries the block.
-                        let o = self.sel.origin().unwrap();
-                        event.drag_block = Some((c.0 - o.0, c.1 - o.1));
+                    } else if let Some((ex, ey)) = edges {
+                        self.resize = Some(EdgeDrag { base: self.sel.clone(), ex, ey });
                     } else {
                         self.base = if ctrl { self.sel.clone() } else { Sel::default() };
                         self.anchor = Some(c);
@@ -508,16 +856,17 @@ impl Sheet {
                     let c = to_cell(p);
                     if let Some((w, h)) = self.canvas_resize {
                         ui.output_mut(|o| o.cursor_icon = resize_icon(w, h));
-                        let want = |v: f32| ((v / cell_px).round() as u32).max(1);
-                        let cols = if w { want(p.x - rect.min.x) } else { self.cols() };
-                        let rows = if h { want(p.y - rect.min.y) } else { self.rows() };
+                        let want = |v: f32, c: f32| (((v - off_px) / c).round() as u32).max(1);
+                        let cols = if w { want(p.x - rect.min.x, cell_px.x) } else { self.cols() };
+                        let rows = if h { want(p.y - rect.min.y, cell_px.y) } else { self.rows() };
                         if (cols, rows) != (self.cols(), self.rows()) {
                             self.set_size(ui.ctx(), cols, rows);
                         }
-                    } else if let (Some((fx, fy)), Some(area)) = (self.resize, self.sel.bounds()) {
-                        let (x0, x1) = fx.map_or((area.x0, area.x1), |f| (f.min(c.0), f.max(c.0)));
-                        let (y0, y1) = fy.map_or((area.y0, area.y1), |f| (f.min(c.1), f.max(c.1)));
-                        self.sel = Sel::rect((x0, y0), (x1, y1));
+                    } else if let Some(d) = &self.resize {
+                        // The pointer snaps to the nearest grid line.
+                        let lx = ((p.x - rect.min.x - off_px) / cell_px.x).round().clamp(0.0, cols as f32) as u32;
+                        let ly = ((p.y - rect.min.y - off_px) / cell_px.y).round().clamp(0.0, rows as f32) as u32;
+                        self.sel = d.apply(lx, ly);
                     } else if let Some(a) = self.anchor {
                         self.sel = self.base.clone().union(&Sel::rect(a, c));
                     }
@@ -534,6 +883,7 @@ impl Sheet {
             if resp.clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let c = to_cell(p);
+                    self.last_click = Some((ui.input(|i| i.time), c, self.sel.clone()));
                     if ctrl && shift {
                         // Add the rectangle from the last clicked cell to this one.
                         let a = self.anchor.unwrap_or(c);
@@ -584,63 +934,152 @@ impl Sheet {
         event
     }
 
-    /// Texture and UV of one cell, for a preview.
-    pub fn cell_uv(&self, x: u32, y: u32) -> Option<(egui::TextureId, Rect)> {
-        let p = Pos2::new((x * TILE) as f32, (y * TILE) as f32);
-        let (r, tex) = self.chunks.iter().find(|(r, _)| r.contains(p))?;
-        let min = Pos2::new((p.x - r.min.x) / r.width(), (p.y - r.min.y) / r.height());
-        let size = Vec2::new(TILE as f32 / r.width(), TILE as f32 / r.height());
-        Some((tex.id(), Rect::from_min_size(min, size)))
+    /// Draws a pixel region of the sheet at `to` on screen, scaled by `zoom`.
+    /// The region may cross texture chunks.
+    pub fn draw_px_rect(&self, painter: &egui::Painter, region: Rect, to: Pos2, zoom: f32) {
+        for (r, tex) in &self.chunks {
+            let part = r.intersect(region);
+            if part.is_negative() {
+                continue;
+            }
+            let uv = Rect::from_min_max(
+                Pos2::new((part.min.x - r.min.x) / r.width(), (part.min.y - r.min.y) / r.height()),
+                Pos2::new((part.max.x - r.min.x) / r.width(), (part.max.y - r.min.y) / r.height()),
+            );
+            let screen = Rect::from_min_size(to + (part.min - region.min) * zoom, part.size() * zoom);
+            painter.image(tex.id(), screen, uv, Color32::WHITE);
+        }
     }
 
     // --- edits --------------------------------------------------------------
 
     pub fn copy(&self) -> Option<Block> {
-        let b = self.sel.bounds()?;
-        let mut img = RgbaImage::new(b.cols() * TILE, b.rows() * TILE);
-        let mut cells = Vec::new();
+        self.copy_sel(&self.sel.clone())
+    }
+
+    /// A block of the given cells; the selection itself is not touched.
+    pub fn copy_sel(&self, sel: &Sel) -> Option<Block> {
+        // A GIF unrolls into a strip only where something actually moves;
+        // a still region is just a picture.
+        if self.frames.len() > 1 && self.region_animates(sel) {
+            return self.copy_strip(sel);
+        }
+        let b = sel.bounds()?;
+        let [tw, th] = self.tile;
+        let mut img = RgbaImage::new(b.cols() * tw, b.rows() * th);
+        let mut prov = ProvMap::new(b.cols() * tw, b.rows() * th);
+        let own = self.rel.clone();
         let mut mask = Vec::new();
         for y in b.y0..=b.y1 {
             for x in b.x0..=b.x1 {
-                let chosen = self.sel.contains((x, y));
+                let chosen = sel.contains((x, y));
                 mask.push(chosen);
                 if !chosen {
-                    cells.push(None);
                     continue;
                 }
                 let mut empty = true;
-                for py in 0..TILE {
-                    for px in 0..TILE {
-                        let (ix, iy) = (x * TILE + px, y * TILE + py);
+                let (ix0, iy0, _, _) = self.cell_img_rect(x, y);
+                for py in 0..th {
+                    for px in 0..tw {
+                        let (ix, iy) = (ix0 + px, iy0 + py);
                         let p = if ix < self.img.width() && iy < self.img.height() { *self.img.get_pixel(ix, iy) } else { Rgba([0; 4]) };
                         empty &= p.0[3] == 0;
-                        img.put_pixel((x - b.x0) * TILE + px, (y - b.y0) * TILE + py, p);
+                        img.put_pixel((x - b.x0) * tw + px, (y - b.y0) * th + py, p);
+                        if let Some(name) = self.prov.get(ix, iy) {
+                            let v = prov.intern(name);
+                            prov.set((x - b.x0) * tw + px, (y - b.y0) * th + py, v);
+                        }
                     }
                 }
-                let known = self.side.get(x, y).cloned();
-                let tags = self.cell_tags(x, y);
-                cells.push(match known {
-                    Some(c) => Some(Cell { src: c.src.or_else(|| Some(self.rel.clone())), at: c.at.or(Some([x, y])), tags }),
-                    None if empty => None,
-                    None => Some(Cell { src: Some(self.rel.clone()), at: Some([x, y]), tags }),
-                });
+                // A cell of this sheet itself, unless it is empty or traced.
+                if !empty {
+                    let v = prov.intern(&own);
+                    for py in 0..th {
+                        for px in 0..tw {
+                            let (bx, by) = ((x - b.x0) * tw + px, (y - b.y0) * th + py);
+                            if prov.get(bx, by).is_none() && self.prov.get(ix0 + px, iy0 + py).is_none() {
+                                prov.set(bx, by, v);
+                            }
+                        }
+                    }
+                }
             }
         }
+        // Animations whose pixels lie inside the selection travel along,
+        // moved to the block's origin.
+        let (px0, py0) = ((b.x0 * tw) as i64, (b.y0 * th) as i64);
+        let sel_px = (b.x0 * tw, b.y0 * th, (b.x1 + 1) * tw, (b.y1 + 1) * th);
         let animations = self
             .side
             .animations
             .iter()
             .filter(|a| {
-                let (x0, y0, x1, y1) = a.area();
-                x0 >= b.x0 && y0 >= b.y0 && x1 <= b.x1 && y1 <= b.y1
+                let r = a.px_rect();
+                r.0 >= sel_px.0 && r.1 >= sel_px.1 && r.2 <= sel_px.2 && r.3 <= sel_px.3
             })
-            .map(|a| Animation { x: a.x - b.x0, y: a.y - b.y0, ..a.clone() })
+            .map(|a| a.shifted(-px0, -py0))
             .collect();
-        Some(Block { cols: b.cols(), rows: b.rows(), img, cells, mask, animations })
+        Some(Block { tile: self.tile, cols: b.cols(), rows: b.rows(), img, prov, mask, animations })
+    }
+
+    /// Whether the selected cells differ between any two frames.
+    fn region_animates(&self, sel: &Sel) -> bool {
+        let first = &self.frames[0];
+        let pixel = |f: &RgbaImage, x: u32, y: u32| {
+            if x < f.width() && y < f.height() { f.get_pixel(x, y).0 } else { [0; 4] }
+        };
+        self.frames[1..].iter().any(|frame| {
+            sel.iter().any(|(x, y)| {
+                let (ix0, iy0, ix1, iy1) = self.cell_img_rect(x, y);
+                (iy0..iy1).any(|iy| (ix0..ix1).any(|ix| pixel(first, ix, iy) != pixel(frame, ix, iy)))
+            })
+        })
+    }
+
+    /// The selection cut from every frame of an animated GIF, laid out left
+    /// to right: a ready animation strip, marked as one.
+    fn copy_strip(&self, sel: &Sel) -> Option<Block> {
+        let b = sel.bounds()?;
+        let [tw, th] = self.tile;
+        let n = self.frames.len() as u32;
+        let (fw, fh) = (b.cols() * tw, b.rows() * th);
+        let mut img = RgbaImage::new(fw * n, fh);
+        let mut prov = ProvMap::new(fw * n, fh);
+        let v = prov.intern(&self.rel);
+        prov.fill(0, 0, fw * n, fh, v);
+        for (f, frame) in self.frames.iter().enumerate() {
+            for y in b.y0..=b.y1 {
+                for x in b.x0..=b.x1 {
+                    if !sel.contains((x, y)) {
+                        continue;
+                    }
+                    let (ix0, iy0, _, _) = self.cell_img_rect(x, y);
+                    for py in 0..th {
+                        for px in 0..tw {
+                            let (ix, iy) = (ix0 + px, iy0 + py);
+                            let p = if ix < frame.width() && iy < frame.height() { *frame.get_pixel(ix, iy) } else { Rgba([0; 4]) };
+                            img.put_pixel(f as u32 * fw + (x - b.x0) * tw + px, (y - b.y0) * th + py, p);
+                        }
+                    }
+                }
+            }
+        }
+        // The selection's shape repeats for every frame.
+        let cols = b.cols() * n;
+        let mut mask = vec![false; (cols * b.rows()) as usize];
+        for f in 0..n {
+            for y in 0..b.rows() {
+                for x in 0..b.cols() {
+                    mask[(y * cols + f * b.cols() + x) as usize] = sel.contains((b.x0 + x, b.y0 + y));
+                }
+            }
+        }
+        let animations = vec![Animation { px: [0, 0], frame: [fw, fh], frames: n, ms: self.frame_ms.max(20) }];
+        Some(Block { tile: self.tile, cols, rows: b.rows(), img, prov, mask, animations })
     }
 
     fn snapshot(&mut self) {
-        self.undo.push((self.img.clone(), self.side.clone()));
+        self.undo.push((self.img.clone(), self.side.clone(), self.prov.clone()));
         if self.undo.len() > 64 {
             self.undo.remove(0);
         }
@@ -652,82 +1091,140 @@ impl Sheet {
         if cols <= self.cols() && rows <= self.rows() {
             return;
         }
-        let mut img = RgbaImage::new(cols.max(self.cols()) * TILE, rows.max(self.rows()) * TILE);
+        let (w, h) = self.img_size_for(cols.max(self.cols()), rows.max(self.rows()));
+        let mut img = RgbaImage::new(w, h);
         image::imageops::replace(&mut img, &self.img, 0, 0);
         self.img = img;
+        self.prov = self.prov.resized(w, h);
     }
 
-    /// Writes the masked cells of the block and selects them.
+    /// The image size that holds the given cell count on this sheet's grid.
+    fn img_size_for(&self, cols: u32, rows: u32) -> (u32, u32) {
+        let p = self.pitch();
+        (self.offset + cols * p[0] - self.gap, self.offset + rows * p[1] - self.gap)
+    }
+
+    /// Writes the block, pixel for pixel, onto this sheet's grid. The block
+    /// may come from a sheet with another tile size; it lands with its
+    /// top-left on the target cell and is padded with transparent pixels to
+    /// whole cells. Unmasked source cells stay holes.
     fn put(&mut self, at: (u32, u32), block: &Block) {
-        self.grow(at.0 + block.cols, at.1 + block.rows);
+        let ([dw, dh], [sw, sh]) = (self.tile, block.tile);
+        let (bw, bh) = block.img.dimensions();
+        let (dcols, drows) = (bw.div_ceil(dw), bh.div_ceil(dh));
+        self.grow(at.0 + dcols, at.1 + drows);
+        let src_masked = |bxp: u32, byp: u32| {
+            bxp < bw && byp < bh && block.mask[((byp / sh) * block.cols + bxp / sw) as usize]
+        };
+        // The block's source names, interned into this sheet's table.
+        let mapped: Vec<i32> = block.prov.sources.iter().map(|n| self.prov.intern(n)).collect();
         let mut sel = Sel::default();
-        for (i, cell) in block.cells.iter().enumerate() {
-            if !block.mask[i] {
-                continue;
+        for j in 0..drows {
+            for i in 0..dcols {
+                let any = (0..dh).any(|py| (0..dw).any(|px| src_masked(i * dw + px, j * dh + py)));
+                if !any {
+                    continue;
+                }
+                let (x, y) = (at.0 + i, at.1 + j);
+                let (ix0, iy0, _, _) = self.cell_img_rect(x, y);
+                for py in 0..dh {
+                    for px in 0..dw {
+                        let (bxp, byp) = (i * dw + px, j * dh + py);
+                        let (v, p) = if src_masked(bxp, byp) {
+                            let idx = block.prov.index_at(bxp, byp).map_or(-1, |k| mapped[k]);
+                            (*block.img.get_pixel(bxp, byp), idx)
+                        } else {
+                            (Rgba([0; 4]), -1)
+                        };
+                        self.img.put_pixel(ix0 + px, iy0 + py, v);
+                        self.prov.set(ix0 + px, iy0 + py, p);
+                    }
+                }
+                sel.toggle((x, y));
             }
-            let (bx, by) = (i as u32 % block.cols, i as u32 / block.cols);
-            let (x, y) = (at.0 + bx, at.1 + by);
-            let tile = image::imageops::crop_imm(&block.img, bx * TILE, by * TILE, TILE, TILE);
-            image::imageops::replace(&mut self.img, &*tile, (x * TILE) as i64, (y * TILE) as i64);
-            self.side.set(x, y, cell.clone());
-            sel.toggle((x, y));
         }
         for a in &block.animations {
-            let a = Animation { x: a.x + at.0, y: a.y + at.1, ..a.clone() };
-            let (x0, y0, x1, y1) = a.area();
-            self.side.animations.retain(|o| {
-                let (ox0, oy0, ox1, oy1) = o.area();
-                ox1 < x0 || ox0 > x1 || oy1 < y0 || oy0 > y1
-            });
+            let a = a.shifted((at.0 * dw) as i64, (at.1 * dh) as i64);
+            let r = a.px_rect();
+            self.side.animations.retain(|o| !o.px_overlaps(r));
             self.side.animations.push(a);
         }
-        self.side.animations.sort_by_key(|a| (a.y, a.x));
+        self.side.animations.sort_by_key(|a| (a.px[1], a.px[0]));
         self.sel = sel;
     }
 
     fn clear_cells(&mut self, s: &Sel) {
+        let [tw, th] = self.tile;
         for (x, y) in s.iter() {
-            for py in 0..TILE {
-                for px in 0..TILE {
-                    let (ix, iy) = (x * TILE + px, y * TILE + py);
+            let (ix0, iy0, _, _) = self.cell_img_rect(x, y);
+            for py in 0..th {
+                for px in 0..tw {
+                    let (ix, iy) = (ix0 + px, iy0 + py);
                     if ix < self.img.width() && iy < self.img.height() {
                         self.img.put_pixel(ix, iy, Rgba([0; 4]));
                     }
                 }
             }
-            self.side.set(x, y, None);
+            let (cx0, cy0, cx1, cy1) = self.cell_img_rect(x, y);
+            self.prov.fill(cx0, cy0, cx1 - cx0, cy1 - cy0, -1);
         }
-        self.side.animations.retain(|a| !s.iter().any(|(x, y)| a.contains(x, y)));
+        let rects: Vec<_> = s.iter().map(|(x, y)| self.cell_px_rect(x, y)).collect();
+        self.side.animations.retain(|a| !rects.iter().any(|r| a.px_overlaps(*r)));
     }
 
     pub fn paste(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) {
         self.snapshot();
+        let before = self.img.dimensions();
         self.put(at, block);
-        self.upload(ctx);
+        if self.img.dimensions() != before {
+            self.upload(ctx);
+        } else {
+            let (bw, bh) = block.img.dimensions();
+            let (x0, y0, _, _) = self.cell_img_rect(at.0, at.1);
+            self.upload_region(x0, y0, x0 + bw.div_ceil(self.tile[0]) * self.tile[0], y0 + bh.div_ceil(self.tile[1]) * self.tile[1]);
+        }
     }
 
     /// Clears `from`, then puts the block at `at`: one undo step.
     pub fn move_block(&mut self, ctx: &egui::Context, from: &Sel, at: (u32, u32), block: &Block) {
         self.snapshot();
+        let before = self.img.dimensions();
         self.clear_cells(from);
         self.put(at, block);
-        self.upload(ctx);
+        if self.img.dimensions() != before {
+            self.upload(ctx);
+        } else {
+            if let Some(b) = from.bounds() {
+                let (x0, y0, _, _) = self.cell_img_rect(b.x0, b.y0);
+                let (_, _, x1, y1) = self.cell_img_rect(b.x1, b.y1);
+                self.upload_region(x0, y0, x1, y1);
+            }
+            let (bw, bh) = block.img.dimensions();
+            let (x0, y0, _, _) = self.cell_img_rect(at.0, at.1);
+            self.upload_region(x0, y0, x0 + bw.div_ceil(self.tile[0]) * self.tile[0], y0 + bh.div_ceil(self.tile[1]) * self.tile[1]);
+        }
     }
 
     pub fn clear_selection(&mut self, ctx: &egui::Context) {
         if self.sel.is_empty() {
             return;
         }
+        let _ = ctx;
         self.snapshot();
         let s = self.sel.clone();
         self.clear_cells(&s);
-        self.upload(ctx);
+        if let Some(b) = s.bounds() {
+            let (x0, y0, _, _) = self.cell_img_rect(b.x0, b.y0);
+            let (_, _, x1, y1) = self.cell_img_rect(b.x1, b.y1);
+            self.upload_region(x0, y0, x1, y1);
+        }
     }
 
     pub fn undo(&mut self, ctx: &egui::Context) {
-        if let Some((img, side)) = self.undo.pop() {
+        if let Some((img, side, prov)) = self.undo.pop() {
             self.img = img;
             self.side = side;
+            self.prov = prov;
             self.dirty = true;
             self.upload(ctx);
         }
@@ -748,7 +1245,10 @@ impl Sheet {
     /// The panel shows when the selection touches a stored animation, or
     /// while a draft opened with `A` still matches the selection.
     pub fn show_anim_panel(&self) -> bool {
-        let on_stored = self.sel.iter().any(|(x, y)| self.side.animation_at(x, y).is_some());
+        let on_stored = self.sel.iter().any(|(x, y)| {
+            let r = self.cell_px_rect(x, y);
+            self.side.animations.iter().any(|a| a.px_overlaps(r))
+        });
         let on_draft = self.anim_panel && self.draft.as_ref().is_some_and(|d| Some(d.area) == self.sel.bounds());
         on_stored || on_draft
     }
@@ -759,63 +1259,108 @@ impl Sheet {
         self.draft();
     }
 
-    /// The stored animation under the selection, if there is one.
+    /// The animation under the selection, in this sheet's grid.
     pub fn stored_animation(&self) -> Option<Animation> {
         let (x, y) = self.sel.origin()?;
-        self.side.animation_at(x, y).cloned()
+        self.animation_at(x, y)
+    }
+
+    /// The stored animation whose pixels equal the given one's.
+    fn stored_mut(&mut self, view: &Animation) -> Option<&mut Animation> {
+        let r = view.px_rect();
+        self.side.animations.iter_mut().find(|a| a.px_rect() == r)
     }
 
     /// Stores the draft strip as an animation, or removes the stored one
-    /// that covers the same area.
+    /// that covers the same pixels.
     pub fn toggle_animation(&mut self) -> Result<(), String> {
         let Some(b) = self.sel.bounds() else { return Ok(()) };
-        let same = |a: &Animation| a.area() == (b.x0, b.y0, b.x1, b.y1);
+        let [tw, th] = self.tile;
+        let sel_px = (b.x0 * tw, b.y0 * th, (b.x1 + 1) * tw, (b.y1 + 1) * th);
+        let same = |a: &Animation| a.px_rect() == sel_px;
         if self.side.animations.iter().any(same) {
             self.snapshot();
             self.side.animations.retain(|a| !same(a));
             return Ok(());
         }
+        if self.gap != 0 || self.offset != 0 {
+            return Err("this sheet has gaps between tiles; copy the strip to a tilemap and mark it there".into());
+        }
         let Some(d) = self.draft().cloned() else { return Ok(()) };
-        if b.cols() % d.frames != 0 {
-            return Err(format!("the strip is {} cells wide; the frame count must divide that", b.cols()));
+        let width_px = b.cols() * tw;
+        if width_px % d.frames != 0 {
+            return Err(format!("the strip is {width_px} px wide; the frame count must divide that"));
         }
         self.snapshot();
-        self.side.animations.retain(|a| !self.sel.iter().any(|(x, y)| a.contains(x, y)));
-        self.side.animations.push(d.animation());
-        self.side.animations.sort_by_key(|a| (a.y, a.x));
+        self.side.animations.retain(|a| !a.px_overlaps(sel_px));
+        self.side.animations.push(d.animation([tw, th]));
+        self.side.animations.sort_by_key(|a| (a.px[1], a.px[0]));
         Ok(())
     }
 
-    /// Changes the frame count of the animation under the selection. The strip
-    /// keeps its width, so the count must divide it.
+    /// Changes the frame count of the animation under the selection. The
+    /// strip keeps its pixel width, so the count must divide it.
     pub fn set_animation(&mut self, frames: u32, ms: u32) -> Result<(), String> {
-        let Some((x, y)) = self.sel.origin() else { return Ok(()) };
-        let Some(a) = self.side.animation_at(x, y) else { return Ok(()) };
-        let width = a.w * a.frames;
-        if frames == 0 || width % frames != 0 {
-            return Err(format!("the strip is {width} cells wide; the frame count must divide that"));
+        let Some(view) = self.stored_animation() else { return Ok(()) };
+        let Some(a) = self.stored_mut(&view) else { return Ok(()) };
+        let width_px = a.frame[0] * a.frames;
+        if frames == 0 || width_px % frames != 0 {
+            return Err(format!("the strip is {width_px} px wide; the frame count must divide that"));
         }
         self.snapshot();
-        let a = self.side.animation_at_mut(x, y).unwrap();
-        a.w = width / frames;
+        let a = self.stored_mut(&view).unwrap();
+        a.frame[0] = width_px / frames;
         a.frames = frames;
         a.ms = ms.max(1);
         Ok(())
     }
 
+    /// Changes the gap or the offset: a view change like the tile size.
+    pub fn set_gap_offset(&mut self, ctx: &egui::Context, gap: u32, offset: u32) {
+        if (gap, offset) == (self.gap, self.offset) {
+            return;
+        }
+        self.gap = gap;
+        self.offset = offset;
+        self.gap_edit = gap;
+        self.offset_edit = offset;
+        self.side.gap = (gap != 0).then_some(gap);
+        self.side.offset = (offset != 0).then_some(offset);
+        self.dirty = true;
+        self.sel = Sel::default();
+        self.draft = None;
+        self.upload(ctx);
+    }
+
+    /// Changes the sheet's tile size: a view change, nothing is rewritten.
+    /// The cell records keep their grid until the next edit; animations are
+    /// pixel strips and never cared. Derived names are cleared until the
+    /// indexer renames them at the new grid.
+    pub fn set_tile(&mut self, ctx: &egui::Context, new: [u32; 2]) {
+        if new == self.tile || new[0] == 0 || new[1] == 0 {
+            return;
+        }
+        self.tile = new;
+        self.tile_edit = new;
+        self.side.tile = Some(TileSize::of(new));
+        self.dirty = true;
+        self.sel = Sel::default();
+        self.draft = None;
+        self.upload(ctx);
+    }
+
     /// Sets the canvas size in cells. Cells outside the new size are lost,
     /// with their origins and animations. No snapshot: the caller takes one.
     fn set_size(&mut self, ctx: &egui::Context, cols: u32, rows: u32) {
-        let mut img = RgbaImage::new(cols * TILE, rows * TILE);
-        let keep = image::imageops::crop_imm(&self.img, 0, 0, (cols * TILE).min(self.img.width()), (rows * TILE).min(self.img.height()));
+        let (w, h) = self.img_size_for(cols, rows);
+        let mut img = RgbaImage::new(w, h);
+        let keep = image::imageops::crop_imm(&self.img, 0, 0, w.min(self.img.width()), h.min(self.img.height()));
         image::imageops::replace(&mut img, &*keep, 0, 0);
         self.img = img;
-        self.side.cells.retain(|k, _| {
-            k.split_once(',').and_then(|(x, y)| Some((x.parse::<u32>().ok()?, y.parse::<u32>().ok()?))).is_some_and(|(x, y)| x < cols && y < rows)
-        });
+        self.prov = self.prov.resized(self.img.width(), self.img.height());
         self.side.animations.retain(|a| {
-            let (_, _, x1, y1) = a.area();
-            x1 < cols && y1 < rows
+            let r = a.px_rect();
+            r.2 <= w && r.3 <= h
         });
         self.sel = Sel::default();
         self.upload(ctx);
@@ -824,9 +1369,16 @@ impl Sheet {
     /// Cuts empty columns on the right and empty rows at the bottom. At least
     /// one cell stays.
     pub fn trim(&mut self, ctx: &egui::Context) {
+        let [tw, th] = self.tile;
         let used = |x: u32, y: u32| {
-            self.side.get(x, y).is_some()
-                || (0..TILE).any(|py| (0..TILE).any(|px| self.img.get_pixel(x * TILE + px, y * TILE + py).0[3] > 0))
+            let (ix0, iy0, ix1, iy1) = self.cell_img_rect(x, y);
+            self.prov.any_in(ix0, iy0, ix1, iy1)
+                || (0..th).any(|py| {
+                    (0..tw).any(|px| {
+                        let (ix, iy) = (ix0 + px, iy0 + py);
+                        ix < self.img.width() && iy < self.img.height() && self.img.get_pixel(ix, iy).0[3] > 0
+                    })
+                })
         };
         let (cols, rows) = (self.cols(), self.rows());
         let mut new_cols = 0;
@@ -840,29 +1392,39 @@ impl Sheet {
             }
         }
         for a in &self.side.animations {
-            let (_, _, x1, y1) = a.area();
-            new_cols = new_cols.max(x1 + 1);
-            new_rows = new_rows.max(y1 + 1);
+            let r = a.px_rect();
+            new_cols = new_cols.max(r.2.div_ceil(self.pitch()[0]));
+            new_rows = new_rows.max(r.3.div_ceil(self.pitch()[1]));
         }
         let (new_cols, new_rows) = (new_cols.max(1), new_rows.max(1));
         if new_cols == cols && new_rows == rows {
             return;
         }
         self.snapshot();
-        self.img = image::imageops::crop_imm(&self.img, 0, 0, new_cols * TILE, new_rows * TILE).to_image();
+        let (w, h) = self.img_size_for(new_cols, new_rows);
+        self.img = image::imageops::crop_imm(&self.img, 0, 0, w, h).to_image();
+        self.prov = self.prov.resized(self.img.width(), self.img.height());
         self.sel = Sel::default();
         self.upload(ctx);
     }
 
-    /// Writes the image and the book entry.
+    /// Writes the image and the book entry. A tilemap's entry always names
+    /// its grid, so it is never lost between runs.
     pub fn save(&mut self) -> Result<(), String> {
         self.img.save(self.dir.join(&self.rel)).map_err(|e| e.to_string())?;
+        self.side.tile = Some(TileSize::of(self.tile));
+        self.side.provenance = self.prov.extract();
         self.save_entry()
     }
 
     /// Writes only the book entry; for sheets whose pixels are not edited.
+    /// A stored entry always names its tile size, so the file explains itself.
     pub fn save_entry(&mut self) -> Result<(), String> {
-        sidecar::store_entry(&self.dir, &self.rel, &self.side)?;
+        let mut side = self.side.clone();
+        if !side.is_empty() {
+            side.tile = Some(TileSize::of(self.tile));
+        }
+        sidecar::store_entry(&self.dir, &self.rel, &side)?;
         self.dirty = false;
         Ok(())
     }
@@ -889,4 +1451,65 @@ fn checkerboard(painter: &egui::Painter, rect: Rect) {
             }
         }
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A changed tile size must survive save and reopen.
+    #[test]
+    fn tile_size_persists() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("tilepick-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sheet = Sheet::new_empty(&ctx, &dir, "map.png", [32, 32], 4, 4);
+        sheet.save().unwrap();
+        sheet.set_tile(&ctx, [64, 48]);
+        sheet.save().unwrap();
+        let book = sidecar::load_book(&dir);
+        let entry = book.get("map.png").cloned();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(entry.and_then(|e| e.tile).map(TileSize::wh), Some([64, 48]));
+    }
+}
+
+
+#[cfg(test)]
+mod prov_tests {
+    use super::*;
+
+    /// Painting the extracted rectangles again gives the same map.
+    #[test]
+    fn provenance_round_trips() {
+        let mut m = ProvMap::new(96, 64);
+        let a = m.intern("packs/a.png");
+        let b = m.intern("packs/b.png");
+        m.fill(0, 0, 32, 32, a);
+        m.fill(32, 0, 64, 64, b);
+        m.fill(16, 16, 16, 16, -1); // a hole from a clear
+        let side = m.extract();
+        let again = ProvMap::from_side(96, 64, &side);
+        for y in 0..64 {
+            for x in 0..96 {
+                assert_eq!(m.get(x, y), again.get(x, y), "at {x},{y}");
+            }
+        }
+        // Grouped by file, and the hole split rects for a.
+        assert_eq!(side.len(), 2);
+        assert!(side.iter().any(|p| p.source == "packs/b.png" && p.rects == vec![[32, 0, 64, 64]]));
+    }
+}
+
+/// The frames of a GIF, composited to full canvas, and the first delay in ms.
+fn decode_gif(path: &Path) -> (Vec<RgbaImage>, u32) {
+    use image::AnimationDecoder;
+    let Ok(file) = std::fs::File::open(path) else { return (Vec::new(), 0) };
+    let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)) else {
+        return (Vec::new(), 0);
+    };
+    let Ok(frames) = decoder.into_frames().collect_frames() else { return (Vec::new(), 0) };
+    let ms = frames.first().map(|f| f.delay().numer_denom_ms().0).unwrap_or(100);
+    (frames.into_iter().map(|f| f.into_buffer()).collect(), ms.max(1))
 }
