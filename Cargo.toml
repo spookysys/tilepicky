@@ -5,6 +5,9 @@ edition = "2024"
 description = "Browse sprite sheets, search them, and pick tiles into tilesheets of your own."
 repository = "https://github.com/spookysys/tilepicky"
 license = "GPL-3.0-only"
+keywords = ["tiles", "sprites", "tilesheet", "pixel-art", "egui"]
+categories = ["game-development", "multimedia::images"]
+include = ["src/**", "icon.png", "README.md", "LICENSE"]
 
 [dependencies]
 eframe = { version = "0.36.1", features = ["default"] }
