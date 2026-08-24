@@ -5,10 +5,11 @@ copy cells into tilemaps of your own. Each sheet has its own grid.
 
 <https://github.com/spookysys/tilepick>
 
-![Tilepick with a Kenney sheet open and a tilemap being built](media/screenshot.png)
+![Tiles are selected in a sheet and carried into a tilemap](media/demo.gif)
 
-The sheets in the pictures are from [Kenney](https://kenney.nl), who puts
-them in the public domain (CC0).
+Select cells in a sheet, hold the button on them until they lift, and carry
+them into your own tilemap. The sheets in the pictures are from
+[Kenney](https://kenney.nl), who puts them in the public domain (CC0).
 
 ## Run
 
@@ -36,6 +37,8 @@ animation. A region that stands still gives one picture.
 The left column holds the search box, the tree of source sheets, and the tree
 of your tilemaps. The top panel shows the source sheet you opened. The bottom
 panel shows your tilemap.
+
+![The three panels: the trees on the left, the source sheet above, the tilemap below](media/screenshot.png)
 
 ## The grid
 
