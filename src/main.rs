@@ -1317,7 +1317,7 @@ impl eframe::App for App {
             });
             egui::Panel::top("library tree")
                 .resizable(true)
-                .default_size(ui.available_height() * 0.6)
+                .default_size(ui.available_height() * if project_set { 0.6 } else { 0.45 })
                 .size_range(80.0..=f32::INFINITY)
                 .show(ui, |ui| {
                     ui.strong("LIBRARY");
@@ -1329,7 +1329,7 @@ impl eframe::App for App {
                         if !library_set {
                             ui.weak("No library folder yet.");
                             ui.add_space(4.0);
-                            ui.weak("Your library holds the sheets and packs you collected. Tilepicky only reads it.");
+                            ui.weak("Your library holds the sheets and packs you collected. Tilepicky leaves them as they are, and writes only a tilepicky.json that remembers their grids.");
                             ui.add_space(6.0);
                             ui.weak("Click here to choose it.");
                             if bg.clicked() {
@@ -1394,7 +1394,9 @@ impl eframe::App for App {
                     if !project_set {
                         ui.weak("No project folder yet.");
                         ui.add_space(4.0);
-                        ui.weak("Click here to choose the folder your own tilemaps live in.");
+                        ui.weak("Your tilemaps live here. Tilepicky writes them, with a tilepicky.json beside them.");
+                        ui.add_space(6.0);
+                        ui.weak("Click here to choose it.");
                         if bg.clicked() {
                             ask = Some(Panel::Project);
                         }
@@ -1600,7 +1602,8 @@ impl eframe::App for App {
         let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
         ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
         egui::Panel::top("library panel").resizable(true).show(ui, |ui| {
-            library_tile = Self::sheet_header(ui, "LIBRARY", self.active == Panel::Library, true, self.library_sheet.as_mut());
+            let live = self.active == Panel::Library && self.library_sheet.is_some();
+                library_tile = Self::sheet_header(ui, "LIBRARY", live, true, self.library_sheet.as_mut());
             if let Some(s) = &mut self.library_sheet {
                 if s.show_anim_panel() {
                     egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
@@ -1620,7 +1623,7 @@ impl eframe::App for App {
                     let hint = if library_set {
                         "Open a sheet on the left, or type a search."
                     } else {
-                        "No library folder yet. Click here to choose the folder your sheets and packs live in."
+                        "Click to open your asset library."
                     };
                     let r = ui.interact(ui.max_rect(), Id::new("library empty"), egui::Sense::click());
                     ui.weak(hint);
@@ -1637,7 +1640,8 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().show(ui, |ui| {
             self.project_rect = ui.max_rect();
-            project_tile = Self::sheet_header(ui, "PROJECT", self.active == Panel::Project, false, self.project_sheet.as_mut());
+            let live = self.active == Panel::Project && self.project_sheet.is_some();
+            project_tile = Self::sheet_header(ui, "PROJECT", live, false, self.project_sheet.as_mut());
             if let Some(s) = &mut self.project_sheet {
                 if s.show_anim_panel() {
                     egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
@@ -1662,7 +1666,7 @@ impl eframe::App for App {
                 let hint = if project_set {
                     "Create or open a tilemap on the left. Then select cells in the library, Ctrl+C, click a cell here, Ctrl+V."
                 } else {
-                    "No project folder yet. Click here to choose the folder your own tilemaps live in."
+                    "Click to open your project folder."
                 };
                 let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
                 ui.weak(hint);
