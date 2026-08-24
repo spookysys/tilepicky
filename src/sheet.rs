@@ -1,7 +1,7 @@
 //! One sheet on screen: an image on a 32 px grid with a selection. The source
 //! panel and your own tilemap are the same thing; only the edits differ.
 
-use crate::sidecar::{self, Animation, Provenance, Sidecar, TileSize};
+use crate::sidecar::{self, Animation, Pair, Provenance, Sidecar};
 use eframe::egui::{self, Color32, Id, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use image::{Rgba, RgbaImage};
 use std::collections::BTreeSet;
@@ -12,6 +12,22 @@ const CHUNK: u32 = 2048;
 const ZOOMS: [f32; 10] = [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0];
 /// Touchpads report points, not wheel clicks; this many points make one zoom step.
 const POINTS_PER_STEP: f32 = 50.0;
+
+/// The zoom that keeps the pixels even. One image pixel must cover a whole
+/// number of screen pixels, or a whole number of image pixels must cover one
+/// screen pixel. With nearest sampling any other factor makes some rows and
+/// columns of the image thicker than their neighbours.
+fn even_zoom(level: f32, ppp: f32) -> f32 {
+    let s = level * ppp;
+    let even = if s >= 1.0 { s.round() } else { 1.0 / (1.0 / s).round().max(1.0) };
+    even / ppp
+}
+
+/// A point moved onto the screen's pixel grid. The sheet must start on a
+/// whole screen pixel for the same reason.
+fn even_pos(p: Pos2, ppp: f32) -> Pos2 {
+    Pos2::new((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
+}
 
 /// A zoom level that steps through fixed values. Every view has its own.
 #[derive(Clone, Copy, Debug)]
@@ -41,7 +57,11 @@ impl Zoom {
                         continue;
                     }
                     match unit {
-                        egui::MouseWheelUnit::Line => steps += delta.y.signum() as i32,
+                        // f32::signum maps 0.0 to +1; a tilt-only event must
+                        // not count as a zoom click.
+                        egui::MouseWheelUnit::Line if delta.y > 0.0 => steps += 1,
+                        egui::MouseWheelUnit::Line if delta.y < 0.0 => steps -= 1,
+                        egui::MouseWheelUnit::Line => {}
                         egui::MouseWheelUnit::Point | egui::MouseWheelUnit::Page => self.acc += delta.y / POINTS_PER_STEP,
                     }
                 }
@@ -136,23 +156,36 @@ impl Sel {
     }
 }
 
-/// A strip that is not stored: the selection, played with a frame count.
+/// A block of frames that is not stored: the selection, played with a frame
+/// grid.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Draft {
     pub area: Area,
-    pub frames: u32,
+    /// Frames in a row, and the number of rows.
+    pub frames: [u32; 2],
     pub ms: u32,
 }
 
 impl Draft {
     pub fn animation(&self, tile: [u32; 2]) -> Animation {
         let b = self.area;
+        let [c, r] = self.frames;
         Animation {
             px: [b.x0 * tile[0], b.y0 * tile[1]],
-            frame: [b.cols() * tile[0] / self.frames, b.rows() * tile[1]],
-            frames: self.frames,
+            frame: [b.cols() * tile[0] / c.max(1), b.rows() * tile[1] / r.max(1)],
+            frames: Pair::strip(self.frames),
             ms: self.ms,
         }
+    }
+
+    /// The selection in pixels, and whether the frame grid divides it.
+    pub fn area_px(&self, tile: [u32; 2]) -> [u32; 2] {
+        [self.area.cols() * tile[0], self.area.rows() * tile[1]]
+    }
+    pub fn fits(&self, tile: [u32; 2]) -> bool {
+        let [w, h] = self.area_px(tile);
+        let [c, r] = self.frames;
+        c > 0 && r > 0 && w % c == 0 && h % r == 0
     }
 }
 
@@ -409,6 +442,18 @@ impl Block {
     }
 }
 
+/// A canvas edge drag in progress. It holds the canvas as it was when the
+/// drag started, and each step cuts the new size from that copy. A step that
+/// makes the canvas smaller therefore does not lose the pixels: a step that
+/// makes it larger again gives them back.
+struct CanvasDrag {
+    /// Which of width and height follow the pointer.
+    wh: (bool, bool),
+    img: RgbaImage,
+    prov: ProvMap,
+    side: Sidecar,
+}
+
 pub struct Sheet {
     pub rel: String,
     /// The directory whose book describes this sheet.
@@ -417,16 +462,9 @@ pub struct Sheet {
     pub tile: [u32; 2],
     /// Pixels between neighbouring tiles, and before the first one.
     pub gap: u32,
-    pub offset: u32,
-    /// The values in the header's grid fields, applied when the drag ends.
-    pub tile_edit: [u32; 2],
+    pub offset: [u32; 2],
+    /// The value in the header's gap field, applied when the drag ends.
     pub gap_edit: u32,
-    pub offset_edit: u32,
-    /// Typing in the tile field: the text, and whether it still needs focus.
-    pub tile_text: Option<String>,
-    pub tile_text_focus: bool,
-    /// Drag distance collected by the tile field between steps.
-    pub tile_acc: f32,
     /// The last click, for the double-click-and-drag lift shortcut: its
     /// time, its cell, and the selection it replaced.
     last_click: Option<(f64, (u32, u32), Sel)>,
@@ -441,8 +479,8 @@ pub struct Sheet {
     /// An edge drag in progress: the selection and its bounds at the start,
     /// and the fixed x and y of the bounds, for the axes that move.
     resize: Option<EdgeDrag>,
-    /// A canvas edge drag in progress: which of width and height follow the pointer.
-    canvas_resize: Option<(bool, bool)>,
+    /// A canvas edge drag in progress.
+    canvas_resize: Option<CanvasDrag>,
     pub zoom: Zoom,
     pub hover: Option<(u32, u32)>,
     scroll_to: Option<Vec2>,
@@ -456,6 +494,9 @@ pub struct Sheet {
     /// The animation panel is open. It also opens by itself when animations are stored.
     pub anim_panel: bool,
     pub preview_zoom: Zoom,
+    /// Screen pixels in one point, as the window reports them. The drawing
+    /// needs it to keep the image pixels even.
+    pub ppp: f32,
     /// The pointer was over the animation preview last frame.
     pub preview_hovered: bool,
     /// Which source file each pixel came from, in image coordinates.
@@ -470,7 +511,7 @@ pub struct Sheet {
 impl Sheet {
     /// `inherit` is the grid (tile, gap, offset) to assume for whatever the
     /// entry does not name: the settings of the sheet that was open before.
-    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, u32), side: Sidecar) -> Result<Self, String> {
+    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, [u32; 2]), side: Sidecar) -> Result<Self, String> {
         let path = dir.join(rel);
         let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
         let img = match frames.first() {
@@ -485,25 +526,20 @@ impl Sheet {
 
     pub fn new_empty(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], cols: u32, rows: u32) -> Self {
         let img = RgbaImage::new(cols * tile[0], rows * tile[1]);
-        Self::from_image(ctx, dir, rel, (tile, 0, 0), img, Sidecar::default())
+        Self::from_image(ctx, dir, rel, (tile, 0, [0, 0]), img, Sidecar::default())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, u32), img: RgbaImage, side: Sidecar) -> Self {
-        let tile = side.tile.map(TileSize::wh).unwrap_or(inherit.0);
+    fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, [u32; 2]), img: RgbaImage, side: Sidecar) -> Self {
+        let tile = side.tile.map(Pair::xy).unwrap_or(inherit.0);
         let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
             rel: rel.to_string(),
             dir: dir.to_path_buf(),
             tile,
             gap: side.gap.unwrap_or(inherit.1),
-            offset: side.offset.unwrap_or(inherit.2),
-            tile_edit: tile,
+            offset: side.offset.map(Pair::xy).unwrap_or(inherit.2),
             gap_edit: side.gap.unwrap_or(inherit.1),
-            offset_edit: side.offset.unwrap_or(inherit.2),
-            tile_text: None,
-            tile_text_focus: false,
-            tile_acc: 0.0,
             last_click: None,
             img,
             side,
@@ -522,6 +558,7 @@ impl Sheet {
             draft: None,
             anim_panel: false,
             preview_zoom: Zoom::new(2.0),
+            ppp: 1.0,
             preview_hovered: false,
             prov,
             frames: Vec::new(),
@@ -538,15 +575,15 @@ impl Sheet {
         [self.tile[0] + self.gap, self.tile[1] + self.gap]
     }
     pub fn cols(&self) -> u32 {
-        (self.img.width().saturating_sub(self.offset) + self.gap).div_ceil(self.pitch()[0]).max(1)
+        (self.img.width().saturating_sub(self.offset[0]) + self.gap).div_ceil(self.pitch()[0]).max(1)
     }
     pub fn rows(&self) -> u32 {
-        (self.img.height().saturating_sub(self.offset) + self.gap).div_ceil(self.pitch()[1]).max(1)
+        (self.img.height().saturating_sub(self.offset[1]) + self.gap).div_ceil(self.pitch()[1]).max(1)
     }
     /// Where a cell's pixels sit on the image: x0, y0, one past x1, y1.
     fn cell_img_rect(&self, x: u32, y: u32) -> (u32, u32, u32, u32) {
         let p = self.pitch();
-        let (ox, oy) = (self.offset + x * p[0], self.offset + y * p[1]);
+        let (ox, oy) = (self.offset[0] + x * p[0], self.offset[1] + y * p[1]);
         (ox, oy, ox + self.tile[0], oy + self.tile[1])
     }
 
@@ -601,10 +638,21 @@ impl Sheet {
         })
     }
 
+    /// The zoom the sheet is drawn with: the chosen level, moved to the
+    /// nearest factor that keeps the image pixels even.
+    pub fn zoom_px(&self) -> f32 {
+        even_zoom(self.zoom.level, self.ppp)
+    }
+
+    /// The same for the animation preview.
+    pub fn preview_zoom_px(&self) -> f32 {
+        even_zoom(self.preview_zoom.level, self.ppp)
+    }
+
     /// One cell's screen size, per axis.
     pub fn cell_px(&self) -> Vec2 {
         let p = self.pitch();
-        Vec2::new(p[0] as f32, p[1] as f32) * self.zoom.level
+        Vec2::new(p[0] as f32, p[1] as f32) * self.zoom_px()
     }
 
     /// The strip that covers a cell, if one does.
@@ -629,7 +677,8 @@ impl Sheet {
             return None;
         }
         let c = self.cell_px();
-        let d = p - self.screen.min - Vec2::splat(self.offset as f32 * self.zoom.level);
+        let off = Vec2::new(self.offset[0] as f32, self.offset[1] as f32) * self.zoom_px();
+        let d = p - self.screen.min - off;
         Some(((d.x / c.x).max(0.0) as u32, (d.y / c.y).max(0.0) as u32))
     }
 
@@ -649,10 +698,11 @@ impl Sheet {
             }
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
         }
-        let zoom = self.zoom.level;
+        self.ppp = ui.ctx().pixels_per_point();
+        let zoom = self.zoom_px();
         let cell_px = self.cell_px();
         let tile_px = Vec2::new(self.tile[0] as f32, self.tile[1] as f32) * zoom;
-        let off_px = self.offset as f32 * zoom;
+        let off_px = Vec2::new(self.offset[0] as f32, self.offset[1] as f32) * zoom;
         /// Room past the right and bottom edges, where the canvas handles sit.
         const MARGIN: f32 = 12.0;
         let size = Vec2::new(self.cols() as f32 * cell_px.x, self.rows() as f32 * cell_px.y);
@@ -665,7 +715,8 @@ impl Sheet {
         let out = area.show(ui, |ui| {
             let margin = if editable { Vec2::splat(MARGIN) } else { Vec2::ZERO };
             let (outer, _) = ui.allocate_exact_size(size + margin, Sense::hover());
-            let rect = Rect::from_min_size(outer.min, size);
+            // The image starts on a whole screen pixel; see `even_pos`.
+            let rect = Rect::from_min_size(even_pos(outer.min, self.ppp), size);
             let resp = ui.interact(outer, id, Sense::click_and_drag());
             self.screen = rect;
             self.clip = ui.clip_rect();
@@ -676,11 +727,11 @@ impl Sheet {
                 painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             }
             let cell_rect = |x: u32, y: u32| {
-                Rect::from_min_size(rect.min + Vec2::splat(off_px) + Vec2::new(x as f32 * cell_px.x, y as f32 * cell_px.y), tile_px)
+                Rect::from_min_size(rect.min + off_px + Vec2::new(x as f32 * cell_px.x, y as f32 * cell_px.y), tile_px)
             };
             if tile_px.min_elem() >= 16.0 {
                 let grid = Stroke::new(1.0, Color32::from_black_alpha(40));
-                if self.gap == 0 && self.offset == 0 {
+                if self.gap == 0 && self.offset == [0, 0] {
                     for x in 0..=self.cols() {
                         let sx = rect.min.x + x as f32 * cell_px.x;
                         painter.line_segment([Pos2::new(sx, rect.min.y), Pos2::new(sx, rect.max.y)], grid);
@@ -706,14 +757,20 @@ impl Sheet {
                     rect.min + Vec2::new(x1 as f32, y1 as f32) * zoom,
                 );
                 painter.rect_stroke(r, 0.0, Stroke::new(2.0, orange), egui::StrokeKind::Inside);
-                for f in 1..a.frames {
+                let [c, rows] = a.grid();
+                for f in 1..c {
                     let sx = rect.min.x + (a.px[0] + f * a.frame[0]) as f32 * zoom;
                     painter.line_segment([Pos2::new(sx, r.min.y), Pos2::new(sx, r.max.y)], Stroke::new(1.0, orange));
                 }
+                for f in 1..rows {
+                    let sy = rect.min.y + (a.px[1] + f * a.frame[1]) as f32 * zoom;
+                    painter.line_segment([Pos2::new(r.min.x, sy), Pos2::new(r.max.x, sy)], Stroke::new(1.0, orange));
+                }
+                let count = if rows == 1 { format!("{c}") } else { format!("{c}x{rows}") };
                 painter.text(
                     r.left_bottom() + Vec2::new(3.0, -2.0),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("{} frames of {}x{} px", a.frames, a.frame[0], a.frame[1]),
+                    format!("{count} frames of {}x{} px", a.frame[0], a.frame[1]),
                     egui::FontId::proportional(11.0),
                     orange,
                 );
@@ -740,7 +797,7 @@ impl Sheet {
 
             let (cols, rows) = (self.cols(), self.rows());
             let to_cell = move |p: Pos2| {
-                let d = p - rect.min - Vec2::splat(off_px);
+                let d = p - rect.min - off_px;
                 (((d.x / cell_px.x).max(0.0) as u32).min(cols - 1), ((d.y / cell_px.y).max(0.0) as u32).min(rows - 1))
             };
             self.hover = resp.hover_pos().map(to_cell);
@@ -752,7 +809,7 @@ impl Sheet {
             // Both the vertical and the horizontal boundary are looked up.
             let edges_at = |sel: &Sel, p: Pos2| -> Option<(Option<Edge>, Option<Edge>)> {
                 const GRIP: f32 = 6.0;
-                let (fx, fy) = ((p.x - rect.min.x - off_px) / cell_px.x, (p.y - rect.min.y - off_px) / cell_px.y);
+                let (fx, fy) = ((p.x - rect.min.x - off_px.x) / cell_px.x, (p.y - rect.min.y - off_px.y) / cell_px.y);
                 let (lx, ly) = (fx.round(), fy.round());
                 let c = to_cell(p);
                 let near_x = (fx - lx).abs() * cell_px.x <= GRIP && lx >= 0.0 && lx <= cols as f32;
@@ -839,8 +896,15 @@ impl Sheet {
                     let c = to_cell(p);
                     let edges = edges_at(&self.sel, p);
                     if let Some(wh) = canvas_edge_at(p).filter(|_| edges.is_none()) {
-                        self.canvas_resize = Some(wh);
-                        self.snapshot();
+                        // The undo step goes on the stack when the drag ends;
+                        // until then the copy is the base of every step.
+                        self.canvas_resize = Some(CanvasDrag {
+                            wh,
+                            img: self.img.clone(),
+                            prov: self.prov.clone(),
+                            side: self.side.clone(),
+                        });
+                        self.dirty = true;
                     } else if let Some((ex, ey)) = edges {
                         self.resize = Some(EdgeDrag { base: self.sel.clone(), ex, ey });
                     } else {
@@ -854,18 +918,18 @@ impl Sheet {
             if resp.dragged() && event.drag_block.is_none() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let c = to_cell(p);
-                    if let Some((w, h)) = self.canvas_resize {
+                    if let Some((w, h)) = self.canvas_resize.as_ref().map(|d| d.wh) {
                         ui.output_mut(|o| o.cursor_icon = resize_icon(w, h));
-                        let want = |v: f32, c: f32| (((v - off_px) / c).round() as u32).max(1);
-                        let cols = if w { want(p.x - rect.min.x, cell_px.x) } else { self.cols() };
-                        let rows = if h { want(p.y - rect.min.y, cell_px.y) } else { self.rows() };
+                        let want = |v: f32, o: f32, c: f32| (((v - o) / c).round() as u32).max(1);
+                        let cols = if w { want(p.x - rect.min.x, off_px.x, cell_px.x) } else { self.cols() };
+                        let rows = if h { want(p.y - rect.min.y, off_px.y, cell_px.y) } else { self.rows() };
                         if (cols, rows) != (self.cols(), self.rows()) {
                             self.set_size(ui.ctx(), cols, rows);
                         }
                     } else if let Some(d) = &self.resize {
                         // The pointer snaps to the nearest grid line.
-                        let lx = ((p.x - rect.min.x - off_px) / cell_px.x).round().clamp(0.0, cols as f32) as u32;
-                        let ly = ((p.y - rect.min.y - off_px) / cell_px.y).round().clamp(0.0, rows as f32) as u32;
+                        let lx = ((p.x - rect.min.x - off_px.x) / cell_px.x).round().clamp(0.0, cols as f32) as u32;
+                        let ly = ((p.y - rect.min.y - off_px.y) / cell_px.y).round().clamp(0.0, rows as f32) as u32;
                         self.sel = d.apply(lx, ly);
                     } else if let Some(a) = self.anchor {
                         self.sel = self.base.clone().union(&Sel::rect(a, c));
@@ -875,7 +939,9 @@ impl Sheet {
             }
             if resp.drag_stopped() {
                 self.resize = None;
-                if self.canvas_resize.take().is_some() {
+                if let Some(d) = self.canvas_resize.take() {
+                    // The whole drag is one undo step: the canvas before it.
+                    self.push_undo((d.img, d.side, d.prov));
                     event.resized = true;
                 }
             }
@@ -1074,12 +1140,17 @@ impl Sheet {
                 }
             }
         }
-        let animations = vec![Animation { px: [0, 0], frame: [fw, fh], frames: n, ms: self.frame_ms.max(20) }];
+        let animations = vec![Animation { px: [0, 0], frame: [fw, fh], frames: Pair::strip([n, 1]), ms: self.frame_ms.max(20) }];
         Some(Block { tile: self.tile, cols, rows: b.rows(), img, prov, mask, animations })
     }
 
     fn snapshot(&mut self) {
-        self.undo.push((self.img.clone(), self.side.clone(), self.prov.clone()));
+        let state = (self.img.clone(), self.side.clone(), self.prov.clone());
+        self.push_undo(state);
+    }
+
+    fn push_undo(&mut self, state: (RgbaImage, Sidecar, ProvMap)) {
+        self.undo.push(state);
         if self.undo.len() > 64 {
             self.undo.remove(0);
         }
@@ -1101,7 +1172,7 @@ impl Sheet {
     /// The image size that holds the given cell count on this sheet's grid.
     fn img_size_for(&self, cols: u32, rows: u32) -> (u32, u32) {
         let p = self.pitch();
-        (self.offset + cols * p[0] - self.gap, self.offset + rows * p[1] - self.gap)
+        (self.offset[0] + cols * p[0] - self.gap, self.offset[1] + rows * p[1] - self.gap)
     }
 
     /// Writes the block, pixel for pixel, onto this sheet's grid. The block
@@ -1205,6 +1276,29 @@ impl Sheet {
         }
     }
 
+    /// Exchanges the block with the cells it lands on: those cells travel
+    /// back to the place the block came from. One undo step.
+    pub fn swap_block(&mut self, ctx: &egui::Context, from: &Sel, at: (u32, u32), block: &Block) {
+        let Some(b) = from.bounds() else { return };
+        // The cells the block covers when it lands, in its own shape.
+        let mut there = Sel::default();
+        for j in 0..block.rows {
+            for i in 0..block.cols {
+                if block.mask[(j * block.cols + i) as usize] {
+                    there.toggle((at.0 + i, at.1 + j));
+                }
+            }
+        }
+        let Some(other) = self.copy_sel(&there) else { return };
+        self.move_block(ctx, from, at, block);
+        self.put((b.x0, b.y0), &other);
+        let (x0, y0, _, _) = self.cell_img_rect(b.x0, b.y0);
+        let (_, _, x1, y1) = self.cell_img_rect(b.x1, b.y1);
+        self.upload_region(x0, y0, x1, y1);
+        // The block the user carried stays selected, at its new place.
+        self.sel = there;
+    }
+
     pub fn clear_selection(&mut self, ctx: &egui::Context) {
         if self.sel.is_empty() {
             return;
@@ -1232,12 +1326,14 @@ impl Sheet {
 
     /// Marks the selected area as an animation strip, or unmarks it. A new
     /// strip starts with one frame per column; set the frame count afterwards.
-    /// The draft strip for the current selection. It resets when the
-    /// selection bounds change, and keeps its frame count otherwise.
+    /// The draft for the current selection. It follows the selection and
+    /// keeps its numbers, so that the user can resize the selection until
+    /// the frames divide it.
     pub fn draft(&mut self) -> Option<&mut Draft> {
         let b = self.sel.bounds()?;
-        if self.draft.as_ref().is_none_or(|d| d.area != b) {
-            self.draft = Some(Draft { area: b, frames: b.cols(), ms: 100 });
+        match &mut self.draft {
+            Some(d) => d.area = b,
+            None => self.draft = Some(Draft { area: b, frames: [b.cols(), 1], ms: 100 }),
         }
         self.draft.as_mut()
     }
@@ -1249,13 +1345,16 @@ impl Sheet {
             let r = self.cell_px_rect(x, y);
             self.side.animations.iter().any(|a| a.px_overlaps(r))
         });
-        let on_draft = self.anim_panel && self.draft.as_ref().is_some_and(|d| Some(d.area) == self.sel.bounds());
+        // The panel stays open while there is a selection to play; a new
+        // selection does not close it, so its edges can be dragged.
+        let on_draft = self.anim_panel && !self.sel.is_empty();
         on_stored || on_draft
     }
 
-    /// Opens the panel with a draft for the current selection.
+    /// Opens the panel with a fresh draft for the current selection.
     pub fn open_anim_panel(&mut self) {
         self.anim_panel = true;
+        self.draft = None;
         self.draft();
     }
 
@@ -1283,13 +1382,13 @@ impl Sheet {
             self.side.animations.retain(|a| !same(a));
             return Ok(());
         }
-        if self.gap != 0 || self.offset != 0 {
+        if self.gap != 0 || self.offset != [0, 0] {
             return Err("this sheet has gaps between tiles; copy the strip to a tilemap and mark it there".into());
         }
         let Some(d) = self.draft().cloned() else { return Ok(()) };
-        let width_px = b.cols() * tw;
-        if width_px % d.frames != 0 {
-            return Err(format!("the strip is {width_px} px wide; the frame count must divide that"));
+        if !d.fits([tw, th]) {
+            let [w, h] = d.area_px([tw, th]);
+            return Err(format!("the block is {w}x{h} px; the frame numbers must divide that"));
         }
         self.snapshot();
         self.side.animations.retain(|a| !a.px_overlaps(sel_px));
@@ -1298,34 +1397,34 @@ impl Sheet {
         Ok(())
     }
 
-    /// Changes the frame count of the animation under the selection. The
-    /// strip keeps its pixel width, so the count must divide it.
-    pub fn set_animation(&mut self, frames: u32, ms: u32) -> Result<(), String> {
+    /// Changes the frame grid of the animation under the selection. The
+    /// block keeps its pixels, so each number must divide its side.
+    pub fn set_animation(&mut self, frames: [u32; 2], ms: u32) -> Result<(), String> {
         let Some(view) = self.stored_animation() else { return Ok(()) };
         let Some(a) = self.stored_mut(&view) else { return Ok(()) };
-        let width_px = a.frame[0] * a.frames;
-        if frames == 0 || width_px % frames != 0 {
-            return Err(format!("the strip is {width_px} px wide; the frame count must divide that"));
+        let [c, r] = a.grid();
+        let (w, h) = (a.frame[0] * c, a.frame[1] * r);
+        if frames[0] == 0 || frames[1] == 0 || w % frames[0] != 0 || h % frames[1] != 0 {
+            return Err(format!("the block is {w}x{h} px; the frame numbers must divide that"));
         }
         self.snapshot();
         let a = self.stored_mut(&view).unwrap();
-        a.frame[0] = width_px / frames;
-        a.frames = frames;
+        a.frame = [w / frames[0], h / frames[1]];
+        a.frames = Pair::strip(frames);
         a.ms = ms.max(1);
         Ok(())
     }
 
     /// Changes the gap or the offset: a view change like the tile size.
-    pub fn set_gap_offset(&mut self, ctx: &egui::Context, gap: u32, offset: u32) {
+    pub fn set_gap_offset(&mut self, ctx: &egui::Context, gap: u32, offset: [u32; 2]) {
         if (gap, offset) == (self.gap, self.offset) {
             return;
         }
         self.gap = gap;
         self.offset = offset;
         self.gap_edit = gap;
-        self.offset_edit = offset;
         self.side.gap = (gap != 0).then_some(gap);
-        self.side.offset = (offset != 0).then_some(offset);
+        self.side.offset = (offset != [0, 0]).then_some(Pair::of(offset));
         self.dirty = true;
         self.sel = Sel::default();
         self.draft = None;
@@ -1341,27 +1440,37 @@ impl Sheet {
             return;
         }
         self.tile = new;
-        self.tile_edit = new;
-        self.side.tile = Some(TileSize::of(new));
+        self.side.tile = Some(Pair::of(new));
         self.dirty = true;
         self.sel = Sel::default();
         self.draft = None;
         self.upload(ctx);
     }
 
-    /// Sets the canvas size in cells. Cells outside the new size are lost,
-    /// with their origins and animations. No snapshot: the caller takes one.
+    /// Sets the canvas size in cells while a canvas edge drag runs. The
+    /// pixels come from the copy the drag holds, not from the canvas on
+    /// screen. Cells outside the new size are lost, with their origins and
+    /// their animations.
     fn set_size(&mut self, ctx: &egui::Context, cols: u32, rows: u32) {
         let (w, h) = self.img_size_for(cols, rows);
+        let Some(base) = &self.canvas_resize else { return };
         let mut img = RgbaImage::new(w, h);
-        let keep = image::imageops::crop_imm(&self.img, 0, 0, w.min(self.img.width()), h.min(self.img.height()));
+        let keep = image::imageops::crop_imm(&base.img, 0, 0, w.min(base.img.width()), h.min(base.img.height()));
         image::imageops::replace(&mut img, &*keep, 0, 0);
+        let prov = base.prov.resized(w, h);
+        let animations = base
+            .side
+            .animations
+            .iter()
+            .filter(|a| {
+                let r = a.px_rect();
+                r.2 <= w && r.3 <= h
+            })
+            .cloned()
+            .collect();
         self.img = img;
-        self.prov = self.prov.resized(self.img.width(), self.img.height());
-        self.side.animations.retain(|a| {
-            let r = a.px_rect();
-            r.2 <= w && r.3 <= h
-        });
+        self.prov = prov;
+        self.side.animations = animations;
         self.sel = Sel::default();
         self.upload(ctx);
     }
@@ -1412,7 +1521,7 @@ impl Sheet {
     /// its grid, so it is never lost between runs.
     pub fn save(&mut self) -> Result<(), String> {
         self.img.save(self.dir.join(&self.rel)).map_err(|e| e.to_string())?;
-        self.side.tile = Some(TileSize::of(self.tile));
+        self.side.tile = Some(Pair::of(self.tile));
         self.side.provenance = self.prov.extract();
         self.save_entry()
     }
@@ -1422,7 +1531,7 @@ impl Sheet {
     pub fn save_entry(&mut self) -> Result<(), String> {
         let mut side = self.side.clone();
         if !side.is_empty() {
-            side.tile = Some(TileSize::of(self.tile));
+            side.tile = Some(Pair::of(self.tile));
         }
         sidecar::store_entry(&self.dir, &self.rel, &side)?;
         self.dirty = false;
@@ -1471,7 +1580,7 @@ mod tests {
         let book = sidecar::load_book(&dir);
         let entry = book.get("map.png").cloned();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(entry.and_then(|e| e.tile).map(TileSize::wh), Some([64, 48]));
+        assert_eq!(entry.and_then(|e| e.tile).map(Pair::xy), Some([64, 48]));
     }
 }
 
