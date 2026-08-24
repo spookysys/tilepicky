@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Tilepick: browse a large set of sheets, search them, and copy
+//! Tilepicky: browse a large set of sheets, search them, and copy
 //! cells into tilemaps of your own.
 //!
-//! Usage: `tilepick <source dir> <destination dir>`
+//! Usage: `tilepicky <source dir> <destination dir>`
 
 mod index;
 mod sheet;
@@ -426,7 +426,7 @@ impl App {
     }
 
     /// Puts a file's path on the clipboard: the whole path, or the short
-    /// form for the directory tilepick runs in.
+    /// form for the directory tilepicky runs in.
     fn copy_path(&mut self, ctx: &egui::Context, root: &Path, rel: &str, whole: bool) {
         let abs = file_path(root, rel);
         let text = if whole { home_path(&abs) } else { near_path(&abs) };
@@ -1548,7 +1548,7 @@ fn home_path(abs: &Path) -> String {
     }
 }
 
-/// The path as a person would type it in the directory tilepick runs in.
+/// The path as a person would type it in the directory tilepicky runs in.
 /// A file somewhere else keeps its whole path.
 fn near_path(abs: &Path) -> String {
     let here = std::env::current_dir().ok().and_then(|d| abs.strip_prefix(d).ok().map(Path::to_path_buf));
@@ -1809,7 +1809,7 @@ fn main() -> eframe::Result {
         }
     }
     if dirs.len() != 2 {
-        eprintln!("usage: tilepick [--tile N|WxH] <source dir> <destination dir>");
+        eprintln!("usage: tilepicky [--tile N|WxH] <source dir> <destination dir>");
         std::process::exit(2);
     }
     let src = PathBuf::from(&dirs[0]);
@@ -1825,11 +1825,11 @@ fn main() -> eframe::Result {
             .with_inner_size([1500.0, 950.0])
             .with_title("Tilepicky")
             .with_icon(icon)
-            .with_app_id("tilepick"),
+            .with_app_id("tilepicky"),
         ..Default::default()
     };
     eframe::run_native(
-        "tilepick",
+        "tilepicky",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::light());

@@ -1,9 +1,9 @@
 [package]
-name = "tilepick"
+name = "tilepicky"
 version = "0.1.0"
 edition = "2024"
 description = "Browse sprite sheets, search them, and pick tiles into tilemaps of your own."
-repository = "https://github.com/spookysys/tilepick"
+repository = "https://github.com/spookysys/tilepicky"
 license = "GPL-3.0-or-later"
 
 [dependencies]

@@ -1,9 +1,9 @@
-# Tilepick
+# Tilepicky
 
 A small desktop tool to browse a large set of sprite sheets, search them, and
 copy cells into tilemaps of your own. Each sheet has its own grid.
 
-<https://github.com/spookysys/tilepick>
+<https://github.com/spookysys/tilepicky>
 
 ![A tilemap of your own is built from two packs, found through the search box](media/demo.gif)
 
@@ -20,7 +20,7 @@ both in the public domain (CC0).
 `--tile` sets the default tile size in pixels (32 when absent). Write one
 number for a square tile, or `32x48` for a tile that is not square. Each
 sheet can override it in the header; the override is stored in
-`tilepick.json`.
+`tilepicky.json`.
 
 The source directory holds the original sheets. The destination directory
 holds the tilemaps you make. The tool creates it when it does not exist.
@@ -131,7 +131,7 @@ holds already is refused, and the other files still move.
 
 "Open location" asks the desktop's file manager to show the file. "Copy
 relative path" writes the path as you would type it in the directory where
-tilepick runs; "Copy absolute path" writes the whole path, with your home
+tilepicky runs; "Copy absolute path" writes the whole path, with your home
 directory as `~`.
 
 ## Search
@@ -141,10 +141,10 @@ every word: a word matches when it is the prefix of a word in a file or
 folder name. Search inside the tiles (captions, tags) is planned for a later
 version.
 
-## tilepick.json
+## tilepicky.json
 
 Each directory, the source and the one with your tilemaps, holds one
-`tilepick.json`. It describes the sheets in that directory: the grid (tile
+`tilepicky.json`. It describes the sheets in that directory: the grid (tile
 size, gap, offset), where the pixels came from, and animations. The file is
 keyed by the path relative to the directory.
 
@@ -182,7 +182,7 @@ sheet only changes the grid you see and the cells you can select.
 
 ## Your tilemaps
 
-A tilemap is a `name.png` with its entry in `tilepick.json`. `provenance`
+A tilemap is a `name.png` with its entry in `tilepicky.json`. `provenance`
 lists, per source file, the pixel rectangles `[x, y, w, h]` of your tilemap
 that came from it. Where in the source they came from is not recorded: the
 source file answers that. In memory the tool keeps one source index per
@@ -210,5 +210,5 @@ selection lies on a stored animation, the fields edit that one.
 
 ## Licence
 
-Tilepick is free software under the GNU General Public License, version 3 or
+Tilepicky is free software under the GNU General Public License, version 3 or
 any later version. The whole text is in `LICENSE`.

@@ -439,7 +439,7 @@ impl Block {
     pub fn note(&self) -> String {
         let mut from: Vec<&str> = self.prov.sources.iter().map(String::as_str).collect();
         from.sort_unstable();
-        format!("tilepick: {}x{} cells from {}", self.cols, self.rows, from.join(", "))
+        format!("tilepicky: {}x{} cells from {}", self.cols, self.rows, from.join(", "))
     }
 }
 
@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn tile_size_persists() {
         let ctx = egui::Context::default();
-        let dir = std::env::temp_dir().join(format!("tilepick-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tilepicky-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut sheet = Sheet::new_empty(&ctx, &dir, "map.png", [32, 32], 4, 4);
         sheet.save().unwrap();

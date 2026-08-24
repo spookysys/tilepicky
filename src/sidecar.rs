@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `tilepick.json`: one file per directory that describes the sheets in it.
+//! `tilepicky.json`: one file per directory that describes the sheets in it.
 //! Each entry holds the sheet's grid, the origin of cells, and animations.
 //! The source directory and your tilemap directory use the same format.
 
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const BOOK: &str = "tilepick.json";
+pub const BOOK: &str = "tilepicky.json";
 
 /// The regions of this sheet that came from one source file, as pixel
 /// rectangles `[x, y, w, h]`. Where in the source they came from is not
