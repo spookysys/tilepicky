@@ -234,13 +234,15 @@ impl App {
         let _ = ctx;
         match panel {
             Panel::Library => {
-                self.settings.library.path = Some(dir);
+                self.settings.library.path = Some(dir.clone());
+                self.library.root = dir;
                 self.library_sheet = None;
                 self.library_sel = None;
                 self.rescan_library();
             }
             Panel::Project => {
-                self.settings.project.path = Some(dir);
+                self.settings.project.path = Some(dir.clone());
+                self.project.root = dir;
                 self.project_sheet = None;
                 self.project_sel = None;
                 self.marked.clear();
