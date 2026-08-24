@@ -1315,7 +1315,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             egui::Panel::bottom("legend").show(ui, |ui| {
                 ui.set_max_width(ui.available_width());
-                ui.weak("click / drag: select   long click and drag: move   ctrl+a: select all   shift+click: rectangle from the last click   ctrl+click: add or remove a cell   ctrl+shift+click: add a rectangle   right click: clear selection / inside it: delete content   (drop with ctrl held: copy, with alt: swap the two places)   ctrl+c / ctrl+x / ctrl+v   delete   a: animation panel / store   ctrl+z   ctrl+s: save   ctrl+shift+s: save as   ctrl+t: trim   drag the canvas edge: resize   ctrl+wheel or + / -: zoom the view under the pointer");
+                ui.weak("long click and drag: move   click / drag: select   shift+click: rectangle from the last click   ctrl+click: add or remove a cell   ctrl+shift+click: add a rectangle   ctrl+a: select all   right click: clear selection / inside it: delete content   (drop with ctrl held: copy, with alt: swap the two places)   ctrl+c / ctrl+x / ctrl+v   delete   a: animation panel / store   ctrl+z   ctrl+s: save   ctrl+shift+s: save as   ctrl+t: trim   drag the canvas edge: resize   ctrl+wheel or + / -: zoom the view");
             });
             egui::Panel::top("library tree")
                 .resizable(true)
@@ -1331,7 +1331,7 @@ impl eframe::App for App {
                         if !library_set {
                             ui.weak("No library folder yet.");
                             ui.add_space(4.0);
-                            ui.weak("Your library holds the sheets and packs you collected. Tilepicky leaves them as they are, and writes only a tilepicky.json that remembers their grids.");
+                            ui.weak("This is your library of tilemaps, sheets and packs. I'll help you browse and search them, and to transfer what you need into your own tilemaps. I'll track details about your assets in a tilepicky.json.");
                             ui.add_space(6.0);
                             ui.weak("Click here to choose it.");
                             if bg.clicked() {
@@ -1396,7 +1396,7 @@ impl eframe::App for App {
                     if !project_set {
                         ui.weak("No project folder yet.");
                         ui.add_space(4.0);
-                        ui.weak("Your tilemaps live here. Tilepicky writes them, with a tilepicky.json beside them.");
+                        ui.weak("Your tilemaps live here - I'll help you edit them and create new ones, tracking details in a tilepicky.json.");
                         ui.add_space(6.0);
                         ui.weak("Click here to choose it.");
                         if bg.clicked() {
