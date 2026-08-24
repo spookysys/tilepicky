@@ -552,7 +552,10 @@ impl Sheet {
             canvas_resize: None,
             zoom: Zoom::new(2.0),
             hover: None,
-            scroll_to: None,
+            // A sheet that opens starts at its top-left. The scroll area is
+            // shared by every sheet of a panel, so without this a new sheet
+            // would inherit where the last one stood.
+            scroll_to: Some(Vec2::ZERO),
             screen: Rect::NOTHING,
             clip: Rect::NOTHING,
             dirty: false,
