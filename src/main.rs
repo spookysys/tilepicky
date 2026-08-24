@@ -1823,7 +1823,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
-            .with_title("Tilepick")
+            .with_title("Tilepicky")
             .with_icon(icon)
             .with_app_id("tilepick"),
         ..Default::default()

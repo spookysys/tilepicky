@@ -5,11 +5,13 @@ copy cells into tilemaps of your own. Each sheet has its own grid.
 
 <https://github.com/spookysys/tilepick>
 
-![Tiles are selected in a sheet and carried into a tilemap](media/demo.gif)
+![A tilemap of your own is built from two packs, found through the search box](media/demo.gif)
 
-Select cells in a sheet, hold the button on them until they lift, and carry
-them into your own tilemap. The sheets in the pictures are from
-[Kenney](https://kenney.nl), who puts them in the public domain (CC0).
+That is the loop: open a tilemap of your own, search the packs for what the
+map needs, select the cells, hold the button until they lift, and carry them
+over. The sheets in the pictures are from [Kenney](https://kenney.nl) and
+from [ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites),
+both in the public domain (CC0).
 
 ## Run
 
