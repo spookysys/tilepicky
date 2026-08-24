@@ -2,9 +2,10 @@
 //! Tilepicky: browse a large set of sheets, search them, and copy
 //! cells into tilemaps of your own.
 //!
-//! Usage: `tilepicky <source dir> <destination dir>`
+//! Usage: `tilepicky [<library dir> [<project dir>]]`
 
 mod index;
+mod settings;
 mod sheet;
 mod sidecar;
 mod tree;
@@ -12,7 +13,7 @@ mod tree;
 use eframe::egui::{self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle, Vec2};
 use index::Index;
 use sheet::{Block, Sel, Sheet};
-use sidecar::Animation;
+use sidecar::{Animation, Pair};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,11 +26,13 @@ const TILE_SIZES: [u32; 12] = [4, 8, 10, 12, 16, 24, 32, 48, 64, 128, 256, 512];
 
 /// A new tilemap starts near this size, rounded to whole tiles.
 const NEW_PX: u32 = 512;
+/// The tile size a folder starts with when nothing has said otherwise.
+const TILE: [u32; 2] = [32, 32];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
-    Source,
-    Mine,
+    Library,
+    Project,
 }
 
 /// A block on its way from one place to another, under the pointer.
@@ -80,57 +83,65 @@ struct App {
     tree_anchor: Option<usize>,
     /// Where the arrow keys stand in MY TILEMAPS; the moving end of a range.
     tree_cursor: Option<usize>,
+    /// What the tool remembers between runs: the two folders and their
+    /// tile sizes.
+    settings: settings::Settings,
+    /// A folder dialog is open for this side; the answer arrives on the channel.
+    picking: Option<(Panel, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
     /// A drag across the files started here and marks a group while it lasts.
     sweep: Option<usize>,
     /// Files held in the air, waiting for a folder to land in.
     file_drag: Option<Vec<String>>,
     /// A file the arrow keys moved to, to bring into view next frame.
-    src_scroll: Option<usize>,
-    dst_scroll: Option<usize>,
-    /// Where the MINE pane sat last frame, for drops onto the empty pane.
-    mine_rect: Rect,
+    library_scroll: Option<usize>,
+    project_scroll: Option<usize>,
+    /// Where the project pane sat last frame, for drops onto the empty pane.
+    project_rect: Rect,
     /// A pending deletion, waiting for the user's yes.
     confirm: Option<(String, Vec<String>)>,
     /// An action that waits for the save dialog.
     pending: Option<Pending>,
-    src: Index,
-    dst: Index,
-    src_tree: Node,
-    dst_tree: Node,
+    library: Index,
+    project: Index,
+    library_tree: Node,
+    project_tree: Node,
     query: String,
     qwords: Vec<String>,
-    src_visible: Option<Vec<bool>>,
-    dst_visible: Option<Vec<bool>>,
-    src_sheet: Option<Sheet>,
-    dst_sheet: Option<Sheet>,
-    src_sel: Option<usize>,
-    dst_sel: Option<usize>,
+    library_visible: Option<Vec<bool>>,
+    project_visible: Option<Vec<bool>>,
+    library_sheet: Option<Sheet>,
+    project_sheet: Option<Sheet>,
+    library_sel: Option<usize>,
+    project_sel: Option<usize>,
     active: Panel,
     clip: Option<Block>,
     new_name: String,
     status: String,
     /// Set when the query changes, so that the trees expand once to show the matches.
     open_trees: bool,
-    /// Where the split between the source and your tilemap sits, as a fraction of the height.
+    /// Where the split between the library and the project sits, as a fraction of the height.
     split: f32,
     /// The status as last shown, and when it changed; it fades after a while.
     shown_status: String,
     status_at: std::time::Instant,
 }
 
-fn src_id() -> Id {
-    Id::new("source sheet")
+fn library_id() -> Id {
+    Id::new("library sheet")
 }
-fn dst_id() -> Id {
-    Id::new("my sheet")
+fn project_id() -> Id {
+    Id::new("project sheet")
 }
 
 impl App {
-    fn new(src_root: PathBuf, dst_root: PathBuf, tile: [u32; 2]) -> Self {
-        let src = Index::scan(&src_root, tile);
-        let mut dst = Index::scan(&dst_root, tile);
-        migrate_sidecars(&mut dst);
+    fn new(settings: settings::Settings) -> Self {
+        let root = |s: &Option<PathBuf>| s.clone().unwrap_or_default();
+        let library = Index::scan(&root(&settings.library.path), settings.library.tile.map_or(TILE, Pair::xy));
+        let mut project = Index::scan(&root(&settings.project.path), settings.project.tile.map_or(TILE, Pair::xy));
+        migrate_sidecars(&mut project);
         Self {
+            settings,
+            picking: None,
             drag: None,
             prompt: None,
             marked: HashSet::new(),
@@ -138,25 +149,25 @@ impl App {
             tree_cursor: None,
             sweep: None,
             file_drag: None,
-            src_scroll: None,
-            dst_scroll: None,
-            mine_rect: Rect::NOTHING,
+            library_scroll: None,
+            project_scroll: None,
+            project_rect: Rect::NOTHING,
             confirm: None,
             pending: None,
-            src_tree: Node::build(&src.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &src.dirs),
-            dst_tree: Node::build(&dst.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &dst.dirs),
-            status: format!("{} files", src.entries.len()),
-            src,
-            dst,
+            library_tree: Node::build(&library.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &library.dirs),
+            project_tree: Node::build(&project.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &project.dirs),
+            status: String::new(),
+            library,
+            project,
             query: String::new(),
             qwords: Vec::new(),
-            src_visible: None,
-            dst_visible: None,
-            src_sheet: None,
-            dst_sheet: None,
-            src_sel: None,
-            dst_sel: None,
-            active: Panel::Source,
+            library_visible: None,
+            project_visible: None,
+            library_sheet: None,
+            project_sheet: None,
+            library_sel: None,
+            project_sel: None,
+            active: Panel::Library,
             clip: None,
             new_name: String::new(),
             open_trees: false,
@@ -166,19 +177,118 @@ impl App {
         }
     }
 
+    /// Whether a side has a folder to work in.
+    fn is_set(&self, panel: Panel) -> bool {
+        !self.index(panel).root.as_os_str().is_empty()
+    }
+
+    fn index(&self, panel: Panel) -> &Index {
+        match panel {
+            Panel::Library => &self.library,
+            Panel::Project => &self.project,
+        }
+    }
+
+    /// Opens the folder dialog for one side. It runs on its own thread, so
+    /// the window keeps drawing while the dialog is up.
+    fn ask_folder(&mut self, panel: Panel) {
+        if self.picking.is_some() {
+            return;
+        }
+        let (title, at) = match panel {
+            Panel::Library => ("Choose your library folder", self.settings.library.path.clone()),
+            Panel::Project => ("Choose your project folder", self.settings.project.path.clone()),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new().set_title(title);
+            if let Some(dir) = at.filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(dir);
+            }
+            let _ = tx.send(dialog.pick_folder());
+        });
+        self.picking = Some((panel, rx));
+    }
+
+    /// Takes the answer of an open folder dialog, once it comes.
+    fn poll_folder(&mut self, ctx: &egui::Context) {
+        let Some((panel, rx)) = &self.picking else {
+            return;
+        };
+        let panel = *panel;
+        match rx.try_recv() {
+            Ok(answer) => {
+                self.picking = None;
+                if let Some(dir) = answer {
+                    self.set_folder(ctx, panel, dir);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.picking = None,
+        }
+    }
+
+    /// Points one side at a folder: reads it, drops what was open there, and
+    /// remembers it for the next run.
+    fn set_folder(&mut self, ctx: &egui::Context, panel: Panel, dir: PathBuf) {
+        let _ = ctx;
+        match panel {
+            Panel::Library => {
+                self.settings.library.path = Some(dir);
+                self.library_sheet = None;
+                self.library_sel = None;
+                self.rescan_library();
+            }
+            Panel::Project => {
+                self.settings.project.path = Some(dir);
+                self.project_sheet = None;
+                self.project_sel = None;
+                self.marked.clear();
+                self.rescan_project();
+            }
+        }
+        self.settings.save();
+        let name = match panel {
+            Panel::Library => "library",
+            Panel::Project => "project",
+        };
+        self.status = format!("{name}: {}", self.index(panel).root.display());
+    }
+
+    /// Remembers the tile size a side used last, in the folder's own book and
+    /// in the settings, so that a new sheet there starts with it.
+    fn remember_tile(&mut self, panel: Panel, tile: [u32; 2]) {
+        if !self.is_set(panel) {
+            return;
+        }
+        let root = self.index(panel).root.clone();
+        let _ = sidecar::store_tile(&root, tile);
+        match panel {
+            Panel::Library => {
+                self.library.tile = tile;
+                self.settings.library.tile = Some(Pair::of(tile));
+            }
+            Panel::Project => {
+                self.project.tile = tile;
+                self.settings.project.tile = Some(Pair::of(tile));
+            }
+        }
+        self.settings.save();
+    }
+
     fn refresh_query(&mut self) {
         self.qwords = index::query_words(&self.query);
         self.open_trees = true;
-        self.src_visible = self.src.visible(&self.qwords);
-        self.dst_visible = self.dst.visible(&self.qwords);
+        self.library_visible = self.library.visible(&self.qwords);
+        self.project_visible = self.project.visible(&self.qwords);
     }
 
     /// The grid to assume for a sheet whose entry names none: the sheet now
     /// open in the same panel, else the run's default.
     fn inherited_grid(&self, panel: Panel) -> ([u32; 2], u32, [u32; 2]) {
         let (sheet, default) = match panel {
-            Panel::Source => (&self.src_sheet, self.src.tile),
-            Panel::Mine => (&self.dst_sheet, self.dst.tile),
+            Panel::Library => (&self.library_sheet, self.library.tile),
+            Panel::Project => (&self.project_sheet, self.project.tile),
         };
         sheet.as_ref().map_or((default, 0, [0, 0]), |s| (s.tile, s.gap, s.offset))
     }
@@ -186,9 +296,9 @@ impl App {
     /// The arrow keys walk the file tree of the panel in use, and open what
     /// they reach. In MY TILEMAPS, Shift and the arrows grow the marked
     /// group instead, and Enter opens the file the group ends on.
-    fn tree_keys(&mut self, ctx: &egui::Context, src_order: &[usize], dst_order: &[usize]) {
+    fn tree_keys(&mut self, ctx: &egui::Context, library_order: &[usize], project_order: &[usize]) {
         let focus = ctx.memory(|m| m.focused());
-        if !focus.is_none_or(|id| id == src_id() || id == dst_id()) {
+        if !focus.is_none_or(|id| id == library_id() || id == project_id()) {
             return;
         }
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k)) as i32;
@@ -201,29 +311,33 @@ impl App {
             return;
         }
         match self.active {
-            Panel::Source => {
-                if let Some(i) = walk(src_order, self.src_sel, step + grow) {
-                    self.open_source(ctx, i);
-                    self.src_scroll = Some(i);
+            Panel::Library => {
+                if let Some(i) = walk(library_order, self.library_sel, step + grow) {
+                    self.open_library(ctx, i);
+                    self.library_scroll = Some(i);
                 }
             }
-            Panel::Mine => {
-                let cursor = self.tree_cursor.or(self.dst_sel);
+            Panel::Project => {
+                let cursor = self.tree_cursor.or(self.project_sel);
                 if grow != 0 {
                     // The group runs from the anchor to the new cursor.
-                    let Some(i) = walk(dst_order, cursor, grow) else { return };
+                    let Some(i) = walk(project_order, cursor, grow) else {
+                        return;
+                    };
                     let a = self.tree_anchor.or(cursor).unwrap_or(i);
-                    self.mark_range(dst_order, a, i, false);
+                    self.mark_range(project_order, a, i, false);
                     self.tree_anchor = Some(a);
                     self.tree_cursor = Some(i);
-                    self.dst_scroll = Some(i);
+                    self.project_scroll = Some(i);
                 } else if step != 0 {
-                    let Some(i) = walk(dst_order, cursor, step) else { return };
+                    let Some(i) = walk(project_order, cursor, step) else {
+                        return;
+                    };
                     self.marked.clear();
                     self.marked.insert(i);
                     self.tree_anchor = Some(i);
                     self.tree_cursor = Some(i);
-                    self.dst_scroll = Some(i);
+                    self.project_scroll = Some(i);
                     self.request(ctx, Pending::Open(i));
                 } else if let Some(i) = cursor {
                     self.request(ctx, Pending::Open(i));
@@ -236,7 +350,9 @@ impl App {
     /// `additive` keeps the files that are marked already.
     fn mark_range(&mut self, order: &[usize], a: usize, i: usize, additive: bool) {
         let (pa, pi) = (order.iter().position(|&x| x == a), order.iter().position(|&x| x == i));
-        let (Some(pa), Some(pi)) = (pa, pi) else { return };
+        let (Some(pa), Some(pi)) = (pa, pi) else {
+            return;
+        };
         if !additive {
             self.marked.clear();
         }
@@ -245,72 +361,72 @@ impl App {
         }
     }
 
-    fn open_source(&mut self, ctx: &egui::Context, i: usize) {
-        let e = &self.src.entries[i];
-        match Sheet::open(ctx, &self.src.root, &e.rel, self.inherited_grid(Panel::Source), e.side.clone()) {
+    fn open_library(&mut self, ctx: &egui::Context, i: usize) {
+        let e = &self.library.entries[i];
+        match Sheet::open(ctx, &self.library.root, &e.rel, self.inherited_grid(Panel::Library), e.side.clone()) {
             Ok(mut s) => {
-                if let Some(prev) = &self.src_sheet {
+                if let Some(prev) = &self.library_sheet {
                     s.zoom = prev.zoom;
                 }
-                self.src_sheet = Some(s);
-                self.src_sel = Some(i);
-                self.active = Panel::Source;
+                self.library_sheet = Some(s);
+                self.library_sel = Some(i);
+                self.active = Panel::Library;
             }
             Err(err) => self.status = err,
         }
     }
 
-    fn open_mine(&mut self, ctx: &egui::Context, i: usize) {
-        let e = &self.dst.entries[i];
-        match Sheet::open(ctx, &self.dst.root, &e.rel, self.inherited_grid(Panel::Mine), e.side.clone()) {
+    fn open_project(&mut self, ctx: &egui::Context, i: usize) {
+        let e = &self.project.entries[i];
+        match Sheet::open(ctx, &self.project.root, &e.rel, self.inherited_grid(Panel::Project), e.side.clone()) {
             Ok(mut s) => {
-                if let Some(prev) = &self.dst_sheet {
+                if let Some(prev) = &self.project_sheet {
                     s.zoom = prev.zoom;
                 }
-                self.dst_sheet = Some(s);
-                self.dst_sel = Some(i);
-                self.active = Panel::Mine;
+                self.project_sheet = Some(s);
+                self.project_sel = Some(i);
+                self.active = Panel::Project;
             }
             Err(err) => self.status = err,
         }
     }
 
-    fn create_mine(&mut self, ctx: &egui::Context) {
+    fn create_project(&mut self, ctx: &egui::Context) {
         let name = self.new_name.trim().trim_end_matches(".png").to_string();
         if name.is_empty() {
             return;
         }
         let rel = format!("{name}.png");
-        let tile = self.inherited_grid(Panel::Mine).0;
+        let tile = self.inherited_grid(Panel::Project).0;
         let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
         let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
-        let mut sheet = Sheet::new_empty(ctx, &self.dst.root, &rel, tile, cols, rows);
+        let mut sheet = Sheet::new_empty(ctx, &self.project.root, &rel, tile, cols, rows);
         if let Err(e) = sheet.save() {
             self.status = e;
             return;
         }
         self.new_name.clear();
-        self.rescan_mine();
-        if let Some(i) = self.dst.position(&rel) {
-            self.open_mine(ctx, i);
+        self.rescan_project();
+        if let Some(i) = self.project.position(&rel) {
+            self.open_project(ctx, i);
         }
     }
 
-    fn rescan_source(&mut self) {
-        self.src = Index::scan(&self.src.root, self.src.tile);
-        self.src_tree = Node::build(&self.src.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.src.dirs);
-        self.src_visible = self.src.visible(&self.qwords);
-        self.src_sel = self.src_sheet.as_ref().and_then(|s| self.src.position(&s.rel));
-        self.status = format!("{} source files", self.src.entries.len());
+    fn rescan_library(&mut self) {
+        self.library = Index::scan(&self.library.root, self.library.tile);
+        self.library_tree = Node::build(&self.library.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.library.dirs);
+        self.library_visible = self.library.visible(&self.qwords);
+        self.library_sel = self.library_sheet.as_ref().and_then(|s| self.library.position(&s.rel));
+        self.status = format!("{} files in the library", self.library.entries.len());
     }
 
-    fn rescan_mine(&mut self) {
+    fn rescan_project(&mut self) {
         self.marked.clear();
-        self.dst = Index::scan(&self.dst.root, self.dst.tile);
-        self.dst_tree = Node::build(&self.dst.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.dst.dirs);
-        self.dst_visible = self.dst.visible(&self.qwords);
-        if let Some(rel) = self.dst_sheet.as_ref().map(|s| s.rel.clone()) {
-            self.dst_sel = self.dst.position(&rel);
+        self.project = Index::scan(&self.project.root, self.project.tile);
+        self.project_tree = Node::build(&self.project.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.project.dirs);
+        self.project_visible = self.project.visible(&self.qwords);
+        if let Some(rel) = self.project_sheet.as_ref().map(|s| s.rel.clone()) {
+            self.project_sel = self.project.position(&rel);
         }
     }
 
@@ -331,7 +447,9 @@ impl App {
 
     /// The name prompt for Save As, renames, duplicates, and new folders.
     fn name_dialog(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = &mut self.prompt else { return };
+        let Some(prompt) = &mut self.prompt else {
+            return;
+        };
         let mut apply = false;
         let mut cancel = false;
         egui::Modal::new(Id::new("name dialog")).show(ctx, |ui| {
@@ -368,35 +486,37 @@ impl App {
     /// Deletes files (and, through their paths, whole folders), with their
     /// book entries. Runs only after the confirm dialog.
     fn delete_paths(&mut self, rels: &[String]) -> Result<(), String> {
-        let root = self.dst.root.clone();
+        let root = self.project.root.clone();
         let mut book = sidecar::load_book(&root);
         for rel in rels {
             let path = root.join(rel);
             if path.is_dir() {
                 std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
-                book.retain(|k, _| k != rel && !k.starts_with(&format!("{rel}/")));
-                if let Some(sheet) = &self.dst_sheet {
+                book.sheets.retain(|k, _| k != rel && !k.starts_with(&format!("{rel}/")));
+                if let Some(sheet) = &self.project_sheet {
                     if sheet.rel.starts_with(&format!("{rel}/")) {
-                        self.dst_sheet = None;
+                        self.project_sheet = None;
                     }
                 }
             } else {
                 std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-                book.remove(rel);
-                if self.dst_sheet.as_ref().is_some_and(|s| s.rel == *rel) {
-                    self.dst_sheet = None;
+                book.sheets.remove(rel);
+                if self.project_sheet.as_ref().is_some_and(|s| s.rel == *rel) {
+                    self.project_sheet = None;
                 }
             }
         }
         let json = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
         std::fs::write(root.join(sidecar::BOOK), json).map_err(|e| e.to_string())?;
         self.status = format!("deleted {}", rels.join(", "));
-        self.rescan_mine();
+        self.rescan_project();
         Ok(())
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some((message, _)) = &self.confirm else { return };
+        let Some((message, _)) = &self.confirm else {
+            return;
+        };
         let message = message.clone();
         let mut choice = None;
         egui::Modal::new(Id::new("confirm dialog")).show(ctx, |ui| {
@@ -472,13 +592,13 @@ impl App {
         let where_to = if dir.is_empty() { "the top".to_string() } else { dir.clone() };
         self.status = format!("{} {what} to {where_to}", files.len());
         self.marked.clear();
-        self.rescan_mine();
+        self.rescan_project();
     }
 
     /// Moves or copies one file of MY TILEMAPS, with its book entry. The
     /// open sheet follows its own file.
     fn relocate(&mut self, old: &str, new: &str, copy: bool) -> Result<(), String> {
-        let root = self.dst.root.clone();
+        let root = self.project.root.clone();
         if new == old {
             return Ok(());
         }
@@ -492,7 +612,7 @@ impl App {
             std::fs::copy(root.join(old), root.join(new)).map_err(|e| e.to_string())?;
         } else {
             std::fs::rename(root.join(old), root.join(new)).map_err(|e| e.to_string())?;
-            if let Some(sheet) = &mut self.dst_sheet {
+            if let Some(sheet) = &mut self.project_sheet {
                 if sheet.rel == old {
                     sheet.rel = new.to_string();
                 }
@@ -502,13 +622,13 @@ impl App {
     }
 
     fn apply_name(&mut self, ctx: &egui::Context, what: &NameFor, name: &str) -> Result<(), String> {
-        let root = self.dst.root.clone();
+        let root = self.project.root.clone();
         match what {
             NameFor::NewFolder(parent) => {
                 let rel = Self::normalize_name(name, None).ok_or("that is not a usable name")?;
                 let dir = if parent.is_empty() { rel } else { format!("{parent}/{rel}") };
                 std::fs::create_dir_all(root.join(&dir)).map_err(|e| e.to_string())?;
-                self.rescan_mine();
+                self.rescan_project();
             }
             NameFor::RenameFolder(old) => {
                 let rel = Self::normalize_name(name, None).ok_or("that is not a usable name")?;
@@ -522,12 +642,12 @@ impl App {
                     }
                     std::fs::rename(root.join(old), root.join(&new)).map_err(|e| e.to_string())?;
                     sidecar::move_prefix(&root, old, &new)?;
-                    if let Some(sheet) = &mut self.dst_sheet {
+                    if let Some(sheet) = &mut self.project_sheet {
                         if let Some(rest) = sheet.rel.strip_prefix(&format!("{old}/")) {
                             sheet.rel = format!("{new}/{rest}");
                         }
                     }
-                    self.rescan_mine();
+                    self.rescan_project();
                 }
             }
             NameFor::SaveAs => {
@@ -535,28 +655,30 @@ impl App {
                 if root.join(&rel).exists() {
                     return Err(format!("{rel} exists"));
                 }
-                let Some(sheet) = &mut self.dst_sheet else { return Ok(()) };
+                let Some(sheet) = &mut self.project_sheet else {
+                    return Ok(());
+                };
                 if let Some(parent) = root.join(&rel).parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 sheet.rel = rel.clone();
                 sheet.save()?;
                 self.status = format!("saved as {rel}");
-                self.rescan_mine();
+                self.rescan_project();
             }
             NameFor::RenameFile(old) => {
                 let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
                 if rel != *old {
                     self.relocate(old, &rel, false)?;
-                    self.rescan_mine();
+                    self.rescan_project();
                 }
             }
             NameFor::DuplicateFile(old) => {
                 let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
                 self.relocate(old, &rel, true)?;
-                self.rescan_mine();
-                if let Some(i) = self.dst.position(&rel) {
-                    self.open_mine(ctx, i);
+                self.rescan_project();
+                if let Some(i) = self.project.position(&rel) {
+                    self.open_project(ctx, i);
                 }
             }
         }
@@ -565,17 +687,26 @@ impl App {
 
     /// Keeps search in step with an edit. Saving is explicit: Ctrl+S.
     fn after_edit(&mut self) {
-        let Some(sheet) = &mut self.dst_sheet else { return };
-        if let Some(i) = self.dst_sel {
-            self.dst.entries[i].side = sheet.side.clone();
+        let Some(sheet) = &mut self.project_sheet else {
+            return;
+        };
+        if let Some(i) = self.project_sel {
+            self.project.entries[i].side = sheet.side.clone();
         }
-        self.dst_visible = self.dst.visible(&self.qwords);
+        self.project_visible = self.project.visible(&self.qwords);
     }
 
     fn save(&mut self) {
-        let Some(sheet) = &mut self.dst_sheet else { return };
+        let Some(sheet) = &mut self.project_sheet else {
+            return;
+        };
         if sheet.rel.is_empty() {
-            self.prompt = Some(NamePrompt { title: "Save as".into(), value: String::new(), what: NameFor::SaveAs, focus: true });
+            self.prompt = Some(NamePrompt {
+                title: "Save as".into(),
+                value: String::new(),
+                what: NameFor::SaveAs,
+                focus: true,
+            });
             return;
         }
         match sheet.save() {
@@ -585,7 +716,9 @@ impl App {
     }
 
     fn trim(&mut self, ctx: &egui::Context) {
-        let Some(sheet) = &mut self.dst_sheet else { return };
+        let Some(sheet) = &mut self.project_sheet else {
+            return;
+        };
         let before = (sheet.cols(), sheet.rows());
         sheet.trim(ctx);
         self.status = if (sheet.cols(), sheet.rows()) == before {
@@ -597,7 +730,7 @@ impl App {
     }
 
     fn has_unsaved(&self) -> bool {
-        self.dst_sheet.as_ref().is_some_and(|s| s.dirty)
+        self.project_sheet.as_ref().is_some_and(|s| s.dirty)
     }
 
     /// Runs the action, or asks about unsaved changes first.
@@ -611,10 +744,10 @@ impl App {
 
     fn run(&mut self, ctx: &egui::Context, action: Pending) {
         match action {
-            Pending::Open(i) => self.open_mine(ctx, i),
-            Pending::Create => self.create_mine(ctx),
+            Pending::Open(i) => self.open_project(ctx, i),
+            Pending::Create => self.create_project(ctx),
             Pending::Close => {
-                self.dst_sheet = None;
+                self.project_sheet = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -623,7 +756,7 @@ impl App {
     /// The dialog for unsaved changes: save, discard, or cancel.
     fn save_dialog(&mut self, ctx: &egui::Context) {
         let Some(action) = self.pending else { return };
-        let name = self.dst_sheet.as_ref().map(|s| s.rel.clone()).unwrap_or_default();
+        let name = self.project_sheet.as_ref().map(|s| s.rel.clone()).unwrap_or_default();
         let mut choice = None;
         egui::Modal::new(Id::new("save dialog")).show(ctx, |ui| {
             ui.set_width(360.0);
@@ -643,7 +776,7 @@ impl App {
             });
         });
         if let Some(save) = choice {
-            if save && self.dst_sheet.as_ref().is_some_and(|s| s.rel.is_empty()) {
+            if save && self.project_sheet.as_ref().is_some_and(|s| s.rel.is_empty()) {
                 // No name yet: ask for one; the interrupted action is dropped.
                 self.pending = None;
                 self.save();
@@ -652,7 +785,7 @@ impl App {
             if save {
                 self.save();
             }
-            if let Some(sheet) = &mut self.dst_sheet {
+            if let Some(sheet) = &mut self.project_sheet {
                 sheet.dirty = false;
             }
             self.pending = None;
@@ -665,15 +798,20 @@ impl App {
         let cmd = Modifiers::COMMAND;
         // Saving works no matter what has focus; a swallowed Ctrl+S loses work.
         if key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
-            if let Some(sheet) = &self.dst_sheet {
-                self.prompt = Some(NamePrompt { title: "Save as".into(), value: sheet.rel.clone(), what: NameFor::SaveAs, focus: true });
+            if let Some(sheet) = &self.project_sheet {
+                self.prompt = Some(NamePrompt {
+                    title: "Save as".into(),
+                    value: sheet.rel.clone(),
+                    what: NameFor::SaveAs,
+                    focus: true,
+                });
             }
         }
         if key(cmd, Key::S) {
             self.save();
         }
         let focus = ctx.memory(|m| m.focused());
-        if !focus.is_none_or(|id| id == src_id() || id == dst_id()) {
+        if !focus.is_none_or(|id| id == library_id() || id == project_id()) {
             return;
         }
         // The window layer turns Ctrl+C into a Copy event, and Ctrl+V into a Paste
@@ -688,8 +826,8 @@ impl App {
 
         if copy || cut || key(cmd, Key::C) {
             let from = match self.active {
-                Panel::Source => &self.src_sheet,
-                Panel::Mine => &self.dst_sheet,
+                Panel::Library => &self.library_sheet,
+                Panel::Project => &self.project_sheet,
             };
             if let Some(b) = from.as_ref().and_then(Sheet::copy) {
                 self.status = format!("copied {}x{} cells", b.cols, b.rows);
@@ -697,8 +835,8 @@ impl App {
                 ctx.copy_text(b.note());
                 self.clip = Some(b);
                 // A cut clears the cells; only your tilemap is editable.
-                if cut && self.active == Panel::Mine {
-                    if let Some(sheet) = &mut self.dst_sheet {
+                if cut && self.active == Panel::Project {
+                    if let Some(sheet) = &mut self.project_sheet {
                         sheet.clear_selection(ctx);
                         self.after_edit();
                     }
@@ -706,10 +844,10 @@ impl App {
             }
         }
         if paste || key(cmd, Key::V) {
-            if let (Some(block), Some(sheet)) = (&self.clip, &mut self.dst_sheet) {
+            if let (Some(block), Some(sheet)) = (&self.clip, &mut self.project_sheet) {
                 let at = sheet.sel.origin().unwrap_or((0, 0));
                 sheet.paste(ctx, at, block);
-                self.active = Panel::Mine;
+                self.active = Panel::Project;
                 self.after_edit();
             }
         }
@@ -717,14 +855,14 @@ impl App {
             self.trim(ctx);
         }
         if key(cmd, Key::Z) {
-            if let Some(sheet) = &mut self.dst_sheet {
+            if let Some(sheet) = &mut self.project_sheet {
                 sheet.undo(ctx);
                 self.after_edit();
             }
         }
-        if self.active == Panel::Mine {
+        if self.active == Panel::Project {
             if key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace) {
-                if let Some(sheet) = &mut self.dst_sheet {
+                if let Some(sheet) = &mut self.project_sheet {
                     sheet.clear_selection(ctx);
                     self.after_edit();
                 }
@@ -760,61 +898,77 @@ impl App {
 
     fn start_drag(&mut self, ctx: &egui::Context, from: Panel, cell: (u32, u32)) {
         let sheet = match from {
-            Panel::Source => self.src_sheet.as_ref(),
-            Panel::Mine => self.dst_sheet.as_ref(),
+            Panel::Library => self.library_sheet.as_ref(),
+            Panel::Project => self.project_sheet.as_ref(),
         };
         let Some(sheet_ref) = sheet else { return };
         let from_selection = sheet_ref.sel.contains(cell);
         let origin = if from_selection { sheet_ref.sel.clone() } else { Sel::rect(cell, cell) };
         let grab = origin.origin().map(|o| (cell.0 - o.0, cell.1 - o.1)).unwrap_or((0, 0));
-        let Some(block) = sheet_ref.copy_sel(&origin) else { return };
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [block.img.width() as usize, block.img.height() as usize],
-            block.img.as_raw(),
-        );
+        let Some(block) = sheet_ref.copy_sel(&origin) else {
+            return;
+        };
+        let image = egui::ColorImage::from_rgba_unmultiplied([block.img.width() as usize, block.img.height() as usize], block.img.as_raw());
         let ghost = ctx.load_texture("drag ghost", image, egui::TextureOptions::NEAREST);
-        self.drag = Some(Drag { block, from, origin, from_selection, grab, ghost });
+        self.drag = Some(Drag {
+            block,
+            from,
+            origin,
+            from_selection,
+            grab,
+            ghost,
+        });
         self.active = from;
     }
 
     /// Draws the ghost under the pointer, and drops the block on release.
     fn update_drag(&mut self, ctx: &egui::Context) {
         let Some(drag) = &self.drag else { return };
-        let Some(p) = ctx.input(|i| i.pointer.latest_pos()) else { return };
+        let Some(p) = ctx.input(|i| i.pointer.latest_pos()) else {
+            return;
+        };
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
 
         // Over the tilemap the ghost snaps to the grid; elsewhere it floats at the pointer.
-        let mut target = self.dst_sheet.as_ref().and_then(|d| {
+        let mut target = self.project_sheet.as_ref().and_then(|d| {
             let c = d.cell_at(p)?;
             Some((c.0.saturating_sub(drag.grab.0), c.1.saturating_sub(drag.grab.1)))
         });
         // The ghost is drawn at the zoom of the panel it is over, in pixels
         // of the block, since the tile sizes may differ.
         let block_px = Vec2::new(drag.block.img.width() as f32, drag.block.img.height() as f32);
-        let src_cell = Vec2::new(drag.block.tile[0] as f32, drag.block.tile[1] as f32);
-        let (min, zoom) = match (target, &self.dst_sheet) {
+        let library_cell = Vec2::new(drag.block.tile[0] as f32, drag.block.tile[1] as f32);
+        let (min, zoom) = match (target, &self.project_sheet) {
             (Some(t), Some(d)) => {
                 let c = d.cell_px();
                 (d.screen.min + Vec2::new(t.0 as f32 * c.x, t.1 as f32 * c.y), d.zoom_px())
             }
             _ => {
                 let z = match drag.from {
-                    Panel::Source => self.src_sheet.as_ref().map_or(2.0, |s| s.zoom_px()),
-                    Panel::Mine => self.dst_sheet.as_ref().map_or(2.0, |s| s.zoom_px()),
+                    Panel::Library => self.library_sheet.as_ref().map_or(2.0, |s| s.zoom_px()),
+                    Panel::Project => self.project_sheet.as_ref().map_or(2.0, |s| s.zoom_px()),
                 };
-                (p - Vec2::new((drag.grab.0 as f32 + 0.5) * src_cell.x, (drag.grab.1 as f32 + 0.5) * src_cell.y) * z, z)
+                (
+                    p - Vec2::new((drag.grab.0 as f32 + 0.5) * library_cell.x, (drag.grab.1 as f32 + 0.5) * library_cell.y) * z,
+                    z,
+                )
             }
         };
         let size = block_px * zoom;
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("drag ghost")));
         let rect = Rect::from_min_size(min, size);
-        painter.image(drag.ghost.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha(160));
+        painter.image(
+            drag.ghost.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::from_white_alpha(160),
+        );
         painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, Color32::from_rgb(80, 160, 255)), egui::StrokeKind::Inside);
         // What the drop will do, when a key changes it: a plus for a copy,
         // two arrows for a swap. The sign sits on the block itself, so that
-        // only one thing follows the pointer. A block from the source can
+        // only one thing follows the pointer. A block from the library can
         // only be copied, so it needs no sign.
-        if drag.from == Panel::Mine {
+        if drag.from == Panel::Project {
             let (ctrl, alt) = ctx.input(|i| (i.modifiers.command, i.modifiers.alt));
             if ctrl || alt {
                 drop_sign(&painter, rect.min + Vec2::splat(3.0), ctrl);
@@ -831,22 +985,24 @@ impl App {
         let drag = self.drag.take().unwrap();
         // A drop on the empty pane starts a fresh, unnamed tilemap; its name
         // is asked for at the first save.
-        if target.is_none() && self.dst_sheet.is_none() && self.mine_rect.contains(p) {
+        if target.is_none() && self.project_sheet.is_none() && self.project_rect.contains(p) {
             // The new tilemap takes the grid of the block that lands on it.
             let tile = drag.block.tile;
             let (cols, rows) = (((NEW_PX + tile[0] / 2) / tile[0]).max(1), ((NEW_PX + tile[1] / 2) / tile[1]).max(1));
-            self.dst_sheet = Some(Sheet::new_empty(ctx, &self.dst.root, "", tile, cols, rows));
-            self.dst_sel = None;
+            self.project_sheet = Some(Sheet::new_empty(ctx, &self.project.root, "", tile, cols, rows));
+            self.project_sel = None;
             target = Some((0, 0));
         }
-        let (Some(at), Some(sheet)) = (target, &mut self.dst_sheet) else { return };
-        let copy = drag.from == Panel::Source || ctx.input(|i| i.modifiers.command);
-        // Alt exchanges the two places. The source sheet never changes, so a
+        let (Some(at), Some(sheet)) = (target, &mut self.project_sheet) else {
+            return;
+        };
+        let copy = drag.from == Panel::Library || ctx.input(|i| i.modifiers.command);
+        // Alt exchanges the two places. A library sheet never changes, so a
         // block from there can only be copied.
         let swap = !copy && ctx.input(|i| i.modifiers.alt);
         // A lone lifted tile leaves the selections as they were; only a
         // dragged selection keeps following its block.
-        let keep = (!drag.from_selection || drag.from == Panel::Source).then(|| sheet.sel.clone());
+        let keep = (!drag.from_selection || drag.from == Panel::Library).then(|| sheet.sel.clone());
         if copy {
             sheet.paste(ctx, at, &drag.block);
         } else if Some(at) == drag.origin.origin() {
@@ -859,16 +1015,20 @@ impl App {
         if let Some(prev) = keep {
             sheet.sel = prev;
         }
-        self.active = Panel::Mine;
+        self.active = Panel::Project;
         self.after_edit();
     }
 
     /// Returns the new grid when the user finished editing a field:
     /// (tile, gap, offset).
-    fn sheet_header(ui: &mut egui::Ui, title: &str, active: bool, source: bool, sheet: Option<&mut Sheet>) -> Option<([u32; 2], u32, [u32; 2])> {
+    fn sheet_header(ui: &mut egui::Ui, title: &str, active: bool, library: bool, sheet: Option<&mut Sheet>) -> Option<([u32; 2], u32, [u32; 2])> {
         let mut new_grid = None;
         ui.horizontal(|ui| {
-            let color = if active { egui::Color32::from_rgb(80, 160, 255) } else { ui.visuals().weak_text_color() };
+            let color = if active {
+                egui::Color32::from_rgb(80, 160, 255)
+            } else {
+                ui.visuals().weak_text_color()
+            };
             ui.colored_label(color, egui::RichText::new(title).strong());
             let Some(s) = sheet else {
                 ui.weak("nothing open");
@@ -876,10 +1036,10 @@ impl App {
             };
             ui.weak(format!("{}x{} cells", s.cols(), s.rows()));
             ui.label("tile");
-            if let Some(t) = tile_field(source).ui(ui, s.tile) {
+            if let Some(t) = tile_field(library).ui(ui, s.tile) {
                 new_grid = Some((t, s.gap, s.offset));
             }
-            if source {
+            if library {
                 // Sheets drawn with gaps between the tiles, and a border
                 // before the first one.
                 ui.label("gap");
@@ -888,7 +1048,7 @@ impl App {
                     new_grid = Some((s.tile, s.gap_edit, s.offset));
                 }
                 ui.label("offset");
-                if let Some(o) = offset_field(source).ui(ui, s.offset) {
+                if let Some(o) = offset_field(library).ui(ui, s.offset) {
                     new_grid = Some((s.tile, s.gap, o));
                 }
             }
@@ -896,7 +1056,7 @@ impl App {
             if let Some(b) = s.sel.bounds() {
                 ui.weak(format!("sel {} cells, {}x{} at {},{}", s.sel.len(), b.cols(), b.rows(), b.x0, b.y0));
             }
-            // The name and the source of the hovered cell come last, and both
+            // The name and the origin of the hovered cell come last, and both
             // are truncated: a long path can never push the fields off screen.
             let name = if s.rel.is_empty() { "(unnamed)" } else { s.rel.as_str() };
             let name = if s.dirty { format!("{name} *") } else { name.to_string() };
@@ -914,7 +1074,9 @@ impl App {
     /// stores the draft, or removes the stored animation under the selection.
     fn press_a(&mut self) {
         let panel = self.active;
-        let Some(sheet) = self.sheet_mut(panel) else { return };
+        let Some(sheet) = self.sheet_mut(panel) else {
+            return;
+        };
         if !sheet.show_anim_panel() {
             sheet.open_anim_panel();
             return;
@@ -930,10 +1092,10 @@ impl App {
     fn zoom_under_pointer(&mut self) -> Option<&mut sheet::Zoom> {
         let active = self.active;
         let hovered = |s: &Sheet| s.preview_hovered || s.hover.is_some();
-        let panel = if self.src_sheet.as_ref().is_some_and(hovered) {
-            Panel::Source
-        } else if self.dst_sheet.as_ref().is_some_and(hovered) {
-            Panel::Mine
+        let panel = if self.library_sheet.as_ref().is_some_and(hovered) {
+            Panel::Library
+        } else if self.project_sheet.as_ref().is_some_and(hovered) {
+            Panel::Project
         } else {
             active
         };
@@ -942,22 +1104,27 @@ impl App {
     }
 
     /// Applies a new grid (tile, gap, offset) to a sheet. Your tilemap keeps
-    /// it as an unsaved edit; a source sheet stores it at once.
+    /// it as an unsaved edit; a library sheet stores it at once.
     fn change_grid(&mut self, ctx: &egui::Context, panel: Panel, (t, gap, offset): ([u32; 2], u32, [u32; 2])) {
-        let Some(sheet) = self.sheet_mut(panel) else { return };
+        let Some(sheet) = self.sheet_mut(panel) else {
+            return;
+        };
         sheet.set_tile(ctx, t);
         sheet.set_gap_offset(ctx, gap, offset);
         self.status = format!("grid: {} px tiles, {gap} px gap, {} px offset", show_tile(t), show_tile(offset));
+        // The folder keeps the size, so the next sheet without an entry of
+        // its own starts with it.
+        self.remember_tile(panel, t);
         match panel {
-            Panel::Mine => self.after_edit(),
-            Panel::Source => {
-                if let Some(sheet) = &mut self.src_sheet {
+            Panel::Project => self.after_edit(),
+            Panel::Library => {
+                if let Some(sheet) = &mut self.library_sheet {
                     if let Err(e) = sheet.save_entry() {
                         self.status = e;
                     }
                 }
-                if let (Some(i), Some(sheet)) = (self.src_sel, &self.src_sheet) {
-                    self.src.entries[i].side = sheet.side.clone();
+                if let (Some(i), Some(sheet)) = (self.library_sel, &self.library_sheet) {
+                    self.library.entries[i].side = sheet.side.clone();
                 }
             }
         }
@@ -965,24 +1132,26 @@ impl App {
 
     fn sheet_mut(&mut self, panel: Panel) -> Option<&mut Sheet> {
         match panel {
-            Panel::Source => self.src_sheet.as_mut(),
-            Panel::Mine => self.dst_sheet.as_mut(),
+            Panel::Library => self.library_sheet.as_mut(),
+            Panel::Project => self.project_sheet.as_mut(),
         }
     }
 
-    /// A tilemap keeps the change until Ctrl+S. A source sheet has no pixel
+    /// A tilemap keeps the change until Ctrl+S. A library sheet has no pixel
     /// edits, so its book entry is written at once.
     fn after_animation_edit(&mut self, panel: Panel) {
         match panel {
-            Panel::Mine => self.after_edit(),
-            Panel::Source => {
-                let Some(sheet) = &mut self.src_sheet else { return };
+            Panel::Project => self.after_edit(),
+            Panel::Library => {
+                let Some(sheet) = &mut self.library_sheet else {
+                    return;
+                };
                 match sheet.save_entry() {
-                    Ok(()) => self.status = format!("stored in {}", self.src.root.join(sidecar::BOOK).display()),
+                    Ok(()) => self.status = format!("stored in {}", self.library.root.join(sidecar::BOOK).display()),
                     Err(e) => self.status = e,
                 }
-                if let Some(i) = self.src_sel {
-                    self.src.entries[i].side = sheet.side.clone();
+                if let Some(i) = self.library_sel {
+                    self.library.entries[i].side = sheet.side.clone();
                 }
             }
         }
@@ -992,7 +1161,7 @@ impl App {
     /// fields for the frame grid and the frame time. A stored animation is
     /// edited in place; otherwise the fields shape a draft. Returns whether a
     /// stored animation changed, or the reason a change was refused.
-    fn animation_panel(ui: &mut egui::Ui, sheet: &mut Sheet, source: bool) -> Result<bool, String> {
+    fn animation_panel(ui: &mut egui::Ui, sheet: &mut Sheet, library: bool) -> Result<bool, String> {
         ui.strong("Animation");
         let Some(b) = sheet.sel.bounds() else {
             ui.weak("Select cells to play them.");
@@ -1027,7 +1196,7 @@ impl App {
         let mut changed = false;
         egui::Grid::new("animation fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("frames");
-            if let Some(f) = frames_field(source).ui(ui, frames) {
+            if let Some(f) = frames_field(library).ui(ui, frames) {
                 frames = f;
                 changed = true;
             }
@@ -1068,9 +1237,12 @@ impl App {
         });
         if let Some(a) = anim {
             egui::CentralPanel::default().show(ui, |ui| {
-                egui::ScrollArea::both().id_salt("animation preview").auto_shrink([false, false]).show(ui, |ui| {
-                    Self::play(ui, sheet, &a);
-                });
+                egui::ScrollArea::both()
+                    .id_salt("animation preview")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        Self::play(ui, sheet, &a);
+                    });
             });
         }
         result
@@ -1094,7 +1266,12 @@ impl App {
         ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(225));
         let [fx, fy] = a.frame_px(frame);
         let origin = Pos2::new(fx as f32, fy as f32);
-        sheet.draw_px_rect(ui.painter(), Rect::from_min_size(origin, Vec2::new(a.frame[0] as f32, a.frame[1] as f32)), rect.min, zoom);
+        sheet.draw_px_rect(
+            ui.painter(),
+            Rect::from_min_size(origin, Vec2::new(a.frame[0] as f32, a.frame[1] as f32)),
+            rect.min,
+            zoom,
+        );
         ui.weak(format!("frame {}/{}", frame + 1, n));
         ui.ctx().request_repaint_after(Duration::from_millis(a.ms.max(16) as u64));
     }
@@ -1113,15 +1290,18 @@ impl eframe::App for App {
         self.handle_keys(ctx);
         // The preview sets this flag while drawing; clear it first, so that
         // a closed preview does not keep it.
-        for s in [&mut self.src_sheet, &mut self.dst_sheet].into_iter().flatten() {
+        for s in [&mut self.library_sheet, &mut self.project_sheet].into_iter().flatten() {
             s.preview_hovered = false;
         }
 
-        let mut src_action = None;
-        let mut dst_action = None;
+        let mut library_action = None;
+        let mut project_action = None;
+        // A click in an empty pane asks for that side's folder.
+        let (library_set, project_set) = (self.is_set(Panel::Library), self.is_set(Panel::Project));
+        let mut ask: Option<Panel> = None;
         let mut hover_dir: Option<String> = None;
-        let mut src_order: Vec<usize> = Vec::new();
-        let mut dst_order: Vec<usize> = Vec::new();
+        let mut library_order: Vec<usize> = Vec::new();
+        let mut project_order: Vec<usize> = Vec::new();
         let mut delete_in_mine = false;
         let mut create = false;
         egui::Panel::left("left").resizable(true).default_size(340.0).size_range(240.0..=800.0).show(ui, |ui| {
@@ -1135,39 +1315,54 @@ impl eframe::App for App {
                 ui.set_max_width(ui.available_width());
                 ui.weak("click / drag: select   long click and drag: move   ctrl+a: select all   shift+click: rectangle from the last click   ctrl+click: add or remove a cell   ctrl+shift+click: add a rectangle   right click: clear selection / inside it: delete content   (drop with ctrl held: copy, with alt: swap the two places)   ctrl+c / ctrl+x / ctrl+v   delete   a: animation panel / store   ctrl+z   ctrl+s: save   ctrl+shift+s: save as   ctrl+t: trim   drag the canvas edge: resize   ctrl+wheel or + / -: zoom the view under the pointer");
             });
-            egui::Panel::top("source tree")
+            egui::Panel::top("library tree")
                 .resizable(true)
                 .default_size(ui.available_height() * 0.6)
                 .size_range(80.0..=f32::INFINITY)
                 .show(ui, |ui| {
-                    ui.strong("SOURCE");
-                    egui::ScrollArea::vertical().id_salt("source scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.strong("LIBRARY");
+                    egui::ScrollArea::vertical().id_salt("library scroll").auto_shrink([false, false]).show(ui, |ui| {
                         // The whole visible area answers, before the tree
                         // draws: the files and folders lie on top of it, so
                         // every place that is not one of them is free space.
-                        let bg = ui.interact(ui.clip_rect(), Id::new("source free space"), egui::Sense::click());
+                        let bg = ui.interact(ui.clip_rect(), Id::new("library free space"), egui::Sense::click());
+                        if !library_set {
+                            ui.weak("No library folder yet.");
+                            ui.add_space(4.0);
+                            ui.weak("Your library holds the sheets and packs you collected. Tilepicky only reads it.");
+                            ui.add_space(6.0);
+                            ui.weak("Click here to choose it.");
+                            if bg.clicked() {
+                                ask = Some(Panel::Library);
+                            }
+                        }
                         let view = tree::View {
-                            visible: self.src_visible.as_deref(),
-                            selected: self.src_sel,
+                            visible: self.library_visible.as_deref(),
+                            selected: self.library_sel,
                             marked: None,
                             query: &self.qwords,
                             apply_query: self.open_trees,
                             menus: false,
-                            scroll_to: self.src_scroll,
+                            scroll_to: self.library_scroll,
                             sweeping: false,
                             lifting: false,
                         };
-                        src_action = self.src_tree.show(ui, &view, "", &mut Vec::new(), &mut src_order, &mut None);
+                        library_action = self.library_tree.show(ui, &view, "", &mut Vec::new(), &mut library_order, &mut None);
                         bg.context_menu(|ui| {
-                            if ui.button("Refresh").clicked() {
-                                src_action = Some(TreeAction::Refresh);
+                            let label = if library_set { "Change library folder…" } else { "Set library folder…" };
+                            if ui.button(label).clicked() {
+                                ask = Some(Panel::Library);
+                                ui.close();
+                            }
+                            if library_set && ui.button("Refresh").clicked() {
+                                library_action = Some(TreeAction::Refresh);
                                 ui.close();
                             }
                         });
                     });
                 });
             egui::CentralPanel::default().show(ui, |ui| {
-                let heading = ui.add(egui::Label::new(egui::RichText::new("MY TILEMAPS").strong()).sense(egui::Sense::click()));
+                let heading = ui.add(egui::Label::new(egui::RichText::new("PROJECT").strong()).sense(egui::Sense::click()));
                 heading.context_menu(|ui| {
                     if ui.button("New folder…").clicked() {
                         self.prompt = Some(NamePrompt {
@@ -1181,6 +1376,7 @@ impl eframe::App for App {
                 });
                 // The button first, at the right; the field takes what is left. One row high.
                 let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+                if project_set {
                 ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("New").clicked() {
                         create = true;
@@ -1191,17 +1387,26 @@ impl eframe::App for App {
                         create = true;
                     }
                 });
-                egui::ScrollArea::vertical().id_salt("mine scroll").auto_shrink([false, false]).show(ui, |ui| {
+                }
+                egui::ScrollArea::vertical().id_salt("project scroll").auto_shrink([false, false]).show(ui, |ui| {
                     // The free space around the tree offers the folder menu.
-                    let bg = ui.interact(ui.clip_rect(), Id::new("tilemaps free space"), egui::Sense::click());
+                    let bg = ui.interact(ui.clip_rect(), Id::new("project free space"), egui::Sense::click());
+                    if !project_set {
+                        ui.weak("No project folder yet.");
+                        ui.add_space(4.0);
+                        ui.weak("Click here to choose the folder your own tilemaps live in.");
+                        if bg.clicked() {
+                            ask = Some(Panel::Project);
+                        }
+                    }
                     let view = tree::View {
-                        visible: self.dst_visible.as_deref(),
-                        selected: self.dst_sel,
+                        visible: self.project_visible.as_deref(),
+                        selected: self.project_sel,
                         marked: Some(&self.marked),
                         query: &self.qwords,
                         apply_query: self.open_trees,
                         menus: true,
-                        scroll_to: self.dst_scroll,
+                        scroll_to: self.project_scroll,
                         sweeping: self.sweep.is_some(),
                         lifting: self.file_drag.is_some(),
                     };
@@ -1210,15 +1415,22 @@ impl eframe::App for App {
                     if self.file_drag.is_some() && bg.contains_pointer() {
                         hover_dir = Some(String::new());
                     }
-                    dst_action = self.dst_tree.show(ui, &view, "", &mut Vec::new(), &mut dst_order, &mut hover_dir);
+                    project_action = self.project_tree.show(ui, &view, "", &mut Vec::new(), &mut project_order, &mut hover_dir);
                     bg.context_menu(|ui| {
-                        if ui.button("New folder…").clicked() {
-                            self.prompt = Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(String::new()), focus: true });
+                        let label = if project_set { "Change project folder…" } else { "Set project folder…" };
+                        if ui.button(label).clicked() {
+                            ask = Some(Panel::Project);
                             ui.close();
                         }
-                        if ui.button("Refresh").clicked() {
-                            dst_action = Some(TreeAction::Refresh);
-                            ui.close();
+                        if project_set {
+                            if ui.button("New folder…").clicked() {
+                                self.prompt = Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(String::new()), focus: true });
+                                ui.close();
+                            }
+                            if ui.button("Refresh").clicked() {
+                                project_action = Some(TreeAction::Refresh);
+                                ui.close();
+                            }
                         }
                     });
                 });
@@ -1243,20 +1455,20 @@ impl eframe::App for App {
             });
         });
         self.open_trees = false;
-        self.src_scroll = None;
-        self.dst_scroll = None;
-        self.tree_keys(ctx, &src_order, &dst_order);
-        match src_action {
-            Some(TreeAction::Open(i)) => self.open_source(ctx, i),
-            Some(TreeAction::Refresh) => self.rescan_source(),
-            Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.src.root, &self.src.entries[i].rel)),
+        self.library_scroll = None;
+        self.project_scroll = None;
+        self.tree_keys(ctx, &library_order, &project_order);
+        match library_action {
+            Some(TreeAction::Open(i)) => self.open_library(ctx, i),
+            Some(TreeAction::Refresh) => self.rescan_library(),
+            Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.library.root, &self.library.entries[i].rel)),
             Some(TreeAction::CopyPath(i, whole)) => {
-                let rel = self.src.entries[i].rel.clone();
-                self.copy_path(ctx, &self.src.root.clone(), &rel, whole);
+                let rel = self.library.entries[i].rel.clone();
+                self.copy_path(ctx, &self.library.root.clone(), &rel, whole);
             }
             _ => {}
         }
-        match dst_action {
+        match project_action {
             Some(TreeAction::Open(i)) => {
                 // The plainly clicked file is the start of any group.
                 self.marked.clear();
@@ -1275,18 +1487,18 @@ impl eframe::App for App {
             Some(TreeAction::Range(i, additive)) => {
                 self.tree_cursor = Some(i);
                 let a = self.tree_anchor.unwrap_or(i);
-                self.mark_range(&dst_order, a, i, additive);
+                self.mark_range(&project_order, a, i, additive);
             }
             Some(TreeAction::LiftFile(i)) => {
                 let group = self.marked.len() > 1 && self.marked.contains(&i);
                 self.file_drag = Some(if group {
-                    let mut rels: Vec<String> = self.marked.iter().map(|&k| self.dst.entries[k].rel.clone()).collect();
+                    let mut rels: Vec<String> = self.marked.iter().map(|&k| self.project.entries[k].rel.clone()).collect();
                     rels.sort();
                     rels
                 } else {
                     self.marked.clear();
                     self.marked.insert(i);
-                    vec![self.dst.entries[i].rel.clone()]
+                    vec![self.project.entries[i].rel.clone()]
                 });
             }
             Some(TreeAction::SweepStart(i)) => {
@@ -1299,40 +1511,60 @@ impl eframe::App for App {
             Some(TreeAction::Sweep(i)) => {
                 let a = self.sweep.unwrap_or(i);
                 self.tree_cursor = Some(i);
-                self.mark_range(&dst_order, a, i, false);
+                self.mark_range(&project_order, a, i, false);
             }
             Some(TreeAction::DeleteFile(i)) => {
-                let rel = self.dst.entries[i].rel.clone();
+                let rel = self.project.entries[i].rel.clone();
                 self.confirm = Some((format!("Delete {rel}? There is no undo."), vec![rel]));
             }
             Some(TreeAction::DeleteMarked) => {
-                let rels: Vec<String> = self.marked.iter().map(|&i| self.dst.entries[i].rel.clone()).collect();
+                let rels: Vec<String> = self.marked.iter().map(|&i| self.project.entries[i].rel.clone()).collect();
                 self.confirm = Some((format!("Delete {} files? There is no undo.", rels.len()), rels));
             }
-            Some(TreeAction::Refresh) => self.rescan_mine(),
-            Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.dst.root, &self.dst.entries[i].rel)),
+            Some(TreeAction::Refresh) => self.rescan_project(),
+            Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.project.root, &self.project.entries[i].rel)),
             Some(TreeAction::CopyPath(i, whole)) => {
-                let rel = self.dst.entries[i].rel.clone();
-                self.copy_path(ctx, &self.dst.root.clone(), &rel, whole);
+                let rel = self.project.entries[i].rel.clone();
+                self.copy_path(ctx, &self.project.root.clone(), &rel, whole);
             }
             Some(TreeAction::DeleteFolder(dir)) => {
                 self.confirm = Some((format!("Delete the folder {dir} and everything in it? There is no undo."), vec![dir]));
             }
             Some(TreeAction::RenameFile(i)) => {
-                let rel = self.dst.entries[i].rel.clone();
-                self.prompt = Some(NamePrompt { title: "Rename".into(), value: rel.clone(), what: NameFor::RenameFile(rel), focus: true });
+                let rel = self.project.entries[i].rel.clone();
+                self.prompt = Some(NamePrompt {
+                    title: "Rename".into(),
+                    value: rel.clone(),
+                    what: NameFor::RenameFile(rel),
+                    focus: true,
+                });
             }
             Some(TreeAction::DuplicateFile(i)) => {
-                let rel = self.dst.entries[i].rel.clone();
+                let rel = self.project.entries[i].rel.clone();
                 let suggestion = format!("{} copy", rel.trim_end_matches(".png"));
-                self.prompt = Some(NamePrompt { title: "Duplicate".into(), value: suggestion, what: NameFor::DuplicateFile(rel), focus: true });
+                self.prompt = Some(NamePrompt {
+                    title: "Duplicate".into(),
+                    value: suggestion,
+                    what: NameFor::DuplicateFile(rel),
+                    focus: true,
+                });
             }
             Some(TreeAction::NewFolder(dir)) => {
-                self.prompt = Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(dir), focus: true });
+                self.prompt = Some(NamePrompt {
+                    title: "New folder".into(),
+                    value: String::new(),
+                    what: NameFor::NewFolder(dir),
+                    focus: true,
+                });
             }
             Some(TreeAction::RenameFolder(dir)) => {
                 let name = dir.rsplit_once('/').map(|(_, n)| n).unwrap_or(&dir).to_string();
-                self.prompt = Some(NamePrompt { title: "Rename folder".into(), value: name, what: NameFor::RenameFolder(dir), focus: true });
+                self.prompt = Some(NamePrompt {
+                    title: "Rename folder".into(),
+                    value: name,
+                    what: NameFor::RenameFolder(dir),
+                    focus: true,
+                });
             }
             None => {}
         }
@@ -1356,95 +1588,115 @@ impl eframe::App for App {
         let dragging = self.drag.is_some();
         let mut drag_from = None;
         let mut anim_changed = Ok(false);
-        let mut src_anim = Ok(false);
-        let mut src_tile = None;
-        let mut dst_tile = None;
+        let mut library_anim = Ok(false);
+        let mut library_tile = None;
+        let mut project_tile = None;
         let mut resized = false;
         // The split is kept as a fraction of the height, so that it stays in
         // place when the window changes size. The panel state is written from
         // it each frame and read back after the user drags the divider.
         let total = ui.available_height();
-        let panel_id = Id::new("source panel");
+        let panel_id = Id::new("library panel");
         let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
         ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
-        egui::Panel::top("source panel")
-            .resizable(true)
-            .show(ui, |ui| {
-                src_tile = Self::sheet_header(ui, "SOURCE", self.active == Panel::Source, true, self.src_sheet.as_mut());
-                if let Some(s) = &mut self.src_sheet {
-                    if s.show_anim_panel() {
-                        egui::Panel::right("source animation").resizable(true).default_size(220.0).show(ui, |ui| {
-                            src_anim = Self::animation_panel(ui, s, true);
-                        });
-                    }
-                    let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, src_id(), dragging, false)).inner;
-                    if ev.interacted {
-                        self.active = Panel::Source;
-                    }
-                    if let Some(grab) = ev.drag_block {
-                        drag_from = Some((Panel::Source, grab));
-                    }
-                } else {
-                    // Fill the panel, so that it keeps its height and can be dragged.
-                    egui::CentralPanel::default().show(ui, |ui| {
-                        ui.weak("Open a sheet on the left, or type a search.");
+        egui::Panel::top("library panel").resizable(true).show(ui, |ui| {
+            library_tile = Self::sheet_header(ui, "LIBRARY", self.active == Panel::Library, true, self.library_sheet.as_mut());
+            if let Some(s) = &mut self.library_sheet {
+                if s.show_anim_panel() {
+                    egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                        library_anim = Self::animation_panel(ui, s, true);
                     });
                 }
-            });
+                let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false)).inner;
+                if ev.interacted {
+                    self.active = Panel::Library;
+                }
+                if let Some(grab) = ev.drag_block {
+                    drag_from = Some((Panel::Library, grab));
+                }
+            } else {
+                // Fill the panel, so that it keeps its height and can be dragged.
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let hint = if library_set {
+                        "Open a sheet on the left, or type a search."
+                    } else {
+                        "No library folder yet. Click here to choose the folder your sheets and packs live in."
+                    };
+                    let r = ui.interact(ui.max_rect(), Id::new("library empty"), egui::Sense::click());
+                    ui.weak(hint);
+                    if !library_set && r.clicked() {
+                        ask = Some(Panel::Library);
+                    }
+                });
+            }
+        });
         if let Some(state) = egui::PanelState::load(ctx, panel_id) {
             if total > 0.0 {
                 self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
             }
         }
         egui::CentralPanel::default().show(ui, |ui| {
-            self.mine_rect = ui.max_rect();
-            dst_tile = Self::sheet_header(ui, "MINE", self.active == Panel::Mine, false, self.dst_sheet.as_mut());
-            if let Some(s) = &mut self.dst_sheet {
+            self.project_rect = ui.max_rect();
+            project_tile = Self::sheet_header(ui, "PROJECT", self.active == Panel::Project, false, self.project_sheet.as_mut());
+            if let Some(s) = &mut self.project_sheet {
                 if s.show_anim_panel() {
                     egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
                         anim_changed = Self::animation_panel(ui, s, false);
                     });
                 }
-                let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, dst_id(), dragging, true)).inner;
+                let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, project_id(), dragging, true)).inner;
                 if ev.interacted {
-                    self.active = Panel::Mine;
+                    self.active = Panel::Project;
                 }
                 if ev.resized {
                     resized = true;
                 }
                 if let Some(grab) = ev.drag_block {
-                    drag_from = Some((Panel::Mine, grab));
+                    drag_from = Some((Panel::Project, grab));
                 }
                 if ev.delete {
                     s.clear_selection(ctx);
                     delete_in_mine = true;
                 }
             } else {
-                ui.weak("Create or open a tilemap on the left. Then select cells in the source, Ctrl+C, click a cell here, Ctrl+V.");
+                let hint = if project_set {
+                    "Create or open a tilemap on the left. Then select cells in the library, Ctrl+C, click a cell here, Ctrl+V."
+                } else {
+                    "No project folder yet. Click here to choose the folder your own tilemaps live in."
+                };
+                let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
+                ui.weak(hint);
+                if !project_set && r.clicked() {
+                    ask = Some(Panel::Project);
+                }
             }
         });
         match anim_changed {
-            Ok(true) => self.after_animation_edit(Panel::Mine),
+            Ok(true) => self.after_animation_edit(Panel::Project),
             Ok(false) => {}
             Err(e) => self.status = e,
         }
-        if let Some(g) = src_tile {
-            self.change_grid(ctx, Panel::Source, g);
+        if let Some(panel) = ask {
+            self.ask_folder(panel);
         }
-        if let Some(g) = dst_tile {
-            self.change_grid(ctx, Panel::Mine, g);
+        self.poll_folder(ctx);
+        if let Some(g) = library_tile {
+            self.change_grid(ctx, Panel::Library, g);
+        }
+        if let Some(g) = project_tile {
+            self.change_grid(ctx, Panel::Project, g);
         }
         if delete_in_mine {
             self.after_edit();
         }
         if resized {
-            if let Some(s) = &self.dst_sheet {
+            if let Some(s) = &self.project_sheet {
                 self.status = format!("resized to {}x{} cells", s.cols(), s.rows());
             }
             self.after_edit();
         }
-        match src_anim {
-            Ok(true) => self.after_animation_edit(Panel::Source),
+        match library_anim {
+            Ok(true) => self.after_animation_edit(Panel::Library),
             Ok(false) => {}
             Err(e) => self.status = e,
         }
@@ -1456,16 +1708,19 @@ impl eframe::App for App {
 }
 
 /// Moves the old `name.json` files next to tilemaps into the book, once.
-fn migrate_sidecars(dst: &mut Index) {
-    for e in &mut dst.entries {
-        let old = dst.root.join(&e.rel).with_extension("json");
+fn migrate_sidecars(project: &mut Index) {
+    for e in &mut project.entries {
+        let old = project.root.join(&e.rel).with_extension("json");
         if !e.side.is_empty() || !old.exists() {
             continue;
         }
-        let Some(side) = std::fs::read_to_string(&old).ok().and_then(|s| serde_json::from_str::<sidecar::Sidecar>(&s).ok()) else {
+        let Some(side) = std::fs::read_to_string(&old)
+            .ok()
+            .and_then(|s| serde_json::from_str::<sidecar::Sidecar>(&s).ok())
+        else {
             continue;
         };
-        if sidecar::store_entry(&dst.root, &e.rel, &side).is_ok() {
+        if sidecar::store_entry(&project.root, &e.rel, &side).is_ok() {
             let _ = std::fs::remove_file(&old);
             e.side = side;
         }
@@ -1683,9 +1938,9 @@ impl PairField {
 }
 
 /// The tile size: the usual sizes, and both numbers move while it is square.
-fn tile_field(source: bool) -> PairField {
+fn tile_field(library: bool) -> PairField {
     PairField {
-        id: egui::Id::new(("tile field", source)),
+        id: egui::Id::new(("tile field", library)),
         px_per_step: 20.0,
         unit: " px",
         hover: "drag: step the size (only the width when not square)   scroll: the height   click: type, 48 or 32x48",
@@ -1701,9 +1956,9 @@ fn tile_field(source: bool) -> PairField {
 }
 
 /// The pixels before the first tile: single steps.
-fn offset_field(source: bool) -> PairField {
+fn offset_field(library: bool) -> PairField {
     PairField {
-        id: egui::Id::new(("offset field", source)),
+        id: egui::Id::new(("offset field", library)),
         px_per_step: 12.0,
         unit: " px",
         hover: "drag: step the offset (only x when they differ)   scroll: the y offset   click: type, 4 or 4x8",
@@ -1716,9 +1971,9 @@ fn offset_field(source: bool) -> PairField {
 
 /// The frame grid of an animation: frames in a row, and rows. One row is the
 /// usual case, so the rows never follow the drag.
-fn frames_field(source: bool) -> PairField {
+fn frames_field(library: bool) -> PairField {
     PairField {
-        id: egui::Id::new(("frames field", source)),
+        id: egui::Id::new(("frames field", library)),
         px_per_step: 12.0,
         unit: "",
         hover: "drag: frames in a row   scroll: the number of rows   click: type, 6 or 4x2",
@@ -1731,7 +1986,15 @@ fn frames_field(source: bool) -> PairField {
 
 fn field_wheel(ui: &egui::Ui) -> i32 {
     // f32::signum maps 0.0 to +1, so a plain three-way sign it is.
-    let sig = |v: f32| if v > 0.0 { 1 } else if v < 0.0 { -1 } else { 0 };
+    let sig = |v: f32| {
+        if v > 0.0 {
+            1
+        } else if v < 0.0 {
+            -1
+        } else {
+            0
+        }
+    };
     let mut steps = 0;
     ui.input(|i| {
         for e in &i.events {
@@ -1795,31 +2058,42 @@ fn parse_frames(text: &str) -> Option<[u32; 2]> {
 }
 
 fn main() -> eframe::Result {
-    let mut tile: [u32; 2] = [32, 32];
     let mut dirs: Vec<String> = Vec::new();
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if a == "--tile" {
-            tile = args.next().as_deref().and_then(parse_tile).unwrap_or_else(|| {
-                eprintln!("--tile needs a pixel size like 32 or 32x48, between 1 and 1024");
-                std::process::exit(2);
-            });
-        } else {
-            dirs.push(a);
+    for a in std::env::args().skip(1) {
+        if a == "--help" || a == "-h" {
+            println!("usage: tilepicky [<library dir> [<project dir>]]");
+            println!("Without a folder, the tool asks for one and remembers it.");
+            return Ok(());
         }
+        dirs.push(a);
     }
-    if dirs.len() != 2 {
-        eprintln!("usage: tilepicky [--tile N|WxH] <source dir> <destination dir>");
+    if dirs.len() > 2 {
+        eprintln!("usage: tilepicky [<library dir> [<project dir>]]");
         std::process::exit(2);
     }
-    let src = PathBuf::from(&dirs[0]);
-    let dst = PathBuf::from(&dirs[1]);
-    if let Err(e) = std::fs::create_dir_all(&dst) {
-        eprintln!("cannot create {}: {e}", dst.display());
-        std::process::exit(1);
+    let mut settings = settings::Settings::load();
+    // A folder named on the command line wins for this run, and is what the
+    // tool offers next time.
+    if let Some(d) = dirs.first() {
+        settings.library.path = Some(PathBuf::from(d));
     }
+    if let Some(d) = dirs.get(1) {
+        let project = PathBuf::from(d);
+        if let Err(e) = std::fs::create_dir_all(&project) {
+            eprintln!("cannot create {}: {e}", project.display());
+            std::process::exit(1);
+        }
+        settings.project.path = Some(project);
+    }
+    // A folder given here is what the tool offers next time, so it is
+    // written before the window opens.
+    settings.save();
     let icon = image::load_from_memory(include_bytes!("../icon.png")).expect("icon.png").to_rgba8();
-    let icon = egui::IconData { width: icon.width(), height: icon.height(), rgba: icon.into_raw() };
+    let icon = egui::IconData {
+        width: icon.width(),
+        height: icon.height(),
+        rgba: icon.into_raw(),
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
@@ -1833,7 +2107,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(App::new(src, dst, tile)))
+            Ok(Box::new(App::new(settings)))
         }),
     )
 }

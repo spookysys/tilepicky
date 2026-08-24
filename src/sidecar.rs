@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `tilepicky.json`: one file per directory that describes the sheets in it.
 //! Each entry holds the sheet's grid, the origin of cells, and animations.
-//! The source directory and your tilemap directory use the same format.
+//! The library and the project use the same format.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -120,47 +120,80 @@ impl Sidecar {
     pub fn is_empty(&self) -> bool {
         self.tile.is_none() && self.gap.is_none() && self.offset.is_none() && self.provenance.is_empty() && self.animations.is_empty()
     }
-
-
-
 }
 
-pub type Book = BTreeMap<String, Sidecar>;
+/// The book of one directory: the tile size the directory used last, and
+/// one entry per sheet in it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Book {
+    /// The tile size a sheet here starts with when it has no entry of its
+    /// own. It follows the directory, so a project keeps its own size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile: Option<Pair>,
+    #[serde(default)]
+    pub sheets: BTreeMap<String, Sidecar>,
+}
 
+/// Reads the book. The first shape of this file was the bare map of sheets,
+/// so a file without a "sheets" key is read as that map. Serde would drop
+/// every entry of such a file in silence, which is why the shape is settled
+/// here before it is parsed.
 pub fn load_book(dir: &Path) -> Book {
-    std::fs::read_to_string(dir.join(BOOK))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Ok(text) = std::fs::read_to_string(dir.join(BOOK)) else {
+        return Book::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Book::default();
+    };
+    if value.get("sheets").is_some() {
+        return serde_json::from_value(value).unwrap_or_default();
+    }
+    let sheets = serde_json::from_value(value).unwrap_or_default();
+    Book { tile: None, sheets }
+}
+
+fn write_book(dir: &Path, book: &Book) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(book).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())
+}
+
+/// Remembers the tile size of a directory, for the sheets that name none.
+pub fn store_tile(dir: &Path, tile: [u32; 2]) -> Result<(), String> {
+    let mut book = load_book(dir);
+    let want = Some(Pair::of(tile));
+    if book.tile == want {
+        return Ok(());
+    }
+    book.tile = want;
+    write_book(dir, &book)
 }
 
 /// Moves or copies one entry to a new path, for a renamed or duplicated
 /// sheet.
 pub fn move_entry(dir: &Path, old: &str, new: &str, keep_old: bool) -> Result<(), String> {
     let mut book = load_book(dir);
-    if let Some(e) = book.get(old).cloned() {
+    if let Some(e) = book.sheets.get(old).cloned() {
         if !keep_old {
-            book.remove(old);
+            book.sheets.remove(old);
         }
-        book.insert(new.to_string(), e);
-        let json = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())?;
+        book.sheets.insert(new.to_string(), e);
+        write_book(dir, &book)?;
     }
     Ok(())
 }
 
 /// Re-keys every entry under a renamed folder.
 pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
-    let book = load_book(dir);
-    let moved: Book = book
+    let mut book = load_book(dir);
+    book.sheets = book
+        .sheets
         .into_iter()
         .map(|(k, v)| match k.strip_prefix(&format!("{old}/")) {
             Some(rest) => (format!("{new}/{rest}"), v),
             None => (k, v),
         })
         .collect();
-    let json = serde_json::to_string_pretty(&moved).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())
+    write_book(dir, &book)
 }
 
 /// Writes one entry. The book is read again first, so that entries changed
@@ -168,12 +201,11 @@ pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
 pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> {
     let mut book = load_book(dir);
     if side.is_empty() {
-        book.remove(rel);
+        book.sheets.remove(rel);
     } else {
-        book.insert(rel.to_string(), side.clone());
+        book.sheets.insert(rel.to_string(), side.clone());
     }
-    let json = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())
+    write_book(dir, &book)
 }
 
 #[cfg(test)]
@@ -182,7 +214,12 @@ mod tests {
 
     #[test]
     fn a_strip_is_a_pixel_rectangle() {
-        let a = Animation { px: [128, 64], frame: [64, 96], frames: Pair::One(6), ms: 100 };
+        let a = Animation {
+            px: [128, 64],
+            frame: [64, 96],
+            frames: Pair::One(6),
+            ms: 100,
+        };
         assert_eq!(a.px_rect(), (128, 64, 128 + 6 * 64, 64 + 96));
         assert!(a.px_overlaps((0, 0, 129, 65)));
         assert!(!a.px_overlaps((0, 0, 128, 64)));
@@ -191,7 +228,12 @@ mod tests {
 
     #[test]
     fn a_block_of_frames_reads_row_by_row() {
-        let a = Animation { px: [10, 20], frame: [8, 8], frames: Pair::Two([4, 3]), ms: 100 };
+        let a = Animation {
+            px: [10, 20],
+            frame: [8, 8],
+            frames: Pair::Two([4, 3]),
+            ms: 100,
+        };
         assert_eq!(a.count(), 12);
         assert_eq!(a.px_rect(), (10, 20, 10 + 32, 20 + 24));
         assert_eq!(a.frame_px(0), [10, 20]);

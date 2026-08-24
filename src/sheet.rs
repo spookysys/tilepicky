@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! One sheet on screen: an image on a 32 px grid with a selection. The source
-//! panel and your own tilemap are the same thing; only the edits differ.
+//! One sheet on screen: an image on a grid with a selection. A sheet of the
+//! library and a tilemap of your project are the same thing; only the edits
+//! differ.
 
 use crate::sidecar::{self, Animation, Pair, Provenance, Sidecar};
 use eframe::egui::{self, Color32, Id, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
@@ -1582,7 +1583,7 @@ mod tests {
         sheet.set_tile(&ctx, [64, 48]);
         sheet.save().unwrap();
         let book = sidecar::load_book(&dir);
-        let entry = book.get("map.png").cloned();
+        let entry = book.sheets.get("map.png").cloned();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(entry.and_then(|e| e.tile).map(Pair::xy), Some([64, 48]));
     }

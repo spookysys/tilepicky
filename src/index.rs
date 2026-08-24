@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Scans a directory of sheets and searches their file and folder names.
 
-use crate::sidecar::{self, Sidecar};
+use crate::sidecar::{self, Pair, Sidecar};
 use std::path::{Path, PathBuf};
 
 /// The formats the tool reads. It always writes 32 bit RGBA PNG.
@@ -16,6 +16,7 @@ pub struct Entry {
 }
 
 pub struct Index {
+    /// The folder this side reads. Empty when none is chosen yet.
     pub root: PathBuf,
     pub entries: Vec<Entry>,
     /// Every directory under the root, so that empty folders show too.
@@ -27,6 +28,15 @@ pub struct Index {
 impl Index {
     /// Lists every PNG and GIF under `root`, sorted by path.
     pub fn scan(root: &Path, default_tile: [u32; 2]) -> Self {
+        // No folder chosen for this side yet: nothing to list.
+        if root.as_os_str().is_empty() {
+            return Self {
+                root: PathBuf::new(),
+                entries: Vec::new(),
+                dirs: Vec::new(),
+                tile: default_tile,
+            };
+        }
         let mut rels: Vec<String> = Vec::new();
         let mut dirs: Vec<String> = Vec::new();
         for e in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -51,11 +61,21 @@ impl Index {
         let entries = rels
             .into_iter()
             .map(|rel| {
-                let side = book.remove(&rel).unwrap_or_default();
-                Entry { words: path_words(&rel), side, rel }
+                let side = book.sheets.remove(&rel).unwrap_or_default();
+                Entry {
+                    words: path_words(&rel),
+                    side,
+                    rel,
+                }
             })
             .collect();
-        Self { root: root.to_path_buf(), entries, dirs, tile: default_tile }
+        let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
+        Self {
+            root: root.to_path_buf(),
+            entries,
+            dirs,
+            tile,
+        }
     }
 
     pub fn position(&self, rel: &str) -> Option<usize> {

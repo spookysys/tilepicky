@@ -13,24 +13,33 @@ over. The sheets in the pictures are from [Kenney](https://kenney.nl) and
 from [ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites),
 both in the public domain (CC0).
 
-## Run
+## The library and the project
 
-    cargo run --release -- [--tile N|WxH] <source dir> <destination dir>
+Tilepicky works with two folders.
 
-`--tile` sets the default tile size in pixels (32 when absent). Write one
-number for a square tile, or `32x48` for a tile that is not square. Each
-sheet can override it in the header; the override is stored in
-`tilepicky.json`.
+Your **library** holds the sheets and packs you collected. The tool only
+reads it.
 
-The source directory holds the original sheets. The destination directory
-holds the tilemaps you make. The tool creates it when it does not exist.
+Your **project** holds the tilemaps you make. The tool writes them there,
+with a `tilepicky.json` beside them.
+
+Start the tool and it asks for neither. A panel that has no folder yet says
+so; click anywhere in it and the folder dialog opens. The right-click menu of
+each tree carries the same item, and it reads "Change" once a folder is set,
+so you can point either side somewhere else and keep working. Both folders
+are remembered for the next run, in
+`~/.config/tilepicky/settings.json`.
+
+You can also name them when you start the tool:
+
+    cargo run --release -- [<library dir> [<project dir>]]
 
 ## Formats
 
 The tool reads PNG, GIF, JPEG, WebP, BMP, and TGA. It writes one
 format only: 32 bit RGBA PNG with straight alpha, which every engine reads.
 
-An animated GIF plays in the source panel. When you copy a region that moves
+An animated GIF plays in the library panel. When you copy a region that moves
 between the frames, the frames unroll into one strip, marked as an
 animation. A region that stands still gives one picture.
 
@@ -41,11 +50,11 @@ packs by RafaelMatos, from a purchased copy.
 
 ## Layout
 
-The left column holds the search box, the tree of source sheets, and the tree
-of your tilemaps. The top panel shows the source sheet you opened. The bottom
-panel shows your tilemap.
+The left column holds the search box, the tree of your library, and the tree
+of your project. The top panel shows the library sheet you opened. The bottom
+panel shows the tilemap you are building.
 
-![The three panels: the trees on the left, the source sheet above, the tilemap below](media/screenshot.png)
+![The three panels: the trees on the left, the library sheet above, the tilemap below](media/screenshot.png)
 
 ## The grid
 
@@ -63,9 +72,10 @@ the wheel over it to step the second number, which splits `32` into `32x48`.
 Click it to type any value. Each step applies at once, so the grid on screen
 follows the pointer.
 
-A source sheet stores a grid change in its book entry at once. Your tilemap
+A library sheet stores a grid change in its book entry at once. A tilemap
 keeps it until you save. A sheet with no entry of its own starts with the
-grid of the sheet that is open in the same panel.
+tile size the folder used last, which the folder's own `tilepicky.json`
+records; a folder that has never said one starts at 32 px.
 
 ## Keys
 
@@ -98,7 +108,7 @@ While you drag a block, two keys change what the drop does. Ctrl copies: the
 cells it came from stay as they are. Alt exchanges the two places: what lies
 where the block lands travels back to the place the block came from. A sign
 in the corner of the block shows which one is in force. A block from the
-source panel can only be copied, because the source never changes.
+library panel can only be copied, because the library never changes.
 
 A drop on an empty tilemap panel starts a new tilemap. It takes the tile size
 of the block you dropped, and it asks for a name at the first save.
@@ -108,15 +118,15 @@ runs.
 
 ## Files
 
-Both trees answer the same actions. The tree of your tilemaps also changes
-files; the source tree does not.
+Both trees answer the same actions. The project tree also changes files; the
+library tree does not.
 
 | Action | Effect |
 | --- | --- |
 | click | open the file |
 | up, down | walk the files of the panel you last worked in, and open them |
 | Enter | open the file the group ends on |
-| shift+up, shift+down | grow the marked group in your tilemaps |
+| shift+up, shift+down | grow the marked group in the project |
 | Ctrl+click, shift+click | mark one file, or a range |
 | drag across the files | mark every file the pointer crosses |
 | press and hold ~250 ms, then drag | carry the file, or the marked group, into a folder |
@@ -143,38 +153,44 @@ version.
 
 ## tilepicky.json
 
-Each directory, the source and the one with your tilemaps, holds one
-`tilepicky.json`. It describes the sheets in that directory: the grid (tile
-size, gap, offset), where the pixels came from, and animations. The file is
-keyed by the path relative to the directory.
+The library and the project each hold one `tilepicky.json`. It describes the
+sheets in that folder: the grid (tile size, gap, offset), where the pixels
+came from, and animations. The sheets are keyed by their path inside the
+folder, and `tile` at the top is the size that folder used last.
 
     {
-      "erw/erw_grass_land/Tilesets/Tileset-Terrain.png": {
-        "tile": 32,
-        "animations": [
-          { "px": [1280, 64], "frame": [64, 64], "frames": 6, "ms": 100 }
-        ]
-      },
-      "terrain.png": {
-        "tile": [32, 48],
-        "provenance": [
-          { "source": "erw/erw_sewers/Props/atlas-props.png", "rects": [[96, 48, 96, 96]] }
-        ],
-        "animations": [
-          { "px": [256, 32], "frame": [64, 64], "frames": [4, 2], "ms": 100 }
-        ]
+      "tile": 16,
+      "sheets": {
+        "kenney_tiny-town/Tilemap/tilemap_packed.png": {
+          "animations": [
+            { "px": [1280, 64], "frame": [64, 64], "frames": 6, "ms": 100 }
+          ]
+        },
+        "village.png": {
+          "tile": [32, 48],
+          "provenance": [
+            { "source": "kenney_tiny-town/Tilemap/tilemap_packed.png", "rects": [[96, 48, 96, 96]] }
+          ],
+          "animations": [
+            { "px": [256, 32], "frame": [64, 64], "frames": [4, 2], "ms": 100 }
+          ]
+        }
       }
     }
 
+A file written by an older version held the sheets alone, without the two
+keys around them. Tilepicky reads that shape as well, and writes the new one
+the next time it stores an entry.
+
 A field with one number means both axes agree, except `frames`, where one
 number means one row. For your tilemaps, the tool writes the entry on Ctrl+S,
-together with the PNG. For a source sheet, a grid change or an animation you
+together with the PNG. For a library sheet, a grid change or an animation you
 store with `A` is written at once. The tool re-reads the file before it
 writes an entry, so changes you make by hand survive.
 
 ## Tile sizes
 
-The source and your tilemap may use different tile sizes. A copy is pixel for
+A library sheet and your tilemap may use different tile sizes. A copy is pixel for
 pixel: the block lands with its top-left on the target cell and is padded
 with transparent pixels to whole cells. Provenance and animations are pixel
 records, so the tile size does not touch them. Changing the tile size of a
