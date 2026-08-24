@@ -32,6 +32,11 @@ An animated GIF plays in the source panel. When you copy a region that moves
 between the frames, the frames unroll into one strip, marked as an
 animation. A region that stands still gives one picture.
 
+![A waterfall is taken out of an animated GIF and lands as a marked strip](media/animation.gif)
+
+The scene in that picture is a mockup from the [Epic RPG World](https://rafaelmatos.itch.io/epic-rpg-world-collection)
+packs by RafaelMatos, from a purchased copy.
+
 ## Layout
 
 The left column holds the search box, the tree of source sheets, and the tree
