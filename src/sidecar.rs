@@ -11,7 +11,7 @@ pub const BOOK: &str = "tilepicky.json";
 
 /// The regions of this sheet that came from one source file, as pixel
 /// rectangles `[x, y, w, h]`. Where in the source they came from is not
-/// recorded: the source file itself answers that.
+/// recorded.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Provenance {
     pub source: String,
@@ -134,22 +134,12 @@ pub struct Book {
     pub sheets: BTreeMap<String, Sidecar>,
 }
 
-/// Reads the book. The first shape of this file was the bare map of sheets,
-/// so a file without a "sheets" key is read as that map. Serde would drop
-/// every entry of such a file in silence, which is why the shape is settled
-/// here before it is parsed.
+/// Reads the book. A missing or unreadable file is an empty book.
 pub fn load_book(dir: &Path) -> Book {
-    let Ok(text) = std::fs::read_to_string(dir.join(BOOK)) else {
-        return Book::default();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Book::default();
-    };
-    if value.get("sheets").is_some() {
-        return serde_json::from_value(value).unwrap_or_default();
-    }
-    let sheets = serde_json::from_value(value).unwrap_or_default();
-    Book { tile: None, sheets }
+    std::fs::read_to_string(dir.join(BOOK))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 fn write_book(dir: &Path, book: &Book) -> Result<(), String> {
