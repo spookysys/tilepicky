@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! One sheet on screen: an image on a 32 px grid with a selection. The source
 //! panel and your own tilemap are the same thing; only the edits differ.
 

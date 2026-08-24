@@ -192,3 +192,8 @@ button, to store the animation.
 
 A stored animation travels with the block when you copy or drag it. When the
 selection lies on a stored animation, the fields edit that one.
+
+## Licence
+
+Tilepick is free software under the GNU General Public License, version 3 or
+any later version. The whole text is in `LICENSE`.

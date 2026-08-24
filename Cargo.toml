@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Browse sprite sheets, search them, and pick tiles into tilemaps of your own."
 repository = "https://github.com/spookysys/tilepick"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 eframe = { version = "0.36.1", features = ["default"] }

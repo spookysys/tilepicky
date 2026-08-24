@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Scans a directory of sheets and searches their file and folder names.
 
 use crate::sidecar::{self, Sidecar};

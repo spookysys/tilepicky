@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! `tilepick.json`: one file per directory that describes the sheets in it.
 //! Each entry holds the sheet's grid, the origin of cells, and animations.
 //! The source directory and your tilemap directory use the same format.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Tilepick: browse a large set of sheets, search them, and copy
 //! cells into tilemaps of your own.
 //!

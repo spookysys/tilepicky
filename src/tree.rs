@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! A folder tree built from relative paths, filtered by a visibility mask.
 
 use eframe::egui::{self, Color32, Stroke, Ui};
