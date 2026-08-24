@@ -230,5 +230,5 @@ The search box works on your tilesheets too, with the same rules.
 
 ## Licence
 
-Tilepicky is free software under the GNU General Public License, version 3 or
-any later version. The whole text is in `LICENSE`.
+Tilepicky is free software under the GNU General Public License, version 3. The
+whole text is in `LICENSE`.

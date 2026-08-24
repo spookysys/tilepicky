@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 //! One sheet on screen: an image on a grid with a selection. A sheet of the
 //! library and a tilesheet of your project are the same thing; only the edits
 //! differ.

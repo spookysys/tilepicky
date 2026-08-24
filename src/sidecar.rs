@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 //! `tilepicky.json`: one file per directory that describes the sheets in it.
 //! Each entry holds the sheet's grid, the origin of cells, and animations.
 //! The library and the project use the same format.

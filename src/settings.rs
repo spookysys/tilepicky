@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 //! What the tool remembers between runs: the two folders it worked in, and
 //! the tile size each of them used last. The folder's own `tilepicky.json`
 //! holds that tile size as well, so a folder keeps it when it travels; this

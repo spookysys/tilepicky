@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 //! Tilepicky: browse a large set of sheets, search them, and copy
 //! cells into tilesheets of your own.
 //!
