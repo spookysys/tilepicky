@@ -49,7 +49,7 @@ tilesheet, the cell also names the sheet its pixels came from:
 
     cell 4,2 <- kenney_tiny-town/Tilemap/tilemap_packed.png
 
-See "Your tilesheets" for how the tool remembers that.
+See "Provenance tracking" for how the tool remembers that.
 
 Select cells and press `A`, and the animation panel opens on the right. See
 "Animations".
@@ -217,7 +217,7 @@ with transparent pixels to whole cells. Provenance and animations are pixel
 records, so the tile size does not touch them. Changing the tile size of a
 sheet only changes the grid you see and the cells you can select.
 
-## Your tilesheets
+## Provenance tracking
 
 A tilesheet is a `name.png` with its entry in `tilepicky.json`. The entry
 remembers where every pixel came from. A block you copy from a library sheet
