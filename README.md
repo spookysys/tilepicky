@@ -15,29 +15,63 @@ both in the public domain (CC0).
 
 ## The library and the project
 
-Tilepicky works with two folders.
+Tilepicky works with two folders. It reads each one with all its subfolders.
 
-Your **library** holds the sheets and packs you collected. The tool only
-reads it.
+Your **library** holds the tilemaps, sheets and packs you collected. The
+tool helps you browse and search them, and copy what you need into your own
+tilemaps. It leaves the images as they are, and writes only a `tilepicky.json`
+that remembers their grids and animations.
 
-Your **project** holds the tilemaps you make. The tool writes them there,
-with a `tilepicky.json` beside them.
+Your **project** holds the tilemaps you make and edit. The tool writes them
+there, with a `tilepicky.json` beside them.
 
-Start the tool and it asks for neither. A panel that has no folder yet says
-so; click anywhere in it and the folder dialog opens. The right-click menu of
-each tree carries the same item, and it reads "Change" once a folder is set,
-so you can point either side somewhere else and keep working. Both folders
-are remembered for the next run, in
-`~/.config/tilepicky/settings.json`.
+You can start the tool without a folder. A panel without a folder tells you
+so. Click in the panel to open the folder dialog. The right-click menu of each
+tree has the item "Set library folder" or "Set project folder". When a folder
+is set, the item reads "Change ...", and you can choose a different folder at
+any time. The tool stores both folders in `~/.config/tilepicky/settings.json`.
 
 You can also name them when you start the tool:
 
     cargo run --release -- [<library dir> [<project dir>]]
 
-## Formats
+## Layout
 
-The tool reads PNG, GIF, JPEG, WebP, BMP, and TGA. It writes one
-format only: 32 bit RGBA PNG with straight alpha, which every engine reads.
+The left column holds the search box, the tree of your library, and the tree
+of your project. The top panel shows the library sheet you opened. The bottom
+panel shows the tilemap you are building.
+
+![The three panels: the trees on the left, the library sheet above, the tilemap below](media/screenshot.png)
+
+Each panel has a header line. It holds the grid fields, the zoom, the
+selection, the name of the sheet, and the cell under the pointer. In your
+tilemap, the cell also names the sheet its pixels came from:
+
+    cell 4,2 <- kenney_tiny-town/Tilemap/tilemap_packed.png
+
+See "Your tilemaps" for how the tool remembers that.
+
+Select cells and press `A`, and the animation panel opens on the right. See
+"Animations".
+
+## Animations
+
+An animation is a block of frames on the bitmap: a place in pixels, a frame
+size, the frames in a row and the number of rows, and the time per frame. The
+frames play left to right, then the next row down.
+
+Select the cells that hold the frames and press `A`. The animation panel
+opens on the right and plays them. The frames field works like the tile
+field: drag it for the frames in a row, turn the mouse wheel for the number
+of rows, click it to type. The frame size follows, so each number must divide
+its side of the selection. The panel says so when it does not, and it stays
+open while you drag the edges of the selection, until the numbers fit. Press
+`A` again, or the Store button, to store the animation.
+
+![Two blocks of water cells become animations: paste, A, set the frames, Store](media/animation-panel.gif)
+
+A stored animation travels with the block when you copy or drag it. When the
+selection lies on a stored animation, the fields edit that one.
 
 An animated GIF plays in the library panel. When you copy a region that moves
 between the frames, the frames unroll into one strip, marked as an
@@ -48,13 +82,10 @@ animation. A region that stands still gives one picture.
 The scene in that picture is a mockup from the [Epic RPG World](https://rafaelmatos.itch.io/epic-rpg-world-collection)
 packs by RafaelMatos, from a purchased copy.
 
-## Layout
+## Formats
 
-The left column holds the search box, the tree of your library, and the tree
-of your project. The top panel shows the library sheet you opened. The bottom
-panel shows the tilemap you are building.
-
-![The three panels: the trees on the left, the library sheet above, the tilemap below](media/screenshot.png)
+The tool reads PNG, GIF, JPEG, WebP, BMP, and TGA. It writes one
+format only: 32 bit RGBA PNG with straight alpha.
 
 ## The grid
 
@@ -66,16 +97,13 @@ The header of each panel holds the grid fields. A sheet keeps its own values.
 | gap | pixels between neighbouring tiles (Kenney sheets use 1) |
 | offset | pixels before the first tile, `4` or `4x8` |
 
-Every field takes the same three actions. Drag it left and right to step the
-first number; one number moves as one, and a pair moves only its width. Turn
-the wheel over it to step the second number, which splits `32` into `32x48`.
-Click it to type any value. Each step applies at once, so the grid on screen
-follows the pointer.
+Every field takes the same three actions. Drag it left and right to adjust
+the first number, the width. A single number changes as one. A pair changes
+only its width. Turn the mouse wheel over it to adjust the second number, the
+height. A single `32` then becomes `32x48`. Click it to type any value.
 
-A library sheet stores a grid change in its book entry at once. A tilemap
-keeps it until you save. A sheet with no entry of its own starts with the
-tile size the folder used last, which the folder's own `tilepicky.json`
-records; a folder that has never said one starts at 32 px.
+A new sheet starts with the tile size its library or project used last, or
+32 px.
 
 ## Keys
 
@@ -102,7 +130,7 @@ records; a folder that has never said one starts at 32 px.
 | Ctrl+T | trim empty columns on the right and empty rows at the bottom |
 | drag the right or bottom edge of the canvas | resize your tilemap |
 | Ctrl+wheel, + / - | zoom |
-| Escape | clear the selection, or drop what you carry |
+| Escape | clear the selection, or cancel a drag |
 
 While you drag a block, two keys change what the drop does. Ctrl copies: the
 cells it came from stay as they are. Alt exchanges the two places: what lies
@@ -153,10 +181,11 @@ version.
 
 ## tilepicky.json
 
-The library and the project each hold one `tilepicky.json`. It describes the
-sheets in that folder: the grid (tile size, gap, offset), where the pixels
-came from, and animations. The sheets are keyed by their path inside the
-folder, and `tile` at the top is the size that folder used last.
+The library and the project each hold one `tilepicky.json` in their top
+folder. It describes every sheet in the tree below: the grid (tile size, gap,
+offset), where the pixels came from, and animations. The sheets are keyed by
+their path from the top folder, and `tile` at the start of the file is the
+size that tree used last.
 
     {
       "tile": 16,
@@ -178,15 +207,7 @@ folder, and `tile` at the top is the size that folder used last.
       }
     }
 
-A file written by an older version held the sheets alone, without the two
-keys around them. Tilepicky reads that shape as well, and writes the new one
-the next time it stores an entry.
-
-A field with one number means both axes agree, except `frames`, where one
-number means one row. For your tilemaps, the tool writes the entry on Ctrl+S,
-together with the PNG. For a library sheet, a grid change or an animation you
-store with `A` is written at once. The tool re-reads the file before it
-writes an entry, so changes you make by hand survive.
+One number stands for both axes. For `frames`, one number means one row.
 
 ## Tile sizes
 
@@ -198,31 +219,14 @@ sheet only changes the grid you see and the cells you can select.
 
 ## Your tilemaps
 
-A tilemap is a `name.png` with its entry in `tilepicky.json`. `provenance`
-lists, per source file, the pixel rectangles `[x, y, w, h]` of your tilemap
-that came from it. Where in the source they came from is not recorded: the
-source file answers that. In memory the tool keeps one source index per
-pixel, so overwrites are exact; the rectangles are computed when you save.
+A tilemap is a `name.png` with its entry in `tilepicky.json`. The entry
+remembers where every pixel came from. A block you copy from a library sheet
+carries the path of that sheet. A block you copy from another tilemap keeps
+the origin it had. Hover over a cell, and the header names its origin. In the
+entry, `provenance` lists per source sheet the pixel rectangles `[x, y, w, h]`
+of your tilemap that hold pixels from it.
+
 The search box works on your tilemaps too, with the same rules.
-
-## Animations
-
-An animation is a block of frames on the bitmap, stored as
-`{ "px": [x, y], "frame": [w, h], "frames": n, "ms": t }`. The frames play
-left to right, then the next row down. `frames` is one number for a single
-row, or `[columns, rows]` for a block; `6` is a strip of six, and `[4, 2]` is
-eight frames in two rows.
-
-Select the cells and press `A`. The animation panel opens on the right and
-plays them. The frames field works like the tile field: drag it for the
-frames in a row, turn the wheel for the number of rows, click it to type.
-The frame size follows, so each number must divide its side of the selection.
-The panel says so when it does not, and it stays open while you drag the
-edges of the selection, until the numbers fit. Press `A` again, or the Store
-button, to store the animation.
-
-A stored animation travels with the block when you copy or drag it. When the
-selection lies on a stored animation, the fields edit that one.
 
 ## Licence
 
