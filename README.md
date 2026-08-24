@@ -5,7 +5,7 @@ copy cells into tilesheets of your own. Each sheet has its own grid.
 
 <https://github.com/spookysys/tilepicky>
 
-![A tilesheet of your own is built from two packs, found through the search box](media/demo.gif)
+![A tilesheet of your own is built from two packs, found through the search box](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/demo.gif)
 
 That is the loop: open a tilesheet of your own, search the packs for what the
 map needs, select the cells, hold the button until they lift, and carry them
@@ -41,7 +41,7 @@ The left column holds the search box, the tree of your library, and the tree
 of your project. The top panel shows the library sheet you opened. The bottom
 panel shows the tilesheet you are building.
 
-![The three panels: the trees on the left, the library sheet above, the tilesheet below](media/screenshot.png)
+![The three panels: the trees on the left, the library sheet above, the tilesheet below](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/screenshot.png)
 
 Each panel has a header line. It holds the grid fields, the zoom, the
 selection, the name of the sheet, and the cell under the pointer. In your
@@ -68,7 +68,7 @@ its side of the selection. The panel says so when it does not, and it stays
 open while you drag the edges of the selection, until the numbers fit. Press
 `A` again, or the Store button, to store the animation.
 
-![Two blocks of water cells become animations: paste, A, set the frames, Store](media/animation-panel.gif)
+![Two blocks of water cells become animations: paste, A, set the frames, Store](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation-panel.gif)
 
 A stored animation travels with the block when you copy or drag it. When the
 selection lies on a stored animation, the fields edit that one.
@@ -77,7 +77,7 @@ An animated GIF plays in the library panel. When you copy a region that moves
 between the frames, the frames unroll into one strip, marked as an
 animation. A region that stands still gives one picture.
 
-![A waterfall is taken out of an animated GIF and lands as a marked strip](media/animation.gif)
+![A waterfall is taken out of an animated GIF and lands as a marked strip](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation.gif)
 
 The scene in that picture is a mockup from the [Epic RPG World](https://rafaelmatos.itch.io/epic-rpg-world-collection)
 packs by RafaelMatos, from a purchased copy.
