@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Tilepicky: browse a large set of sheets, search them, and copy
-//! cells into tilemaps of your own.
+//! cells into tilesheets of your own.
 //!
 //! Usage: `tilepicky [<library dir> [<project dir>]]`
 
@@ -19,12 +19,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tree::{Node, TreeAction};
 
-/// A new tilemap starts with this many cells.
+/// A new tilesheet starts with this many cells.
 /// The sizes the tile field steps through when dragged. Typing allows any
 /// size, so the list stays short.
 const TILE_SIZES: [u32; 12] = [4, 8, 10, 12, 16, 24, 32, 48, 64, 128, 256, 512];
 
-/// A new tilemap starts near this size, rounded to whole tiles.
+/// A new tilesheet starts near this size, rounded to whole tiles.
 const NEW_PX: u32 = 512;
 /// The tile size a folder starts with when nothing has said otherwise.
 const TILE: [u32; 2] = [32, 32];
@@ -77,11 +77,11 @@ struct NamePrompt {
 struct App {
     drag: Option<Drag>,
     prompt: Option<NamePrompt>,
-    /// Files marked with Ctrl+click in MY TILEMAPS.
+    /// Files marked with Ctrl+click in MY TILESHEETS.
     marked: HashSet<usize>,
     /// The last plainly clicked file, for shift ranges.
     tree_anchor: Option<usize>,
-    /// Where the arrow keys stand in MY TILEMAPS; the moving end of a range.
+    /// Where the arrow keys stand in MY TILESHEETS; the moving end of a range.
     tree_cursor: Option<usize>,
     /// What the tool remembers between runs: the two folders and their
     /// tile sizes.
@@ -296,7 +296,7 @@ impl App {
     }
 
     /// The arrow keys walk the file tree of the panel in use, and open what
-    /// they reach. In MY TILEMAPS, Shift and the arrows grow the marked
+    /// they reach. In MY TILESHEETS, Shift and the arrows grow the marked
     /// group instead, and Enter opens the file the group ends on.
     fn tree_keys(&mut self, ctx: &egui::Context, library_order: &[usize], project_order: &[usize]) {
         let focus = ctx.memory(|m| m.focused());
@@ -597,7 +597,7 @@ impl App {
         self.rescan_project();
     }
 
-    /// Moves or copies one file of MY TILEMAPS, with its book entry. The
+    /// Moves or copies one file of MY TILESHEETS, with its book entry. The
     /// open sheet follows its own file.
     fn relocate(&mut self, old: &str, new: &str, copy: bool) -> Result<(), String> {
         let root = self.project.root.clone();
@@ -836,7 +836,7 @@ impl App {
                 // A note in the system clipboard, so that Ctrl+V reaches us as a Paste event.
                 ctx.copy_text(b.note());
                 self.clip = Some(b);
-                // A cut clears the cells; only your tilemap is editable.
+                // A cut clears the cells; only your tilesheet is editable.
                 if cut && self.active == Panel::Project {
                     if let Some(sheet) = &mut self.project_sheet {
                         sheet.clear_selection(ctx);
@@ -931,7 +931,7 @@ impl App {
         };
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
 
-        // Over the tilemap the ghost snaps to the grid; elsewhere it floats at the pointer.
+        // Over the tilesheet the ghost snaps to the grid; elsewhere it floats at the pointer.
         let mut target = self.project_sheet.as_ref().and_then(|d| {
             let c = d.cell_at(p)?;
             Some((c.0.saturating_sub(drag.grab.0), c.1.saturating_sub(drag.grab.1)))
@@ -985,10 +985,10 @@ impl App {
             return;
         }
         let drag = self.drag.take().unwrap();
-        // A drop on the empty pane starts a fresh, unnamed tilemap; its name
+        // A drop on the empty pane starts a fresh, unnamed tilesheet; its name
         // is asked for at the first save.
         if target.is_none() && self.project_sheet.is_none() && self.project_rect.contains(p) {
-            // The new tilemap takes the grid of the block that lands on it.
+            // The new tilesheet takes the grid of the block that lands on it.
             let tile = drag.block.tile;
             let (cols, rows) = (((NEW_PX + tile[0] / 2) / tile[0]).max(1), ((NEW_PX + tile[1] / 2) / tile[1]).max(1));
             self.project_sheet = Some(Sheet::new_empty(ctx, &self.project.root, "", tile, cols, rows));
@@ -1107,7 +1107,7 @@ impl App {
         Some(if s.preview_hovered { &mut s.preview_zoom } else { &mut s.zoom })
     }
 
-    /// Applies a new grid (tile, gap, offset) to a sheet. Your tilemap keeps
+    /// Applies a new grid (tile, gap, offset) to a sheet. Your tilesheet keeps
     /// it as an unsaved edit; a library sheet stores it at once.
     fn change_grid(&mut self, ctx: &egui::Context, panel: Panel, (t, gap, offset): ([u32; 2], u32, [u32; 2])) {
         let Some(sheet) = self.sheet_mut(panel) else {
@@ -1141,7 +1141,7 @@ impl App {
         }
     }
 
-    /// A tilemap keeps the change until Ctrl+S. A library sheet has no pixel
+    /// A tilesheet keeps the change until Ctrl+S. A library sheet has no pixel
     /// edits, so its book entry is written at once.
     fn after_animation_edit(&mut self, panel: Panel) {
         match panel {
@@ -1333,7 +1333,7 @@ impl eframe::App for App {
                         if !library_set {
                             ui.weak("No library folder yet.");
                             ui.add_space(4.0);
-                            ui.weak("This is your library of tilemaps, sheets and packs. I'll help you browse and search them, and to transfer what you need into your own tilemaps. I'll track details about your assets in a tilepicky.json.");
+                            ui.weak("This is your library of tilesheets and packs. I'll help you browse and search them, and to transfer what you need into your own tilesheets. I'll track details about your assets in a tilepicky.json.");
                             ui.add_space(6.0);
                             ui.weak("Click here to choose it.");
                             if bg.clicked() {
@@ -1385,7 +1385,7 @@ impl eframe::App for App {
                     if ui.button("New").clicked() {
                         create = true;
                     }
-                    let field = egui::TextEdit::singleline(&mut self.new_name).hint_text("new tilemap name").desired_width(ui.available_width());
+                    let field = egui::TextEdit::singleline(&mut self.new_name).hint_text("new tilesheet name").desired_width(ui.available_width());
                     let r = ui.add(field);
                     if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         create = true;
@@ -1398,7 +1398,7 @@ impl eframe::App for App {
                     if !project_set {
                         ui.weak("No project folder yet.");
                         ui.add_space(4.0);
-                        ui.weak("Your tilemaps live here - I'll help you edit them and create new ones, tracking details in a tilepicky.json.");
+                        ui.weak("Your tilesheets live here - I'll help you edit them and create new ones, tracking details in a tilepicky.json.");
                         ui.add_space(6.0);
                         ui.weak("Click here to choose it.");
                         if bg.clicked() {
@@ -1670,7 +1670,7 @@ impl eframe::App for App {
                 // The same frame as the library pane, so both hints sit alike.
                 egui::CentralPanel::default().show(ui, |ui| {
                     let hint = if project_set {
-                        "Create or open a tilemap on the left. Then select cells in the library, Ctrl+C, click a cell here, Ctrl+V."
+                        "Create or open a tilesheet on the left. Then select cells in the library, Ctrl+C, click a cell here, Ctrl+V."
                     } else {
                         "Click to open your project folder."
                     };
@@ -1718,7 +1718,7 @@ impl eframe::App for App {
     }
 }
 
-/// Moves the old `name.json` files next to tilemaps into the book, once.
+/// Moves the old `name.json` files next to tilesheets into the book, once.
 fn migrate_sidecars(project: &mut Index) {
     for e in &mut project.entries {
         let old = project.root.join(&e.rel).with_extension("json");

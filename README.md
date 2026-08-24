@@ -1,13 +1,13 @@
 # Tilepicky
 
 A small desktop tool to browse a large set of sprite sheets, search them, and
-copy cells into tilemaps of your own. Each sheet has its own grid.
+copy cells into tilesheets of your own. Each sheet has its own grid.
 
 <https://github.com/spookysys/tilepicky>
 
-![A tilemap of your own is built from two packs, found through the search box](media/demo.gif)
+![A tilesheet of your own is built from two packs, found through the search box](media/demo.gif)
 
-That is the loop: open a tilemap of your own, search the packs for what the
+That is the loop: open a tilesheet of your own, search the packs for what the
 map needs, select the cells, hold the button until they lift, and carry them
 over. The sheets in the pictures are from [Kenney](https://kenney.nl) and
 from [ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites),
@@ -17,12 +17,12 @@ both in the public domain (CC0).
 
 Tilepicky works with two folders. It reads each one with all its subfolders.
 
-Your **library** holds the tilemaps, sheets and packs you collected. The
+Your **library** holds the tilesheets and packs you collected. The
 tool helps you browse and search them, and copy what you need into your own
-tilemaps. It leaves the images as they are, and writes only a `tilepicky.json`
+tilesheets. It leaves the images as they are, and writes only a `tilepicky.json`
 that remembers their grids and animations.
 
-Your **project** holds the tilemaps you make and edit. The tool writes them
+Your **project** holds the tilesheets you make and edit. The tool writes them
 there, with a `tilepicky.json` beside them.
 
 You can start the tool without a folder. A panel without a folder tells you
@@ -39,17 +39,17 @@ You can also name them when you start the tool:
 
 The left column holds the search box, the tree of your library, and the tree
 of your project. The top panel shows the library sheet you opened. The bottom
-panel shows the tilemap you are building.
+panel shows the tilesheet you are building.
 
-![The three panels: the trees on the left, the library sheet above, the tilemap below](media/screenshot.png)
+![The three panels: the trees on the left, the library sheet above, the tilesheet below](media/screenshot.png)
 
 Each panel has a header line. It holds the grid fields, the zoom, the
 selection, the name of the sheet, and the cell under the pointer. In your
-tilemap, the cell also names the sheet its pixels came from:
+tilesheet, the cell also names the sheet its pixels came from:
 
     cell 4,2 <- kenney_tiny-town/Tilemap/tilemap_packed.png
 
-See "Your tilemaps" for how the tool remembers that.
+See "Your tilesheets" for how the tool remembers that.
 
 Select cells and press `A`, and the animation panel opens on the right. See
 "Animations".
@@ -120,15 +120,15 @@ A new sheet starts with the tile size its library or project used last, or
 | Ctrl+A | select the whole sheet |
 | right click | clear the selection; inside the selection it clears the cells |
 | Ctrl+C | copy the selection of the active panel |
-| Ctrl+X | cut: copy, then clear the cells (your tilemap only) |
-| Ctrl+V | paste at the selected cell of your tilemap |
-| Delete | clear the selection in your tilemap |
+| Ctrl+X | cut: copy, then clear the cells (your tilesheet only) |
+| Ctrl+V | paste at the selected cell of your tilesheet |
+| Delete | clear the selection in your tilesheet |
 | A | open the animation panel; again, store the animation or remove it |
 | Ctrl+Z | undo |
 | Ctrl+S | save |
 | Ctrl+Shift+S | save as |
 | Ctrl+T | trim empty columns on the right and empty rows at the bottom |
-| drag the right or bottom edge of the canvas | resize your tilemap |
+| drag the right or bottom edge of the canvas | resize your tilesheet |
 | Ctrl+wheel, + / - | zoom |
 | Escape | clear the selection, or cancel a drag |
 
@@ -138,10 +138,10 @@ where the block lands travels back to the place the block came from. A sign
 in the corner of the block shows which one is in force. A block from the
 library panel can only be copied, because the library never changes.
 
-A drop on an empty tilemap panel starts a new tilemap. It takes the tile size
+A drop on an empty tilesheet panel starts a new tilesheet. It takes the tile size
 of the block you dropped, and it asks for a name at the first save.
 
-Your tilemap is written when you save it. Undo stays available while the tool
+Your tilesheet is written when you save it. Undo stays available while the tool
 runs.
 
 ## Files
@@ -163,7 +163,7 @@ library tree does not.
 | right click the free space | new folder, refresh |
 
 A carried file moves into the folder under the pointer. Hold Ctrl on the drop
-to copy it instead. The book entry follows the file, and an open tilemap
+to copy it instead. The book entry follows the file, and an open tilesheet
 keeps its identity when its own file moves. A name that the target folder
 holds already is refused, and the other files still move.
 
@@ -211,22 +211,22 @@ One number stands for both axes. For `frames`, one number means one row.
 
 ## Tile sizes
 
-A library sheet and your tilemap may use different tile sizes. A copy is pixel for
+A library sheet and your tilesheet may use different tile sizes. A copy is pixel for
 pixel: the block lands with its top-left on the target cell and is padded
 with transparent pixels to whole cells. Provenance and animations are pixel
 records, so the tile size does not touch them. Changing the tile size of a
 sheet only changes the grid you see and the cells you can select.
 
-## Your tilemaps
+## Your tilesheets
 
-A tilemap is a `name.png` with its entry in `tilepicky.json`. The entry
+A tilesheet is a `name.png` with its entry in `tilepicky.json`. The entry
 remembers where every pixel came from. A block you copy from a library sheet
-carries the path of that sheet. A block you copy from another tilemap keeps
+carries the path of that sheet. A block you copy from another tilesheet keeps
 the origin it had. Hover over a cell, and the header names its origin. In the
 entry, `provenance` lists per source sheet the pixel rectangles `[x, y, w, h]`
-of your tilemap that hold pixels from it.
+of your tilesheet that hold pixels from it.
 
-The search box works on your tilemaps too, with the same rules.
+The search box works on your tilesheets too, with the same rules.
 
 ## Licence
 

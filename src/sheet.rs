@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One sheet on screen: an image on a grid with a selection. A sheet of the
-//! library and a tilemap of your project are the same thing; only the edits
+//! library and a tilesheet of your project are the same thing; only the edits
 //! differ.
 
 use crate::sidecar::{self, Animation, Pair, Provenance, Sidecar};
@@ -1388,7 +1388,7 @@ impl Sheet {
             return Ok(());
         }
         if self.gap != 0 || self.offset != [0, 0] {
-            return Err("this sheet has gaps between tiles; copy the strip to a tilemap and mark it there".into());
+            return Err("this sheet has gaps between tiles; copy the strip to a tilesheet and mark it there".into());
         }
         let Some(d) = self.draft().cloned() else { return Ok(()) };
         if !d.fits([tw, th]) {
@@ -1522,7 +1522,7 @@ impl Sheet {
         self.upload(ctx);
     }
 
-    /// Writes the image and the book entry. A tilemap's entry always names
+    /// Writes the image and the book entry. A tilesheet's entry always names
     /// its grid, so it is never lost between runs.
     pub fn save(&mut self) -> Result<(), String> {
         self.img.save(self.dir.join(&self.rel)).map_err(|e| e.to_string())?;
