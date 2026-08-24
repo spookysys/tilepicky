@@ -1024,10 +1024,12 @@ impl App {
     fn sheet_header(ui: &mut egui::Ui, title: &str, active: bool, library: bool, sheet: Option<&mut Sheet>) -> Option<([u32; 2], u32, [u32; 2])> {
         let mut new_grid = None;
         ui.horizontal(|ui| {
+            // Both titles are blue; the panel that takes the keys wears the
+            // strong one.
             let color = if active {
                 egui::Color32::from_rgb(80, 160, 255)
             } else {
-                ui.visuals().weak_text_color()
+                egui::Color32::from_rgb(150, 190, 230)
             };
             ui.colored_label(color, egui::RichText::new(title).strong());
             let Some(s) = sheet else {
@@ -1663,16 +1665,19 @@ impl eframe::App for App {
                     delete_in_mine = true;
                 }
             } else {
-                let hint = if project_set {
-                    "Create or open a tilemap on the left. Then select cells in the library, Ctrl+C, click a cell here, Ctrl+V."
-                } else {
-                    "Click to open your project folder."
-                };
-                let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
-                ui.weak(hint);
-                if !project_set && r.clicked() {
-                    ask = Some(Panel::Project);
-                }
+                // The same frame as the library pane, so both hints sit alike.
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let hint = if project_set {
+                        "Create or open a tilemap on the left. Then select cells in the library, Ctrl+C, click a cell here, Ctrl+V."
+                    } else {
+                        "Click to open your project folder."
+                    };
+                    let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
+                    ui.weak(hint);
+                    if !project_set && r.clicked() {
+                        ask = Some(Panel::Project);
+                    }
+                });
             }
         });
         match anim_changed {
