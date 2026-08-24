@@ -5,6 +5,11 @@ copy cells into tilemaps of your own. Each sheet has its own grid.
 
 <https://github.com/spookysys/tilepick>
 
+![Tilepick with a Kenney sheet open and a tilemap being built](media/screenshot.png)
+
+The sheets in the pictures are from [Kenney](https://kenney.nl), who puts
+them in the public domain (CC0).
+
 ## Run
 
     cargo run --release -- [--tile N|WxH] <source dir> <destination dir>
