@@ -2098,16 +2098,22 @@ fn parse_frames(text: &str) -> Option<[u32; 2]> {
 
 fn main() -> eframe::Result {
     let mut dirs: Vec<String> = Vec::new();
+    let mut renderer = eframe::Renderer::default();
     for a in std::env::args().skip(1) {
-        if a == "--help" || a == "-h" {
-            println!("usage: tilepicky [<library dir> [<project dir>]]");
-            println!("Without a folder, the tool asks for one and remembers it.");
-            return Ok(());
+        match a.as_str() {
+            "--help" | "-h" => {
+                println!("usage: tilepicky [--glow | --wgpu] [<library dir> [<project dir>]]");
+                println!("Without a folder, the tool asks for one and remembers it.");
+                println!("--glow draws with OpenGL; --wgpu with wgpu, the default.");
+                return Ok(());
+            }
+            "--glow" => renderer = eframe::Renderer::Glow,
+            "--wgpu" => renderer = eframe::Renderer::Wgpu,
+            _ => dirs.push(a),
         }
-        dirs.push(a);
     }
     if dirs.len() > 2 {
-        eprintln!("usage: tilepicky [<library dir> [<project dir>]]");
+        eprintln!("usage: tilepicky [--glow | --wgpu] [<library dir> [<project dir>]]");
         std::process::exit(2);
     }
     let mut settings = settings::Settings::load();
@@ -2134,6 +2140,7 @@ fn main() -> eframe::Result {
         rgba: icon.into_raw(),
     };
     let options = eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
             .with_title("Tilepicky")

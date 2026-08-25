@@ -35,6 +35,8 @@ You can also name them when you start the tool:
 
     cargo run --release -- [<library dir> [<project dir>]]
 
+The tool draws with wgpu. Add `--glow` to draw with OpenGL instead.
+
 ## Layout
 
 The left column holds the search box, the tree of your library, and the tree
