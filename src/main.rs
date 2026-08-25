@@ -285,14 +285,14 @@ impl App {
         self.project_visible = self.project.visible(&self.qwords);
     }
 
-    /// The grid to assume for a sheet whose entry names none: the sheet now
-    /// open in the same panel, else the run's default.
-    fn inherited_grid(&self, panel: Panel) -> ([u32; 2], u32, [u32; 2]) {
+    /// The tile size to assume for a sheet whose entry names none: the sheet
+    /// now open in the same panel, else the folder's default.
+    fn inherited_tile(&self, panel: Panel) -> [u32; 2] {
         let (sheet, default) = match panel {
             Panel::Library => (&self.library_sheet, self.library.tile),
             Panel::Project => (&self.project_sheet, self.project.tile),
         };
-        sheet.as_ref().map_or((default, 0, [0, 0]), |s| (s.tile, s.gap, s.offset))
+        sheet.as_ref().map_or(default, |s| s.tile)
     }
 
     /// The arrow keys walk the file tree of the panel in use, and open what
@@ -365,7 +365,7 @@ impl App {
 
     fn open_library(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.library.entries[i];
-        match Sheet::open(ctx, &self.library.root, &e.rel, self.inherited_grid(Panel::Library), e.side.clone()) {
+        match Sheet::open(ctx, &self.library.root, &e.rel, self.inherited_tile(Panel::Library), e.side.clone()) {
             Ok(mut s) => {
                 if let Some(prev) = &self.library_sheet {
                     s.zoom = prev.zoom;
@@ -380,7 +380,7 @@ impl App {
 
     fn open_project(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.project.entries[i];
-        match Sheet::open(ctx, &self.project.root, &e.rel, self.inherited_grid(Panel::Project), e.side.clone()) {
+        match Sheet::open(ctx, &self.project.root, &e.rel, self.inherited_tile(Panel::Project), e.side.clone()) {
             Ok(mut s) => {
                 if let Some(prev) = &self.project_sheet {
                     s.zoom = prev.zoom;
@@ -399,7 +399,7 @@ impl App {
             return;
         }
         let rel = format!("{name}.png");
-        let tile = self.inherited_grid(Panel::Project).0;
+        let tile = self.inherited_tile(Panel::Project);
         let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
         let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
         let mut sheet = Sheet::new_empty(ctx, &self.project.root, &rel, tile, cols, rows);
@@ -1023,7 +1023,7 @@ impl App {
 
     /// Returns the new grid when the user finished editing a field:
     /// (tile, gap, offset).
-    fn sheet_header(ui: &mut egui::Ui, title: &str, active: bool, library: bool, sheet: Option<&mut Sheet>) -> Option<([u32; 2], u32, [u32; 2])> {
+    fn sheet_header(ui: &mut egui::Ui, title: &str, active: bool, library: bool, sheet: Option<&mut Sheet>) -> Option<([u32; 2], [u32; 2], [i32; 2])> {
         let mut new_grid = None;
         ui.horizontal(|ui| {
             // Both titles are blue; the panel that takes the keys wears the
@@ -1047,9 +1047,8 @@ impl App {
                 // Sheets drawn with gaps between the tiles, and a border
                 // before the first one.
                 ui.label("gap");
-                let g = ui.add(egui::DragValue::new(&mut s.gap_edit).range(0..=64).speed(0.05));
-                if (g.drag_stopped() || g.lost_focus()) && s.gap_edit != s.gap {
-                    new_grid = Some((s.tile, s.gap_edit, s.offset));
+                if let Some(g) = gap_field(library).ui(ui, s.gap) {
+                    new_grid = Some((s.tile, g, s.offset));
                 }
                 ui.label("offset");
                 if let Some(o) = offset_field(library).ui(ui, s.offset) {
@@ -1109,13 +1108,14 @@ impl App {
 
     /// Applies a new grid (tile, gap, offset) to a sheet. Your tilesheet keeps
     /// it as an unsaved edit; a library sheet stores it at once.
-    fn change_grid(&mut self, ctx: &egui::Context, panel: Panel, (t, gap, offset): ([u32; 2], u32, [u32; 2])) {
+    fn change_grid(&mut self, ctx: &egui::Context, panel: Panel, (t, gap, offset): ([u32; 2], [u32; 2], [i32; 2])) {
         let Some(sheet) = self.sheet_mut(panel) else {
             return;
         };
-        sheet.set_tile(ctx, t);
-        sheet.set_gap_offset(ctx, gap, offset);
-        self.status = format!("grid: {} px tiles, {gap} px gap, {} px offset", show_tile(t), show_tile(offset));
+        if !sheet.set_grid(ctx, t, gap, offset) {
+            return;
+        }
+        self.status = format!("grid: {} px tiles, {} px gap, {} px offset", show_tile(t), show_tile(gap), show_tile(offset));
         // The folder keeps the size, so the next sheet without an entry of
         // its own starts with it.
         self.remember_tile(panel, t);
@@ -1866,7 +1866,7 @@ struct PairEdit {
 /// A field that holds one number or two. A horizontal drag steps the first
 /// number, the wheel steps the second, and a click turns the field into a
 /// text box. Each step applies at once, so the drawing follows the pointer.
-struct PairField {
+struct PairField<T = u32> {
     /// The same id in every frame; it holds the drag state.
     id: egui::Id,
     /// Pixels of drag that make one step.
@@ -1875,25 +1875,25 @@ struct PairField {
     unit: &'static str,
     hover: &'static str,
     /// Moves one number by whole steps, inside its own limits.
-    step: fn(u32, i32) -> u32,
+    step: fn(T, i32) -> T,
     /// Writes the pair; one number when the field collapses it.
-    show: fn([u32; 2]) -> String,
-    parse: fn(&str) -> Option<[u32; 2]>,
+    show: fn([T; 2]) -> String,
+    parse: fn(&str) -> Option<[T; 2]>,
     /// The drag moves both numbers when this holds.
-    linked: fn([u32; 2]) -> bool,
+    linked: fn([T; 2]) -> bool,
 }
 
-impl PairField {
+impl<T: Copy + PartialEq> PairField<T> {
     /// Draws the field. Returns a new value at each step of a drag, at each
     /// wheel step, and when the user accepts a typed value.
-    fn ui(&self, ui: &mut egui::Ui, value: [u32; 2]) -> Option<[u32; 2]> {
+    fn ui(&self, ui: &mut egui::Ui, value: [T; 2]) -> Option<[T; 2]> {
         let mut edit: PairEdit = ui.data_mut(|d| d.get_temp(self.id)).unwrap_or_default();
         let out = self.field(ui, value, &mut edit);
         ui.data_mut(|d| d.insert_temp(self.id, edit));
         out
     }
 
-    fn field(&self, ui: &mut egui::Ui, value: [u32; 2], edit: &mut PairEdit) -> Option<[u32; 2]> {
+    fn field(&self, ui: &mut egui::Ui, value: [T; 2], edit: &mut PairEdit) -> Option<[T; 2]> {
         if let Some(buf) = &mut edit.text {
             let r = ui.add(egui::TextEdit::singleline(buf).desired_width(56.0));
             if edit.focus {
@@ -1966,14 +1966,29 @@ fn tile_field(library: bool) -> PairField {
     }
 }
 
-/// The pixels before the first tile: single steps.
-fn offset_field(library: bool) -> PairField {
+/// The pixels between neighbouring tiles: single steps.
+fn gap_field(library: bool) -> PairField {
+    PairField {
+        id: egui::Id::new(("gap field", library)),
+        px_per_step: 12.0,
+        unit: " px",
+        hover: "drag: step the gap (only x when they differ)   scroll: the y gap   click: type, 1 or 1x2",
+        step: |from, steps| (from as i32 + steps).clamp(0, 64) as u32,
+        show: show_tile,
+        parse: parse_px,
+        linked: |v| v[0] == v[1],
+    }
+}
+
+/// The pixels before the first tile: single steps, below zero as well. The
+/// sheet stops a drag one pitch before its edge.
+fn offset_field(library: bool) -> PairField<i32> {
     PairField {
         id: egui::Id::new(("offset field", library)),
         px_per_step: 12.0,
         unit: " px",
-        hover: "drag: step the offset (only x when they differ)   scroll: the y offset   click: type, 4 or 4x8",
-        step: |from, steps| (from as i32 + steps).clamp(0, 64) as u32,
+        hover: "drag: step the offset (only x when they differ)   scroll: the y offset   click: type, 4, 4x8, or -3",
+        step: |from, steps| (from + steps).clamp(-1024, 64),
         show: show_tile,
         parse: parse_offset,
         linked: |v| v[0] == v[1],
@@ -2019,10 +2034,23 @@ fn field_wheel(ui: &egui::Ui) -> i32 {
     steps
 }
 
-/// "4" or "4x8", in pixels, zero allowed. For offsets.
-fn parse_offset(text: &str) -> Option<[u32; 2]> {
+/// "4" or "4x8", in pixels, zero allowed. For gaps.
+fn parse_px(text: &str) -> Option<[u32; 2]> {
     let text = text.trim().trim_end_matches("px").trim();
     let ok = |n: u32| n <= 1024;
+    if let Some((x, y)) = text.split_once(['x', 'X']) {
+        let (x, y) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
+        (ok(x) && ok(y)).then_some([x, y])
+    } else {
+        let n = text.parse().ok()?;
+        ok(n).then_some([n, n])
+    }
+}
+
+/// "4", "4x8", or "-3", in pixels. For offsets, which may be negative.
+fn parse_offset(text: &str) -> Option<[i32; 2]> {
+    let text = text.trim().trim_end_matches("px").trim();
+    let ok = |n: i32| (-1024..=1024).contains(&n);
     if let Some((x, y)) = text.split_once(['x', 'X']) {
         let (x, y) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
         (ok(x) && ok(y)).then_some([x, y])
@@ -2046,7 +2074,7 @@ fn parse_tile(text: &str) -> Option<[u32; 2]> {
 }
 
 /// "32" for square tiles, "32x48" otherwise.
-fn show_tile(t: [u32; 2]) -> String {
+fn show_tile<T: std::fmt::Display + PartialEq>(t: [T; 2]) -> String {
     if t[0] == t[1] { format!("{}", t[0]) } else { format!("{}x{}", t[0], t[1]) }
 }
 

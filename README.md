@@ -94,8 +94,8 @@ The header of each panel holds the grid fields. A sheet keeps its own values.
 | Field | Meaning |
 | --- | --- |
 | tile | the size of one cell, `32` or `32x48` |
-| gap | pixels between neighbouring tiles (Kenney sheets use 1) |
-| offset | pixels before the first tile, `4` or `4x8` |
+| gap | pixels between neighbouring tiles, `1` or `1x2` (Kenney sheets use 1) |
+| offset | pixels before the first tile, `4` or `4x8`; `-3` when the first tile starts before the edge |
 
 Every field takes the same three actions. Drag it left and right to adjust
 the first number, the width. A single number changes as one. A pair changes

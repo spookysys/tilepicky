@@ -462,11 +462,11 @@ pub struct Sheet {
     pub dir: PathBuf,
     /// The sheet's tile size in pixels: the grid drawn over the bitmap.
     pub tile: [u32; 2],
-    /// Pixels between neighbouring tiles, and before the first one.
-    pub gap: u32,
-    pub offset: [u32; 2],
-    /// The value in the header's gap field, applied when the drag ends.
-    pub gap_edit: u32,
+    /// Pixels between neighbouring tiles.
+    pub gap: [u32; 2],
+    /// Pixels before the first tile. Negative when the first tile starts
+    /// before the image edge, by at most one pitch: see `clamp_offset`.
+    pub offset: [i32; 2],
     /// The last click, for the double-click-and-drag lift shortcut: its
     /// time, its cell, and the selection it replaced.
     last_click: Option<(f64, (u32, u32), Sel)>,
@@ -510,17 +510,38 @@ pub struct Sheet {
     undo: Vec<(RgbaImage, Sidecar, ProvMap)>,
 }
 
+/// How many cells of one pitch cover a length from an offset. The last cell
+/// may run past the end, and there is always one.
+fn span(len: u32, offset: i32, gap: u32, pitch: u32) -> u32 {
+    let free = (len as i64 - offset as i64 + gap as i64).max(0) as u32;
+    free.div_ceil(pitch).max(1)
+}
+
+/// An offset reaches at most one pitch before the image edge. Further out,
+/// a smaller offset only adds an empty first cell.
+fn clamp_offset(offset: [i32; 2], tile: [u32; 2], gap: [u32; 2]) -> [i32; 2] {
+    [offset[0].max(-((tile[0] + gap[0]) as i32)), offset[1].max(-((tile[1] + gap[1]) as i32))]
+}
+
+/// A position as coordinates on the image, or none when it is outside.
+fn inside(img: &RgbaImage, (x, y): (i64, i64)) -> Option<(u32, u32)> {
+    match (u32::try_from(x), u32::try_from(y)) {
+        (Ok(x), Ok(y)) if x < img.width() && y < img.height() => Some((x, y)),
+        _ => None,
+    }
+}
+
 impl Sheet {
-    /// `inherit` is the grid (tile, gap, offset) to assume for whatever the
-    /// entry does not name: the settings of the sheet that was open before.
-    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, [u32; 2]), side: Sidecar) -> Result<Self, String> {
+    /// `tile` is the tile size to assume when the entry names none. A gap or
+    /// an offset comes from the entry alone; without one, a sheet has none.
+    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], side: Sidecar) -> Result<Self, String> {
         let path = dir.join(rel);
         let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
         let img = match frames.first() {
             Some(f) => f.clone(),
             None => image::open(&path).map_err(|e| format!("{rel}: {e}"))?.to_rgba8(),
         };
-        let mut sheet = Self::from_image(ctx, dir, rel, inherit, img, side);
+        let mut sheet = Self::from_image(ctx, dir, rel, tile, img, side);
         sheet.frames = frames;
         sheet.frame_ms = frame_ms;
         Ok(sheet)
@@ -528,20 +549,20 @@ impl Sheet {
 
     pub fn new_empty(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], cols: u32, rows: u32) -> Self {
         let img = RgbaImage::new(cols * tile[0], rows * tile[1]);
-        Self::from_image(ctx, dir, rel, (tile, 0, [0, 0]), img, Sidecar::default())
+        Self::from_image(ctx, dir, rel, tile, img, Sidecar::default())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, inherit: ([u32; 2], u32, [u32; 2]), img: RgbaImage, side: Sidecar) -> Self {
-        let tile = side.tile.map(Pair::xy).unwrap_or(inherit.0);
+    fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], img: RgbaImage, side: Sidecar) -> Self {
+        let tile = side.tile.map(Pair::xy).unwrap_or(tile);
+        let gap = side.gap.map(Pair::xy).unwrap_or([0, 0]);
+        let offset = clamp_offset(side.offset.map(Pair::xy).unwrap_or([0, 0]), tile, gap);
         let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
             rel: rel.to_string(),
             dir: dir.to_path_buf(),
             tile,
-            gap: side.gap.unwrap_or(inherit.1),
-            offset: side.offset.map(Pair::xy).unwrap_or(inherit.2),
-            gap_edit: side.gap.unwrap_or(inherit.1),
+            gap,
+            offset,
             last_click: None,
             img,
             side,
@@ -577,19 +598,26 @@ impl Sheet {
 
     /// Distance from one tile's origin to the next, per axis, on the image.
     pub fn pitch(&self) -> [u32; 2] {
-        [self.tile[0] + self.gap, self.tile[1] + self.gap]
+        [self.tile[0] + self.gap[0], self.tile[1] + self.gap[1]]
     }
     pub fn cols(&self) -> u32 {
-        (self.img.width().saturating_sub(self.offset[0]) + self.gap).div_ceil(self.pitch()[0]).max(1)
+        span(self.img.width(), self.offset[0], self.gap[0], self.pitch()[0])
     }
     pub fn rows(&self) -> u32 {
-        (self.img.height().saturating_sub(self.offset[1]) + self.gap).div_ceil(self.pitch()[1]).max(1)
+        span(self.img.height(), self.offset[1], self.gap[1], self.pitch()[1])
     }
-    /// Where a cell's pixels sit on the image: x0, y0, one past x1, y1.
-    fn cell_img_rect(&self, x: u32, y: u32) -> (u32, u32, u32, u32) {
+    /// The image position of a cell's top left pixel. Negative before the
+    /// image edge, where the offset is negative.
+    fn cell_origin(&self, x: u32, y: u32) -> (i64, i64) {
         let p = self.pitch();
-        let (ox, oy) = (self.offset[0] + x * p[0], self.offset[1] + y * p[1]);
-        (ox, oy, ox + self.tile[0], oy + self.tile[1])
+        (self.offset[0] as i64 + (x * p[0]) as i64, self.offset[1] as i64 + (y * p[1]) as i64)
+    }
+    /// Where a cell's pixels sit on the image: x0, y0, one past x1, y1. A
+    /// cell that starts before the image edge is cut at the edge.
+    fn cell_img_rect(&self, x: u32, y: u32) -> (u32, u32, u32, u32) {
+        let (ox, oy) = self.cell_origin(x, y);
+        let (x1, y1) = (ox + self.tile[0] as i64, oy + self.tile[1] as i64);
+        (ox.max(0) as u32, oy.max(0) as u32, x1.max(0) as u32, y1.max(0) as u32)
     }
 
     /// Re-uploads only the pixels inside an image rectangle (x0, y0, one
@@ -736,7 +764,7 @@ impl Sheet {
             };
             if tile_px.min_elem() >= 16.0 {
                 let grid = Stroke::new(1.0, Color32::from_black_alpha(40));
-                if self.gap == 0 && self.offset == [0, 0] {
+                if self.gap == [0, 0] && self.offset == [0, 0] {
                     for x in 0..=self.cols() {
                         let sx = rect.min.x + x as f32 * cell_px.x;
                         painter.line_segment([Pos2::new(sx, rect.min.y), Pos2::new(sx, rect.max.y)], grid);
@@ -1049,14 +1077,17 @@ impl Sheet {
                     continue;
                 }
                 let mut empty = true;
-                let (ix0, iy0, _, _) = self.cell_img_rect(x, y);
+                let (ox, oy) = self.cell_origin(x, y);
+                // The pixel of the cell at (px, py) on this sheet, and the
+                // source it is traced to; none past the image edge.
+                let at = |px: u32, py: u32| inside(&self.img, (ox + px as i64, oy + py as i64));
+                let traced = |px: u32, py: u32| at(px, py).and_then(|(ix, iy)| self.prov.get(ix, iy));
                 for py in 0..th {
                     for px in 0..tw {
-                        let (ix, iy) = (ix0 + px, iy0 + py);
-                        let p = if ix < self.img.width() && iy < self.img.height() { *self.img.get_pixel(ix, iy) } else { Rgba([0; 4]) };
+                        let p = at(px, py).map_or(Rgba([0; 4]), |(ix, iy)| *self.img.get_pixel(ix, iy));
                         empty &= p.0[3] == 0;
                         img.put_pixel((x - b.x0) * tw + px, (y - b.y0) * th + py, p);
-                        if let Some(name) = self.prov.get(ix, iy) {
+                        if let Some(name) = traced(px, py) {
                             let v = prov.intern(name);
                             prov.set((x - b.x0) * tw + px, (y - b.y0) * th + py, v);
                         }
@@ -1068,7 +1099,7 @@ impl Sheet {
                     for py in 0..th {
                         for px in 0..tw {
                             let (bx, by) = ((x - b.x0) * tw + px, (y - b.y0) * th + py);
-                            if prov.get(bx, by).is_none() && self.prov.get(ix0 + px, iy0 + py).is_none() {
+                            if prov.get(bx, by).is_none() && traced(px, py).is_none() {
                                 prov.set(bx, by, v);
                             }
                         }
@@ -1124,11 +1155,11 @@ impl Sheet {
                     if !sel.contains((x, y)) {
                         continue;
                     }
-                    let (ix0, iy0, _, _) = self.cell_img_rect(x, y);
+                    let (ox, oy) = self.cell_origin(x, y);
                     for py in 0..th {
                         for px in 0..tw {
-                            let (ix, iy) = (ix0 + px, iy0 + py);
-                            let p = if ix < frame.width() && iy < frame.height() { *frame.get_pixel(ix, iy) } else { Rgba([0; 4]) };
+                            let at = inside(frame, (ox + px as i64, oy + py as i64));
+                            let p = at.map_or(Rgba([0; 4]), |(ix, iy)| *frame.get_pixel(ix, iy));
                             img.put_pixel(f as u32 * fw + (x - b.x0) * tw + px, (y - b.y0) * th + py, p);
                         }
                     }
@@ -1177,7 +1208,8 @@ impl Sheet {
     /// The image size that holds the given cell count on this sheet's grid.
     fn img_size_for(&self, cols: u32, rows: u32) -> (u32, u32) {
         let p = self.pitch();
-        (self.offset[0] + cols * p[0] - self.gap, self.offset[1] + rows * p[1] - self.gap)
+        let len = |offset: i32, n: u32, pitch: u32, gap: u32| (offset as i64 + (n * pitch) as i64 - gap as i64).max(0) as u32;
+        (len(self.offset[0], cols, p[0], self.gap[0]), len(self.offset[1], rows, p[1], self.gap[1]))
     }
 
     /// Writes the block, pixel for pixel, onto this sheet's grid. The block
@@ -1387,7 +1419,7 @@ impl Sheet {
             self.side.animations.retain(|a| !same(a));
             return Ok(());
         }
-        if self.gap != 0 || self.offset != [0, 0] {
+        if self.gap != [0, 0] || self.offset != [0, 0] {
             return Err("this sheet has gaps between tiles; copy the strip to a tilesheet and mark it there".into());
         }
         let Some(d) = self.draft().cloned() else { return Ok(()) };
@@ -1420,36 +1452,30 @@ impl Sheet {
         Ok(())
     }
 
-    /// Changes the gap or the offset: a view change like the tile size.
-    pub fn set_gap_offset(&mut self, ctx: &egui::Context, gap: u32, offset: [u32; 2]) {
-        if (gap, offset) == (self.gap, self.offset) {
-            return;
+    /// Changes the grid (tile, gap, offset): a view change, nothing is
+    /// rewritten. The cell records keep their grid until the next edit;
+    /// animations are pixel strips and never cared. Derived names are
+    /// cleared until the indexer renames them at the new grid. Returns
+    /// false when the grid stays as it was.
+    pub fn set_grid(&mut self, ctx: &egui::Context, tile: [u32; 2], gap: [u32; 2], offset: [i32; 2]) -> bool {
+        if tile[0] == 0 || tile[1] == 0 {
+            return false;
         }
+        let offset = clamp_offset(offset, tile, gap);
+        if (tile, gap, offset) == (self.tile, self.gap, self.offset) {
+            return false;
+        }
+        self.tile = tile;
         self.gap = gap;
         self.offset = offset;
-        self.gap_edit = gap;
-        self.side.gap = (gap != 0).then_some(gap);
+        self.side.tile = Some(Pair::of(tile));
+        self.side.gap = (gap != [0, 0]).then_some(Pair::of(gap));
         self.side.offset = (offset != [0, 0]).then_some(Pair::of(offset));
         self.dirty = true;
         self.sel = Sel::default();
         self.draft = None;
         self.upload(ctx);
-    }
-
-    /// Changes the sheet's tile size: a view change, nothing is rewritten.
-    /// The cell records keep their grid until the next edit; animations are
-    /// pixel strips and never cared. Derived names are cleared until the
-    /// indexer renames them at the new grid.
-    pub fn set_tile(&mut self, ctx: &egui::Context, new: [u32; 2]) {
-        if new == self.tile || new[0] == 0 || new[1] == 0 {
-            return;
-        }
-        self.tile = new;
-        self.side.tile = Some(Pair::of(new));
-        self.dirty = true;
-        self.sel = Sel::default();
-        self.draft = None;
-        self.upload(ctx);
+        true
     }
 
     /// Sets the canvas size in cells while a canvas edge drag runs. The
@@ -1580,12 +1606,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut sheet = Sheet::new_empty(&ctx, &dir, "map.png", [32, 32], 4, 4);
         sheet.save().unwrap();
-        sheet.set_tile(&ctx, [64, 48]);
+        sheet.set_grid(&ctx, [64, 48], [0, 0], [0, 0]);
         sheet.save().unwrap();
         let book = sidecar::load_book(&dir);
         let entry = book.sheets.get("map.png").cloned();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(entry.and_then(|e| e.tile).map(Pair::xy), Some([64, 48]));
+    }
+
+    /// A negative offset reaches one pitch before the edge, and the first
+    /// cell is cut there.
+    #[test]
+    fn offset_stops_one_pitch_before_the_edge() {
+        let ctx = egui::Context::default();
+        let mut sheet = Sheet::new_empty(&ctx, &std::env::temp_dir(), "map.png", [8, 8], 4, 4);
+        assert!(sheet.set_grid(&ctx, [8, 8], [0, 2], [-3, -20]));
+        assert_eq!(sheet.offset, [-3, -10]);
+        assert!(!sheet.set_grid(&ctx, [8, 8], [0, 2], [-3, -30]));
+        assert_eq!((sheet.cols(), sheet.rows()), (5, 5));
+        assert_eq!(sheet.cell_img_rect(0, 0), (0, 0, 5, 0));
+        assert_eq!(sheet.cell_img_rect(1, 1), (5, 0, 13, 8));
     }
 }
 

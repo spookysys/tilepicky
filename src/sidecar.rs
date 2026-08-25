@@ -65,31 +65,34 @@ impl Animation {
 }
 
 /// One number or two. What one number means belongs to the field that holds
-/// it: a tile size and an offset write one number when both axes agree
-/// (`of` and `xy`); a frame count writes one number when there is a single
-/// row (`strip` and `row`).
+/// it: a tile size, a gap, and an offset write one number when both axes
+/// agree (`of` and `xy`); a frame count writes one number when there is a
+/// single row (`strip` and `row`).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(untagged)]
-pub enum Pair {
-    One(u32),
-    Two([u32; 2]),
+pub enum Pair<T = u32> {
+    One(T),
+    Two([T; 2]),
 }
 
-impl Pair {
-    pub fn xy(self) -> [u32; 2] {
+impl<T: Copy + PartialEq> Pair<T> {
+    pub fn xy(self) -> [T; 2] {
         match self {
             Pair::One(n) => [n, n],
             Pair::Two(a) => a,
         }
     }
+    pub fn of(xy: [T; 2]) -> Self {
+        if xy[0] == xy[1] { Pair::One(xy[0]) } else { Pair::Two(xy) }
+    }
+}
+
+impl Pair {
     pub fn row(self) -> [u32; 2] {
         match self {
             Pair::One(n) => [n, 1],
             Pair::Two(a) => a,
         }
-    }
-    pub fn of(xy: [u32; 2]) -> Self {
-        if xy[0] == xy[1] { Pair::One(xy[0]) } else { Pair::Two(xy) }
     }
     pub fn strip(xy: [u32; 2]) -> Self {
         if xy[1] == 1 { Pair::One(xy[0]) } else { Pair::Two(xy) }
@@ -102,13 +105,14 @@ pub struct Sidecar {
     /// The sheet's tile size. Absent: the run's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile: Option<Pair>,
-    /// Pixels between neighbouring tiles on this sheet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gap: Option<u32>,
-    /// Pixels before the first tile: one number for both axes, `[x, y]`
+    /// Pixels between neighbouring tiles: one number for both axes, `[x, y]`
     /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<Pair>,
+    pub gap: Option<Pair>,
+    /// Pixels before the first tile: one number for both axes, `[x, y]`
+    /// otherwise. Negative when the first tile starts before the image edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<Pair<i32>>,
     /// Where the regions of this sheet came from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<Provenance>,
@@ -239,5 +243,17 @@ mod tests {
         assert_eq!(Pair::strip([4, 2]), Pair::Two([4, 2]));
         // The same number reads differently as a tile size.
         assert_eq!(Pair::One(6).xy(), [6, 6]);
+    }
+
+    #[test]
+    fn a_gap_or_an_offset_is_one_number_or_two() {
+        let one: Sidecar = serde_json::from_str(r#"{"gap": 1}"#).unwrap();
+        assert_eq!(one.gap.map(Pair::xy), Some([1, 1]));
+        let two: Sidecar = serde_json::from_str(r#"{"gap": [1, 2]}"#).unwrap();
+        assert_eq!(two.gap.map(Pair::xy), Some([1, 2]));
+        assert_eq!(serde_json::to_string(&two).unwrap(), r#"{"gap":[1,2]}"#);
+        let neg: Sidecar = serde_json::from_str(r#"{"offset": [-3, 0]}"#).unwrap();
+        assert_eq!(neg.offset.map(Pair::xy), Some([-3, 0]));
+        assert_eq!(serde_json::to_string(&neg).unwrap(), r#"{"offset":[-3,0]}"#);
     }
 }
