@@ -81,24 +81,20 @@ animation panel opens on the right. See "Animations".
 
 ## From the keyboard
 
-The whole loop works without the mouse. The window is seven panes, and Tab
-walks them in the order you read them: the library tree, the source sheet and
-its animation panel, then the project tree, the canvas and its animation
-panel, and the status bar at the foot. Shift+Tab walks back, and Ctrl+Tab
-crosses between the library half and the project half without leaving the
-pane you are in, so a sheet meets a sheet.
+You can do the whole job without the mouse.
 
-The arrows work inside the pane that holds the keys, and never leave it. In a
-sheet they move the selection, and Shift extends it. In a file tree they move
-a cursor over the folders and files, opening nothing until you press Enter;
-Right and Left unfold and fold a folder. The title of the pane that holds the
-keys is deep blue, and so is the selection of its sheet, so a glance says
-where you are.
+`Tab` goes to the next panel, `Ctrl+Tab` jumps between the library and your
+own tilesheets. Inside a panel the arrows do the work: in a sheet they move
+the selection, and `Shift` makes it bigger; in a file tree they move a cursor,
+where `Enter` opens the file and Right and Left open and close a folder. Then
+`Ctrl+C` there and `Ctrl+V` here.
 
-![A whole house, then a column of trees, bushes and ground, are picked out of a packed pack into a tilesheet of your own, without the mouse](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+The panel your keys are in has a blue title, and so does its selection.
 
-The legend along the foot of the window holds the keys worth knowing. The
-settings, behind the gear, hide it once you no longer need it.
+![Picking a whole house, and then a column of trees, out of a pack and into a tilesheet of your own, without touching the mouse](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+
+The legend at the foot of the window lists the keys worth knowing. Hide it in
+the settings when you no longer need it.
 
 ## Animations
 
