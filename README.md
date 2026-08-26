@@ -95,7 +95,7 @@ Right and Left unfold and fold a folder. The title of the pane that holds the
 keys is deep blue, and so is the selection of its sheet, so a glance says
 where you are.
 
-![A whole house and two trees are picked out of a pack into a tilesheet of your own, without the mouse](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+![A whole house, then a column of trees, bushes and ground, are picked out of a packed pack into a tilesheet of your own, without the mouse](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
 
 The legend along the foot of the window holds the keys worth knowing. The
 settings, behind the gear, hide it once you no longer need it.
