@@ -10,9 +10,7 @@ packs and into a tilesheet of your own.
 
 That is the whole loop: open a sheet of your own, search the packs for what
 the map needs, select the tiles, hold the button until they lift, and carry
-them over. The sheets in the pictures are from [Kenney](https://kenney.nl)
-and from [ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites),
-both in the public domain (CC0).
+them over.
 
 ## The library and the project
 
@@ -30,7 +28,7 @@ use the right-click menu of either tree, and pick a different one whenever
 you like. Both paths are kept in `~/.config/tilepicky/settings.json`. You can
 also name them on the command line:
 
-    cargo run --release -- [<library dir> [<project dir>]]
+    tilepicky <library dir> <project dir>
 
 The tool draws with wgpu. Add `--glow` to draw with OpenGL instead.
 
@@ -54,7 +52,7 @@ you opened, **Canvas** below is the tilesheet you are building.
 
 Each panel has a header line with its grid fields, its zoom, what you have
 selected, the name of the sheet, and the tile under the pointer. The buttons
-at the right end open the side panels.
+at its right end open the side panels.
 
 Your tilesheet has an eye, `E`. Switch it on when you want to ask questions
 rather than make changes: hover over a tile and a tooltip names the pack its
@@ -106,9 +104,6 @@ between the frames, the frames unroll into one strip, marked as an
 animation. A region that stands still gives one picture.
 
 ![A waterfall is taken out of an animated GIF and lands as a marked strip](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation.gif)
-
-The scene in that picture is a mockup from the [Epic RPG World](https://rafaelmatos.itch.io/epic-rpg-world-collection)
-packs by RafaelMatos, from a purchased copy.
 
 ## Formats
 
@@ -170,10 +165,9 @@ A new sheet starts at the tile size that library or project used last, or at
 
 Undo keeps the last 64 steps of a sheet, and a step is more than a change of
 pixels: the tile size, the gap, the offset and every animation you store or
-change are all on the same list. A whole drag over the tile field counts as
-one step, so undo takes you back to where the drag began. The library sheet
-has a list of its own, since its grid and its animations are yours to change
-even though its pixels are not.
+change are all on the same list. The library sheet has a list of its own,
+since its grid and its animations are yours to change even though its pixels
+are not.
 
 While you drag a block, two keys change what the drop does. Ctrl copies, and
 leaves the tiles it came from where they are. Alt swaps: whatever lies where
@@ -209,13 +203,8 @@ anything: the library is read and never written.
 | right click the free space | new folder, refresh |
 
 A carried file moves into the folder under the pointer; hold Ctrl to copy it
-instead. Its entry in the book follows it, and a tilesheet you have open
-keeps its identity when its file moves. A name the target folder already
-holds is refused, and the other files still move.
-
-"Open location" asks your file manager to show the file. "Copy relative
-path" gives the path as you would type it from where tilepicky runs; "Copy
-absolute path" gives the whole path, with your home directory as `~`.
+instead. Its grid and animations go with it, and a tilesheet you have open
+survives its own file moving.
 
 ## Search
 
@@ -259,8 +248,8 @@ One number stands for both axes. For `frames`, one number means one row.
 A pack and your tilesheet need not agree on tile size. A copy is pixel for
 pixel: the block lands with its top left corner on the tile you chose, and
 transparent pixels pad it out to whole tiles. Changing a sheet's tile size
-changes only the grid you see and the tiles you can pick; it moves no pixels,
-and leaves provenance and animations alone, because both are kept in pixels.
+moves no pixels at all; it changes the grid you see and the tiles you can
+pick.
 
 ## Provenance tracking
 
@@ -272,8 +261,15 @@ and hover, and a tooltip tells you:
     kenney_tiny-town/Tilemap/tilemap_packed.png
 
 Six months later, when you want three more tiles in that style, you can ask
-the sheet where it got them. In the book, `provenance` lists for each source
-the pixel rectangles `[x, y, w, h]` of your sheet that came from it.
+the sheet where it got them.
+
+## Credits
+
+The packs in the pictures are [Kenney](https://kenney.nl)'s and
+[ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites)'s,
+both public domain (CC0). The animated scene is a mockup from the
+[Epic RPG World](https://rafaelmatos.itch.io/epic-rpg-world-collection) packs
+by RafaelMatos, from a purchased copy.
 
 ## Licence
 
