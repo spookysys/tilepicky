@@ -75,6 +75,15 @@ Four things that each cost an hour to find out:
   Its frame has no name of its own: find it as the parent of the app window,
   not by searching for the title.
 
+Decide the take before you film it. Say what a reader should think when
+they see it, and build a project that makes them think it: the tool picks
+tiles out of a pack into a tilesheet of your own, so the film pulls a whole
+house out of a packed sheet and plants two trees beside it. Paste replaces
+pixels, it does not blend them, so a transparent sprite dropped on a filled
+tile leaves a hole; a sheet that fills up reads as work, a map with holes in
+it reads as a broken tilesheet. Caption the keys: a film of a keyboard with
+no keys in it looks the same as a film of a mouse.
+
 Drive the app with XTEST through python-xlib. Prepare the state off camera
 and record only the part worth watching. Count the rows of a tree from a
 fresh start: the keys begin on the title of a pane, so the first Down enters
