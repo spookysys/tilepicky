@@ -98,30 +98,25 @@ the settings when you no longer need it.
 
 ## Animations
 
-An animation is a block of frames on the bitmap: a place in pixels, a frame
-size, the frames in a row and the number of rows, and the time per frame. The
-frames play left to right, then the next row down.
+Mark a strip of tiles as an animation and the sheet remembers it: which
+tiles, how big one frame is, and how fast it plays.
 
-Select the tiles that hold the frames and press `A`. The animation panel
-opens on the right and plays them. The cell field gives the size of one cell
-of the animation, in tiles. It works like the tile field: drag it for the
-width, turn the mouse wheel for the height, click it to type.
+Select the tiles and press `A`. The panel opens on the right and plays them
+straight away. The `cell` field says how many tiles make one frame, `1x1` for
+a row of single tiles or `2x2` for something drawn two tiles across, and `ms`
+is how long each frame is on screen. Tiles that no whole frame reaches turn
+grey and are left out.
 
-Whole frames fill the selection from its top left corner. Tiles that no whole
-frame reaches turn grey, and the animation leaves them out. While the panel
-is open, a new selection grows in whole cells. The cell field itself never
-moves the selection. Press `M`, or the Store button, to store the animation;
-on a stored one, the same key, or the Unmark button, removes it. Press `A`
-again to close the panel.
+Press `M`, or the Store button, to keep it. The same key on a stored one
+removes it, and `A` closes the panel.
 
 ![Two blocks of water tiles become animations: paste, A, set the frames, Store](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation-panel.gif)
 
-A stored animation travels with the block when you copy or drag it. When the
-selection lies on a stored animation, the fields edit that one. An animation
-lives in pixels, so changing the sheet's tile size leaves it alone. Its cell
-size is then read back in whatever tiles the sheet wears; when they do not
-divide its frames, the field says the frame size in pixels instead, because
-a rounded number of tiles would not be true of it.
+A stored animation travels with the tiles when you copy or drag them, and
+selecting it again brings its numbers back into the fields. It is remembered
+in pixels, so changing the sheet's tile size leaves it alone; if the new
+tiles no longer divide its frames, the `cell` field says their size in pixels
+instead.
 
 An animated GIF plays in the library panel. When you copy a region that moves
 between the frames, the frames unroll into one strip, marked as an
