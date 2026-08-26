@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Scans a directory of sheets and searches their file and folder names.
 
+use crate::settings::SearchIn;
 use crate::sidecar::{self, Pair, Sidecar};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,9 @@ pub const IMAGE_EXTS: [&str; 7] = ["png", "gif", "jpg", "jpeg", "webp", "bmp", "
 pub struct Entry {
     pub rel: String,
     /// The words of the path, lower case.
-    pub words: Vec<String>,
+    /// The words of the folders on the path, and of the file name.
+    pub dir_words: Vec<String>,
+    pub name_words: Vec<String>,
     /// The book entry: grid, origins, animations.
     pub side: Sidecar,
 }
@@ -62,11 +65,9 @@ impl Index {
             .into_iter()
             .map(|rel| {
                 let side = book.sheets.remove(&rel).unwrap_or_default();
-                Entry {
-                    words: path_words(&rel),
-                    side,
-                    rel,
-                }
+                let (dirs, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
+                let (dir_words, name_words) = (words(dirs), path_words(name));
+                Entry { dir_words, name_words, side, rel }
             })
             .collect();
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
@@ -83,15 +84,16 @@ impl Index {
     }
 
     /// True when every query word is the prefix of a word in the file path.
-    pub fn entry_matches(e: &Entry, query: &[String]) -> bool {
-        matches(query, |q| e.words.iter().any(|w| w.starts_with(q)))
+    pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn) -> bool {
+        let starts = |ws: &[String], q: &str| ws.iter().any(|w| w.starts_with(q));
+        matches(query, |q| (search.folders && starts(&e.dir_words, q)) || (search.files && starts(&e.name_words, q)))
     }
 
-    pub fn visible(&self, query: &[String]) -> Option<Vec<bool>> {
+    pub fn visible(&self, query: &[String], search: SearchIn) -> Option<Vec<bool>> {
         if query.is_empty() {
             return None;
         }
-        Some(self.entries.iter().map(|e| Self::entry_matches(e, query)).collect())
+        Some(self.entries.iter().map(|e| Self::entry_matches(e, query, search)).collect())
     }
 }
 

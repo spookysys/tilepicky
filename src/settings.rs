@@ -19,13 +19,36 @@ pub struct Side {
     pub tile: Option<Pair>,
 }
 
+/// What the search matches on. More comes with the AI features.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchIn {
+    pub folders: bool,
+    pub files: bool,
+}
+
+impl Default for SearchIn {
+    fn default() -> Self {
+        SearchIn { folders: true, files: true }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Settings {
+    #[serde(default)]
     pub library: Side,
+    #[serde(default)]
     pub project: Side,
     /// The tool explained itself once already.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub greeted: bool,
+    /// The legend of keys in the lower left corner is hidden.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_legend: bool,
+    /// The AI providers, and the models chosen among them.
+    #[serde(default)]
+    pub ai: crate::ai::Ai,
+    #[serde(default)]
+    pub search: SearchIn,
 }
 
 impl Settings {
@@ -33,6 +56,10 @@ impl Settings {
         file()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
+            .map(|mut s: Settings| {
+                s.ai.heal();
+                s
+            })
             .unwrap_or_default()
     }
 
@@ -50,11 +77,30 @@ impl Settings {
     }
 }
 
-/// `$XDG_CONFIG_HOME/tilepicky/settings.json`, or the same under `~/.config`.
 fn file() -> Option<PathBuf> {
+    dir().map(|d| d.join("settings.json"))
+}
+
+/// `$XDG_CONFIG_HOME/tilepicky`, or the same under `~/.config`.
+pub fn dir() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(dir.join("tilepicky").join("settings.json"))
+    Some(dir.join("tilepicky"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file from before the AI settings gets the shipped providers; a file
+    /// that lists none keeps none.
+    #[test]
+    fn an_old_file_gets_the_ai_defaults() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.ai, crate::ai::Ai::default());
+        let s: Settings = serde_json::from_str(r#"{"ai": {"providers": []}}"#).unwrap();
+        assert!(s.ai.providers.is_empty());
+    }
 }

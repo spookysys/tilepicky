@@ -99,6 +99,15 @@ impl Pair {
     }
 }
 
+/// "1 animation", "3 animations"; nothing for none.
+pub fn count_text(n: usize, noun: &str) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some(format!("1 {noun}")),
+        n => Some(format!("{n} {noun}s")),
+    }
+}
+
 /// What the book says about one sheet.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Sidecar {

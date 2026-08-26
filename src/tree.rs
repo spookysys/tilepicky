@@ -31,10 +31,24 @@ pub enum TreeAction {
     DeleteMarked,
     /// Scan the directory again; files may have changed behind our back.
     Refresh,
+    /// Show the folder in the desktop's file manager.
+    RevealDir(String),
+    /// Put the folder's path on the clipboard: relative to the root, or whole.
+    CopyDirPath(String, bool),
     /// Make a folder inside this directory ("" is the root).
     NewFolder(String),
     RenameFolder(String),
     DeleteFolder(String),
+}
+
+/// One row of the tree, in the order the eye reads them. The arrow keys walk
+/// these, so a folder is a place to stand as much as a file is.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Row {
+    /// A folder, by its path below the root.
+    Dir(String),
+    /// A file, by its index in the index.
+    File(usize),
 }
 
 /// What the tree needs to draw itself, apart from the nodes.
@@ -50,8 +64,13 @@ pub struct View<'a> {
     pub apply_query: bool,
     /// Offer the file and folder menus.
     pub menus: bool,
-    /// Bring this file into view: the keyboard moved to it.
-    pub scroll_to: Option<usize>,
+    /// Bring this row into view: the keyboard moved to it.
+    pub scroll_to: Option<&'a Row>,
+    /// The row the arrow keys stand on. A folder shows it with a frame; a
+    /// file is already marked as the open one.
+    pub cursor: Option<&'a Row>,
+    /// Open or close this folder once, because the keyboard said so.
+    pub open_dir: Option<(&'a str, bool)>,
     /// A drag over the files is marking a group right now.
     pub sweeping: bool,
     /// Files are in the air, looking for a folder to land in.
@@ -105,7 +124,7 @@ impl Node {
         v: &View,
         dir_rel: &str,
         path_words: &mut Vec<String>,
-        order: &mut Vec<usize>,
+        rows: &mut Vec<Row>,
         hover_dir: &mut Option<String>,
     ) -> Option<TreeAction> {
         let mut action = None;
@@ -119,27 +138,47 @@ impl Node {
                     path_words.push(w);
                 }
             }
+            let rel = if dir_rel.is_empty() { name.clone() } else { format!("{dir_rel}/{name}") };
             let open = if v.apply_query {
                 let satisfied = crate::index::matches(v.query, |q| path_words.iter().any(|w| w.starts_with(q)));
                 Some(!satisfied)
             } else {
-                None
+                // A folder the keyboard opened or closed. `CollapsingHeader`
+                // keeps what it is given, so one frame of this is enough.
+                v.open_dir.filter(|(d, _)| *d == rel).map(|(_, o)| o)
             };
-            let rel = if dir_rel.is_empty() { name.clone() } else { format!("{dir_rel}/{name}") };
+            // The folder comes before what it holds, and a closed one draws
+            // no body, so the rows read as the eye does.
+            rows.push(Row::Dir(rel.clone()));
+            let here = Row::Dir(rel.clone());
+            // A band behind the row, kept back until the header has drawn
+            // and its size is known. It goes in first, so the letters of the
+            // folder stay on top of it.
+            let band = ui.painter().add(egui::Shape::Noop);
             let id = ui.make_persistent_id(("tree", &rel));
             let header = egui::CollapsingHeader::new(name).id_salt(id).open(open).show(ui, |ui| {
-                if let Some(a) = dir.show(ui, v, &rel, path_words, order, hover_dir) {
+                if let Some(a) = dir.show(ui, v, &rel, path_words, rows, hover_dir) {
                     action = Some(a);
                 }
             });
+            if v.scroll_to == Some(&here) {
+                header.header_response.scroll_to_me(None);
+            }
+            // The arrow keys stand here. A folder has no chosen look of its
+            // own, so it borrows the one a chosen file wears.
+            if v.cursor == Some(&here) {
+                let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.4);
+                ui.painter().set(band, egui::Shape::rect_filled(header.header_response.rect, 2.0, fill));
+            }
             // A folder under lifted files is where they land.
             if v.lifting && header.header_response.contains_pointer() {
                 *hover_dir = Some(rel.clone());
                 let stroke = Stroke::new(2.0, Color32::from_rgb(80, 160, 255));
                 ui.painter().rect_stroke(header.header_response.rect, 2.0, stroke, egui::StrokeKind::Inside);
             }
-            if v.menus {
-                header.header_response.context_menu(|ui| {
+            header.header_response.context_menu(|ui| {
+                // Only a tree the user owns offers the items that change folders.
+                if v.menus {
                     if ui.button("New folder…").clicked() {
                         action = Some(TreeAction::NewFolder(rel.clone()));
                         ui.close();
@@ -152,18 +191,38 @@ impl Node {
                         action = Some(TreeAction::DeleteFolder(rel.clone()));
                         ui.close();
                     }
-                });
-            }
+                    ui.separator();
+                }
+                if ui.button("Open location").clicked() {
+                    action = Some(TreeAction::RevealDir(rel.clone()));
+                    ui.close();
+                }
+                if ui.button("Copy relative path").clicked() {
+                    action = Some(TreeAction::CopyDirPath(rel.clone(), false));
+                    ui.close();
+                }
+                if ui.button("Copy absolute path").clicked() {
+                    action = Some(TreeAction::CopyDirPath(rel.clone(), true));
+                    ui.close();
+                }
+            });
             path_words.truncate(before);
         }
         for (name, i) in &self.files {
             if v.visible.is_some_and(|vis| !vis[*i]) {
                 continue;
             }
-            order.push(*i);
+            rows.push(Row::File(*i));
             let is_marked = v.marked.is_some_and(|m| m.contains(i));
+            // The cursor goes on behind: the file on show wears the solid
+            // colour, and this pale band says only where the keys stand.
+            let band = ui.painter().add(egui::Shape::Noop);
             let mut r = ui.selectable_label(v.selected == Some(*i) || is_marked, name);
-            if v.scroll_to == Some(*i) {
+            if v.cursor == Some(&Row::File(*i)) {
+                let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.4);
+                ui.painter().set(band, egui::Shape::rect_filled(r.rect, 2.0, fill));
+            }
+            if v.scroll_to == Some(&Row::File(*i)) {
                 r.scroll_to_me(None);
             }
             // Only a tree that marks groups answers a drag across the files.
@@ -243,5 +302,47 @@ impl Node {
             });
         }
         action
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One headless pass over a small tree. It gives back the rows the arrow
+    /// keys walk.
+    fn rows_of(open: Option<(&str, bool)>) -> Vec<Row> {
+        let ctx = egui::Context::default();
+        let tree = Node::build(&["a/one.png".to_string(), "a/two.png".to_string(), "top.png".to_string()], &[]);
+        let mut rows = Vec::new();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            {
+                let v = View {
+                    visible: None,
+                    selected: None,
+                    marked: None,
+                    query: &[],
+                    apply_query: false,
+                    menus: false,
+                    scroll_to: None,
+                    cursor: None,
+                    open_dir: open,
+                    sweeping: false,
+                    lifting: false,
+                };
+                tree.show(ui, &v, "", &mut Vec::new(), &mut rows, &mut None);
+            }
+        });
+        // The pass made a font texture that no screen will ever take.
+        out.textures_delta.clear();
+        rows
+    }
+
+    /// A folder is a row of its own, before the files it holds, and a closed
+    /// one hides them.
+    #[test]
+    fn the_rows_hold_the_folders() {
+        assert_eq!(rows_of(None), vec![Row::Dir("a".into()), Row::File(2)]);
+        assert_eq!(rows_of(Some(("a", true))), vec![Row::Dir("a".into()), Row::File(0), Row::File(1), Row::File(2)]);
     }
 }

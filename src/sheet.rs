@@ -3,6 +3,8 @@
 //! library and a tilesheet of your project are the same thing; only the edits
 //! differ.
 
+use crate::sidecar::count_text;
+use image::ImageDecoder;
 use crate::sidecar::{self, Animation, Pair, Provenance, Sidecar};
 use eframe::egui::{self, Color32, Id, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use image::{Rgba, RgbaImage};
@@ -14,6 +16,20 @@ const CHUNK: u32 = 2048;
 const ZOOMS: [f32; 10] = [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0];
 /// Touchpads report points, not wheel clicks; this many points make one zoom step.
 const POINTS_PER_STEP: f32 = 50.0;
+
+/// The selection, and the spare cells the animation leaves out.
+const SELECTED: Color32 = Color32::from_rgb(80, 160, 255);
+const SELECTED_FILL: Color32 = Color32::from_rgba_unmultiplied_const(80, 160, 255, 50);
+pub const SPARE: Color32 = Color32::from_rgb(150, 150, 150);
+const SPARE_FILL: Color32 = Color32::from_rgba_unmultiplied_const(150, 150, 150, 50);
+
+/// egui walks the keyboard focus with the arrows and with Tab, from one
+/// widget to the next. The panes of the window answer both themselves: the
+/// arrows move a selection, and Tab steps to the next pane. So each pane
+/// claims them while it holds the focus. Escape still reaches the sheet.
+pub fn pane_focus() -> egui::EventFilter {
+    egui::EventFilter { tab: true, escape: false, horizontal_arrows: true, vertical_arrows: true }
+}
 
 /// The zoom that keeps the pixels even. One image pixel must cover a whole
 /// number of screen pixels, or a whole number of image pixels must cover one
@@ -98,6 +114,9 @@ impl Area {
     pub fn rows(&self) -> u32 {
         self.y1 - self.y0 + 1
     }
+    pub fn holds(&self, x: u32, y: u32) -> bool {
+        (self.x0..=self.x1).contains(&x) && (self.y0..=self.y1).contains(&y)
+    }
 }
 
 /// The selected cells. Any shape; the bounding area gives it a position.
@@ -138,6 +157,13 @@ impl Sel {
             }
         }
     }
+    /// The same cells, moved by whole cells. The caller keeps them on the
+    /// sheet: a move past the top or the left edge wraps.
+    pub fn moved(&self, dx: i32, dy: i32) -> Self {
+        let at = |v: u32, d: i32| (v as i64 + d as i64) as u32;
+        Self { cells: self.cells.iter().map(|&(x, y)| (at(x, dx), at(y, dy))).collect() }
+    }
+
     pub fn union(mut self, other: &Sel) -> Self {
         self.cells.extend(other.cells.iter().copied());
         self
@@ -158,36 +184,87 @@ impl Sel {
     }
 }
 
-/// A block of frames that is not stored: the selection, played with a frame
-/// grid.
+/// The far end of a run of whole frames on one axis. The run starts at `a`,
+/// the cell the user pressed, and reaches towards `c`, the cell under the
+/// pointer. It takes the nearest whole number of frames, and it stays inside
+/// the sheet, whose last cell is `last`. A sheet with no room for one whole
+/// frame keeps what room it has.
+fn snap_far(a: u32, c: u32, f: u32, last: u32) -> u32 {
+    let f = f.max(1);
+    if c >= a {
+        let room = (last - a + 1) / f;
+        if room == 0 {
+            return last;
+        }
+        a + (((c - a + 1) as f32 / f as f32).round() as u32).clamp(1, room) * f - 1
+    } else {
+        let room = (a + 1) / f;
+        if room == 0 {
+            return 0;
+        }
+        a + 1 - (((a - c + 1) as f32 / f as f32).round() as u32).clamp(1, room) * f
+    }
+}
+
+/// One step of a sheet's history: its book, its grid, and its pixels when
+/// the step rewrote them. A grid or animation change rewrites no pixels, and
+/// a sheet can be many megabytes, so those steps travel light.
+struct Step {
+    side: Sidecar,
+    grid: ([u32; 2], [u32; 2], [i32; 2]),
+    pixels: Option<(RgbaImage, ProvMap)>,
+    /// The step changed the grid and nothing else. A drag over the tile
+    /// field makes one of these at every step it takes, so a run of them
+    /// collapses into the first: undo returns to the grid you had before you
+    /// began, not to the step before last.
+    grid_only: bool,
+}
+
+/// A block of frames that is not stored: the selection, played with one
+/// frame size. Whole frames fill the area from its top left corner, and the
+/// cells they do not reach are spare.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Draft {
     pub area: Area,
-    /// Frames in a row, and the number of rows.
-    pub frames: [u32; 2],
+    /// The size of one frame, in cells. The panel keeps it above zero.
+    pub frame: [u32; 2],
     pub ms: u32,
 }
 
 impl Draft {
-    pub fn animation(&self, tile: [u32; 2]) -> Animation {
-        let b = self.area;
-        let [c, r] = self.frames;
-        Animation {
-            px: [b.x0 * tile[0], b.y0 * tile[1]],
-            frame: [b.cols() * tile[0] / c.max(1), b.rows() * tile[1] / r.max(1)],
-            frames: Pair::strip(self.frames),
-            ms: self.ms,
-        }
+    /// Frames in a row, and the number of rows: the whole frames the area
+    /// holds. A frame larger than the area gives a zero.
+    pub fn grid(&self) -> [u32; 2] {
+        let [fw, fh] = self.frame;
+        [self.area.cols() / fw.max(1), self.area.rows() / fh.max(1)]
     }
 
-    /// The selection in pixels, and whether the frame grid divides it.
-    pub fn area_px(&self, tile: [u32; 2]) -> [u32; 2] {
-        [self.area.cols() * tile[0], self.area.rows() * tile[1]]
+    /// How many frames play.
+    pub fn count(&self) -> u32 {
+        let [c, r] = self.grid();
+        c * r
     }
-    pub fn fits(&self, tile: [u32; 2]) -> bool {
-        let [w, h] = self.area_px(tile);
-        let [c, r] = self.frames;
-        c > 0 && r > 0 && w % c == 0 && h % r == 0
+
+    /// The part of the area that whole frames fill. None when no whole frame
+    /// fits; the whole area is spare then.
+    pub fn used(&self) -> Option<Area> {
+        let [c, r] = self.grid();
+        let [fw, fh] = self.frame;
+        let b = self.area;
+        (c > 0 && r > 0).then_some(Area { x0: b.x0, y0: b.y0, x1: b.x0 + c * fw - 1, y1: b.y0 + r * fh - 1 })
+    }
+
+    /// The animation the frames make, in pixels. None when no whole frame
+    /// fits.
+    pub fn animation(&self, tile: [u32; 2]) -> Option<Animation> {
+        let b = self.used()?;
+        let [fw, fh] = self.frame;
+        Some(Animation {
+            px: [b.x0 * tile[0], b.y0 * tile[1]],
+            frame: [fw * tile[0], fh * tile[1]],
+            frames: Pair::strip(self.grid()),
+            ms: self.ms,
+        })
     }
 }
 
@@ -440,7 +517,7 @@ impl Block {
     pub fn note(&self) -> String {
         let mut from: Vec<&str> = self.prov.sources.iter().map(String::as_str).collect();
         from.sort_unstable();
-        format!("tilepicky: {}x{} cells from {}", self.cols, self.rows, from.join(", "))
+        format!("tilepicky: {}x{} tiles from {}", self.cols, self.rows, from.join(", "))
     }
 }
 
@@ -460,6 +537,9 @@ pub struct Sheet {
     pub rel: String,
     /// The directory whose book describes this sheet.
     pub dir: PathBuf,
+    /// The file format and color type as the loader saw them, such as
+    /// "PNG, Rgba8". Empty for a sheet that was never a file.
+    kind: String,
     /// The sheet's tile size in pixels: the grid drawn over the bitmap.
     pub tile: [u32; 2],
     /// Pixels between neighbouring tiles.
@@ -476,6 +556,12 @@ pub struct Sheet {
     chunks: Vec<(Rect, TextureHandle)>,
     pub sel: Sel,
     anchor: Option<(u32, u32)>,
+    /// The pair of corners a run of Shift and the arrows moves: the corner
+    /// that stays, and the corner that walks. It lives only while Shift
+    /// stays down, so nothing invisible outlasts the gesture.
+    run: Option<((u32, u32), (u32, u32))>,
+    /// A cell the next repaint must scroll into sight.
+    scroll_cell: Option<(u32, u32)>,
     /// The selection when a range drag began; the dragged rectangle is added to it.
     base: Sel,
     /// An edge drag in progress: the selection and its bounds at the start,
@@ -495,6 +581,12 @@ pub struct Sheet {
     draft: Option<Draft>,
     /// The animation panel is open. It also opens by itself when animations are stored.
     pub anim_panel: bool,
+    /// The stored animation the selection sat on at the last frame, as its
+    /// pixel rectangle.
+    last_stored: Option<(u32, u32, u32, u32)>,
+    /// The islands of the eye: the provenance rectangles by source, made
+    /// once while the eye is on. Nothing changes the pixels meanwhile.
+    eye_islands: Option<Vec<Provenance>>,
     pub preview_zoom: Zoom,
     /// Screen pixels in one point, as the window reports them. The drawing
     /// needs it to keep the image pixels even.
@@ -507,7 +599,52 @@ pub struct Sheet {
     frames: Vec<RgbaImage>,
     frame_ms: u32,
     cur_frame: usize,
-    undo: Vec<(RgbaImage, Sidecar, ProvMap)>,
+    undo: Vec<Step>,
+    /// The steps taken back, ready to be taken again. Any new edit empties
+    /// it: from there the way forward is a different one.
+    redo: Vec<Step>,
+}
+
+/// The format and the color type as the file stores them, such as
+/// "PNG, indexed 8 bit". A PNG is read by the png crate for that, because
+/// the loader expands a palette; a GIF is always a palette; the rest is
+/// what the loader reports.
+fn file_kind(path: &Path, format: Option<image::ImageFormat>, decoded: image::ExtendedColorType) -> String {
+    let name = format.and_then(|f| f.extensions_str().first().copied()).map(str::to_uppercase).unwrap_or_default();
+    let color = match format {
+        Some(image::ImageFormat::Png) => png_color(path).unwrap_or_else(|| color_text(decoded)),
+        Some(image::ImageFormat::Gif) => "indexed 8 bit".to_string(),
+        _ => color_text(decoded),
+    };
+    format!("{name}, {color}")
+}
+
+fn png_color(path: &Path) -> Option<String> {
+    let reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).ok()?)).read_info().ok()?;
+    let info = reader.info();
+    let color = match info.color_type {
+        png::ColorType::Grayscale => "gray",
+        png::ColorType::Rgb => "RGB",
+        png::ColorType::Indexed => "indexed",
+        png::ColorType::GrayscaleAlpha => "gray+alpha",
+        png::ColorType::Rgba => "RGBA",
+    };
+    Some(format!("{color} {} bit", info.bit_depth as u8))
+}
+
+fn color_text(c: image::ExtendedColorType) -> String {
+    use image::ExtendedColorType as C;
+    match c {
+        C::L8 => "gray 8 bit".into(),
+        C::La8 => "gray+alpha 8 bit".into(),
+        C::Rgb8 => "RGB 8 bit".into(),
+        C::Rgba8 => "RGBA 8 bit".into(),
+        C::L16 => "gray 16 bit".into(),
+        C::La16 => "gray+alpha 16 bit".into(),
+        C::Rgb16 => "RGB 16 bit".into(),
+        C::Rgba16 => "RGBA 16 bit".into(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// How many cells of one pitch cover a length from an offset. The last cell
@@ -537,11 +674,17 @@ impl Sheet {
     pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], side: Sidecar) -> Result<Self, String> {
         let path = dir.join(rel);
         let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
+        let fail = |e: image::ImageError| format!("{rel}: {e}");
+        let reader = image::ImageReader::open(&path).and_then(image::ImageReader::with_guessed_format).map_err(|e| format!("{rel}: {e}"))?;
+        let format = reader.format();
+        let decoder = reader.into_decoder().map_err(fail)?;
+        let kind = file_kind(&path, format, decoder.original_color_type());
         let img = match frames.first() {
             Some(f) => f.clone(),
-            None => image::open(&path).map_err(|e| format!("{rel}: {e}"))?.to_rgba8(),
+            None => image::DynamicImage::from_decoder(decoder).map_err(fail)?.to_rgba8(),
         };
         let mut sheet = Self::from_image(ctx, dir, rel, tile, img, side);
+        sheet.kind = kind;
         sheet.frames = frames;
         sheet.frame_ms = frame_ms;
         Ok(sheet)
@@ -560,6 +703,7 @@ impl Sheet {
         let mut s = Self {
             rel: rel.to_string(),
             dir: dir.to_path_buf(),
+            kind: String::new(),
             tile,
             gap,
             offset,
@@ -569,6 +713,8 @@ impl Sheet {
             chunks: Vec::new(),
             sel: Sel::default(),
             anchor: None,
+            run: None,
+            scroll_cell: None,
             base: Sel::default(),
             resize: None,
             canvas_resize: None,
@@ -583,6 +729,8 @@ impl Sheet {
             dirty: false,
             draft: None,
             anim_panel: false,
+            last_stored: None,
+            eye_islands: None,
             preview_zoom: Zoom::new(2.0),
             ppp: 1.0,
             preview_hovered: false,
@@ -591,6 +739,7 @@ impl Sheet {
             frame_ms: 0,
             cur_frame: 0,
             undo: Vec::new(),
+            redo: Vec::new(),
         };
         s.upload(ctx);
         s
@@ -663,12 +812,27 @@ impl Sheet {
         }
     }
 
-    /// The source file a view cell's pixels came from, if one is recorded.
-    pub fn cell_source(&self, x: u32, y: u32) -> Option<&str> {
-        let (ix0, iy0, ix1, iy1) = self.cell_img_rect(x, y);
-        self.prov.get(ix0, iy0).or_else(|| {
-            (iy0..iy1).flat_map(|iy| (ix0..ix1).map(move |ix| (ix, iy))).find_map(|(ix, iy)| self.prov.get(ix, iy))
-        })
+    /// What a tooltip says about the whole sheet: its name, its size, its
+    /// file format, and its animations. The grid is a setting of the editor
+    /// and no fact about the sheet, so it stays out.
+    pub fn sheet_info(&self) -> String {
+        let (w, h) = self.img.dimensions();
+        let name = if self.rel.is_empty() { "(unnamed)" } else { self.rel.as_str() };
+        let mut lines = vec![name.to_string(), format!("{w}x{h} px, {}x{} tiles", self.cols(), self.rows())];
+        if !self.kind.is_empty() {
+            lines.push(self.kind.clone());
+        }
+        lines.extend(count_text(self.side.animations.len(), "animation"));
+        lines.join("\n")
+    }
+
+    /// The source of the pixel under a screen position, when it has one.
+    fn pixel_source(&self, p: Pos2, rect: Rect, zoom: f32) -> Option<String> {
+        let d = (p - rect.min) / zoom;
+        if d.x < 0.0 || d.y < 0.0 || d.x as u32 >= self.img.width() || d.y as u32 >= self.img.height() {
+            return None;
+        }
+        self.prov.get(d.x as u32, d.y as u32).map(str::to_string)
     }
 
     /// The zoom the sheet is drawn with: the chosen level, moved to the
@@ -686,6 +850,53 @@ impl Sheet {
     pub fn cell_px(&self) -> Vec2 {
         let p = self.pitch();
         Vec2::new(p[0] as f32, p[1] as f32) * self.zoom_px()
+    }
+
+    /// The step of the selection, in cells: one frame while the animation
+    /// panel shapes it, else one cell. The mouse, the arrow keys and the
+    /// spare cells all measure with it.
+    pub fn unit(&self) -> [u32; 2] {
+        match &self.draft {
+            Some(d) if self.anim_panel && self.stored_animation().is_none() => d.frame,
+            _ => [1, 1],
+        }
+    }
+
+    /// Whether a cell holds any pixel that is not clear. `Ctrl` and an arrow
+    /// walk from one block of them to the next.
+    fn filled(&self, x: u32, y: u32) -> bool {
+        let (x0, y0, x1, y1) = self.cell_img_rect(x, y);
+        let (w, h) = self.img.dimensions();
+        let (x1, y1) = (x1.min(w), y1.min(h));
+        (y0..y1).any(|y| (x0..x1).any(|x| self.img.get_pixel(x, y).0[3] != 0))
+    }
+
+    /// The cell `Ctrl` and an arrow reach from `from`. A filled neighbour
+    /// takes it to the last filled cell of that block; an empty one takes it
+    /// to the next filled cell. With neither, it takes the edge of the sheet.
+    fn jump(&self, from: (u32, u32), d: (i32, i32)) -> (u32, u32) {
+        let (last_x, last_y) = (self.cols() - 1, self.rows() - 1);
+        let ahead = |(x, y): (u32, u32)| -> Option<(u32, u32)> {
+            let (nx, ny) = (x as i64 + d.0 as i64, y as i64 + d.1 as i64);
+            (nx >= 0 && ny >= 0 && nx <= last_x as i64 && ny <= last_y as i64).then_some((nx as u32, ny as u32))
+        };
+        let Some(next) = ahead(from) else { return from };
+        let mut at = next;
+        if self.filled(next.0, next.1) {
+            // A block of filled cells: stop on the last one of it.
+            while let Some(n) = ahead(at).filter(|n| self.filled(n.0, n.1)) {
+                at = n;
+            }
+        } else {
+            // A gap: stop on the first filled cell after it, else at the edge.
+            while !self.filled(at.0, at.1) {
+                match ahead(at) {
+                    Some(n) => at = n,
+                    None => break,
+                }
+            }
+        }
+        at
     }
 
     /// The strip that covers a cell, if one does.
@@ -716,9 +927,35 @@ impl Sheet {
     }
 
     /// Draws the sheet and handles pointer input. While a block drag is in
-    /// progress (`dragging`), the sheet only draws.
-    pub fn view(&mut self, ui: &mut Ui, id: Id, dragging: bool, editable: bool) -> ViewEvent {
+    /// progress (`dragging`), the sheet only draws. With the eye on, the
+    /// sheet is for looking: hovering tells what a place is, and nothing
+    /// selects, drags, or edits.
+    ///
+    /// `live` says the keys are on this grid. Its selection is blue then,
+    /// and grey when they are elsewhere, so that a glance at the selection
+    /// answers which of the two sheets you are working in.
+    pub fn view(&mut self, ui: &mut Ui, id: Id, dragging: bool, editable: bool, eye: bool, live: bool) -> ViewEvent {
         let mut event = ViewEvent::default();
+        let editable = editable && !eye;
+        if !eye {
+            self.eye_islands = None;
+        }
+        // A selection that lands on a stored animation opens the animation
+        // panel. The button in the header closes it, and it stays closed
+        // until the selection lands on another one.
+        let stored = self.stored_animation().map(|a| a.px_rect());
+        if stored.is_some() && stored != self.last_stored {
+            self.anim_panel = true;
+            ui.ctx().request_repaint();
+        }
+        self.last_stored = stored;
+        // While the animation panel shapes the selection, whole frames fill
+        // it from its top left corner. The cells they miss are spare, and a
+        // new selection grows in whole frames. A stored animation has its
+        // own block, so it leaves the selection alone.
+        let shaping = self.anim_panel && stored.is_none() && self.draft.is_some();
+        let used = shaping.then(|| self.draft.as_ref().and_then(|d| d.used())).flatten();
+        let step = shaping.then(|| self.unit());
         // An animated GIF plays in place.
         if self.frames.len() > 1 {
             let ms = self.frame_ms.max(20) as u64;
@@ -739,6 +976,11 @@ impl Sheet {
         /// Room past the right and bottom edges, where the canvas handles sit.
         const MARGIN: f32 = 12.0;
         let size = Vec2::new(self.cols() as f32 * cell_px.x, self.rows() as f32 * cell_px.y);
+        // With the eye on, the free area around the sheet stands for the
+        // whole sheet. It is registered first, so that the sheet itself
+        // stays on top of it.
+        let free = eye.then(|| ui.interact(ui.max_rect(), id.with("sheet tip"), Sense::hover()));
+        let tint = Color32::from_rgba_unmultiplied(80, 160, 255, 70);
         let mut area = egui::ScrollArea::both().id_salt((id, "scroll")).auto_shrink([false, false]);
         if let Some(offset) = self.scroll_to.take() {
             area = area.scroll_offset(offset);
@@ -751,6 +993,7 @@ impl Sheet {
             // The image starts on a whole screen pixel; see `even_pos`.
             let rect = Rect::from_min_size(even_pos(outer.min, self.ppp), size);
             let resp = ui.interact(outer, id, Sense::click_and_drag());
+            ui.memory_mut(|m| m.set_focus_lock_filter(id, pane_focus()));
             self.screen = rect;
             self.clip = ui.clip_rect();
             let painter = ui.painter_at(rect);
@@ -808,23 +1051,30 @@ impl Sheet {
                     orange,
                 );
             }
-            let blue = Color32::from_rgb(80, 160, 255);
-            for (x, y) in self.sel.iter() {
-                let r = cell_rect(x, y);
-                painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(80, 160, 255, 50));
-                // A border only where the neighbour is outside the selection.
-                let w = 2.0;
-                if !self.sel.contains((x, y.wrapping_sub(1))) {
-                    painter.line_segment([r.left_top(), r.right_top()], Stroke::new(w, blue));
-                }
-                if !self.sel.contains((x, y + 1)) {
-                    painter.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(w, blue));
-                }
-                if !self.sel.contains((x.wrapping_sub(1), y)) {
-                    painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(w, blue));
-                }
-                if !self.sel.contains((x + 1, y)) {
-                    painter.line_segment([r.right_top(), r.right_bottom()], Stroke::new(w, blue));
+            // The selection has no function in eye mode, so it stays hidden.
+            if !eye {
+                for (x, y) in self.sel.iter() {
+                    let r = cell_rect(x, y);
+                    // Grey says this cell has no part in anything right now:
+                    // the animation leaves it out, or the keys are in another
+                    // pane and this selection is only waiting.
+                    let spare = shaping && !used.is_some_and(|u| u.holds(x, y));
+                    let (line, fill) = if spare || !live { (SPARE, SPARE_FILL) } else { (SELECTED, SELECTED_FILL) };
+                    painter.rect_filled(r, 0.0, fill);
+                    // A border only where the neighbour is outside the selection.
+                    let w = 2.0;
+                    if !self.sel.contains((x, y.wrapping_sub(1))) {
+                        painter.line_segment([r.left_top(), r.right_top()], Stroke::new(w, line));
+                    }
+                    if !self.sel.contains((x, y + 1)) {
+                        painter.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(w, line));
+                    }
+                    if !self.sel.contains((x.wrapping_sub(1), y)) {
+                        painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(w, line));
+                    }
+                    if !self.sel.contains((x + 1, y)) {
+                        painter.line_segment([r.right_top(), r.right_bottom()], Stroke::new(w, line));
+                    }
                 }
             }
 
@@ -834,6 +1084,30 @@ impl Sheet {
                 (((d.x / cell_px.x).max(0.0) as u32).min(cols - 1), ((d.y / cell_px.y).max(0.0) as u32).min(rows - 1))
             };
             self.hover = resp.hover_pos().map(to_cell);
+            // The far corner of a new rectangle, moved to the end of the
+            // nearest whole frame. The corner it starts from stays put, and
+            // an area too small for one frame keeps what it has.
+            let snap = move |a: (u32, u32), c: (u32, u32)| -> (u32, u32) {
+                let Some([fw, fh]) = step else { return c };
+                (snap_far(a.0, c.0, fw, cols - 1), snap_far(a.1, c.1, fh, rows - 1))
+            };
+            if eye {
+                // The pixel under the pointer names its island: every pixel
+                // from the same source lights up, and the tooltip names the
+                // source.
+                if let Some(name) = resp.hover_pos().and_then(|p| self.pixel_source(p, rect, zoom)) {
+                    let prov = &self.prov;
+                    let islands = self.eye_islands.get_or_insert_with(|| prov.extract());
+                    if let Some(island) = islands.iter().find(|p| p.source == name) {
+                        for [x, y, w, h] in &island.rects {
+                            let r = Rect::from_min_size(rect.min + Vec2::new(*x as f32, *y as f32) * zoom, Vec2::new(*w as f32, *h as f32) * zoom);
+                            painter.rect_filled(r, 0.0, tint);
+                        }
+                    }
+                    resp.clone().on_hover_text_at_pointer(name);
+                }
+                return;
+            }
             let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
             if dragging {
                 return;
@@ -943,7 +1217,7 @@ impl Sheet {
                     } else {
                         self.base = if ctrl { self.sel.clone() } else { Sel::default() };
                         self.anchor = Some(c);
-                        self.sel = self.base.clone().union(&Sel::rect(c, c));
+                        self.sel = self.base.clone().union(&Sel::rect(c, snap(c, c)));
                     }
                     event.interacted = true;
                 }
@@ -965,7 +1239,7 @@ impl Sheet {
                         let ly = ((p.y - rect.min.y - off_px.y) / cell_px.y).round().clamp(0.0, rows as f32) as u32;
                         self.sel = d.apply(lx, ly);
                     } else if let Some(a) = self.anchor {
-                        self.sel = self.base.clone().union(&Sel::rect(a, c));
+                        self.sel = self.base.clone().union(&Sel::rect(a, snap(a, c)));
                     }
                     event.interacted = true;
                 }
@@ -974,7 +1248,8 @@ impl Sheet {
                 self.resize = None;
                 if let Some(d) = self.canvas_resize.take() {
                     // The whole drag is one undo step: the canvas before it.
-                    self.push_undo((d.img, d.side, d.prov));
+                    let grid = (self.tile, self.gap, self.offset);
+                    self.push_undo(Step { side: d.side, grid, pixels: Some((d.img, d.prov)), grid_only: false });
                     event.resized = true;
                 }
             }
@@ -986,22 +1261,23 @@ impl Sheet {
                     if ctrl && shift {
                         // Add the rectangle from the last clicked cell to this one.
                         let a = self.anchor.unwrap_or(c);
-                        self.sel = self.sel.clone().union(&Sel::rect(a, c));
+                        self.sel = self.sel.clone().union(&Sel::rect(a, snap(a, c)));
                     } else if ctrl {
                         self.sel.toggle(c);
                         self.anchor = Some(c);
                     } else if shift {
                         let a = self.anchor.unwrap_or(c);
-                        self.sel = Sel::rect(a, c);
+                        self.sel = Sel::rect(a, snap(a, c));
                     } else {
                         self.anchor = Some(c);
-                        self.sel = Sel::rect(c, c);
+                        self.sel = Sel::rect(c, snap(c, c));
                     }
                     event.interacted = true;
                 }
             }
             if event.interacted {
                 resp.request_focus();
+                self.run = None;
             }
             if resp.hovered() {
                 let before = self.zoom.level;
@@ -1012,6 +1288,30 @@ impl Sheet {
                 }
             }
         });
+        // The free area lights up the whole view and tells about the whole
+        // sheet. The pointer over the sheet ends that at once.
+        let outside = ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| !self.screen.contains(p));
+        if let Some(free) = free
+            && free.hovered()
+            && outside
+        {
+            ui.painter().rect_filled(ui.max_rect(), 0.0, tint);
+            free.on_hover_ui_at_pointer(|ui| {
+                ui.label(self.sheet_info());
+            });
+        }
+        // The arrow keys reached a cell; bring it into sight.
+        if let Some((cx, cy)) = self.scroll_cell.take() {
+            let p0 = off_px + Vec2::new(cx as f32 * cell_px.x, cy as f32 * cell_px.y);
+            let p1 = p0 + cell_px;
+            let seen = self.clip.size();
+            let now = out.state.offset;
+            let to = Vec2::new(now.x.max(p1.x - seen.x).min(p0.x), now.y.max(p1.y - seen.y).min(p0.y));
+            if to != now {
+                self.scroll_to = Some(to);
+                ui.ctx().request_repaint();
+            }
+        }
         // Keep the cell under the pointer where it is.
         if let Some((at, k)) = rezoom {
             self.scroll_to = Some(out.state.offset + at * (k - 1.0));
@@ -1180,17 +1480,53 @@ impl Sheet {
         Some(Block { tile: self.tile, cols, rows: b.rows(), img, prov, mask, animations })
     }
 
-    fn snapshot(&mut self) {
-        let state = (self.img.clone(), self.side.clone(), self.prov.clone());
-        self.push_undo(state);
+    /// The sheet as it stands, to come back to. `pixels` says whether the
+    /// step about to be taken rewrites them.
+    fn step(&self, pixels: bool) -> Step {
+        Step {
+            side: self.side.clone(),
+            grid: (self.tile, self.gap, self.offset),
+            pixels: pixels.then(|| (self.img.clone(), self.prov.clone())),
+            grid_only: false,
+        }
     }
 
-    fn push_undo(&mut self, state: (RgbaImage, Sidecar, ProvMap)) {
-        self.undo.push(state);
+    /// Keeps the sheet as it stands, before something rewrites its pixels.
+    fn snapshot(&mut self) {
+        let step = self.step(true);
+        self.push_undo(step);
+    }
+
+    /// Keeps the book of the sheet, before something changes the grid or the
+    /// animations. Those rewrite no pixels, and a sheet can be large.
+    fn snapshot_book(&mut self) {
+        let step = self.step(false);
+        self.push_undo(step);
+    }
+
+    fn push_undo(&mut self, step: Step) {
+        self.undo.push(step);
         if self.undo.len() > 64 {
             self.undo.remove(0);
         }
+        self.redo.clear();
         self.dirty = true;
+    }
+
+    /// Puts a kept step back. The grid comes with it, so that a sheet that
+    /// went back to another tile size shows it.
+    fn restore(&mut self, ctx: &egui::Context, step: Step) {
+        self.side = step.side;
+        (self.tile, self.gap, self.offset) = step.grid;
+        if let Some((img, prov)) = step.pixels {
+            self.img = img;
+            self.prov = prov;
+        }
+        self.sel = Sel::default();
+        self.draft = None;
+        self.eye_islands = None;
+        self.dirty = true;
+        self.upload(ctx);
     }
 
     /// Grows the canvas so that it holds the given cell count.
@@ -1352,12 +1688,19 @@ impl Sheet {
     }
 
     pub fn undo(&mut self, ctx: &egui::Context) {
-        if let Some((img, side, prov)) = self.undo.pop() {
-            self.img = img;
-            self.side = side;
-            self.prov = prov;
-            self.dirty = true;
-            self.upload(ctx);
+        if let Some(step) = self.undo.pop() {
+            let now = self.step(step.pixels.is_some());
+            self.redo.push(now);
+            self.restore(ctx, step);
+        }
+    }
+
+    /// Takes a step that was taken back again.
+    pub fn redo(&mut self, ctx: &egui::Context) {
+        if let Some(step) = self.redo.pop() {
+            let now = self.step(step.pixels.is_some());
+            self.undo.push(now);
+            self.restore(ctx, step);
         }
     }
 
@@ -1370,22 +1713,106 @@ impl Sheet {
         let b = self.sel.bounds()?;
         match &mut self.draft {
             Some(d) => d.area = b,
-            None => self.draft = Some(Draft { area: b, frames: [b.cols(), 1], ms: 100 }),
+            None => self.draft = Some(Draft { area: b, frame: [1, 1], ms: 100 }),
         }
         self.draft.as_mut()
     }
 
-    /// The panel shows when the selection touches a stored animation, or
-    /// while a draft opened with `A` still matches the selection.
-    pub fn show_anim_panel(&self) -> bool {
-        let on_stored = self.sel.iter().any(|(x, y)| {
-            let r = self.cell_px_rect(x, y);
-            self.side.animations.iter().any(|a| a.px_overlaps(r))
-        });
-        // The panel stays open while there is a selection to play; a new
-        // selection does not close it, so its edges can be dragged.
-        let on_draft = self.anim_panel && !self.sel.is_empty();
-        on_stored || on_draft
+    /// An arrow key. `d` names the direction, one step on one axis.
+    ///
+    /// The selection alone says where a command starts from: the edge of it
+    /// that faces the way you press, with the other axis on its top or left
+    /// edge. A plain arrow leaves the selection on that side and takes one
+    /// unit there. `Ctrl` jumps to the edge of the filled cells first.
+    ///
+    /// `Shift` holds one corner and walks the other. Which corner walks is
+    /// not in the selection, so the pair lives in `run` for as long as the
+    /// gesture does. A fresh run always grows on the side you press.
+    pub fn arrow(&mut self, d: (i32, i32), shift: bool, ctrl: bool) {
+        let [uw, uh] = self.unit();
+        let (last_x, last_y) = (self.cols() - 1, self.rows() - 1);
+        let Some(b) = self.sel.bounds() else {
+            // Nothing is selected, so the first press takes the top left unit.
+            self.start();
+            return;
+        };
+        if shift {
+            // The corner that stays, and the corner that walks.
+            let (anchor, lead) = self.run.unwrap_or(match d.0 {
+                0 => ((b.x0, if d.1 > 0 { b.y0 } else { b.y1 }), (b.x1, if d.1 > 0 { b.y1 } else { b.y0 })),
+                _ => ((if d.0 > 0 { b.x0 } else { b.x1 }, b.y0), (if d.0 > 0 { b.x1 } else { b.x0 }, b.y1)),
+            });
+            let lead = if ctrl {
+                self.jump(lead, d)
+            } else {
+                let x = (lead.0 as i64 + d.0 as i64 * uw as i64).clamp(0, last_x as i64) as u32;
+                let y = (lead.1 as i64 + d.1 as i64 * uh as i64).clamp(0, last_y as i64) as u32;
+                (x, y)
+            };
+            self.run = Some((anchor, lead));
+            self.anchor = Some(anchor);
+            self.sel = Sel::rect(anchor, lead);
+            self.scroll_cell = Some(lead);
+            return;
+        }
+        // The unit lands one step past the edge it leaves, and it stays
+        // whole: at the edge of the sheet it slides back inside.
+        let from = (if d.0 > 0 { b.x1 } else { b.x0 }, if d.1 > 0 { b.y1 } else { b.y0 });
+        let (tx, ty) = if ctrl { self.jump(from, d) } else { (from.0, from.1) };
+        let lead = |t: u32, step: i32, unit: u32| -> i64 {
+            match (ctrl, step) {
+                (true, s) if s > 0 => t as i64 + 1 - unit as i64,
+                (true, _) => t as i64,
+                (_, s) if s > 0 => t as i64 + 1,
+                (_, s) if s < 0 => t as i64 - unit as i64,
+                _ => t as i64,
+            }
+        };
+        let x = lead(tx, d.0, uw).clamp(0, (last_x as i64 + 1 - uw as i64).max(0)) as u32;
+        let y = lead(ty, d.1, uh).clamp(0, (last_y as i64 + 1 - uh as i64).max(0)) as u32;
+        self.sel = Sel::rect((x, y), ((x + uw - 1).min(last_x), (y + uh - 1).min(last_y)));
+        self.anchor = Some((x, y));
+        self.run = None;
+        self.scroll_cell = Some((x, y));
+    }
+
+    /// Alt and an arrow: the selection keeps its shape and walks one unit.
+    /// The pixels stay where they are. It holds still when a whole unit
+    /// would take any of it off the sheet.
+    pub fn nudge(&mut self, d: (i32, i32)) {
+        let [uw, uh] = self.unit();
+        let Some(b) = self.sel.bounds() else { return };
+        let (dx, dy) = (d.0 * uw as i32, d.1 * uh as i32);
+        let (x0, y0) = (b.x0 as i64 + dx as i64, b.y0 as i64 + dy as i64);
+        let (x1, y1) = (b.x1 as i64 + dx as i64, b.y1 as i64 + dy as i64);
+        if x0 < 0 || y0 < 0 || x1 >= self.cols() as i64 || y1 >= self.rows() as i64 {
+            return;
+        }
+        self.sel = self.sel.moved(dx, dy);
+        self.anchor = Some((x0 as u32, y0 as u32));
+        self.run = None;
+        // The edge it walks towards is the one to keep in sight.
+        self.scroll_cell = Some((if d.0 > 0 { x1 } else { x0 } as u32, if d.1 > 0 { y1 } else { y0 } as u32));
+    }
+
+    /// Selects the top left unit, for a sheet that has nothing selected.
+    /// The keys arriving on a grid with no selection show nothing at all,
+    /// and a place you cannot see you are in is no place to be.
+    pub fn start(&mut self) {
+        if !self.sel.is_empty() {
+            return;
+        }
+        let [uw, uh] = self.unit();
+        let (last_x, last_y) = (self.cols() - 1, self.rows() - 1);
+        self.sel = Sel::rect((0, 0), ((uw - 1).min(last_x), (uh - 1).min(last_y)));
+        self.run = None;
+        self.scroll_cell = Some((0, 0));
+    }
+
+    /// Ends a run of Shift and the arrows: the next one derives its corners
+    /// from the selection again.
+    pub fn end_run(&mut self) {
+        self.run = None;
     }
 
     /// Opens the panel with a fresh draft for the current selection.
@@ -1407,47 +1834,61 @@ impl Sheet {
         self.side.animations.iter_mut().find(|a| a.px_rect() == r)
     }
 
-    /// Stores the draft strip as an animation, or removes the stored one
-    /// that covers the same pixels.
+    /// Stores the frames the selection holds, or removes the stored
+    /// animation the selection lies on. The frames that fit are stored, so a
+    /// selection with spare cells stores the part they fill.
     pub fn toggle_animation(&mut self) -> Result<(), String> {
-        let Some(b) = self.sel.bounds() else { return Ok(()) };
-        let [tw, th] = self.tile;
-        let sel_px = (b.x0 * tw, b.y0 * th, (b.x1 + 1) * tw, (b.y1 + 1) * th);
-        let same = |a: &Animation| a.px_rect() == sel_px;
-        if self.side.animations.iter().any(same) {
-            self.snapshot();
-            self.side.animations.retain(|a| !same(a));
+        if let Some(view) = self.stored_animation() {
+            let r = view.px_rect();
+            self.snapshot_book();
+            self.side.animations.retain(|a| a.px_rect() != r);
+            // The panel goes on showing what it showed. The frames just
+            // unmarked become the draft, so its numbers stay where they
+            // were, and storing them again gives back the same animation.
+            let [tw, th] = self.tile;
+            let cell = [(view.frame[0] / tw).max(1), (view.frame[1] / th).max(1)];
+            if let Some(d) = self.draft() {
+                d.frame = cell;
+                d.ms = view.ms;
+            }
+            return Ok(());
+        }
+        if self.sel.bounds().is_none() {
             return Ok(());
         }
         if self.gap != [0, 0] || self.offset != [0, 0] {
             return Err("this sheet has gaps between tiles; copy the strip to a tilesheet and mark it there".into());
         }
+        let tile = self.tile;
         let Some(d) = self.draft().cloned() else { return Ok(()) };
-        if !d.fits([tw, th]) {
-            let [w, h] = d.area_px([tw, th]);
-            return Err(format!("the block is {w}x{h} px; the frame numbers must divide that"));
+        if d.count() <= 1 {
+            return Err("an animation needs more than one frame".into());
         }
-        self.snapshot();
-        self.side.animations.retain(|a| !a.px_overlaps(sel_px));
-        self.side.animations.push(d.animation([tw, th]));
+        let a = d.animation(tile).expect("more than one frame fits");
+        let r = a.px_rect();
+        self.snapshot_book();
+        self.side.animations.retain(|x| !x.px_overlaps(r));
+        self.side.animations.push(a);
         self.side.animations.sort_by_key(|a| (a.px[1], a.px[0]));
         Ok(())
     }
 
-    /// Changes the frame grid of the animation under the selection. The
-    /// block keeps its pixels, so each number must divide its side.
-    pub fn set_animation(&mut self, frames: [u32; 2], ms: u32) -> Result<(), String> {
+    /// Changes the frame size of the animation under the selection, in
+    /// pixels. An animation lives in pixels, whatever grid the sheet wears
+    /// while you look at it. The block keeps its top left corner and holds
+    /// whole frames only, so a frame that does not divide it shortens it.
+    pub fn set_animation(&mut self, frame: [u32; 2], ms: u32) -> Result<(), String> {
         let Some(view) = self.stored_animation() else { return Ok(()) };
-        let Some(a) = self.stored_mut(&view) else { return Ok(()) };
-        let [c, r] = a.grid();
-        let (w, h) = (a.frame[0] * c, a.frame[1] * r);
-        if frames[0] == 0 || frames[1] == 0 || w % frames[0] != 0 || h % frames[1] != 0 {
-            return Err(format!("the block is {w}x{h} px; the frame numbers must divide that"));
+        let frame = [frame[0].max(1), frame[1].max(1)];
+        let (x0, y0, x1, y1) = view.px_rect();
+        let grid = [(x1 - x0) / frame[0], (y1 - y0) / frame[1]];
+        if grid[0] * grid[1] < 2 {
+            return Err("an animation needs more than one frame".into());
         }
-        self.snapshot();
+        self.snapshot_book();
         let a = self.stored_mut(&view).unwrap();
-        a.frame = [w / frames[0], h / frames[1]];
-        a.frames = Pair::strip(frames);
+        a.frame = frame;
+        a.frames = Pair::strip(grid);
         a.ms = ms.max(1);
         Ok(())
     }
@@ -1464,6 +1905,12 @@ impl Sheet {
         let offset = clamp_offset(offset, tile, gap);
         if (tile, gap, offset) == (self.tile, self.gap, self.offset) {
             return false;
+        }
+        // A run of grid changes is one step back, not one for each.
+        if !self.undo.last().is_some_and(|s| s.grid_only) {
+            let mut step = self.step(false);
+            step.grid_only = true;
+            self.push_undo(step);
         }
         self.tile = tile;
         self.gap = gap;
@@ -1626,6 +2073,125 @@ mod tests {
         assert_eq!((sheet.cols(), sheet.rows()), (5, 5));
         assert_eq!(sheet.cell_img_rect(0, 0), (0, 0, 5, 0));
         assert_eq!(sheet.cell_img_rect(1, 1), (5, 0, 13, 8));
+    }
+
+    fn keyboard_sheet() -> Sheet {
+        let ctx = egui::Context::default();
+        Sheet::new_empty(&ctx, &std::env::temp_dir(), "keys.png", [8, 8], 6, 6)
+    }
+
+    /// Without Shift the selection leaves the block on the side you press,
+    /// and it takes one cell there. The edge of the sheet holds it.
+    #[test]
+    fn an_arrow_steps_out_of_the_selection() {
+        let mut s = keyboard_sheet();
+        s.arrow((1, 0), false, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 0, y0: 0, x1: 0, y1: 0 }), "nothing selected: the top left cell");
+        s.sel = Sel::rect((1, 1), (3, 2));
+        s.arrow((1, 0), false, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 4, y0: 1, x1: 4, y1: 1 }));
+        s.sel = Sel::rect((1, 1), (3, 2));
+        s.arrow((0, 1), false, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 1, y0: 3, x1: 1, y1: 3 }));
+        s.sel = Sel::rect((5, 5), (5, 5));
+        s.arrow((1, 0), false, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 5, y0: 5, x1: 5, y1: 5 }), "the edge holds it");
+    }
+
+    /// A run of Shift and the arrows grows on the side of the first press,
+    /// and walks back while the run lasts. The next run grows again.
+    #[test]
+    fn shift_grows_on_the_side_you_press() {
+        let mut s = keyboard_sheet();
+        s.sel = Sel::rect((1, 1), (2, 2));
+        s.arrow((1, 0), true, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 1, y0: 1, x1: 3, y1: 2 }));
+        s.arrow((-1, 0), true, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 1, y0: 1, x1: 2, y1: 2 }), "the same run walks back");
+        s.end_run();
+        s.arrow((-1, 0), true, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 0, y0: 1, x1: 2, y1: 2 }), "a new run grows to the left");
+    }
+
+    /// Alt and an arrow walk the whole selection, shape and all. The edge of
+    /// the sheet holds it.
+    #[test]
+    fn alt_walks_the_whole_selection() {
+        let mut s = keyboard_sheet();
+        s.sel = Sel::rect((1, 1), (2, 2));
+        s.sel.toggle((2, 2));
+        s.nudge((1, 0));
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 2, y0: 1, x1: 3, y1: 2 }));
+        assert!(!s.sel.contains((3, 2)), "the hole travels with it");
+        s.sel = Sel::rect((4, 0), (5, 0));
+        s.nudge((1, 0));
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 4, y0: 0, x1: 5, y1: 0 }), "the edge holds it");
+    }
+
+    /// Ctrl and an arrow stop on the last filled cell of a block, and cross
+    /// a gap to the first filled cell after it.
+    #[test]
+    fn ctrl_walks_from_block_to_block() {
+        let mut s = keyboard_sheet();
+        for x in [8, 16, 32] {
+            s.img.put_pixel(x, 0, Rgba([255, 255, 255, 255]));
+        }
+        s.sel = Sel::rect((0, 0), (0, 0));
+        s.arrow((1, 0), false, true);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 2, y0: 0, x1: 2, y1: 0 }), "the end of the first block");
+        s.arrow((1, 0), false, true);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 4, y0: 0, x1: 4, y1: 0 }), "over the gap");
+    }
+
+    /// With the animation panel open the arrows measure in frames.
+    #[test]
+    fn the_arrows_step_one_frame() {
+        let mut s = keyboard_sheet();
+        s.sel = Sel::rect((0, 0), (1, 1));
+        s.open_anim_panel();
+        s.draft().unwrap().frame = [2, 2];
+        s.arrow((1, 0), false, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 2, y0: 0, x1: 3, y1: 1 }));
+        s.arrow((0, 1), true, false);
+        assert_eq!(s.sel.bounds(), Some(Area { x0: 2, y0: 0, x1: 3, y1: 3 }));
+    }
+
+    fn draft(cols: u32, rows: u32, frame: [u32; 2]) -> Draft {
+        Draft { area: Area { x0: 2, y0: 1, x1: 1 + cols, y1: rows }, frame, ms: 100 }
+    }
+
+    /// Whole frames fill the area from its top left corner. The cells they
+    /// miss stay outside the animation.
+    #[test]
+    fn whole_frames_fill_the_area_and_the_rest_is_spare() {
+        let d = draft(5, 3, [2, 2]);
+        assert_eq!(d.grid(), [2, 1]);
+        assert_eq!(d.count(), 2);
+        assert_eq!(d.used(), Some(Area { x0: 2, y0: 1, x1: 5, y1: 2 }));
+        let a = d.animation([8, 8]).unwrap();
+        assert_eq!((a.px, a.frame, a.count()), ([16, 8], [16, 16], 2));
+    }
+
+    /// A frame larger than the area fits nowhere, so nothing plays.
+    #[test]
+    fn a_frame_larger_than_the_area_plays_nothing() {
+        let d = draft(5, 3, [6, 1]);
+        assert_eq!(d.count(), 0);
+        assert_eq!(d.used(), None);
+        assert!(d.animation([8, 8]).is_none());
+    }
+
+    /// A new selection takes the nearest whole number of frames, and it stops
+    /// at the edge of the sheet.
+    #[test]
+    fn a_selection_grows_in_whole_frames() {
+        assert_eq!(snap_far(5, 5, 2, 9), 6, "the press alone takes one frame");
+        assert_eq!(snap_far(5, 6, 2, 9), 6);
+        assert_eq!(snap_far(5, 7, 2, 9), 8, "half a frame over rounds up");
+        assert_eq!(snap_far(5, 2, 2, 9), 2, "backwards as well");
+        assert_eq!(snap_far(6, 9, 3, 9), 8, "the edge cuts the second frame");
+        assert_eq!(snap_far(8, 9, 3, 9), 9, "no whole frame fits: keep the room");
+        assert_eq!(snap_far(1, 0, 3, 9), 0);
     }
 }
 
