@@ -1,0 +1,47 @@
+#!/bin/sh
+# Put the primary checkout back on `main`, and say where the work belongs instead.
+#
+# Several agents share this repository at the same time. Each one works in its own worktree under
+# `worktrees/`, and all of them read the primary checkout. A branch switch here changes the files
+# under every agent that did not ask for it, which is why this hook exists.
+#
+# Git has no hook that can refuse a checkout. `post-checkout` runs after the working tree is
+# written, and a `reference-transaction` hook that refuses the ref update leaves the files of the
+# new branch in place with HEAD still on the old one, which is worse. So this hook lets the switch
+# happen and then reverses it. Uncommitted work travels across and back with it.
+#
+# Git finds this file because `core.hooksPath` is set to `.githooks`. A fresh clone must set it
+# again: `git config core.hooksPath .githooks`.
+
+home=main
+
+# $3 is 1 for a branch switch, and 0 for `git checkout -- <path>`, which changes no branch.
+[ "$3" = 1 ] || exit 0
+
+# The one command a person means to move this checkout with, and the switch back below.
+[ -z "$MOVE_PRIMARY" ] || exit 0
+[ -z "$MOVE_PRIMARY_BACK" ] || exit 0
+
+# A linked worktree keeps its own git directory inside the common one, and may switch freely.
+[ "$(git rev-parse --absolute-git-dir)" = "$(cd "$(git rev-parse --git-common-dir)" && pwd)" ] || exit 0
+
+# A detached HEAD belongs to a rebase or a bisect, which put it there and takes it back itself.
+branch=$(git symbolic-ref --quiet --short HEAD) || exit 0
+
+[ "$branch" = "$home" ] || {
+    echo "" >&2
+    echo "This checkout stays on \`$home\`. Several agents read it, so a branch switch here changes" >&2
+    echo "the files under all of them. Work on \`$branch\` in a worktree of its own:" >&2
+    echo "" >&2
+    echo "    git worktree add worktrees/$branch $branch && cd worktrees/$branch" >&2
+    echo "" >&2
+    if MOVE_PRIMARY_BACK=1 git checkout --quiet "$home"; then
+        echo "This checkout is back on \`$home\`, and \`$branch\` is untouched." >&2
+    else
+        echo "The switch back failed. This checkout is on \`$branch\` and every agent sees that." >&2
+        echo "Run \`git checkout $home\` yourself." >&2
+    fi
+    echo "To move this checkout on purpose: \`MOVE_PRIMARY=1 git checkout <branch>\`." >&2
+    echo "" >&2
+}
+exit 0
