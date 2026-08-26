@@ -1,37 +1,34 @@
 # Tilepicky
 
-A small desktop tool to browse a large set of sprite sheets, search them, and
-copy tiles into tilesheets of your own. Each sheet has its own grid.
+You have a folder of sprite packs, and a map that needs a fence, three trees
+and a house. Tilepicky is a small desktop tool for getting those out of the
+packs and into a tilesheet of your own.
 
 <https://github.com/spookysys/tilepicky>
 
 ![A tilesheet of your own is built from two packs, found through the search box](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/demo.gif)
 
-That is the loop: open a tilesheet of your own, search the packs for what the
-map needs, select the tiles, hold the button until they lift, and carry them
-over. The sheets in the pictures are from [Kenney](https://kenney.nl) and
-from [ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites),
+That is the whole loop: open a sheet of your own, search the packs for what
+the map needs, select the tiles, hold the button until they lift, and carry
+them over. The sheets in the pictures are from [Kenney](https://kenney.nl)
+and from [ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites),
 both in the public domain (CC0).
 
 ## The library and the project
 
-Tilepicky works with two folders. It reads each one with all its subfolders.
+Two folders: the packs you collected, and the tilesheets you make. Tilepicky
+reads each one with all its subfolders.
 
-Your **library** holds the tilesheets and packs you collected. The
-tool helps you browse and search them, and copy what you need into your own
-tilesheets. It leaves the images as they are, and writes only a `tilepicky.json`
-that remembers their grids and animations.
+It never changes anything in your **library**. It only writes a
+`tilepicky.json` there, which remembers the grid and the animations you set
+on each sheet, so it can show them the same way next time. Your **project**
+is where it writes tilesheets, with a `tilepicky.json` of its own beside
+them.
 
-Your **project** holds the tilesheets you make and edit. The tool writes them
-there, with a `tilepicky.json` beside them.
-
-You can start the tool without a folder. A panel without a folder tells you
-so. Click in the panel to open the folder dialog. The right-click menu of each
-tree has the item "Set library folder" or "Set project folder". When a folder
-is set, the item reads "Change ...", and you can choose a different folder at
-any time. The tool stores both folders in `~/.config/tilepicky/settings.json`.
-
-You can also name them when you start the tool:
+Start the tool without folders and each panel will ask for one; click it, or
+use the right-click menu of either tree, and pick a different one whenever
+you like. Both paths are kept in `~/.config/tilepicky/settings.json`. You can
+also name them on the command line:
 
     cargo run --release -- [<library dir> [<project dir>]]
 
@@ -43,41 +40,27 @@ The tool draws with wgpu. Add `--glow` to draw with OpenGL instead.
     install -Dm644 tilepicky.desktop ~/.local/share/applications/tilepicky.desktop
     install -Dm644 icon.png ~/.local/share/icons/hicolor/128x128/apps/tilepicky.png
 
-The desktop entry runs `tilepicky` from your PATH, which `cargo install` puts
-in `~/.cargo/bin`. If your desktop session does not see that directory, write
-the whole path in the `Exec=` line. The entry gives the window its icon and
-its name in the dock.
+The desktop entry gives the window its name and icon in the dock. It runs
+`tilepicky` from your PATH, where `cargo install` puts it, in
+`~/.cargo/bin`. If your desktop session does not look there, write the whole
+path in the `Exec=` line.
 
 ## Layout
 
-The left column holds the search box, the tree of your library, and the tree
-of your project. Beside the search box, ☰ picks what the search matches on.
-The top panel, **Source**, shows the library sheet you opened. The bottom
-panel, **Canvas**, shows the tilesheet you are building.
+Files on the left, sheets on the right: **Source** above is the pack sheet
+you opened, **Canvas** below is the tilesheet you are building.
 
 ![The left column with both trees, the source sheet above, and the tilesheet being built below](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/screenshot.png)
 
-Each panel has a header line. It holds the grid fields, the zoom, the
-selection, the name of the sheet, and the tile under the pointer. At its
-right end sit the buttons that open the side panels. In your tilesheet,
-switch on the eye and hover over a tile, and a tooltip names the sheet its
-pixels came from:
+Each panel has a header line with its grid fields, its zoom, what you have
+selected, the name of the sheet, and the tile under the pointer. The buttons
+at the right end open the side panels.
 
-    kenney_tiny-town/Tilemap/tilemap_packed.png
-
-See "Provenance tracking" for how the tool remembers that.
-
-Your tilesheet also has an eye, `E`. With the eye on, the panel is for
-looking: hover over a place, and a tooltip says what it is; nothing there
-selects, drags, or edits until the eye is off again. The pixels that came
-from one sheet light up together under the pointer, and the tooltip names
-that sheet. The free area beside the sheet lights up the whole view and
-tells about the whole sheet: its name, its size in pixels and tiles, its
-file format and color type, and its animations. The eye is off at each
-start.
-
-Select tiles and press `A`, or click 🎬 in the header, and the
-animation panel opens on the right. See "Animations".
+Your tilesheet has an eye, `E`. Switch it on when you want to ask questions
+rather than make changes: hover over a tile and a tooltip names the pack its
+pixels came from, and every pixel from that same pack lights up with it.
+Hover beside the sheet and it tells you about the sheet as a whole. Nothing
+selects or edits while the eye is on, and it starts off.
 
 ## From the keyboard
 
@@ -129,12 +112,12 @@ packs by RafaelMatos, from a purchased copy.
 
 ## Formats
 
-The tool reads PNG, GIF, JPEG, WebP, BMP, and TGA. It writes one
-format only: 32 bit RGBA PNG with straight alpha.
+Tilepicky reads PNG, GIF, JPEG, WebP, BMP and TGA. It writes one format:
+32 bit RGBA PNG with straight alpha.
 
 ## The grid
 
-The header of each panel holds the grid fields. A sheet keeps its own values.
+Every sheet is read through a grid, and each sheet keeps its own.
 
 | Field | Meaning |
 | --- | --- |
@@ -142,12 +125,12 @@ The header of each panel holds the grid fields. A sheet keeps its own values.
 | gap | pixels between neighbouring tiles, `1` or `1x2` (Kenney sheets use 1) |
 | offset | pixels before the first tile, `4` or `4x8`; `-3` when the first tile starts before the edge |
 
-Every field takes the same three actions. Drag it left and right to adjust
-the first number, the width. A single number changes as one. A pair changes
-only its width. Turn the mouse wheel over it to adjust the second number, the
-height. A single `32` then becomes `32x48`. Click it to type any value.
+All three fields answer the same three gestures. Drag one sideways for the
+width, turn the wheel over it for the height, or click it and type. A field
+showing a single `32` means both, and changing the height alone makes it
+`32x48`.
 
-A new sheet starts with the tile size its library or project used last, or
+A new sheet starts at the tile size that library or project used last, or at
 32 px.
 
 ## Keys
@@ -158,108 +141,66 @@ A new sheet starts with the tile size its library or project used last, or
 | drag | select a range of tiles; near the edge of the view it scrolls |
 | press and hold ~250 ms | lift the tile under the pointer, or the whole selection, and drag it |
 | double click and drag | lift at once, without the wait |
-| drag an edge of the selection | move that edge; out of the selection adds tiles, into it removes them |
+| drag an edge of the selection | move that edge; outwards adds tiles, inwards removes them |
 | shift+click | select the rectangle from the last clicked tile to this one |
 | Ctrl+click | add or remove one tile |
 | Ctrl+shift+click | add that rectangle to the selection |
 | Ctrl+A | select the whole sheet |
-| arrows | leave the selection on the side you press, and take one tile there |
-| Shift+arrows | hold one corner of the selection and walk the other |
-| Ctrl+arrows | step to the end of the filled tiles, or over a gap to the next of them |
-| Alt+arrows | walk the whole selection, shape and all; the tiles stay where they are |
-| Tab | the next pane, to the right and then down |
-| Shift+Tab | the pane before it |
-| Ctrl+Tab | the other half of the window, LIBRARY or PROJECT, on the same pane |
 | right click | clear the selection; inside the selection it clears the tiles |
-| Ctrl+C | copy the selection of the active panel |
-| Ctrl+X | cut: copy, then clear the tiles (your tilesheet only) |
-| Ctrl+V | paste at the selected tile of your tilesheet |
-| Delete | clear the selection in your tilesheet |
-| arrows at the edge of a sheet | one more press hands the keys to what lies that way |
-| arrows on a sheet title | Right and Left walk the fields and buttons; Down goes back to the grid |
-| arrows in a file tree | move the cursor over the folders and files; nothing opens |
+| arrows | step the selection out of itself on the side you press |
+| Shift+arrows | hold one corner and walk the other |
+| Ctrl+arrows | jump to the end of the filled tiles, or across a gap to the next of them |
+| Alt+arrows | walk the whole selection, shape and all; the tiles stay put |
+| Tab, Shift+Tab | the next panel, or the one before |
+| Ctrl+Tab | the other half of the window, on the same kind of panel |
+| Ctrl+C, Ctrl+X, Ctrl+V | copy, cut, paste; cut and paste work on your tilesheet only |
+| Delete | clear the selected tiles of your tilesheet |
 | Enter or Space in a file tree | open the file under the cursor, or unfold the folder |
-| Right / Left in a file tree | open or close the folder you stand on |
+| Right, Left in a file tree | unfold and fold the folder you stand on |
 | A | open or close the animation panel |
 | M | store the animation under the selection, or unmark a stored one |
-| E | switch the eye of your tilesheet on or off |
-| Ctrl+, | open the settings |
-| Ctrl+Z | undo, in the sheet you are in |
-| Ctrl+Shift+Z, Ctrl+Y | take that step again |
-| Ctrl+S | save |
-| Ctrl+Shift+S | save as |
+| E | switch the eye on or off |
+| Ctrl+F | jump to the search box |
+| Ctrl+Z, Ctrl+Y | undo, and take the step again |
+| Ctrl+S, Ctrl+Shift+S | save, save as |
 | Ctrl+T | trim empty columns on the right and empty rows at the bottom |
-
-Undo holds the last 64 steps of a sheet, and a step is more than a change of
-pixels: the tile size, the gap, the offset, and every animation you store,
-unmark or change go on the same list. A run of grid changes counts as one
-step, so a drag over the tile field takes you back to where the drag began.
-The library sheet has its own list, since its grid and its animations are
-yours to change even though its pixels are not.
 | drag the right or bottom edge of the canvas | resize your tilesheet |
-| Ctrl+wheel, + / - | zoom |
+| Ctrl+wheel, `+` / `-` | zoom |
 | Escape | clear the selection, or cancel a drag |
 
-The window holds up to seven panes: two file trees, two sheets, the two
-animation panels while they are open, and the status bar. Tab walks them to
-the right and then down, and wraps: library tree, source sheet, source
-animation, project tree, project sheet, project animation, the status bar,
-and around again. Shift+Tab walks
-them the other way. Ctrl+Tab swaps the two halves of the window and stays on
-the same pane, so a tree meets a tree and a sheet meets a sheet. A pane that
-is not open is stepped over. The title of the pane that holds the keys is
-deep blue; the others are grey, and a sheet's selection follows its title:
-blue while the keys are on that grid, grey while they are elsewhere. A click puts the keys where you clicked.
+Undo keeps the last 64 steps of a sheet, and a step is more than a change of
+pixels: the tile size, the gap, the offset and every animation you store or
+change are all on the same list. A whole drag over the tile field counts as
+one step, so undo takes you back to where the drag began. The library sheet
+has a list of its own, since its grid and its animations are yours to change
+even though its pixels are not.
 
-Tab gives a pane back as you left it, and leaves you on its title the first
-time you go there. Ctrl+Tab lands where the work is: the grid of a sheet, the
-rows of a tree.
+While you drag a block, two keys change what the drop does. Ctrl copies, and
+leaves the tiles it came from where they are. Alt swaps: whatever lies where
+the block lands goes back to the place the block came from. A sign on the
+block says which is in force. A block from the library can only be copied,
+because the library never changes.
 
-Inside a pane the arrows move you to the nearest place that way on screen,
-and they never leave the pane. Only Tab does that. In a sheet the arrows
-belong to the selection; on the top row one more press upwards reaches the
-title, and from the title, or from any field beside it, Down goes back to the
-grid.
-
-In a file tree the arrows move a cursor, shown as a pale band. The file on
-show wears the solid colour, and the two are not the same thing: walking the
-tree changes nothing in the sheet panes. Press Enter, or Space, to open the
-file the cursor stands on, or to unfold the folder it stands on. A click opens a file
-as it always did. Hold Shift down for a whole run of arrows: the corner
-that walks is remembered while you hold it, so the selection grows and
-shrinks. Let Shift go, and the next run grows again on the side you press.
-With the animation panel open, every step above is one cell, not one tile.
-
-While you drag a block, two keys change what the drop does. Ctrl copies: the
-tiles it came from stay as they are. Alt exchanges the two places: what lies
-where the block lands travels back to the place the block came from. A sign
-in the corner of the block shows which one is in force. A block from the
-library panel can only be copied, because the library never changes.
-
-A drop on an empty tilesheet panel starts a new tilesheet. It takes the tile size
-of the block you dropped, and it asks for a name at the first save.
-
-Your tilesheet is written when you save it. Undo stays available while the tool
-runs.
+Drop a block on an empty tilesheet panel and it starts a new tilesheet, at
+the tile size of the block, and asks for a name when you first save it.
 
 ## Settings
 
 The gear at the right end of the status line, or `Ctrl+,`, opens the
-settings. A checkbox shows or hides the legend of keys in the lower left
-corner; a click on the legend hides it too, after a question. Settings go
-to `~/.config/tilepicky/settings.json`.
+settings. There is one so far: whether to show the legend of keys in the
+corner. Clicking the legend hides it too, after asking. Settings go to
+`~/.config/tilepicky/settings.json`.
 
 ## Files
 
-Both trees answer the same actions. The project tree also changes files; the
-library tree does not.
+Both trees answer the same actions, but only the project tree changes
+anything: the library is read and never written.
 
 | Action | Effect |
 | --- | --- |
 | click | open the file |
-| up, down | walk the files of the panel you last worked in, and open them |
-| Enter | open the file the group ends on |
-| shift+up, shift+down | grow the marked group in the project |
+| arrows | move the cursor; nothing opens until you press Enter |
+| Shift+up, Shift+down | grow the marked group in the project |
 | Ctrl+click, shift+click | mark one file, or a range |
 | drag across the files | mark every file the pointer crosses |
 | press and hold ~250 ms, then drag | carry the file, or the marked group, into a folder |
@@ -267,29 +208,28 @@ library tree does not.
 | right click a folder | new folder, rename, delete; open its location; copy its path |
 | right click the free space | new folder, refresh |
 
-A carried file moves into the folder under the pointer. Hold Ctrl on the drop
-to copy it instead. The book entry follows the file, and an open tilesheet
-keeps its identity when its own file moves. A name that the target folder
-holds already is refused, and the other files still move.
+A carried file moves into the folder under the pointer; hold Ctrl to copy it
+instead. Its entry in the book follows it, and a tilesheet you have open
+keeps its identity when its file moves. A name the target folder already
+holds is refused, and the other files still move.
 
-"Open location" asks the desktop's file manager to show the file. "Copy
-relative path" writes the path as you would type it in the directory where
-tilepicky runs; "Copy absolute path" writes the whole path, with your home
-directory as `~`.
+"Open location" asks your file manager to show the file. "Copy relative
+path" gives the path as you would type it from where tilepicky runs; "Copy
+absolute path" gives the whole path, with your home directory as `~`.
 
 ## Search
 
-Type words in the search box. The trees show only the files whose path holds
-every word: a word matches when it is the prefix of a word in a file or
-folder name. The ☰ button beside the box picks what the search matches on:
-folder names, file names, or both.
+Type words in the box, and the trees show only the files whose path holds
+every one of them. A word matches from the start: `gra` finds `grass`. The
+☰ button beside the box chooses whether to match folder names, file names,
+or both. It searches your own tilesheets by the same rules.
 
 ## tilepicky.json
 
-The library and the project each hold one `tilepicky.json` in their top
-folder. It describes every sheet in the tree below: the grid (tile size, gap,
-offset), where the pixels came from, and animations. The sheets are keyed by
-their path from the top folder, and `tile` at the start of the file is the
+The library and the project each keep one `tilepicky.json` in their top
+folder. It is the book of that tree: for every sheet, the grid it is read
+through, where its pixels came from, and its animations. Sheets are keyed by
+their path from the top folder, and `tile` at the head of the file is the
 size that tree used last.
 
     {
@@ -316,24 +256,26 @@ One number stands for both axes. For `frames`, one number means one row.
 
 ## Tile sizes
 
-A library sheet and your tilesheet may use different tile sizes. A copy is pixel for
-pixel: the block lands with its top-left on the target tile and is padded
-with transparent pixels to whole tiles. Provenance and animations are pixel
-records, so the tile size does not touch them. Changing the tile size of a
-sheet only changes the grid you see and the tiles you can select.
+A pack and your tilesheet need not agree on tile size. A copy is pixel for
+pixel: the block lands with its top left corner on the tile you chose, and
+transparent pixels pad it out to whole tiles. Changing a sheet's tile size
+changes only the grid you see and the tiles you can pick; it moves no pixels,
+and leaves provenance and animations alone, because both are kept in pixels.
 
 ## Provenance tracking
 
-A tilesheet is a `name.png` with its entry in `tilepicky.json`. The entry
-remembers where every pixel came from. A block you copy from a library sheet
-carries the path of that sheet. A block you copy from another tilesheet keeps
-the origin it had. With the eye on, hover over a tile, and a tooltip names
-its origin. In the entry, `provenance` lists per source sheet the pixel
-rectangles `[x, y, w, h]` of your tilesheet that hold pixels from it.
+Your tilesheet remembers where each of its pixels came from. Copy a block
+out of a pack and it carries the name of that pack; copy it on from one
+tilesheet to another and the original name goes with it. Switch on the eye
+and hover, and a tooltip tells you:
 
-The search box works on your tilesheets too, with the same rules.
+    kenney_tiny-town/Tilemap/tilemap_packed.png
+
+Six months later, when you want three more tiles in that style, you can ask
+the sheet where it got them. In the book, `provenance` lists for each source
+the pixel rectangles `[x, y, w, h]` of your sheet that came from it.
 
 ## Licence
 
-Tilepicky is free software under the GNU General Public License, version 3. The
-whole text is in `LICENSE`.
+Tilepicky is free software under the GNU General Public License, version 3.
+The whole text is in `LICENSE`.
