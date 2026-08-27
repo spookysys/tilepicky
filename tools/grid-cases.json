@@ -27,6 +27,24 @@
         16
       ],
       "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/armm1998_zelda-like/gfx/cave.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/armm1998_zelda-like/gfx/character.png",
+      "tile": [
+        16,
+        32
+      ],
+      "kind": "sprites",
       "expect": "fail"
     },
     {

@@ -34,10 +34,24 @@
 //! starting at its corner with its tiles touching until they can be found
 //! as surely as the pitch.
 //!
+//! The two axes then help each other. A sheet is one picture, and a pitch
+//! that runs across it usually runs down it as well, so a pitch both axes
+//! support is worth more than a pitch one of them merely prefers. Where an
+//! axis cannot make up its mind, and a tileset of soft edges often cannot,
+//! the other axis breaks the tie. An axis that is sure keeps its own
+//! answer, because a sprite is often taller than it is wide.
+//!
 //! Last, the sheet must convince. A mockup or a splash screen holds no
 //! grid, and a search always returns something. A pitch that does not stand
 //! clear of the noise is dropped, and the sheet is read as one whole tile,
 //! which is what a picture with nothing to divide is.
+//!
+//! Two other measurements were tried on the same fold and both were
+//! dropped, so that nobody spends the day again: how much ink each line
+//! holds, and how much that ink varies along the line. Each one helps a
+//! sheet or two, a font most of all, and each costs more sheets than it
+//! saves. Pooled with the difference they scored 7 of 17 against 10, and
+//! the difference alone is what the code keeps.
 
 use image::{Rgba, RgbaImage};
 
@@ -53,10 +67,13 @@ pub struct Axis {
 const MIN_TILE: u32 = 4;
 /// A tile larger than this is one picture, not a sheet.
 const MAX_TILE: u32 = 512;
-/// How much better than nothing a pitch must account for. A pitch that
-/// explains nothing scores about one, whatever its size, so this asks for
-/// several times that.
+/// How much better than nothing a pitch must account for on its own. A
+/// pitch that explains nothing scores about one, whatever its size, so this
+/// asks for several times that.
 const SURE: f32 = 5.0;
+/// What a pitch must account for when the other axis names it too. Two
+/// axes that agree are two measurements, so each needs to say less.
+const AGREE: f32 = 2.0;
 
 /// Reads the grid off the pixels, and off nothing else.
 pub fn grid(img: &RgbaImage) -> (Axis, Axis) {
@@ -67,7 +84,15 @@ pub fn grid(img: &RgbaImage) -> (Axis, Axis) {
     let dy: Vec<f32> = (0..h.saturating_sub(1))
         .map(|y| (0..w).map(|x| diff(img.get_pixel(x, y), img.get_pixel(x, y + 1))).sum::<f32>() / w as f32)
         .collect();
-    (axis(&dx, w), axis(&dy, h))
+    let (fx, fy) = (profile(&dx, w), profile(&dy, h));
+    // The pitch both axes support: the one whose weaker showing is the
+    // strongest. Taking the weaker of the two makes this a test of
+    // agreement, not of one loud axis carrying a quiet one.
+    let both = (0..fx.len().min(fy.len()))
+        .max_by(|&a, &b| fx[a].min(fy[a]).total_cmp(&fx[b].min(fy[b])))
+        .filter(|&i| fx[i].min(fy[i]) >= AGREE)
+        .map(|i| i as u32 + MIN_TILE);
+    (axis(&fx, w, both), axis(&fy, h, both))
 }
 
 /// How much two pixels differ. Colour under a transparent pixel is never
@@ -103,36 +128,39 @@ fn fold(d: &[f32], pitch: u32, mean: f32, total: f32, slot: &mut Vec<f32>) -> f3
     (held / (p - 1) as f32) / (left / (n - p) as f32)
 }
 
-/// The best grid for one axis. `flat` is how many lines at the near edge
-/// hold one colour, which says whether an offset runs forward or back.
-/// `len` is the length of the axis, which is the answer when no pitch
-/// convinces: a sheet that does not divide is one tile.
-fn axis(d: &[f32], len: u32) -> Axis {
-    let whole = Axis { tile: len.max(1), gap: 0, offset: 0 };
+/// How much each pitch from `MIN_TILE` upwards accounts for, on one axis.
+fn profile(d: &[f32], len: u32) -> Vec<f32> {
     let high = (len / 2).min(MAX_TILE);
     if d.is_empty() || high < MIN_TILE {
-        return whole;
+        return Vec::new();
     }
     let mean = d.iter().sum::<f32>() / d.len() as f32;
     let total: f32 = d.iter().map(|v| (v - mean) * (v - mean)).sum();
     if total <= f32::EPSILON {
-        return whole;
+        return Vec::new();
     }
-
-    // How much of the signal each pitch accounts for.
     let mut slot = Vec::new();
-    let (mut pitch, mut top) = (0, 0.0);
-    for p in MIN_TILE..=high {
-        let f = fold(d, p, mean, total, &mut slot);
-        if f > top {
-            (pitch, top) = (p, f);
-        }
-    }
-    // The pixels decide only when they stand clear of the noise. A pitch
-    // that accounts for nothing scores about one, whatever its size.
-    if top < SURE || pitch == 0 {
+    (MIN_TILE..=high).map(|p| fold(d, p, mean, total, &mut slot)).collect()
+}
+
+/// The grid of one axis. `len` is the length of the axis, which is the
+/// answer when no pitch convinces: a sheet that does not divide is one
+/// tile. `both` is the pitch the two axes agree on, if there is one.
+fn axis(f: &[f32], len: u32, both: Option<u32>) -> Axis {
+    let whole = Axis { tile: len.max(1), gap: 0, offset: 0 };
+    let Some(at) = (0..f.len()).max_by(|&a, &b| f[a].total_cmp(&f[b])) else {
         return whole;
-    }
+    };
+    // An axis speaks for itself when it is sure. When it is not, a pitch
+    // the other axis names as well needs to say less to be believed.
+    let pitch = if f[at] >= SURE {
+        at as u32 + MIN_TILE
+    } else {
+        match both {
+            Some(p) if f.get((p - MIN_TILE) as usize).is_some_and(|&v| v >= AGREE) => p,
+            _ => return whole,
+        }
+    };
 
     // The gap and the offset are not read yet. A pitch is hard enough to
     // find on its own, and a wrong offset moves every tile on the screen,
