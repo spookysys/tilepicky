@@ -10,9 +10,10 @@
 # Wayland, EGL and DBus are all opened at runtime rather than linked, and the
 # finished binary needs nothing but libc, libm and libgcc.
 #
-# The test that follows the build does install two, because a build machine
-# has neither a screen nor a graphics driver. Every desktop has both, so this
-# is the cost of testing here, not a cost to the person who downloads.
+# The test that follows the build does install some, because a build machine
+# has no screen, no graphics driver and no keyboard library. Every desktop
+# has all three, so they are the cost of testing here, not a cost to the
+# person who downloads.
 
 name: release
 
@@ -73,9 +74,11 @@ jobs:
       # A binary that links is not a binary that runs. Start it, wait, and
       # fail if it went away by itself. This runs before the packing, so a
       # binary that cannot open its window never reaches the release.
-      - name: Lend Linux a screen and a driver
+      - name: Lend Linux a screen, a driver and a keyboard
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb libegl1 libgl1
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libegl1 libgl1 libxkbcommon-x11-0
 
       - name: Run it
         shell: bash
