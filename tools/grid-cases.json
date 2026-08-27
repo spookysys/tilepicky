@@ -1,0 +1,206 @@
+{
+  "note": [
+    "Sheets whose grid we know, for checking the reader in src/detect.rs.",
+    "The packs are not in the repository, so a case whose file is missing is",
+    "skipped rather than failed. Add a case whenever a sheet reads wrong.",
+    "'kind' says what a sheet is: a grid of tiles, a strip of sprites, or a",
+    "picture with no grid at all, where the numbers are only what was chosen.",
+    "'expect' is what the reader does today. A case marked pass must keep",
+    "passing. A case marked fail is a known weakness, and turning one into a",
+    "pass is the work. The reader finds only the pitch so far, so a case is",
+    "checked on tile plus gap, not on the two apart."
+  ],
+  "cases": [
+    {
+      "file": "assets/armm1998_zelda-like/gfx/Overworld.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/armm1998_zelda-like/gfx/Inner.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "tiles",
+      "expect": "fail"
+    },
+    {
+      "file": "assets/armm1998_zelda-like/gfx/font.png",
+      "tile": [
+        8,
+        8
+      ],
+      "kind": "tiles",
+      "expect": "fail"
+    },
+    {
+      "file": "assets/armm1998_zelda-like/gfx/log.png",
+      "tile": [
+        32,
+        32
+      ],
+      "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/armm1998_zelda-like/gfx/NPC_test.png",
+      "tile": [
+        16,
+        32
+      ],
+      "kind": "sprites",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/kenney_tiny-town/Tilemap/tilemap.png",
+      "tile": [
+        16,
+        16
+      ],
+      "gap": [
+        1,
+        1
+      ],
+      "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/kenney_tiny-dungeon/Tilemap/tilemap.png",
+      "tile": [
+        16,
+        16
+      ],
+      "gap": [
+        1,
+        1
+      ],
+      "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/kenney_tiny-dungeon/Tilemap/tilemap_packed.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "tiles",
+      "expect": "fail"
+    },
+    {
+      "file": "assets/kenney_roguelike-caves/Spritesheet/roguelikeDungeon_magenta.png",
+      "tile": [
+        16,
+        16
+      ],
+      "gap": [
+        1,
+        1
+      ],
+      "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/kenney_roguelike-caves/Spritesheet/roguelikeDungeon_transparent.png",
+      "tile": [
+        16,
+        16
+      ],
+      "gap": [
+        1,
+        1
+      ],
+      "kind": "tiles",
+      "expect": "pass"
+    },
+    {
+      "file": "assets/kenney_tiny-town/Tiles/tile_0001.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "one tile",
+      "expect": "pass"
+    },
+    {
+      "file": "mytilesheets/town.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "tiles",
+      "expect": "fail"
+    },
+    {
+      "file": "mytilesheets/dungeon.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "tiles",
+      "expect": "fail"
+    },
+    {
+      "file": "mytilesheets/characters.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "sprites",
+      "expect": "fail"
+    },
+    {
+      "file": "mytilesheets/overworld/grass.png",
+      "tile": [
+        8,
+        8
+      ],
+      "kind": "tiles",
+      "expect": "fail"
+    },
+    {
+      "file": "assets/erw/erw_ancient_ruins/Mockups/mockup-1.gif",
+      "tile": [
+        32,
+        32
+      ],
+      "kind": "no grid",
+      "expect": "fail"
+    },
+    {
+      "file": "assets/splash1.webp",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "no grid",
+      "expect": "fail"
+    },
+    {
+      "file": "assets/erw/erw_ancient_ruins/Characters/Moose/moose1-all animations-347x192.png",
+      "tile": [
+        16,
+        16
+      ],
+      "kind": "sprites",
+      "expect": "fail"
+    },
+    {
+      "file": "assets/erw/erw_crypt/Props/animated/hole in the wall - fire projectile launcher-firing1.png",
+      "tile": [
+        25,
+        25
+      ],
+      "offset": [
+        12,
+        12
+      ],
+      "kind": "sprites",
+      "expect": "fail"
+    }
+  ]
+}

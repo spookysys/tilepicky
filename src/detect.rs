@@ -9,38 +9,35 @@
 //! differs from the column to its right, down the whole height. A boundary
 //! between tiles stands where that number is large.
 //!
-//! A column either holds a boundary or it does not, so the signal becomes
-//! yes or no: loud enough to stand out of the sheet, or not. This keeps one
-//! very loud edge, the kind an empty margin makes against a solid tile,
-//! from speaking for a whole slot.
+//! Then fold that signal onto itself. For a candidate pitch, gather every
+//! sample that falls in the same slot of the fold. If the pitch is the true
+//! one, the samples in a slot agree with each other, because they are the
+//! same place in the tile seen again and again.
 //!
-//! Then fold that onto itself. For a candidate pitch, gather every sample
-//! that falls in the same slot of the fold, and ask what share of them are
-//! boundaries. The true pitch drops every boundary into one slot, so its
-//! best slot answers yes nearly every time.
+//! Do not ask whether one slot is loud. A tileset parts on a loud line,
+//! where one colour meets another. A sheet of sprites parts on an empty
+//! one, where nothing is drawn at all and the difference falls to zero.
+//! Loud and quiet are the same fact: the sheet repeats. So ask instead how
+//! much of the whole signal the fold accounts for, against how much it
+//! leaves over. That one question answers both kinds of sheet.
 //!
-//! Share alone is not enough, because how often a slot was asked matters as
-//! much as how often it said yes. A pitch of twice the truth answers yes
-//! every time too, on half as many turns. A pitch of half the truth is
-//! asked twice as often and says yes half the time. Weighing the share by
-//! the root of the turns separates all three, and it is the same weighing
-//! that a proportion always needs: an answer from two turns is a guess, and
-//! an answer from fifty is a measurement.
+//! Asking it that way also pays for itself. A fold of five hundred slots
+//! can account for almost anything, so the account is divided by the slots
+//! it used and the leftover by the samples that remain. The ratio of the
+//! two is near one when a pitch explains nothing, whatever its size, and it
+//! climbs only when a pitch is real.
 //!
-//! The rest reads off the fold. A gap makes two slots tall instead of one:
-//! the tile ends against the gap, and the gap ends against the next tile.
-//! The way round from one to the other is the gap, the pitch less the gap
-//! is the tile, and a tile opens one place after the slot that closes the
-//! gap.
-//!
-//! One thing the fold cannot tell is whether the pixels before the first
-//! tile are a margin or a tile that the edge cut. The near columns of the
-//! image answer it: flat colour is a margin, and anything else is a tile
-//! that starts before the edge, which is an offset below zero.
+//! Only the pitch is read. A gap and an offset can be read off the same
+//! fold, and an earlier version did, but they were guessed from the same
+//! evidence that had already been spent on the pitch, and they were wrong
+//! often enough to move every tile on the screen. A sheet is read as
+//! starting at its corner with its tiles touching until they can be found
+//! as surely as the pitch.
 //!
 //! Last, the sheet must convince. A mockup or a splash screen holds no
-//! grid, and a search always returns something, so a grid that does not
-//! stand clear of the noise gives way to the size the folder used last.
+//! grid, and a search always returns something. A pitch that does not stand
+//! clear of the noise is dropped, and the sheet is read as one whole tile,
+//! which is what a picture with nothing to divide is.
 
 use image::{Rgba, RgbaImage};
 
@@ -52,21 +49,17 @@ pub struct Axis {
     pub offset: i32,
 }
 
-/// The most a gap is ever likely to be.
-const MAX_GAP: u32 = 8;
 /// Below this, a tile is not a tile.
 const MIN_TILE: u32 = 4;
 /// A tile larger than this is one picture, not a sheet.
 const MAX_TILE: u32 = 512;
-/// How tall a second slot must stand to be the far side of a gap.
-const PEAK: f32 = 0.5;
-/// How many standard errors the grid needs before the pixels decide. Below
-/// this they have not made their case.
-const SURE: f32 = 8.0;
+/// How much better than nothing a pitch must account for. A pitch that
+/// explains nothing scores about one, whatever its size, so this asks for
+/// several times that.
+const SURE: f32 = 5.0;
 
-/// Reads the grid off the pixels. `hint` is the tile size the folder used
-/// last, which decides a sheet that the pixels cannot.
-pub fn grid(img: &RgbaImage, hint: [u32; 2]) -> (Axis, Axis) {
+/// Reads the grid off the pixels, and off nothing else.
+pub fn grid(img: &RgbaImage) -> (Axis, Axis) {
     let (w, h) = (img.width(), img.height());
     let dx: Vec<f32> = (0..w.saturating_sub(1))
         .map(|x| (0..h).map(|y| diff(img.get_pixel(x, y), img.get_pixel(x + 1, y))).sum::<f32>() / h as f32)
@@ -74,10 +67,7 @@ pub fn grid(img: &RgbaImage, hint: [u32; 2]) -> (Axis, Axis) {
     let dy: Vec<f32> = (0..h.saturating_sub(1))
         .map(|y| (0..w).map(|x| diff(img.get_pixel(x, y), img.get_pixel(x, y + 1))).sum::<f32>() / w as f32)
         .collect();
-    // How many lines at the near edge hold one colour.
-    let flat_x = (0..w).take_while(|&x| (1..h).all(|y| img.get_pixel(x, y) == img.get_pixel(x, 0))).count() as u32;
-    let flat_y = (0..h).take_while(|&y| (1..w).all(|x| img.get_pixel(x, y) == img.get_pixel(0, y))).count() as u32;
-    (axis(&dx, flat_x, hint[0]), axis(&dy, flat_y, hint[1]))
+    (axis(&dx, w), axis(&dy, h))
 }
 
 /// How much two pixels differ. Colour under a transparent pixel is never
@@ -88,90 +78,67 @@ fn diff(a: &Rgba<u8>, b: &Rgba<u8>) -> f32 {
     (a[3] as f32 - b[3] as f32).abs() + colour * seen
 }
 
-/// Folds the signal onto one pitch and leaves the share of each slot in
-/// `slot`. Returns how many whole turns the fold made.
-fn fold(d: &[f32], pitch: u32, slot: &mut Vec<f32>) -> u32 {
-    let p = pitch as usize;
+/// Folds the signal onto one pitch and leaves the mean of each slot in
+/// `slot`. Returns how much of the signal that fold accounts for, against
+/// what it leaves over, with both divided by what they cost.
+fn fold(d: &[f32], pitch: u32, mean: f32, total: f32, slot: &mut Vec<f32>) -> f32 {
+    let (p, n) = (pitch as usize, d.len());
     slot.clear();
     slot.resize(p, 0.0);
     for (i, v) in d.iter().enumerate() {
         slot[i % p] += v;
     }
     // The last turn is short, so the first slots hold one sample more.
-    let (turns, over) = (d.len() / p, d.len() % p);
+    let over = n % p;
+    let mut held = 0.0;
     for (k, v) in slot.iter_mut().enumerate() {
-        *v /= (turns + usize::from(k < over)).max(1) as f32;
+        let turns = (n / p + usize::from(k < over)).max(1);
+        *v /= turns as f32;
+        held += turns as f32 * (*v - mean) * (*v - mean);
     }
-    turns as u32
-}
-
-/// The tallest slot, and the tallest one somewhere else.
-fn two_peaks(slot: &[f32]) -> (usize, usize) {
-    let top = (0..slot.len()).max_by(|&a, &b| slot[a].total_cmp(&slot[b])).unwrap_or(0);
-    let next = (0..slot.len()).filter(|&k| k != top).max_by(|&a, &b| slot[a].total_cmp(&slot[b])).unwrap_or(top);
-    (top, next)
+    if p < 2 || n <= p {
+        return 0.0;
+    }
+    let left = (total - held).max(f32::EPSILON);
+    (held / (p - 1) as f32) / (left / (n - p) as f32)
 }
 
 /// The best grid for one axis. `flat` is how many lines at the near edge
 /// hold one colour, which says whether an offset runs forward or back.
-fn axis(d: &[f32], flat: u32, hint: u32) -> Axis {
-    let len = d.len() as u32 + 1;
-    let fallback = Axis { tile: hint.clamp(MIN_TILE, len.max(MIN_TILE)), gap: 0, offset: 0 };
-    let high = (len / 2).min(MAX_TILE + MAX_GAP);
+/// `len` is the length of the axis, which is the answer when no pitch
+/// convinces: a sheet that does not divide is one tile.
+fn axis(d: &[f32], len: u32) -> Axis {
+    let whole = Axis { tile: len.max(1), gap: 0, offset: 0 };
+    let high = (len / 2).min(MAX_TILE);
     if d.is_empty() || high < MIN_TILE {
-        return fallback;
+        return whole;
     }
     let mean = d.iter().sum::<f32>() / d.len() as f32;
-    let sd = (d.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d.len() as f32).sqrt();
-    if sd <= f32::EPSILON {
-        return fallback;
+    let total: f32 = d.iter().map(|v| (v - mean) * (v - mean)).sum();
+    if total <= f32::EPSILON {
+        return whole;
     }
-    // Loud enough to be a boundary, or not. What share of a sheet answers
-    // yes is what a slot has to beat.
-    let hot: Vec<f32> = d.iter().map(|v| f32::from(*v >= mean + sd)).collect();
-    let share = hot.iter().sum::<f32>() / hot.len() as f32;
-    if share <= 0.0 || share >= 1.0 {
-        return fallback;
-    }
-    let error = (share * (1.0 - share)).sqrt();
 
-    // How far each pitch stands above chance, in standard errors.
+    // How much of the signal each pitch accounts for.
     let mut slot = Vec::new();
     let (mut pitch, mut top) = (0, 0.0);
     for p in MIN_TILE..=high {
-        let turns = fold(&hot, p, &mut slot);
-        let z = (slot[two_peaks(&slot).0] - share) * (turns as f32).sqrt() / error;
-        if z > top {
-            (pitch, top) = (p, z);
+        let f = fold(d, p, mean, total, &mut slot);
+        if f > top {
+            (pitch, top) = (p, f);
         }
     }
-    // The pixels decide only when they stand clear of the noise.
-    if top < SURE {
-        return fallback;
+    // The pixels decide only when they stand clear of the noise. A pitch
+    // that accounts for nothing scores about one, whatever its size.
+    if top < SURE || pitch == 0 {
+        return whole;
     }
 
-    fold(&hot, pitch, &mut slot);
-    let (top, next) = two_peaks(&slot);
-    let p = slot.len();
-    let (ahead, back) = ((next + p - top) % p, (top + p - next) % p);
-    // The way round to the second slot is the gap, and the way back is the
-    // tile, so the gap is the shorter of the two.
-    let paired = next != top && slot[next] >= slot[top] * PEAK && ahead.min(back) <= MAX_GAP as usize;
-    let (gap, closes) = match (paired, ahead <= back) {
-        (true, true) => (ahead as u32, next),
-        (true, false) => (back as u32, top),
-        (false, _) => (0, top),
-    };
-    if pitch <= gap || pitch - gap < MIN_TILE {
-        return fallback;
-    }
-    // A tile opens one place after the slot that closes the gap.
-    let offset = (closes as u32 + 1) % pitch;
-    // Flat colour before the first tile is a margin. Anything else is a
-    // tile that the edge cut, and that offset runs back, not forward.
-    let back = offset > 0 && flat < offset;
-    let offset = if back { offset as i32 - pitch as i32 } else { offset as i32 };
-    Axis { tile: pitch - gap, gap, offset }
+    // The gap and the offset are not read yet. A pitch is hard enough to
+    // find on its own, and a wrong offset moves every tile on the screen,
+    // so until they are as sure as the pitch is, a sheet starts at its
+    // corner with its tiles touching.
+    Axis { tile: pitch, gap: 0, offset: 0 }
 }
 
 #[cfg(test)]
@@ -199,16 +166,18 @@ mod tests {
 
     #[test]
     fn it_reads_a_plain_grid() {
-        let (x, y) = grid(&flat(16, 0, 0, 8), [8, 8]);
+        let (x, y) = grid(&flat(16, 0, 0, 8));
         assert_eq!(x, Axis { tile: 16, gap: 0, offset: 0 });
         assert_eq!(y, Axis { tile: 16, gap: 0, offset: 0 });
     }
 
+    /// A gap is part of the pitch, and the pitch is all we read for now,
+    /// so a sheet of 16 with a gap of 2 reads as 18.
     #[test]
-    fn it_reads_the_gap_and_the_offset() {
-        let (x, y) = grid(&flat(16, 2, 3, 8), [8, 8]);
-        assert_eq!(x, Axis { tile: 16, gap: 2, offset: 3 });
-        assert_eq!(y, Axis { tile: 16, gap: 2, offset: 3 });
+    fn a_gap_counts_into_the_pitch() {
+        let (x, y) = grid(&flat(16, 2, 3, 8));
+        assert_eq!(x.tile, 18);
+        assert_eq!(y.tile, 18);
     }
 
     /// A sheet need not end on a whole tile. Slack at the far edge used to
@@ -219,15 +188,17 @@ mod tests {
         let img = RgbaImage::from_fn(tiles.width() + 9, tiles.height() + 9, |x, y| {
             if x < tiles.width() && y < tiles.height() { *tiles.get_pixel(x, y) } else { Rgba([0, 0, 0, 0]) }
         });
-        assert_eq!(grid(&img, [8, 8]).0, Axis { tile: 16, gap: 0, offset: 0 });
+        assert_eq!(grid(&img).0, Axis { tile: 16, gap: 0, offset: 0 });
     }
 
-    /// A tile that the edge cut sits at an offset below zero.
+    /// The pitch holds even when the first tile is cut by the edge. Where
+    /// the grid then starts is a question for the offset, which is not read
+    /// yet.
     #[test]
-    fn a_cut_first_tile_offsets_backwards() {
+    fn a_cut_first_tile_keeps_the_pitch() {
         let whole = flat(16, 0, 0, 9);
         let img = RgbaImage::from_fn(whole.width() - 6, whole.height(), |x, y| *whole.get_pixel(x + 6, y));
-        assert_eq!(grid(&img, [8, 8]).0, Axis { tile: 16, gap: 0, offset: -6 });
+        assert_eq!(grid(&img).0.tile, 16);
     }
 
     /// Tiles drawn at 32 with no seam down the middle. Half of a 16 grid
@@ -240,7 +211,7 @@ mod tests {
             let base = ((tx * 4 + ty) as u8).wrapping_mul(37);
             Rgba([base.wrapping_add(ramp), 120, 200, 255])
         });
-        assert_eq!(grid(&img, [8, 8]).0.tile, 32);
+        assert_eq!(grid(&img).0.tile, 32);
     }
 
     /// A checkerboard of 16. A 32 grid holds a loud line inside every tile,
@@ -251,13 +222,48 @@ mod tests {
             let c = if (x / 16 + y / 16) % 2 == 0 { 240 } else { 30 };
             Rgba([c, c, c, 255])
         });
-        assert_eq!(grid(&img, [64, 64]).0.tile, 16);
+        assert_eq!(grid(&img).0.tile, 16);
     }
 
-    /// Nothing to read: the pixels say nothing, so the hint stands.
+    /// The sheets of the real packs, from `tools/grid-cases.json`. The packs
+    /// are not in the repository, so a case whose file is missing is skipped
+    /// and this passes quietly on a machine without them.
+    ///
+    /// A case marked `pass` must keep passing. A case marked `fail` is a
+    /// known weakness: it only prints, so that turning one into a pass is
+    /// visible work rather than a broken build.
     #[test]
-    fn an_empty_sheet_keeps_the_hint() {
+    fn the_real_packs_read_as_they_did() {
+        let Ok(text) = std::fs::read_to_string("tools/grid-cases.json") else { return };
+        let book: serde_json::Value = serde_json::from_str(&text).expect("grid-cases.json");
+        let cases = book["cases"].as_array().expect("cases");
+        let (mut broke, mut read) = (Vec::new(), 0);
+        for case in cases {
+            let file = case["file"].as_str().unwrap_or_default();
+            let Ok(img) = image::open(file) else { continue };
+            read += 1;
+            let two = |name: &str| -> [u32; 2] {
+                let v = &case[name];
+                [0, 1].map(|i| v[i].as_u64().unwrap_or(0) as u32)
+            };
+            let (tile, gap) = (two("tile"), two("gap"));
+            let want = [tile[0] + gap[0], tile[1] + gap[1]];
+            let (x, y) = grid(&img.to_rgba8());
+            let got = [x.tile, y.tile];
+            match (case["expect"].as_str() == Some("pass"), got == want) {
+                (true, false) => broke.push(format!("{file}: wanted pitch {want:?}, read {got:?}")),
+                (false, true) => println!("now right, mark it pass: {file}"),
+                _ => {}
+            }
+        }
+        println!("read {read} of {} cases; the rest are not on this machine", cases.len());
+        assert!(broke.is_empty(), "these read differently than before:\n  {}", broke.join("\n  "));
+    }
+
+    /// Nothing to read. A picture with nothing to divide is one tile.
+    #[test]
+    fn an_empty_sheet_is_one_tile() {
         let img = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 0]));
-        assert_eq!(grid(&img, [24, 24]).0.tile, 24);
+        assert_eq!(grid(&img).0, Axis { tile: 64, gap: 0, offset: 0 });
     }
 }

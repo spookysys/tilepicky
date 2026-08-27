@@ -693,14 +693,17 @@ impl Sheet {
 
     pub fn new_empty(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], cols: u32, rows: u32) -> Self {
         let img = RgbaImage::new(cols * tile[0], rows * tile[1]);
-        Self::from_image(ctx, dir, rel, tile, img, Sidecar::default())
+        // The tile size of a new sheet is chosen, not read: it goes in as an
+        // entry, so nothing tries to find a grid in an empty picture.
+        let side = Sidecar { tile: Some(Pair::of(tile)), ..Sidecar::default() };
+        Self::from_image(ctx, dir, rel, tile, img, side)
     }
 
     fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], img: RgbaImage, side: Sidecar) -> Self {
-        // A sheet the book has never seen gets its grid read off its pixels,
-        // with the size this folder used last as the hint. An entry in the
-        // book always wins: it holds what a person chose.
-        let read = side.tile.is_none().then(|| detect::grid(&img, tile));
+        // A sheet the book has never seen gets its grid read off its
+        // pixels, and off nothing else. An entry in the book always wins:
+        // it holds what a person chose.
+        let read = side.tile.is_none().then(|| detect::grid(&img));
         let tile = side.tile.map(Pair::xy).unwrap_or_else(|| read.map_or(tile, |(x, y)| [x.tile, y.tile]));
         let gap = side.gap.map(Pair::xy).unwrap_or_else(|| read.map_or([0, 0], |(x, y)| [x.gap, y.gap]));
         let found = read.map_or([0, 0], |(x, y)| [x.offset, y.offset]);

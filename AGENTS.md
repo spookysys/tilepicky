@@ -8,9 +8,12 @@ the person who uses the tool; this file is for an agent that works on it.
 
 - `cargo run --release -- [<library dir> [<project dir>]]` starts the tool.
   `--glow` draws with OpenGL instead of wgpu.
-- `cargo test` runs the unit tests. A test writes its own files under the
-  temp dir; it does not read `assets/` or `mytiles/`, which are not in the
-  repository.
+- `cargo test` runs the unit tests. Most write their own files under the
+  temp dir. One reads the real packs: `the_real_packs_read_as_they_did`
+  checks `src/detect.rs` against `tools/grid-cases.json`, and skips every
+  case whose file is not on this machine, so it passes where the packs are
+  missing. Add a case there whenever a sheet reads wrong, and mark it
+  `fail`; turning one into a `pass` is the work.
 - `cargo clippy --all-targets` reports 20 old "collapsible if" warnings.
   Do not add to them.
 - The tree is not rustfmt-clean. Do not run `cargo fmt` on a whole file.
@@ -25,7 +28,7 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: the grid of
   each sheet, where its pixels came from, and its animations.
 - `src/index.rs`: the scan of a folder, and the search.
-- `src/detect.rs`: reads the grid of a sheet that the book does not know.
+- `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: the AI providers, models, and keys (`keys.json`, mode 0600),

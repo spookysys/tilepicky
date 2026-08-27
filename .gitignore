@@ -5,4 +5,5 @@
 /mytiles
 /mytilemaps
 /mytilesheets
-/tools
+/tools/*
+!/tools/grid-cases.json
