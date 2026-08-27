@@ -30,7 +30,10 @@ also name them on the command line:
 
     tilepicky <library dir> <project dir>
 
-The tool draws with wgpu. Add `--glow` to draw with OpenGL instead.
+It draws with OpenGL, which every machine has. The binaries on the releases
+page can draw with wgpu as well, with `--wgpu`; a build of your own leaves
+wgpu out, because it is half the compile time. Add it with
+`cargo install tilepicky --features wgpu` if you want it.
 
 ## Install
 

@@ -3417,24 +3417,32 @@ fn short_version() -> String {
     format!("{short}{tag}")
 }
 
+/// Whether this build can draw with wgpu as well as with OpenGL. Only
+/// OpenGL is built by default: wgpu is half the compile time of the whole
+/// tool, and a person installing with `cargo install` waits for it.
+const WGPU: bool = cfg!(feature = "wgpu");
+
 fn main() -> eframe::Result {
     let mut dirs: Vec<String> = Vec::new();
     let mut renderer = eframe::Renderer::default();
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--help" | "-h" => {
-                println!("usage: tilepicky [--glow | --wgpu] [<library dir> [<project dir>]]");
+                println!("usage: tilepicky [--glow{}] [<library dir> [<project dir>]]", if WGPU { " | --wgpu" } else { "" });
                 println!("Without a folder, the tool asks for one and remembers it.");
-                println!("--glow draws with OpenGL; --wgpu with wgpu, the default.");
+                if WGPU {
+                    println!("--glow draws with OpenGL, --wgpu with wgpu.");
+                }
                 return Ok(());
             }
             "--glow" => renderer = eframe::Renderer::Glow,
+            #[cfg(feature = "wgpu")]
             "--wgpu" => renderer = eframe::Renderer::Wgpu,
             _ => dirs.push(a),
         }
     }
     if dirs.len() > 2 {
-        eprintln!("usage: tilepicky [--glow | --wgpu] [<library dir> [<project dir>]]");
+        eprintln!("usage: tilepicky [--glow{}] [<library dir> [<project dir>]]", if WGPU { " | --wgpu" } else { "" });
         std::process::exit(2);
     }
     let mut settings = settings::Settings::load();

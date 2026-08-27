@@ -1,6 +1,6 @@
 [package]
 name = "tilepicky"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Browse sprite sheets, search them, and pick tiles into tilesheets of your own."
 repository = "https://github.com/spookysys/tilepicky"
@@ -9,8 +9,14 @@ keywords = ["tiles", "sprites", "tilesheet", "pixel-art", "egui"]
 categories = ["game-development", "multimedia::images"]
 include = ["src/**", "icon.png", "README.md", "LICENSE"]
 
+[features]
+# wgpu is the other half of the compile time. OpenGL draws this tool just
+# as well, so only that is built unless you ask:
+#     cargo install tilepicky --features wgpu
+wgpu = ["eframe/wgpu"]
+
 [dependencies]
-eframe = { version = "0.36.1", features = ["glow"] }
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp", "tga"] }
 png = "0.18.1"
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }

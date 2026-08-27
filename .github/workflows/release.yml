@@ -46,9 +46,12 @@ jobs:
       - name: Use the current stable Rust
         run: rustup update stable && rustup default stable
 
+      # These builds take both renderers. Compile time is GitHub's problem
+      # here, not a person's, and a Mac then draws through Metal rather than
+      # the OpenGL Apple deprecated.
       - name: Build
         if: matrix.os != 'macos-latest'
-        run: cargo build --release
+        run: cargo build --release --features wgpu
 
       # One download for both kinds of Mac, rather than asking a person
       # which processor they have.
@@ -56,8 +59,8 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --features wgpu --target aarch64-apple-darwin
+          cargo build --release --features wgpu --target x86_64-apple-darwin
           mkdir -p target/release
           lipo -create -output target/release/tilepicky \
             target/aarch64-apple-darwin/release/tilepicky \
