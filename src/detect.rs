@@ -279,6 +279,69 @@ mod tests {
     /// A case marked `pass` must keep passing. A case marked `fail` is a
     /// known weakness: it only prints, so that turning one into a pass is
     /// visible work rather than a broken build.
+    /// Rebuilds `tools/grid-cases.json` from the books of the folders named
+    /// in `TILEPICKY_SYNC_CASES`, so that a grid you set by hand in the app
+    /// becomes a case here. What each sheet is, the `kind`, is kept from the
+    /// old file, and `expect` is set to what the reader does today, which
+    /// makes the suite a guard against going backwards.
+    ///
+    ///     TILEPICKY_SYNC_CASES=assets,mytilesheets cargo test sync_the_cases
+    #[test]
+    fn sync_the_cases() {
+        let Ok(dirs) = std::env::var("TILEPICKY_SYNC_CASES") else { return };
+        let old: serde_json::Value = std::fs::read_to_string("tools/grid-cases.json")
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(serde_json::json!({ "cases": [] }));
+        let mut cases: Vec<serde_json::Value> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for dir in dirs.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+            let Ok(text) = std::fs::read_to_string(format!("{dir}/tilepicky.json")) else { continue };
+            let Ok(book) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let Some(sheets) = book["sheets"].as_object() else { continue };
+            for (rel, entry) in sheets {
+                let Some(tile) = entry.get("tile") else { continue };
+                let file = format!("{dir}/{rel}");
+                if !std::path::Path::new(&file).exists() || !seen.insert(file.clone()) {
+                    continue;
+                }
+                let pair = |v: Option<&serde_json::Value>| -> [i64; 2] {
+                    match v {
+                        Some(serde_json::Value::Number(n)) => [n.as_i64().unwrap_or(0); 2],
+                        Some(serde_json::Value::Array(a)) => [0, 1].map(|i| a[i].as_i64().unwrap_or(0)),
+                        _ => [0, 0],
+                    }
+                };
+                let (t, g, o) = (pair(Some(tile)), pair(entry.get("gap")), pair(entry.get("offset")));
+                let was = old["cases"].as_array().into_iter().flatten().find(|c| c["file"].as_str() == Some(&file));
+                let kind = was.and_then(|c| c["kind"].as_str()).unwrap_or("tiles").to_string();
+                let mut case = serde_json::json!({ "file": file, "tile": t, "kind": kind });
+                if g != [0, 0] {
+                    case["gap"] = serde_json::json!(g);
+                }
+                if o != [0, 0] {
+                    case["offset"] = serde_json::json!(o);
+                }
+                let pass = image::open(&case["file"].as_str().unwrap()).is_ok_and(|img| {
+                    let (x, y) = grid(&img.to_rgba8());
+                    [x.tile as i64, y.tile as i64] == [t[0] + g[0], t[1] + g[1]]
+                });
+                case["expect"] = serde_json::json!(if pass { "pass" } else { "fail" });
+                cases.push(case);
+            }
+        }
+        // Anything the books do not mention keeps its place.
+        for c in old["cases"].as_array().into_iter().flatten() {
+            if c["file"].as_str().is_some_and(|f| !seen.contains(f)) {
+                cases.push(c.clone());
+            }
+        }
+        let hit = cases.iter().filter(|c| c["expect"] == "pass").count();
+        println!("{} cases, {hit} read right today", cases.len());
+        let out = serde_json::json!({ "note": old["note"].clone(), "cases": cases });
+        std::fs::write("tools/grid-cases.json", serde_json::to_string_pretty(&out).unwrap() + "\n").unwrap();
+    }
+
     #[test]
     fn the_real_packs_read_as_they_did() {
         let Ok(text) = std::fs::read_to_string("tools/grid-cases.json") else { return };

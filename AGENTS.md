@@ -12,8 +12,17 @@ the person who uses the tool; this file is for an agent that works on it.
   temp dir. One reads the real packs: `the_real_packs_read_as_they_did`
   checks `src/detect.rs` against `tools/grid-cases.json`, and skips every
   case whose file is not on this machine, so it passes where the packs are
-  missing. Add a case there whenever a sheet reads wrong, and mark it
-  `fail`; turning one into a `pass` is the work.
+  missing. A case marked `pass` must keep passing; turning a `fail` into a
+  `pass` is the work.
+- To grow that suite, set the grid of a sheet in the app, which writes it
+  into the book of its folder, and then fold the books into the cases:
+
+      TILEPICKY_SYNC_CASES=assets,mytilesheets cargo test sync_the_cases -- --nocapture
+
+  It keeps what the old file said each sheet is, sets `expect` to what the
+  reader does today, and prints how many read right. A sheet that is not a
+  grid at all, a mockup or a title screen, needs its `kind` set by hand:
+  the app has no way to say so.
 - `cargo clippy --all-targets` reports 20 old "collapsible if" warnings.
   Do not add to them.
 - The tree is not rustfmt-clean. Do not run `cargo fmt` on a whole file.
