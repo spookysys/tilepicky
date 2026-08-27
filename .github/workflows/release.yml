@@ -1,0 +1,95 @@
+# Builds Tilepicky for Linux, Windows and macOS, and hangs the three
+# binaries on the release of the tag that triggered it.
+#
+# Each one is built on its own machine because macOS cannot be reached from
+# anywhere else: Apple's SDK may not be redistributed, so nothing
+# cross-compiles to it. GitHub lends all three, free for a public repository.
+#
+# No system packages are installed, on any of the three. The eframe docs list
+# a dozen for Ubuntu, and this crate needs none of them: X11, xkbcommon,
+# Wayland, EGL and DBus are all opened at runtime rather than linked, and the
+# finished binary needs nothing but libc, libm and libgcc.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # For a tag that is already pushed, or a build that needs doing again.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build, and to upload to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+          - os: macos-latest
+            name: macos-universal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Use the current stable Rust
+        run: rustup update stable && rustup default stable
+
+      - name: Build
+        if: matrix.os != 'macos-latest'
+        run: cargo build --release
+
+      # One download for both kinds of Mac, rather than asking a person
+      # which processor they have.
+      - name: Build for both Macs and join them
+        if: matrix.os == 'macos-latest'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/tilepicky \
+            target/aarch64-apple-darwin/release/tilepicky \
+            target/x86_64-apple-darwin/release/tilepicky
+
+      - name: Pack it with the licence
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          dir="tilepicky-$tag-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/tilepicky README.md LICENSE "$dir"/
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            cp tilepicky.desktop icon.png "$dir"/
+          fi
+          tar czf "$dir.tar.gz" "$dir"
+          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Pack it with the licence
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          $dir = "tilepicky-$tag-${{ matrix.name }}"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/tilepicky.exe, README.md, LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Hang it on the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ inputs.tag || github.ref_name }}" "$ASSET" --clobber
