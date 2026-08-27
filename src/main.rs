@@ -4,6 +4,11 @@
 //!
 //! Usage: `tilepicky [<library dir> [<project dir>]]`
 
+// Windows opens a console beside a program that asks for one, and this one
+// draws its own window. A debug build keeps the console, because that is
+// where a panic and a `--help` go.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ai;
 mod index;
 mod settings;

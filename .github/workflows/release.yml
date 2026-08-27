@@ -5,10 +5,14 @@
 # anywhere else: Apple's SDK may not be redistributed, so nothing
 # cross-compiles to it. GitHub lends all three, free for a public repository.
 #
-# No system packages are installed, on any of the three. The eframe docs list
-# a dozen for Ubuntu, and this crate needs none of them: X11, xkbcommon,
+# The build installs no system package, on any of the three. The eframe docs
+# list a dozen for Ubuntu, and this crate needs none of them: X11, xkbcommon,
 # Wayland, EGL and DBus are all opened at runtime rather than linked, and the
 # finished binary needs nothing but libc, libm and libgcc.
+#
+# The test that follows the build does install two, because a build machine
+# has neither a screen nor a graphics driver. Every desktop has both, so this
+# is the cost of testing here, not a cost to the person who downloads.
 
 name: release
 
@@ -65,6 +69,36 @@ jobs:
           lipo -create -output target/release/tilepicky \
             target/aarch64-apple-darwin/release/tilepicky \
             target/x86_64-apple-darwin/release/tilepicky
+
+      # A binary that links is not a binary that runs. Start it, wait, and
+      # fail if it went away by itself. This runs before the packing, so a
+      # binary that cannot open its window never reaches the release.
+      - name: Lend Linux a screen and a driver
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb libegl1 libgl1
+
+      - name: Run it
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-latest)  bin="xvfb-run -a ./target/release/tilepicky" ;;
+            windows-latest) bin="./target/release/tilepicky.exe" ;;
+            *)              bin="./target/release/tilepicky" ;;
+          esac
+          # `exec` puts the app itself under this pid, so the kill reaches it.
+          ( exec $bin > app.log 2>&1 ) &
+          pid=$!
+          sleep 20
+          kill "$pid" 2>/dev/null || true
+          rc=0; wait "$pid" || rc=$?
+          # 143 says SIGTERM stopped it, so it was alive the whole 20 seconds.
+          # Its own exit code, whatever it is, says it gave up before we asked.
+          if [ "$rc" -ne 143 ] && [ "$rc" -ne 137 ]; then
+            echo "the app stopped on its own, with $rc"
+            cat app.log
+            exit 1
+          fi
+          echo "the app ran for 20 seconds"
 
       - name: Pack it with the licence
         if: matrix.os != 'windows-latest'
