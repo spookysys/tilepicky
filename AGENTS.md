@@ -51,8 +51,9 @@ a display of your own, never on the user's: your synthesized keys land on
 whatever window has the focus, and the user may be working. A private display
 also gives the same window size and the same result every time.
 
-You need `Xvfb`, `openbox`, `ffmpeg` and `python-xlib`. The venv and the
-driver scripts live in the session scratchpad under `ui/`.
+You need `Xvfb`, `openbox`, `ffmpeg` and `python-xlib`. The driver scripts
+live in the session scratchpad under `ui/`, and the venv one level above
+them, in the scratchpad itself.
 
 ```
 Xvfb :77 -screen 0 1520x1030x24 -nolisten tcp &
@@ -90,8 +91,10 @@ tile leaves a hole; a sheet that fills up reads as work, a map with holes in
 it reads as a broken tilesheet. Caption the keys: a film of a keyboard with
 no keys in it looks the same as a film of a mouse.
 
-Drive the app with XTEST through python-xlib. Prepare the state off camera
-and record only the part worth watching. Do not count the rows of a tree: the
+Drive the app with XTEST through python-xlib. Stop the instance you started
+last: the driver takes the first window it finds that is named Tilepicky, so
+a stray one takes every key while the screenshot shows the window on top of
+it. Prepare the state off camera and record only the part worth watching. Do not count the rows of a tree: the
 keys begin on the title of a pane, so one Down is spent entering it, and the
 count is wrong by one in a way that opens the wrong file. Walk to the end,
 where a tree holds the keys, and step back from there.
