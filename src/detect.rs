@@ -46,12 +46,31 @@
 //! clear of the noise is dropped, and the sheet is read as one whole tile,
 //! which is what a picture with nothing to divide is.
 //!
-//! Two other measurements were tried on the same fold and both were
-//! dropped, so that nobody spends the day again: how much ink each line
-//! holds, and how much that ink varies along the line. Each one helps a
-//! sheet or two, a font most of all, and each costs more sheets than it
-//! saves. Pooled with the difference they scored 7 of 17 against 10, and
-//! the difference alone is what the code keeps.
+//! Three other measurements were tried and dropped, so that nobody spends
+//! the day again.
+//!
+//! How much ink each line holds finds the pitch of a font sheet, which the
+//! difference misses entirely, and costs more sheets elsewhere than it
+//! saves. How much that ink varies along a line does the same, smaller.
+//!
+//! The third is the interesting one. Every place in a tile leaves a
+//! fingerprint: a seam looks the same in every tile, a middle looks
+//! different in each, so how far the samples of a slot stand apart should
+//! name the pitch by itself. It does, and strongly. At the true pitch of
+//! cave.png it carries five times the evidence the difference does.
+//!
+//! It needs one guard. The spread of a slot is measured against that
+//! slot's own mean, and where a slot holds two samples that mean fits them
+//! exactly, the spread collapses, and the ratio divides by nothing. Half
+//! the sheet then scores six hundred against thirteen for the truth.
+//! Refusing a pitch whose slots hold fewer than about twelve samples fixes
+//! it, and leaving one sample out of its own mean does not, because with
+//! two samples the two residuals come out equal whatever you do.
+//!
+//! Guarded, it finds 6 of the 17 sheets on its own. Added to the
+//! difference, taken as the louder of the two, multiplied, or pooled, it
+//! reaches 10, which is what the difference reaches alone. So the code
+//! keeps the difference alone, and this paragraph keeps the reason.
 
 use image::{Rgba, RgbaImage};
 
