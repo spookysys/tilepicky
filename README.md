@@ -128,6 +128,13 @@ width, turn the wheel over it for the height, or click it and type. A field
 showing a single `32` means both, and changing the height alone makes it
 `32x48`.
 
+Open a sheet the tool has never seen and it works the grid out from the
+picture itself: it finds the lines where the tiles meet, and sets the tile,
+the gap and the offset from them. When the picture does not say clearly
+enough, and a sheet with little on it never does, it keeps the size the
+folder used last. Nothing goes into `tilepicky.json` until you change
+something, so a guess never hardens into a decision.
+
 A new sheet starts at the tile size that library or project used last, or at
 32 px.
 

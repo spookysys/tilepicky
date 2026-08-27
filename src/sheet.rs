@@ -3,6 +3,7 @@
 //! library and a tilesheet of your project are the same thing; only the edits
 //! differ.
 
+use crate::detect;
 use crate::sidecar::count_text;
 use image::ImageDecoder;
 use crate::sidecar::{self, Animation, Pair, Provenance, Sidecar};
@@ -696,9 +697,14 @@ impl Sheet {
     }
 
     fn from_image(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], img: RgbaImage, side: Sidecar) -> Self {
-        let tile = side.tile.map(Pair::xy).unwrap_or(tile);
-        let gap = side.gap.map(Pair::xy).unwrap_or([0, 0]);
-        let offset = clamp_offset(side.offset.map(Pair::xy).unwrap_or([0, 0]), tile, gap);
+        // A sheet the book has never seen gets its grid read off its pixels,
+        // with the size this folder used last as the hint. An entry in the
+        // book always wins: it holds what a person chose.
+        let read = side.tile.is_none().then(|| detect::grid(&img, tile));
+        let tile = side.tile.map(Pair::xy).unwrap_or_else(|| read.map_or(tile, |(x, y)| [x.tile, y.tile]));
+        let gap = side.gap.map(Pair::xy).unwrap_or_else(|| read.map_or([0, 0], |(x, y)| [x.gap, y.gap]));
+        let found = read.map_or([0, 0], |(x, y)| [x.offset as i32, y.offset as i32]);
+        let offset = clamp_offset(side.offset.map(Pair::xy).unwrap_or(found), tile, gap);
         let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
             rel: rel.to_string(),

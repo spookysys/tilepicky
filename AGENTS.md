@@ -25,6 +25,7 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: the grid of
   each sheet, where its pixels came from, and its animations.
 - `src/index.rs`: the scan of a folder, and the search.
+- `src/detect.rs`: reads the grid of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: the AI providers, models, and keys (`keys.json`, mode 0600),
