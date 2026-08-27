@@ -23,3 +23,9 @@ rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 walkdir = "2.5.0"
+# We never call winit ourselves. It is named here because eframe's default
+# features carry winit's, and one of those draws the title bar of the window
+# on Wayland. Dropping eframe's defaults to leave wgpu out took that with it,
+# and the window lost the frame of the desktop it runs on. Cargo adds up the
+# features of a crate, so asking here reaches the winit that eframe uses.
+winit = "0.30.13"
