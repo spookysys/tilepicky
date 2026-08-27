@@ -692,6 +692,16 @@ impl App {
         }
     }
 
+    /// Starts the fresh, unnamed tilesheet that an empty canvas grows: a
+    /// block dropped on the panel starts one, and so does a Ctrl+Tab that
+    /// crosses to it. Both name it at the first save.
+    fn start_canvas(&mut self, ctx: &egui::Context, tile: [u32; 2]) {
+        let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
+        let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
+        self.project_sheet = Some(Sheet::new_empty(ctx, &self.project.root, "", tile, cols, rows));
+        self.project_sel = None;
+    }
+
     fn create_project(&mut self, ctx: &egui::Context) {
         let name = self.new_name.trim().trim_end_matches(".png").to_string();
         if name.is_empty() {
@@ -1533,10 +1543,7 @@ impl App {
         // is asked for at the first save.
         if target.is_none() && self.project_sheet.is_none() && self.project_rect.contains(p) {
             // The new tilesheet takes the grid of the block that lands on it.
-            let tile = drag.block.tile;
-            let (cols, rows) = (((NEW_PX + tile[0] / 2) / tile[0]).max(1), ((NEW_PX + tile[1] / 2) / tile[1]).max(1));
-            self.project_sheet = Some(Sheet::new_empty(ctx, &self.project.root, "", tile, cols, rows));
-            self.project_sel = None;
+            self.start_canvas(ctx, drag.block.tile);
             target = Some((0, 0));
         }
         let (Some(at), Some(sheet)) = (target, &mut self.project_sheet) else {
@@ -2044,7 +2051,14 @@ impl App {
             // a question nobody asked.
             let other = if now.0 == Panel::Library { Panel::Project } else { Panel::Library };
             if !self.has_spot(other, now.1) {
-                return;
+                // The canvas is the one pane you can make on the way. A cross
+                // from the source sheet starts a tilesheet there, as a dropped
+                // block does, at the tile size of the sheet you come from.
+                if now != (Panel::Library, Spot::Sheet) || !self.is_set(Panel::Project) {
+                    return;
+                }
+                let tile = self.inherited_tile(Panel::Library);
+                self.start_canvas(ctx, tile);
             }
             (other, now.1)
         } else {

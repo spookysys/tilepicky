@@ -180,6 +180,8 @@ because the library never changes.
 
 Drop a block on an empty tilesheet panel and it starts a new tilesheet, at
 the tile size of the block, and asks for a name when you first save it.
+`Ctrl+Tab` out of the source sheet does the same when the canvas is empty,
+at the tile size of the sheet you come from.
 
 ## Settings
 
