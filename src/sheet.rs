@@ -703,7 +703,7 @@ impl Sheet {
         let read = side.tile.is_none().then(|| detect::grid(&img, tile));
         let tile = side.tile.map(Pair::xy).unwrap_or_else(|| read.map_or(tile, |(x, y)| [x.tile, y.tile]));
         let gap = side.gap.map(Pair::xy).unwrap_or_else(|| read.map_or([0, 0], |(x, y)| [x.gap, y.gap]));
-        let found = read.map_or([0, 0], |(x, y)| [x.offset as i32, y.offset as i32]);
+        let found = read.map_or([0, 0], |(x, y)| [x.offset, y.offset]);
         let offset = clamp_offset(side.offset.map(Pair::xy).unwrap_or(found), tile, gap);
         let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
