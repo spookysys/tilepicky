@@ -122,6 +122,12 @@ pub struct Sidecar {
     /// otherwise. Negative when the first tile starts before the image edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<Pair<i32>>,
+    /// True when the grid was read off the pixels instead of chosen by a
+    /// person. It is written so the reading happens once and not on every
+    /// open, and it is cleared the moment someone sets the grid by hand.
+    /// Anything that wants a grid a person stands behind must skip these.
+    #[serde(default, skip_serializing_if = "not")]
+    pub read: bool,
     /// Where the regions of this sheet came from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<Provenance>,
@@ -201,6 +207,10 @@ pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
 
 /// Writes one entry. The book is read again first, so that entries changed
 /// by hand in the meantime survive. An empty entry is removed.
+fn not(b: &bool) -> bool {
+    !*b
+}
+
 pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> {
     let mut book = load_book(dir);
     if side.is_empty() {

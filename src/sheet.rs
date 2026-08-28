@@ -684,10 +684,19 @@ impl Sheet {
             Some(f) => f.clone(),
             None => image::DynamicImage::from_decoder(decoder).map_err(fail)?.to_rgba8(),
         };
+        let read = side.tile.is_none();
         let mut sheet = Self::from_image(ctx, dir, rel, tile, img, side);
         sheet.kind = kind;
         sheet.frames = frames;
         sheet.frame_ms = frame_ms;
+        // Reading a grid off the pixels costs a walk of the whole sheet, so
+        // it is written down the first time and never done twice. The mark
+        // says a machine chose it, not a person.
+        if read {
+            sheet.side.tile = Some(Pair::of(sheet.tile));
+            sheet.side.read = true;
+            let _ = sidecar::store_entry(dir, rel, &sheet.side);
+        }
         Ok(sheet)
     }
 
@@ -2020,6 +2029,9 @@ impl Sheet {
         if !side.is_empty() {
             side.tile = Some(Pair::of(self.tile));
         }
+        // Saving is a person acting, so the grid is no longer a reading.
+        side.read = false;
+        self.side.read = false;
         sidecar::store_entry(&self.dir, &self.rel, &side)?;
         self.dirty = false;
         Ok(())
@@ -2068,6 +2080,41 @@ mod tests {
         let entry = book.sheets.get("map.png").cloned();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(entry.and_then(|e| e.tile).map(Pair::xy), Some([64, 48]));
+    }
+
+    /// A grid read off the pixels is written down at once, so it is read
+    /// once and not on every open. It is marked as read, and setting the
+    /// grid by hand clears the mark: a reading must never be mistaken for
+    /// a decision, or the sheets a person labelled would be skipped as the
+    /// reader's own guesses.
+    #[test]
+    fn a_reading_is_marked_and_a_choice_clears_it() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("tilepicky-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A sheet of flat 16 px tiles, saved with no entry of its own.
+        let img = RgbaImage::from_fn(128, 128, |x, y| {
+            let v = ((x / 16) * 7 + (y / 16) * 53) as u8;
+            Rgba([v.wrapping_mul(9), 255 - v, v.wrapping_add(90), 255])
+        });
+        img.save(dir.join("flat.png")).unwrap();
+
+        let read = Sheet::open(&ctx, &dir, "flat.png", [8, 8], Sidecar::default()).unwrap();
+        let after_open = sidecar::load_book(&dir).sheets.get("flat.png").cloned();
+
+        let mut chosen = Sheet::open(&ctx, &dir, "flat.png", [8, 8], after_open.clone().unwrap()).unwrap();
+        chosen.set_grid(&ctx, [24, 24], [0, 0], [0, 0]);
+        chosen.save_entry().unwrap();
+        let after_choice = sidecar::load_book(&dir).sheets.get("flat.png").cloned();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(read.tile, [16, 16], "the reader should find the 16 px tiles");
+        let after_open = after_open.expect("opening writes what it read");
+        assert_eq!(after_open.tile.map(Pair::xy), Some([16, 16]));
+        assert!(after_open.read, "and marks it as read, not chosen");
+        let after_choice = after_choice.expect("choosing keeps the entry");
+        assert_eq!(after_choice.tile.map(Pair::xy), Some([24, 24]));
+        assert!(!after_choice.read, "choosing clears the mark");
     }
 
     /// A negative offset reaches one pitch before the edge, and the first

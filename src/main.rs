@@ -677,6 +677,10 @@ impl App {
                 }
                 self.library_sheet = Some(s);
                 self.library_sel = Some(i);
+                // The keys follow the file, however it was opened. A click
+                // that left the cursor behind means the next arrow starts
+                // somewhere the eye is not.
+                self.library_at = Some(tree::Row::File(i));
                 self.active = Panel::Library;
             }
             Err(err) => self.status = err,
@@ -692,6 +696,8 @@ impl App {
                 }
                 self.project_sheet = Some(s);
                 self.project_sel = Some(i);
+                self.project_at = Some(tree::Row::File(i));
+                self.tree_cursor = Some(i);
                 self.active = Panel::Project;
             }
             Err(err) => self.status = err,

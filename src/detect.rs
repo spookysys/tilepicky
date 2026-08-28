@@ -72,7 +72,7 @@
 //! reaches 10, which is what the difference reaches alone. So the code
 //! keeps the difference alone, and this paragraph keeps the reason.
 
-use image::{Rgba, RgbaImage};
+use image::RgbaImage;
 
 /// The grid of one axis.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,12 +97,34 @@ const AGREE: f32 = 2.0;
 /// Reads the grid off the pixels, and off nothing else.
 pub fn grid(img: &RgbaImage) -> (Axis, Axis) {
     let (w, h) = (img.width(), img.height());
-    let dx: Vec<f32> = (0..w.saturating_sub(1))
-        .map(|x| (0..h).map(|y| diff(img.get_pixel(x, y), img.get_pixel(x + 1, y))).sum::<f32>() / h as f32)
-        .collect();
-    let dy: Vec<f32> = (0..h.saturating_sub(1))
-        .map(|y| (0..w).map(|x| diff(img.get_pixel(x, y), img.get_pixel(x, y + 1))).sum::<f32>() / w as f32)
-        .collect();
+    // One walk along the rows builds both signals. Going down a column
+    // instead steps a whole row of memory per pixel, which is the worst
+    // order there is, and doing it twice reads the sheet twice over.
+    let (wide, tall) = (w.saturating_sub(1) as usize, h.saturating_sub(1) as usize);
+    let (mut ax, mut cx) = (vec![0i64; wide], vec![0i64; wide]);
+    let (mut ay, mut cy) = (vec![0i64; tall], vec![0i64; tall]);
+    let (raw, stride) = (img.as_raw(), w as usize * 4);
+    for y in 0..h as usize {
+        let row = y * stride;
+        let down = y + 1 < h as usize;
+        for x in 0..w as usize {
+            let at = row + x * 4;
+            if x + 1 < w as usize {
+                let (a, c) = step(raw, at, at + 4);
+                ax[x] += a;
+                cx[x] += c;
+            }
+            if down {
+                let (a, c) = step(raw, at, at + stride);
+                ay[y] += a;
+                cy[y] += c;
+            }
+        }
+    }
+    let done = |a: Vec<i64>, c: Vec<i64>, over: u32| -> Vec<f32> {
+        a.iter().zip(c).map(|(a, c)| (*a as f32 + c as f32 / 510.0) / over as f32).collect()
+    };
+    let (dx, dy) = (done(ax, cx, h), done(ay, cy, w));
     let (fx, fy) = (profile(&dx, w), profile(&dy, h));
     // The pitch both axes support: the one whose weaker showing is the
     // strongest. Taking the weaker of the two makes this a test of
@@ -114,12 +136,19 @@ pub fn grid(img: &RgbaImage) -> (Axis, Axis) {
     (axis(&fx, w, both), axis(&fy, h, both))
 }
 
-/// How much two pixels differ. Colour under a transparent pixel is never
-/// drawn, so it counts for as much as the two pixels are opaque.
-fn diff(a: &Rgba<u8>, b: &Rgba<u8>) -> f32 {
-    let seen = (a[3] as f32 + b[3] as f32) / 510.0;
-    let colour: f32 = (0..3).map(|i| (a[i] as f32 - b[i] as f32).abs()).sum();
-    (a[3] as f32 - b[3] as f32).abs() + colour * seen
+/// How much the pixels at two places in the buffer differ, as two whole
+/// numbers: how far apart their alpha is, and how far apart their colour
+/// is once weighed by how opaque they are. Colour under a transparent
+/// pixel is never drawn, so it must not count.
+///
+/// The weighing is left as a product for the caller to divide out once at
+/// the end. That keeps this, which runs once per pixel of the sheet, to
+/// whole numbers.
+#[inline]
+fn step(raw: &[u8], a: usize, b: usize) -> (i64, i64) {
+    let (p, q) = (&raw[a..a + 4], &raw[b..b + 4]);
+    let colour = (p[0] as i64 - q[0] as i64).abs() + (p[1] as i64 - q[1] as i64).abs() + (p[2] as i64 - q[2] as i64).abs();
+    ((p[3] as i64 - q[3] as i64).abs(), colour * (p[3] as i64 + q[3] as i64))
 }
 
 /// Folds the signal onto one pitch and leaves the mean of each slot in
@@ -127,21 +156,24 @@ fn diff(a: &Rgba<u8>, b: &Rgba<u8>) -> f32 {
 /// what it leaves over, with both divided by what they cost.
 fn fold(d: &[f32], pitch: u32, mean: f32, total: f32, slot: &mut Vec<f32>) -> f32 {
     let (p, n) = (pitch as usize, d.len());
-    slot.clear();
-    slot.resize(p, 0.0);
-    for (i, v) in d.iter().enumerate() {
-        slot[i % p] += v;
-    }
-    // The last turn is short, so the first slots hold one sample more.
-    let over = n % p;
-    let mut held = 0.0;
-    for (k, v) in slot.iter_mut().enumerate() {
-        let turns = (n / p + usize::from(k < over)).max(1);
-        *v /= turns as f32;
-        held += turns as f32 * (*v - mean) * (*v - mean);
-    }
     if p < 2 || n <= p {
         return 0.0;
+    }
+    slot.clear();
+    slot.resize(p, 0.0);
+    let mut held = 0.0;
+    // Walk each slot by its own stride. Asking `i % p` for every sample of
+    // every pitch is hundreds of thousands of integer divisions, and a
+    // division is the slowest thing in the loop by far.
+    for (k, v) in slot.iter_mut().enumerate() {
+        let (mut sum, mut turns, mut i) = (0.0, 0u32, k);
+        while i < n {
+            sum += d[i];
+            turns += 1;
+            i += p;
+        }
+        *v = sum / turns as f32;
+        held += turns as f32 * (*v - mean) * (*v - mean);
     }
     let left = (total - held).max(f32::EPSILON);
     (held / (p - 1) as f32) / (left / (n - p) as f32)
@@ -191,6 +223,7 @@ fn axis(f: &[f32], len: u32, both: Option<u32>) -> Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::Rgba;
 
     /// A sheet of flat tiles, each one its own colour. Eight tiles across,
     /// because a sheet of four gives only three lines to judge by, and
@@ -281,7 +314,9 @@ mod tests {
     /// visible work rather than a broken build.
     /// Rebuilds `tools/grid-cases.json` from the books of the folders named
     /// in `TILEPICKY_SYNC_CASES`, so that a grid you set by hand in the app
-    /// becomes a case here. What each sheet is, the `kind`, is kept from the
+    /// becomes a case here. An entry the reader wrote itself, marked
+    /// `read`, is skipped: it is this reader's own answer, and grading it
+    /// against itself would say nothing. What each sheet is, the `kind`, is kept from the
     /// old file, and `expect` is set to what the reader does today, which
     /// makes the suite a guard against going backwards.
     ///
@@ -300,6 +335,11 @@ mod tests {
             let Ok(book) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
             let Some(sheets) = book["sheets"].as_object() else { continue };
             for (rel, entry) in sheets {
+                // A grid this reader wrote itself is not evidence about
+                // this reader. Only what a person set counts as a case.
+                if entry["read"] == serde_json::Value::Bool(true) {
+                    continue;
+                }
                 let Some(tile) = entry.get("tile") else { continue };
                 let file = format!("{dir}/{rel}");
                 if !std::path::Path::new(&file).exists() || !seen.insert(file.clone()) {

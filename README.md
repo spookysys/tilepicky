@@ -132,8 +132,13 @@ Open a sheet the tool has never seen and it works the tile size out from
 the picture itself, by finding the pitch at which the picture repeats. A
 picture that does not repeat, a title screen or a mockup, is read as one
 whole tile. It does not find a gap or an offset yet, so set those yourself
-for a pack that uses them. Nothing goes into `tilepicky.json` until you
-change something, so a guess never hardens into a decision.
+for a pack that uses them.
+
+Reading a grid means walking the whole sheet, so the answer goes into
+`tilepicky.json` at once and is never worked out twice. It is marked there
+as read rather than chosen, and setting the grid yourself clears the mark:
+what you choose always wins, and the tool never mistakes its own guess for
+your decision.
 
 A new sheet starts at the tile size that library or project used last, or at
 32 px.
