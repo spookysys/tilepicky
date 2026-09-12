@@ -23,8 +23,7 @@ the person who uses the tool; this file is for an agent that works on it.
   reader does today, and prints how many read right. A sheet that is not a
   grid at all, a mockup or a title screen, needs its `kind` set by hand:
   the app has no way to say so.
-- `cargo clippy --all-targets` reports 20 old "collapsible if" warnings.
-  Do not add to them.
+- `cargo clippy --all-targets` runs clean.
 - The tree is not rustfmt-clean. Do not run `cargo fmt` on a whole file.
   Keep a line at 160 columns or less, as `rustfmt.toml` says.
 

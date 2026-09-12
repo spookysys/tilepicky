@@ -1240,8 +1240,7 @@ impl Sheet {
                     event.interacted = true;
                 }
             }
-            if resp.dragged() && event.drag_block.is_none() {
-                if let Some(p) = resp.interact_pointer_pos() {
+            if resp.dragged() && event.drag_block.is_none() && let Some(p) = resp.interact_pointer_pos() {
                     let c = to_cell(p);
                     if let Some((w, h)) = self.canvas_resize.as_ref().map(|d| d.wh) {
                         ui.output_mut(|o| o.cursor_icon = resize_icon(w, h));
@@ -1260,7 +1259,6 @@ impl Sheet {
                         self.sel = self.base.clone().union(&Sel::rect(a, snap(a, c)));
                     }
                     event.interacted = true;
-                }
             }
             if resp.drag_stopped() {
                 self.resize = None;
@@ -1272,8 +1270,7 @@ impl Sheet {
                 }
             }
             own_drag = resp.dragged() && event.drag_block.is_none();
-            if resp.clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
+            if resp.clicked() && let Some(p) = resp.interact_pointer_pos() {
                     let c = to_cell(p);
                     self.last_click = Some((ui.input(|i| i.time), c, self.sel.clone()));
                     if ctrl && shift {
@@ -1291,7 +1288,6 @@ impl Sheet {
                         self.sel = Sel::rect(c, snap(c, c));
                     }
                     event.interacted = true;
-                }
             }
             if event.interacted {
                 resp.request_focus();
@@ -1299,10 +1295,8 @@ impl Sheet {
             }
             if resp.hovered() {
                 let before = self.zoom.level;
-                if self.zoom.wheel(ui) != 0 {
-                    if let Some(p) = resp.hover_pos() {
-                        rezoom = Some((p - rect.min, self.zoom.level / before));
-                    }
+                if self.zoom.wheel(ui) != 0 && let Some(p) = resp.hover_pos() {
+                    rezoom = Some((p - rect.min, self.zoom.level / before));
                 }
             }
         });

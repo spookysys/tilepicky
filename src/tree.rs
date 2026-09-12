@@ -239,13 +239,11 @@ impl Node {
                     let (t0, from, now, at) = ui.input(|inp| {
                         (inp.pointer.press_start_time(), inp.pointer.press_origin(), inp.time, inp.pointer.latest_pos())
                     });
-                    if let (Some(t0), Some(from), Some(at)) = (t0, from, at) {
-                        if (at - from).length() <= STILL_PX {
-                            if now - t0 >= HOLD_S {
-                                action = Some(TreeAction::LiftFile(*i));
-                            } else {
-                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
-                            }
+                    if let (Some(t0), Some(from), Some(at)) = (t0, from, at) && (at - from).length() <= STILL_PX {
+                        if now - t0 >= HOLD_S {
+                            action = Some(TreeAction::LiftFile(*i));
+                        } else {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
                         }
                     }
                 }

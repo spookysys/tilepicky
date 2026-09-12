@@ -362,7 +362,7 @@ mod tests {
                 if o != [0, 0] {
                     case["offset"] = serde_json::json!(o);
                 }
-                let pass = image::open(&case["file"].as_str().unwrap()).is_ok_and(|img| {
+                let pass = image::open(case["file"].as_str().unwrap()).is_ok_and(|img| {
                     let (x, y) = grid(&img.to_rgba8());
                     [x.tile as i64, y.tile as i64] == [t[0] + g[0], t[1] + g[1]]
                 });

@@ -280,10 +280,8 @@ fn dialog_stops(ui: &egui::Ui, button: &egui::Response, places: &[&egui::Respons
     let mut all: Vec<(Id, egui::Rect)> = vec![(button.id, button.rect)];
     all.extend(places.iter().map(|r| (r.id, r.rect)));
     // The keys land in the dialog when it opens, on the first thing in it.
-    if !all.iter().any(|(id, _)| ui.memory(|m| m.has_focus(*id))) {
-        if let Some(first) = places.first() {
-            first.request_focus();
-        }
+    if !all.iter().any(|(id, _)| ui.memory(|m| m.has_focus(*id))) && let Some(first) = places.first() {
+        first.request_focus();
     }
     ui.data_mut(|d| d.insert_temp(Id::new("dialog stops"), all));
     ui.input(|i| i.key_pressed(egui::Key::Escape))
@@ -760,10 +758,8 @@ impl App {
             return None;
         }
         let mut rel = name.to_string();
-        if let Some(ext) = ext {
-            if !rel.to_ascii_lowercase().ends_with(ext) {
-                rel.push_str(ext);
-            }
+        if let Some(ext) = ext && !rel.to_ascii_lowercase().ends_with(ext) {
+            rel.push_str(ext);
         }
         Some(rel)
     }
@@ -843,10 +839,8 @@ impl App {
             if path.is_dir() {
                 std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
                 book.sheets.retain(|k, _| k != rel && !k.starts_with(&format!("{rel}/")));
-                if let Some(sheet) = &self.project_sheet {
-                    if sheet.rel.starts_with(&format!("{rel}/")) {
-                        self.project_sheet = None;
-                    }
+                if let Some(sheet) = &self.project_sheet && sheet.rel.starts_with(&format!("{rel}/")) {
+                    self.project_sheet = None;
                 }
             } else {
                 std::fs::remove_file(&path).map_err(|e| e.to_string())?;
@@ -962,10 +956,8 @@ impl App {
             std::fs::copy(root.join(old), root.join(new)).map_err(|e| e.to_string())?;
         } else {
             std::fs::rename(root.join(old), root.join(new)).map_err(|e| e.to_string())?;
-            if let Some(sheet) = &mut self.project_sheet {
-                if sheet.rel == old {
-                    sheet.rel = new.to_string();
-                }
+            if let Some(sheet) = &mut self.project_sheet && sheet.rel == old {
+                sheet.rel = new.to_string();
             }
         }
         sidecar::move_entry(&root, old, new, copy)
@@ -992,10 +984,9 @@ impl App {
                     }
                     std::fs::rename(root.join(old), root.join(&new)).map_err(|e| e.to_string())?;
                     sidecar::move_prefix(&root, old, &new)?;
-                    if let Some(sheet) = &mut self.project_sheet {
-                        if let Some(rest) = sheet.rel.strip_prefix(&format!("{old}/")) {
-                            sheet.rel = format!("{new}/{rest}");
-                        }
+                    if let Some(sheet) = &mut self.project_sheet
+                        && let Some(rest) = sheet.rel.strip_prefix(&format!("{old}/")) {
+                        sheet.rel = format!("{new}/{rest}");
                     }
                     self.rescan_project();
                 }
@@ -1251,15 +1242,13 @@ impl App {
             }
         }
         // Saving works no matter what has focus; a swallowed Ctrl+S loses work.
-        if key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
-            if let Some(sheet) = &self.project_sheet {
-                self.prompt = Some(NamePrompt {
-                    title: "Save as".into(),
-                    value: sheet.rel.clone(),
-                    what: NameFor::SaveAs,
-                    focus: true,
-                });
-            }
+        if key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) && let Some(sheet) = &self.project_sheet {
+            self.prompt = Some(NamePrompt {
+                title: "Save as".into(),
+                value: sheet.rel.clone(),
+                what: NameFor::SaveAs,
+                focus: true,
+            });
         }
         if key(cmd, Key::S) {
             self.save();
@@ -1309,21 +1298,17 @@ impl App {
                 ctx.copy_text(b.note());
                 self.clip = Some(b);
                 // A cut clears the cells; only your tilesheet is editable.
-                if cut && self.active == Panel::Project {
-                    if let Some(sheet) = &mut self.project_sheet {
-                        sheet.clear_selection(ctx);
-                        self.after_edit();
-                    }
+                if cut && self.active == Panel::Project && let Some(sheet) = &mut self.project_sheet {
+                    sheet.clear_selection(ctx);
+                    self.after_edit();
                 }
             }
         }
-        if in_half && !project_eye && (paste || key(cmd, Key::V)) {
-            if let (Some(block), Some(sheet)) = (&self.clip, &mut self.project_sheet) {
-                let at = sheet.sel.origin().unwrap_or((0, 0));
-                sheet.paste(ctx, at, block);
-                self.active = Panel::Project;
-                self.after_edit();
-            }
+        if in_half && !project_eye && (paste || key(cmd, Key::V)) && let (Some(block), Some(sheet)) = (&self.clip, &mut self.project_sheet) {
+            let at = sheet.sel.origin().unwrap_or((0, 0));
+            sheet.paste(ctx, at, block);
+            self.active = Panel::Project;
+            self.after_edit();
         }
         if !project_eye && key(cmd, Key::T) {
             self.trim(ctx);
@@ -1346,18 +1331,14 @@ impl App {
                 self.after_animation_edit(panel);
             }
         }
-        if in_half && self.active == Panel::Project && !project_eye {
-            if key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace) {
-                if let Some(sheet) = &mut self.project_sheet {
-                    sheet.clear_selection(ctx);
-                    self.after_edit();
-                }
-            }
+        if in_half && self.active == Panel::Project && !project_eye
+            && (key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace))
+            && let Some(sheet) = &mut self.project_sheet {
+            sheet.clear_selection(ctx);
+            self.after_edit();
         }
-        if in_half && !eye && key(cmd, Key::A) {
-            if let Some(s) = self.sheet_mut(self.active) {
-                s.sel = Sel::rect((0, 0), (s.cols() - 1, s.rows() - 1));
-            }
+        if in_half && !eye && key(cmd, Key::A) && let Some(s) = self.sheet_mut(self.active) {
+            s.sel = Sel::rect((0, 0), (s.cols() - 1, s.rows() - 1));
         }
         if in_half && !eye && key(Modifiers::NONE, Key::A) {
             self.press_a();
@@ -1440,10 +1421,8 @@ impl App {
                 self.step_from(ctx, id, d);
             }
         }
-        if in_half && key(Modifiers::NONE, Key::Escape) {
-            if let Some(s) = self.sheet_mut(self.active) {
-                s.sel = Sel::default();
-            }
+        if in_half && key(Modifiers::NONE, Key::Escape) && let Some(s) = self.sheet_mut(self.active) {
+            s.sel = Sel::default();
         }
         // + and - zoom the view under the pointer, else the active sheet.
         let dir = if key(Modifiers::NONE, Key::Plus) || key(Modifiers::NONE, Key::Equals) {
@@ -1453,10 +1432,8 @@ impl App {
         } else {
             0
         };
-        if dir != 0 {
-            if let Some(z) = self.zoom_under_pointer() {
-                z.step(dir);
-            }
+        if dir != 0 && let Some(z) = self.zoom_under_pointer() {
+            z.step(dir);
         }
     }
 
@@ -1781,10 +1758,8 @@ impl App {
         match panel {
             Panel::Project => self.after_edit(),
             Panel::Library => {
-                if let Some(sheet) = &mut self.library_sheet {
-                    if let Err(e) = sheet.save_entry() {
-                        self.status = e;
-                    }
+                if let Some(sheet) = &mut self.library_sheet && let Err(e) = sheet.save_entry() {
+                    self.status = e;
                 }
                 if let (Some(i), Some(sheet)) = (self.library_sel, &self.library_sheet) {
                     self.library.entries[i].side = sheet.side.clone();
@@ -2473,7 +2448,7 @@ impl eframe::App for App {
                             apply_query: self.open_trees,
                             menus: false,
                             scroll_to: self.library_scroll.as_ref(),
-                            cursor: on_rows.0.then(|| self.library_at.as_ref()).flatten(),
+                            cursor: on_rows.0.then_some(self.library_at.as_ref()).flatten(),
                             open_dir: self.library_open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                             sweeping: false,
                             lifting: false,
@@ -2574,7 +2549,7 @@ impl eframe::App for App {
                         apply_query: self.open_trees,
                         menus: true,
                         scroll_to: self.project_scroll.as_ref(),
-                        cursor: on_rows.1.then(|| self.project_at.as_ref()).flatten(),
+                        cursor: on_rows.1.then_some(self.project_at.as_ref()).flatten(),
                         open_dir: self.project_open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                         sweeping: self.sweep.is_some(),
                         lifting: self.file_drag.is_some(),
@@ -2831,10 +2806,8 @@ impl eframe::App for App {
                 });
             }
         });
-        if let Some(state) = egui::PanelState::load(ctx, panel_id) {
-            if total > 0.0 {
-                self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
-            }
+        if let Some(state) = egui::PanelState::load(ctx, panel_id) && total > 0.0 {
+            self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
         }
         egui::CentralPanel::default().show(ui, |ui| {
             self.project_rect = ui.max_rect();
@@ -3350,10 +3323,8 @@ fn field_wheel(ui: &egui::Ui) -> i32 {
     let mut steps = 0;
     ui.input(|i| {
         for e in &i.events {
-            if let egui::Event::MouseWheel { delta, modifiers, .. } = e {
-                if !modifiers.ctrl {
-                    steps -= sig(delta.y);
-                }
+            if let egui::Event::MouseWheel { delta, modifiers, .. } = e && !modifiers.ctrl {
+                steps -= sig(delta.y);
             }
         }
     });
