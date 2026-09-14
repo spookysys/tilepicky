@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! One explicit labeling operation: sheet context, then groups of island crops.
 
-use crate::{Grid, islands::Island};
+use crate::sidecar::{Label, Status, Saved, StoredIsland};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::RgbaImage;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, io::{Cursor, Write}, path::{Path, PathBuf}, time::Duration};
+use std::{collections::BTreeMap, io::Cursor, path::{Path, PathBuf}, time::Duration};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Status { Labeled, Unlabelable }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action { Label, Remove }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Label {
-    pub status: Status,
-    pub caption: String,
-    pub tags: Vec<String>,
+/// The same commands appear on the library sheet and its file-tree row.
+pub fn menu(ui: &mut eframe::egui::Ui) -> Option<Action> {
+    let mut action = None;
+    for (text, command) in [("Label with AI", Action::Label), ("Remove saved AI labels...", Action::Remove)] {
+        if ui.button(text).clicked() {
+            action = Some(command);
+            ui.close();
+        }
+    }
+    action
 }
 
 impl Label {
@@ -26,6 +29,11 @@ impl Label {
         self.caption = self.caption.split_whitespace().collect::<Vec<_>>().join(" ");
         if self.status == Status::Unlabelable {
             return if self.caption.is_empty() && self.tags.is_empty() { Ok(()) } else { Err("Unusable unlabelable result.".into()) };
+        }
+        let caption = self.caption.to_ascii_lowercase();
+        if ["i cannot", "i can't", "i am unable", "i'm unable", "i'm sorry", "i am sorry", "sorry,", "as an ai", "i must decline"]
+            .iter().any(|prefix| caption.starts_with(prefix)) {
+            return Err("The model returned refusal text instead of a label.".into());
         }
         if self.caption.is_empty() || self.caption.chars().count() > 320 || self.tags.len() > 12 {
             return Err("Caption or tags exceed the response limits, or the caption is empty.".into());
@@ -53,79 +61,104 @@ impl Label {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Saved {
-    pub version: u32,
-    pub identity: String,
-    pub provider: String,
-    pub model: String,
-    pub sheet: Label,
-    pub islands: BTreeMap<String, Label>,
-}
-
 impl Saved {
-    pub fn current(&self, identity: &str) -> bool { self.version == 1 && self.identity == identity }
+    pub fn current(&self, identity: &str) -> bool { self.identity == identity }
 }
 
-/// The first cell names an island independently of response or traversal order.
-pub fn island_id(island: &Island) -> String {
-    let &(x, y) = island.cells.iter().min_by_key(|&&(x, y)| (y, x)).expect("occupied island");
-    format!("island-{x}-{y}")
-}
-
-/// Compare decoded pixels, all grid fields, and canonical cell membership.
-/// Change the version marker when the labeling input or interpretation changes.
-pub fn identity(img: &RgbaImage, grid: Grid, islands: &[Island]) -> String {
-    let mut layout: Vec<_> = islands.iter().map(|island| {
-        let mut cells = island.cells.clone();
-        cells.sort_unstable();
-        cells
-    }).collect();
-    layout.sort();
+/// Only decoded dimensions and pixel bytes determine whether labels are current.
+pub fn identity(img: &RgbaImage) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"tilepicky-labels-1");
     hash.update(img.width().to_le_bytes());
     hash.update(img.height().to_le_bytes());
     hash.update(img.as_raw());
-    hash.update(serde_json::to_vec(&(grid, layout)).expect("integer geometry"));
     format!("{:x}", hash.finalize())
 }
 
-pub fn file(image: &Path) -> PathBuf {
+/// Discard obsolete storage without reading or importing it.
+pub fn delete_legacy(image: &Path) {
     let mut path = image.as_os_str().to_os_string();
     path.push(".tilepicky-labels.json");
-    PathBuf::from(path)
+    let _ = std::fs::remove_file(PathBuf::from(path));
 }
 
-pub fn load(path: &Path) -> Result<Option<Saved>, String> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("Saved labels could not be read.".into()),
-    };
-    let mut saved: Saved = serde_json::from_slice(&bytes).map_err(|_| "Saved labels are invalid or from an unsupported format.")?;
-    saved.sheet.validate()?;
-    for label in saved.islands.values_mut() { label.validate()?; }
-    Ok(Some(saved))
+impl StoredIsland {
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        self.rects.iter().any(|&[left, top, w, h]| x >= left && y >= top && x - left < w && y - top < h)
+    }
+
+    pub fn bounds(&self) -> [u32; 4] {
+        let x = self.rects.iter().map(|r| r[0]).min().unwrap_or(0);
+        let y = self.rects.iter().map(|r| r[1]).min().unwrap_or(0);
+        let right = self.rects.iter().map(|r| r[0].saturating_add(r[2])).max().unwrap_or(0);
+        let bottom = self.rects.iter().map(|r| r[1].saturating_add(r[3])).max().unwrap_or(0);
+        [x, y, right - x, bottom - y]
+    }
 }
 
-/// Replace only after a complete write. A failed save keeps the previous file.
-pub fn save(path: &Path, saved: &Saved) -> Result<(), String> {
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(format!(".{}.tmp", std::process::id()));
-    let temp = PathBuf::from(temp);
-    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)
-        .map_err(|_| "Could not create the labels file. Check folder permissions and temporary files.")?;
-    let result = (|| {
-        let bytes = serde_json::to_vec_pretty(saved).map_err(std::io::Error::other)?;
-        out.write_all(&bytes)?;
-        out.sync_all()?;
-        drop(out);
-        std::fs::rename(&temp, path)
-    })();
-    if result.is_err() { let _ = std::fs::remove_file(temp); }
-    result.map_err(|_| "Could not save labels. Previous saved results were kept.".into())
+/// An owned snapshot keeps requests independent of navigation and later edits.
+pub struct Input {
+    pub path: PathBuf,
+    pub dir: PathBuf,
+    pub rel: String,
+    pub img: RgbaImage,
+    pub islands: Vec<(String, RgbaImage)>,
+    pub identity: String,
+    pub geometry: Vec<StoredIsland>,
+}
+
+impl Input {
+    pub fn run(
+        &self, provider: &str, model: &str, send: impl FnMut(&Value) -> Result<Value, String>,
+        mut accepted: impl FnMut(Saved) -> Result<(), String>,
+    ) -> Result<(), String> {
+        label(&self.img, &self.islands, model, send, |sheet, islands| {
+            let saved = Saved {
+                identity: self.identity.clone(), provider: provider.into(), model: model.into(),
+                sheet: sheet.clone(), islands: self.geometry.iter().zip(&self.islands).map(|(geometry, (id, _))| {
+                    StoredIsland { label: islands.get(id).cloned(), ..geometry.clone() }
+                }).collect(),
+            };
+            accepted(saved)
+        })
+    }
+}
+
+pub enum Update {
+    Saved(Saved),
+    Finished(Result<(), String>),
+}
+
+/// One user-started operation, with no queue or persisted task state.
+pub struct Run {
+    pub path: PathBuf,
+    pub dir: PathBuf,
+    pub rel: String,
+    pub progress: String,
+    pub total: usize,
+    pub saved: Option<Saved>,
+    pub updates: std::sync::mpsc::Receiver<Update>,
+}
+
+impl Run {
+    pub fn start(
+        input: Input, provider: String, model: String,
+        send: impl FnMut(&Value) -> Result<Value, String> + Send + 'static,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self, String> {
+        let (tx, updates) = std::sync::mpsc::channel();
+        let run = Self { path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(), total: input.islands.len(),
+            saved: None, progress: "Labeling whole sheet...".into(), updates };
+        std::thread::Builder::new().name("label sheet".into()).spawn(move || {
+            let result = input.run(&provider, &model, send, |saved| {
+                tx.send(Update::Saved(saved)).map_err(|_| "The labeling window was closed.")?;
+                wake();
+                Ok(())
+            });
+            let _ = tx.send(Update::Finished(result));
+            wake();
+        }).map_err(|_| "Could not start the labeling thread.")?;
+        Ok(run)
+    }
 }
 
 fn label_schema() -> Value {
@@ -214,7 +247,7 @@ pub fn response(value: &Value, expected: &[String]) -> Result<BTreeMap<String, L
     Ok(labels)
 }
 
-/// One foreground operation. Checkpoint accepted results before sending the next group.
+/// Report accepted results in memory before sending the next group.
 pub fn label(
     img: &RgbaImage, islands: &[(String, RgbaImage)], model: &str,
     mut send: impl FnMut(&Value) -> Result<Value, String>,
@@ -234,7 +267,7 @@ pub fn label(
         let missing = next.len() != ids.len();
         labels.extend(next);
         checkpoint(&sheet, &labels)?;
-        if missing { return Err("Some island results were missing. Valid results were saved; label the sheet again to retry.".into()); }
+        if missing { return Err("Some island results were missing. Label the sheet again to retry.".into()); }
     }
     Ok(())
 }
@@ -288,6 +321,82 @@ mod tests {
         json!({"choices":[{"finish_reason":"stop", "message":{"content":json!({"results":results}).to_string()}}]})
     }
 
+    fn temp_dir() -> PathBuf {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("tilepicky-label-test-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn worker_returns_while_request_waits_and_delivers_saved_progress() {
+        use std::sync::mpsc;
+        let dir = temp_dir();
+        let img = RgbaImage::new(2, 2);
+        let input = Input {
+            path: dir.join("sheet.png"), dir: dir.clone(), rel: "sheet.png".into(),
+            geometry: vec![StoredIsland { rects: vec![[0, 0, 1, 1]], label: None }; 2], img: img.clone(), identity: "test-image".into(),
+            islands: vec![("a".into(), img.clone()), ("b".into(), img)],
+        };
+        let (started, waiting) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let mut calls = 0;
+        let run = Run::start(input, "test".into(), "test".into(), move |_| {
+            calls += 1;
+            if calls == 1 {
+                started.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(completion(json!([{"id":"sheet", "label":label_value("Village assets")} ])))
+            } else {
+                Ok(completion(json!([{"id":"b", "label":label_value("House")}, {"id":"a", "label":label_value("Tree")} ])))
+            }
+        }, || {}).unwrap();
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The caller can draw while the transport is waiting on its own thread.
+        let ctx = eframe::egui::Context::default();
+        let mut output = ctx.run_ui(eframe::egui::RawInput::default(), |ui| { ui.label(&run.progress); });
+        output.textures_delta.clear();
+        assert!(matches!(run.updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        let mut counts = Vec::new();
+        let mut latest = None;
+        loop {
+            match run.updates.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Update::Saved(saved) => {
+                    counts.push(saved.islands.iter().filter(|i| i.label.is_some()).count());
+                    latest = Some(saved);
+                }
+                Update::Finished(result) => { result.unwrap(); break; }
+            }
+        }
+        assert_eq!(counts, [0, 2]);
+        assert!(!dir.join(crate::sidecar::BOOK).exists());
+        let saved = latest.unwrap();
+        assert_eq!(saved.identity, "test-image");
+        assert_eq!(saved.islands[0].label.as_ref().unwrap().caption, "Tree");
+        assert_eq!(saved.islands[1].label.as_ref().unwrap().caption, "House");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_cleanup_only_deletes_the_obsolete_file() {
+        let dir = temp_dir();
+        let image = dir.join("sheet.png");
+        let book = dir.join("tilepicky.json");
+        let companion = dir.join("sheet.png.tilepicky-labels.json");
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::write(&book, b"grid").unwrap();
+        std::fs::write(&companion, b"labels").unwrap();
+        delete_legacy(&image);
+        delete_legacy(&image);
+        assert_eq!(std::fs::read(&image).unwrap(), b"image");
+        assert_eq!(std::fs::read(&book).unwrap(), b"grid");
+        std::fs::create_dir(&companion).unwrap();
+        delete_legacy(&image);
+        assert!(companion.is_dir());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn endpoint_urls_keep_the_configured_provider_and_reject_credentials() {
         assert_eq!(endpoint_url(" https://example.test/api/v1/ ").unwrap(), "https://example.test/api/v1/chat/completions");
@@ -325,6 +434,7 @@ mod tests {
             completion(json!([{"id":"other", "label":label_value("Tree")}])),
             completion(json!([{"id":"sheet", "label":label_value("Tree")}, {"id":"sheet", "label":label_value("Rock")}])),
             completion(json!([{"id":"sheet", "label":label_value(" ")} ])),
+            completion(json!([{"id":"sheet", "label":label_value("I cannot help with this image.")} ])),
             completion(json!([{"id":"sheet", "label":{"status":"unlabelable", "caption":"refusal", "tags":[]}}])),
             completion(json!([{"id":"sheet", "label":{"status":"maybe", "caption":"Tree", "tags":[]}}])),
             completion(json!([{"id":"sheet", "label":{"status":"labeled", "caption":"Tree"}}])),
@@ -356,27 +466,18 @@ mod tests {
     }
 
     #[test]
-    fn identity_tracks_pixels_dimensions_grid_and_layout() {
+    fn identity_tracks_only_pixels_and_dimensions() {
         let img = RgbaImage::new(8, 4);
-        let grid = ([4, 4], [0, 0], [0, 0]);
-        let layout = vec![Island { cells: vec![(0, 0), (1, 0)] }];
-        let original = identity(&img, grid, &layout);
-        assert_eq!(original, identity(&img, grid, &[Island { cells: vec![(1, 0), (0, 0)] }]));
-        assert_eq!(island_id(&layout[0]), island_id(&Island { cells: vec![(1, 0), (0, 0)] }));
+        let original = identity(&img);
+        assert_eq!(original, identity(&img.clone()));
         let mut changed = img.clone();
         changed.put_pixel(0, 0, image::Rgba([1, 2, 3, 255]));
-        assert_ne!(original, identity(&changed, grid, &layout));
-        assert_ne!(original, identity(&RgbaImage::new(4, 8), grid, &layout));
-        for grid in [([2, 4], [0, 0], [0, 0]), ([4, 4], [1, 0], [0, 0]), ([4, 4], [0, 0], [-1, 0])] {
-            assert_ne!(original, identity(&img, grid, &layout));
-        }
-        assert_ne!(original, identity(&img, grid, &[Island { cells: vec![(0, 0)] }, Island { cells: vec![(1, 0)] }]));
-        let label = Label { status: Status::Unlabelable, caption: String::new(), tags: vec![] };
-        let mut saved = Saved { version: 1, identity: original.clone(), provider: "test".into(), model: "test".into(), sheet: label, islands: BTreeMap::new() };
+        assert_ne!(original, identity(&changed));
+        assert_ne!(original, identity(&RgbaImage::new(4, 8)));
+        let saved = Saved { identity: original.clone(), provider: "test".into(), model: "test".into(),
+            sheet: Label { status: Status::Unlabelable, caption: String::new(), tags: vec![] }, islands: vec![] };
         assert!(saved.current(&original));
         assert!(!saved.current("different"));
-        saved.version = 2;
-        assert!(!saved.current(&original));
     }
 
     #[test]
@@ -406,15 +507,15 @@ mod tests {
     }
 
     #[test]
-    fn unlabelable_sheet_or_save_failure_stops_before_island_requests() {
+    fn unlabelable_sheet_or_closed_receiver_stops_before_island_requests() {
         let img = RgbaImage::new(2, 2);
-        for fail_save in [false, true] {
+        for closed_receiver in [false, true] {
             let mut calls = 0;
             let result = label(&img, &[("a".into(), img.clone())], "test", |_| {
                 calls += 1;
-                let label = if fail_save { label_value("Tree") } else { json!({"status":"unlabelable", "caption":"", "tags":[]}) };
+                let label = if closed_receiver { label_value("Tree") } else { json!({"status":"unlabelable", "caption":"", "tags":[]}) };
                 Ok(completion(json!([{"id":"sheet", "label":label}])))
-            }, |_, _| if fail_save { Err("Cannot save".into()) } else { Ok(()) });
+            }, |_, _| if closed_receiver { Err("Receiver closed".into()) } else { Ok(()) });
             assert!(result.is_err());
             assert_eq!(calls, 1);
         }

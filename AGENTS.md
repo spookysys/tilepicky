@@ -33,8 +33,11 @@ the person who uses the tool; this file is for an agent that works on it.
   popups, and the drag of a block between the panels.
 - `src/sheet.rs`: one sheet on screen: the grid, the selection, the copy
   and paste, the provenance map, the eye mode, and the animations.
-- `src/sidecar.rs`: `tilepicky.json`, the book of a folder: the grid of
-  each sheet, where its pixels came from, and its animations.
+- `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
+  grid, pixel origins, animations, labels, and saved island geometry.
+  The image fingerprint covers dimensions and pixel bytes only.
+  Island regions use pixel rectangles, as project provenance does.
+  Grid changes leave them alone; Detect islands or Label with AI rebuilds them.
 - `src/index.rs`: the scan of a folder, and the search.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
@@ -44,8 +47,11 @@ the person who uses the tool; this file is for an agent that works on it.
   labeling uses the instant model on an OpenAI-compatible endpoint.
 - `src/islands.rs`: local island detection for the library eye.
 - `src/labels.rs`: structured labeling requests, validation, image identity,
-  and `<image filename>.tilepicky-labels.json`. Requests run only from the
-  explicit Label sheet action. Tests use synthetic images and fake responses.
+  and pixel-region lookup. Requests run only from the explicit Label with AI
+  action. One worker thread sends results to the UI; there is no task queue.
+  Label completion, removal, and existing sheet saves write the book.
+  Analysis stays in memory. Opening a sheet deletes obsolete
+  companion files without importing them. Tests use synthetic images and fake responses.
 
 ## Folders that stay local
 

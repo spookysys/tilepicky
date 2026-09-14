@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! `tilepicky.json`: one file per directory that describes the sheets in it.
-//! Each entry holds the sheet's grid, the origin of cells, and animations.
+//! Each entry holds the grid, cell origins, animations, and AI labels.
 //! The library and the project use the same format.
 
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,35 @@ pub fn count_text(n: usize, noun: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Status { Labeled, Unlabelable }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Label {
+    pub status: Status,
+    pub caption: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct StoredIsland {
+    /// Pixel rectangles [x, y, width, height], independent of the tile grid.
+    #[serde(default)]
+    pub rects: Vec<[u32; 4]>,
+    pub label: Option<Label>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Saved {
+    pub provider: String,
+    pub model: String,
+    pub identity: String,
+    pub sheet: Label,
+    pub islands: Vec<StoredIsland>,
+}
+
 /// What the book says about one sheet.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Sidecar {
@@ -133,11 +162,14 @@ pub struct Sidecar {
     pub provenance: Vec<Provenance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animations: Vec<Animation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Saved>,
 }
 
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
         self.tile.is_none() && self.gap.is_none() && self.offset.is_none() && self.provenance.is_empty() && self.animations.is_empty()
+            && self.labels.is_none()
     }
 }
 
@@ -221,9 +253,46 @@ pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> 
     write_book(dir, &book)
 }
 
+/// Change labels without replacing grid edits made during a request.
+pub fn store_labels(dir: &Path, rel: &str, labels: Option<Saved>) -> Result<(), String> {
+    let mut book = load_book(dir);
+    let side = book.sheets.entry(rel.into()).or_default();
+    side.labels = labels;
+    if side.is_empty() { book.sheets.remove(rel); }
+    write_book(dir, &book)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_roundtrip_rename_and_remove_preserve_the_grid() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tilepicky-book-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let label = Label { status: Status::Labeled, caption: "Tree".into(), tags: vec!["forest".into()] };
+        let labels = Saved { provider: "test".into(), model: "instant".into(), identity: "pixels".into(), sheet: label.clone(),
+            islands: vec![StoredIsland { rects: vec![[3, 5, 20, 10]], label: Some(label) },
+                StoredIsland { rects: vec![[33, 5, 10, 10]], label: None }] };
+        let grid = Sidecar { tile: Some(Pair::Two([10, 20])), ..Sidecar::default() };
+        store_entry(&dir, "folder/sheet.png", &grid).unwrap();
+        store_labels(&dir, "folder/sheet.png", Some(labels.clone())).unwrap();
+        let loaded = load_book(&dir).sheets.remove("folder/sheet.png").unwrap();
+        assert_eq!(loaded.labels, Some(labels.clone()));
+        assert_eq!(loaded.tile, grid.tile);
+        move_entry(&dir, "folder/sheet.png", "folder/renamed.png", false).unwrap();
+        move_prefix(&dir, "folder", "assets").unwrap();
+        let book = load_book(&dir);
+        assert_eq!(book.sheets.len(), 1);
+        assert_eq!(book.sheets["assets/renamed.png"], loaded);
+        store_labels(&dir, "assets/renamed.png", None).unwrap();
+        assert_eq!(load_book(&dir).sheets["assets/renamed.png"], grid);
+        store_labels(&dir, "only-labels.png", Some(labels)).unwrap();
+        store_labels(&dir, "only-labels.png", None).unwrap();
+        assert!(!load_book(&dir).sheets.contains_key("only-labels.png"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_strip_is_a_pixel_rectangle() {

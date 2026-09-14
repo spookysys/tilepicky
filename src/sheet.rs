@@ -370,6 +370,7 @@ impl Sel {
 #[derive(Default)]
 pub struct ViewEvent {
     pub interacted: bool,
+    pub labels: Option<crate::labels::Action>,
     /// A block drag began by holding on this cell.
     pub drag_block: Option<(u32, u32)>,
     /// A canvas resize drag ended.
@@ -588,8 +589,8 @@ pub struct Sheet {
     /// The islands of the eye: the provenance rectangles by source, made
     /// once while the eye is on. Nothing changes the pixels meanwhile.
     eye_islands: Option<Vec<Provenance>>,
-    library_islands: Option<(crate::Grid, crate::islands::Islands)>,
-    labels: Option<crate::labels::Saved>,
+    library_islands: Option<Vec<sidecar::StoredIsland>>,
+    island_identity: String,
     labels_current: bool,
     pub label_notice: String,
     pub preview_zoom: Zoom,
@@ -678,6 +679,7 @@ impl Sheet {
     /// an offset comes from the entry alone; without one, a sheet has none.
     pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], side: Sidecar) -> Result<Self, String> {
         let path = dir.join(rel);
+        crate::labels::delete_legacy(&path);
         let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
         let fail = |e: image::ImageError| format!("{rel}: {e}");
         let reader = image::ImageReader::open(&path).and_then(image::ImageReader::with_guessed_format).map_err(|e| format!("{rel}: {e}"))?;
@@ -701,6 +703,7 @@ impl Sheet {
             sheet.side.read = true;
             let _ = sidecar::store_entry(dir, rel, &sheet.side);
         }
+        sheet.refresh_labels();
         Ok(sheet)
     }
 
@@ -754,7 +757,7 @@ impl Sheet {
             last_stored: None,
             eye_islands: None,
             library_islands: None,
-            labels: None,
+            island_identity: String::new(),
             labels_current: false,
             label_notice: String::new(),
             preview_zoom: Zoom::new(2.0),
@@ -799,8 +802,7 @@ impl Sheet {
     /// past x1, y1), into the chunks it touches. Cheap for small edits on a
     /// large canvas.
     fn upload_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
-        self.library_islands = None;
-        self.labels_current = false;
+        self.check_island_image();
         let (w, h) = self.img.dimensions();
         let (x1, y1) = (x1.min(w), y1.min(h));
         if x0 >= x1 || y0 >= y1 {
@@ -820,8 +822,7 @@ impl Sheet {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
-        self.library_islands = None;
-        self.labels_current = false;
+        self.check_island_image();
         let (w, h) = self.img.dimensions();
         let side = CHUNK.min(ctx.input(|i| i.max_texture_side) as u32).max(64);
         self.chunks.clear();
@@ -956,90 +957,111 @@ impl Sheet {
         Some(((d.x / c.x).max(0.0) as u32, (d.y / c.y).max(0.0) as u32))
     }
 
-    /// Build islands on request. The result lasts until the image or grid changes.
-    pub fn analyze(&mut self) {
+    /// Build pixel regions on request. Later grid edits leave these regions alone.
+    pub fn detect_islands(&mut self) {
         let islands = crate::islands::detect(&self.img, self.cols(), self.rows(), |x, y| self.cell_img_rect(x, y));
-        let grid = (self.tile, self.gap, self.offset);
-        self.labels_current = self.labels.as_ref().is_some_and(|saved| {
-            saved.current(&crate::labels::identity(&self.img, grid, &islands.islands))
-        });
-        self.library_islands = Some((grid, islands));
+        self.check_island_image();
+        self.island_identity = crate::labels::identity(&self.img);
+        self.library_islands = Some(islands.islands.iter().map(|island| self.pixel_island(island)).collect());
     }
 
-    pub fn load_labels(&mut self) {
-        match crate::labels::load(&crate::labels::file(&self.dir.join(&self.rel))) {
-            Ok(saved) => {
-                self.labels = saved;
-                // Restore and verify local geometry when there are saved labels.
-                if self.labels.is_some() { self.analyze(); }
-            }
-            Err(error) => self.label_notice = error,
+    fn check_island_image(&mut self) {
+        if self.side.labels.is_none() && self.library_islands.is_none() { return; }
+        let identity = crate::labels::identity(&self.img);
+        self.labels_current = self.side.labels.as_ref().is_some_and(|saved| saved.current(&identity));
+        if self.island_identity != identity { self.library_islands = None; }
+    }
+
+    fn refresh_labels(&mut self) {
+        self.check_island_image();
+        if let Some(saved) = &self.side.labels && self.labels_current {
+            self.island_identity = saved.identity.clone();
+            self.library_islands = Some(saved.islands.iter().filter(|i| !i.rects.is_empty()).cloned().collect());
         }
     }
 
-    pub fn label_info(&self, ui: &mut Ui, island: Option<&crate::islands::Island>) {
+    pub fn label_info(&self, ui: &mut Ui, island: Option<&sidecar::StoredIsland>) {
         ui.set_max_width(320.0);
-        let Some(saved) = &self.labels else {
-            ui.weak("Not labeled. Open AI assist (I) and choose Label sheet.");
+        let Some(saved) = &self.side.labels else {
+            ui.weak("Not labeled. Open AI assist (I) and choose Label with AI.");
             return;
         };
-        if !self.labels_current || self.library_islands.as_ref().is_none_or(|(grid, _)| *grid != (self.tile, self.gap, self.offset)) {
-            ui.weak("Saved labels are stale. Label the sheet again after checking its grid.");
+        if !self.labels_current {
+            ui.weak("The image changed. Saved labels are stale. Label the sheet again.");
             return;
         }
         if let Some(island) = island {
-            match saved.islands.get(&crate::labels::island_id(island)) {
+            match island.label.as_ref() {
                 Some(label) => label.show(ui),
-                None => { ui.weak("This island has no result. Label the sheet again to retry."); }
+                None => { ui.weak("This island has no result - label again."); }
             }
         } else {
             saved.sheet.show(ui);
-            if let Some((_, islands)) = &self.library_islands {
-                let count = islands.islands.iter().filter(|i| saved.islands.contains_key(&crate::labels::island_id(i))).count();
-                ui.weak(format!("Island results: {count}/{}", islands.islands.len()));
+            if let Some(islands) = &self.library_islands {
+                let count = self.label_count();
+                ui.weak(format!("Island results: {count}/{}", islands.len()));
             }
         }
     }
 
-    /// Crop only island cells. Neighboring objects and grid gaps stay transparent.
-    fn island_crop(&self, island: &crate::islands::Island) -> RgbaImage {
-        let rects: Vec<_> = island.cells.iter().map(|&(x, y)| {
-            let (x0, y0, x1, y1) = self.cell_img_rect(x, y);
-            (x0, y0, x1.min(self.img.width()), y1.min(self.img.height()))
+    fn label_count(&self) -> usize {
+        self.library_islands.as_ref().map_or(0, |islands| islands.iter().filter(|i| i.label.is_some()).count())
+    }
+
+    pub fn label_summary(&self) -> String {
+        let Some(saved) = &self.side.labels else { return "No saved AI labels.".into() };
+        if !self.labels_current {
+            return "Saved AI labels are stale.".into();
+        }
+        let count = self.library_islands.as_ref().map_or(0, Vec::len);
+        let caption = if saved.sheet.status == sidecar::Status::Unlabelable {
+            "The model could not label the sheet.".into()
+        } else { saved.sheet.caption.chars().take(100).collect::<String>() };
+        format!("{caption}\n{}/{} island results", self.label_count(), count)
+    }
+
+    fn pixel_island(&self, island: &crate::islands::Island) -> sidecar::StoredIsland {
+        let rects = island.cells.iter().map(|&(x, y)| {
+            let (left, top, right, bottom) = self.cell_img_rect(x, y);
+            [left, top, right.min(self.img.width()) - left, bottom.min(self.img.height()) - top]
         }).collect();
-        let x0 = rects.iter().map(|r| r.0).min().unwrap();
-        let y0 = rects.iter().map(|r| r.1).min().unwrap();
-        let x1 = rects.iter().map(|r| r.2).max().unwrap();
-        let y1 = rects.iter().map(|r| r.3).max().unwrap();
-        let mut crop = RgbaImage::new(x1 - x0, y1 - y0);
-        for (left, top, right, bottom) in rects {
-            for y in top..bottom {
-                for x in left..right { crop.put_pixel(x - x0, y - y0, *self.img.get_pixel(x, y)); }
+        sidecar::StoredIsland { rects, label: None }
+    }
+
+    /// Crop the stored pixel regions. Holes and gaps stay transparent.
+    fn island_crop(&self, island: &sidecar::StoredIsland) -> RgbaImage {
+        let [x0, y0, width, height] = island.bounds();
+        let mut crop = RgbaImage::new(width, height);
+        for &[left, top, w, h] in &island.rects {
+            for y in top..top + h {
+                for x in left..left + w { crop.put_pixel(x - x0, y - y0, *self.img.get_pixel(x, y)); }
             }
         }
         crop
     }
 
-    pub fn label_with(&mut self, provider: &str, model: &str, send: impl FnMut(&serde_json::Value) -> Result<serde_json::Value, String>) -> Result<(), String> {
+    pub fn label_input(&mut self) -> Result<crate::labels::Input, String> {
         if !self.frames.is_empty() { return Err("Labeling animated sheets is not supported yet.".into()); }
-        self.analyze();
-        let (grid, islands) = self.library_islands.as_ref().unwrap();
-        let identity = crate::labels::identity(&self.img, *grid, &islands.islands);
-        let crops: Vec<_> = islands.islands.iter().map(|i| (crate::labels::island_id(i), self.island_crop(i))).collect();
-        let path = crate::labels::file(&self.dir.join(&self.rel));
-        let img = &self.img;
-        let labels = &mut self.labels;
-        let current = &mut self.labels_current;
-        crate::labels::label(img, &crops, model, send, |sheet, islands| {
-            let saved = crate::labels::Saved {
-                version: 1, identity: identity.clone(), provider: provider.into(), model: model.into(),
-                sheet: sheet.clone(), islands: islands.clone(),
-            };
-            crate::labels::save(&path, &saved)?;
-            *labels = Some(saved);
-            *current = true;
-            Ok(())
+        self.detect_islands();
+        let islands = self.library_islands.as_ref().unwrap();
+        Ok(crate::labels::Input {
+            path: self.dir.join(&self.rel), dir: self.dir.clone(), rel: self.rel.clone(), img: self.img.clone(),
+            identity: crate::labels::identity(&self.img),
+            geometry: islands.clone(),
+            islands: islands.iter().enumerate().map(|(i, island)| (format!("island-{i}"), self.island_crop(island))).collect(),
         })
+    }
+
+    pub fn accept_labels(&mut self, saved: sidecar::Saved) {
+        self.side.labels = Some(saved);
+        self.refresh_labels();
+    }
+
+    pub fn clear_labels(&mut self) {
+        self.side.labels = None;
+        if let Some(islands) = &mut self.library_islands { for island in islands { island.label = None; } }
+        self.labels_current = false;
+        self.label_notice = "Saved AI labels removed.".into();
     }
 
     /// Draws the sheet and handles pointer input. While a block drag is in
@@ -1055,11 +1077,6 @@ impl Sheet {
         let library = !editable;
         let library_eye = eye && library;
         let editable = editable && !eye;
-        let grid = (self.tile, self.gap, self.offset);
-        if self.library_islands.as_ref().is_some_and(|(old, _)| *old != grid) {
-            self.library_islands = None;
-            self.labels_current = false;
-        }
         if !eye {
             self.eye_islands = None;
         }
@@ -1118,10 +1135,12 @@ impl Sheet {
             let resp = ui.interact(outer, id, Sense::click_and_drag());
             if library {
                 resp.context_menu(|ui| {
-                    if ui.button("Analyze").clicked() {
-                        self.analyze();
+                    if ui.button("Detect islands").clicked() {
+                        self.detect_islands();
                         ui.close();
                     }
+                    ui.separator();
+                    event.labels = crate::labels::menu(ui);
                 });
             }
             ui.memory_mut(|m| m.set_focus_lock_filter(id, pane_focus()));
@@ -1225,22 +1244,24 @@ impl Sheet {
             if eye {
                 if library_eye {
                     if let Some(p) = resp.hover_pos() {
-                        let (x, y) = to_cell(p);
+                        let pixel = (p - rect.min) / zoom;
                         let image_rect = Rect::from_min_size(rect.min, Vec2::new(self.img.width() as f32, self.img.height() as f32) * zoom);
                         if !image_rect.contains(p) {
                             resp.clone().on_hover_ui_at_pointer(|ui| {
                                 ui.label(self.sheet_info());
                                 self.label_info(ui, None);
                             });
-                        } else if cell_rect(x, y).contains(p)
-                            && let Some(island) = self.library_islands.as_ref().and_then(|(_, islands)| islands.at(x, y)) {
-                            for &(x, y) in &island.cells {
-                                painter.rect_filled(cell_rect(x, y).intersect(image_rect), 0.0, tint);
+                        } else if let Some(island) = self.library_islands.as_ref()
+                            .and_then(|islands| islands.iter().find(|i| i.contains(pixel.x as u32, pixel.y as u32))) {
+                            for &[x, y, w, h] in &island.rects {
+                                let r = Rect::from_min_size(rect.min + Vec2::new(x as f32, y as f32) * zoom,
+                                    Vec2::new(w as f32, h as f32) * zoom);
+                                painter.rect_filled(r.intersect(image_rect), 0.0, tint);
                             }
                             resp.clone().on_hover_ui_at_pointer(|ui| self.label_info(ui, Some(island)));
                         } else if self.library_islands.is_none() {
                             resp.clone().on_hover_ui_at_pointer(|ui| {
-                                ui.weak("Islands have not been built. Right-click and Analyze, or use Label sheet.");
+                                ui.weak("Islands have not been built. Right-click and choose Detect islands, or use Label with AI.");
                                 self.label_info(ui, None);
                             });
                         }
@@ -1668,7 +1689,9 @@ impl Sheet {
 
     /// Puts a kept step back. The grid comes with it, so that a sheet that
     /// went back to another tile size shows it.
-    fn restore(&mut self, ctx: &egui::Context, step: Step) {
+    fn restore(&mut self, ctx: &egui::Context, mut step: Step) {
+        // Labels belong to the last labeling operation, not the edit history.
+        step.side.labels = self.side.labels.take();
         self.side = step.side;
         (self.tile, self.gap, self.offset) = step.grid;
         if let Some((img, prov)) = step.pixels {
@@ -2202,7 +2225,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_save_reopen_and_become_stale_after_pixel_or_grid_changes() {
+    fn book_labels_survive_grid_changes_but_pixels_make_them_stale() {
         let ctx = egui::Context::default();
         let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("tilepicky-labels-{}-{unique}", std::process::id()));
@@ -2210,34 +2233,55 @@ mod tests {
         let mut sheet = Sheet::new_empty(&ctx, &dir, "sheet.png", [4, 4], 2, 1);
         sheet.img = RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255]));
         sheet.save().unwrap();
+        let before_labels = sheet.step(false);
         let mut calls = 0;
-        sheet.label_with("test", "test", |body| {
+        let input = sheet.label_input().unwrap();
+        input.run("test", "test", |body| {
             calls += 1;
-            let id = if calls == 1 { "sheet" } else { "island-0-0" };
+            let id = if calls == 1 { "sheet" } else { "island-0" };
             assert_eq!(body["model"], "test");
             Ok(serde_json::json!({"choices":[{"finish_reason":"stop", "message":{"content":serde_json::json!({
                 "results":[{"id":id, "label":{"status":"labeled", "caption":"Village", "tags":["Village"]}}]
             }).to_string()}}]}))
-        }).unwrap();
+        }, |saved| { sheet.accept_labels(saved); Ok(()) }).unwrap();
         assert_eq!(calls, 2);
         assert!(sheet.labels_current);
-        let mut reopened = Sheet::open(&ctx, &dir, "sheet.png", sheet.tile, sheet.side.clone()).unwrap();
-        reopened.load_labels();
+        sheet.save_entry().unwrap();
+        let before = std::fs::read(dir.join(sidecar::BOOK)).unwrap();
+        let stored = sheet.side.labels.clone();
+        let regions = sheet.library_islands.clone();
+        sheet.set_grid(&ctx, [2, 4], [0, 0], [0, 0]);
+        assert_eq!(sheet.library_islands, regions);
+        assert!(sheet.labels_current);
+        assert_eq!(sheet.side.labels, stored);
+        assert_eq!(std::fs::read(dir.join(sidecar::BOOK)).unwrap(), before);
+        assert_eq!(sheet.library_islands.as_ref().unwrap()[0].label.as_ref().unwrap().caption, "Village");
+        sheet.restore(&ctx, before_labels);
+        assert!(sheet.labels_current);
+        assert_eq!(sheet.side.labels, stored);
+        let with_labels = sheet.step(false);
+        let legacy = dir.join("sheet.png.tilepicky-labels.json");
+        std::fs::write(&legacy, "invalid").unwrap();
+        let book = sidecar::load_book(&dir);
+        let reopened = Sheet::open(&ctx, &dir, "sheet.png", sheet.tile, book.sheets["sheet.png"].clone()).unwrap();
+        assert!(!legacy.exists());
         assert!(reopened.labels_current);
-        assert_eq!(reopened.labels.as_ref().unwrap().islands["island-0-0"].caption, "Village");
-        reopened.set_grid(&ctx, [2, 4], [0, 0], [0, 0]);
-        reopened.analyze();
-        assert!(!reopened.labels_current);
+        assert_eq!(reopened.side.labels, stored);
+        assert_eq!(reopened.library_islands, regions);
+        sheet.detect_islands();
+        assert!(sheet.library_islands.as_ref().unwrap().iter().all(|i| i.label.is_none()));
+        assert_eq!(sheet.side.labels, stored);
+        assert_eq!(std::fs::read(dir.join(sidecar::BOOK)).unwrap(), before);
         sheet.img.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
         sheet.img.save(dir.join("sheet.png")).unwrap();
-        let mut changed = Sheet::open(&ctx, &dir, "sheet.png", sheet.tile, sheet.side.clone()).unwrap();
-        changed.load_labels();
+        let changed = Sheet::open(&ctx, &dir, "sheet.png", sheet.tile, book.sheets["sheet.png"].clone()).unwrap();
         assert!(!changed.labels_current);
-        std::fs::write(crate::labels::file(&dir.join("sheet.png")), "invalid").unwrap();
-        let mut broken = Sheet::open(&ctx, &dir, "sheet.png", sheet.tile, sheet.side.clone()).unwrap();
-        broken.load_labels();
-        assert!(!broken.label_notice.is_empty());
-        assert!(broken.labels.is_none());
+        let island_count = sheet.library_islands.as_ref().unwrap().len();
+        sheet.clear_labels();
+        assert!(sheet.side.labels.is_none());
+        assert_eq!(sheet.library_islands.as_ref().unwrap().len(), island_count);
+        sheet.restore(&ctx, with_labels);
+        assert!(sheet.side.labels.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2248,7 +2292,8 @@ mod tests {
         sheet.img = RgbaImage::from_pixel(10, 8, Rgba([80, 90, 100, 255]));
         sheet.offset = [1, 1];
         sheet.gap = [2, 1];
-        let crop = sheet.island_crop(&crate::islands::Island { cells: vec![(0, 0), (1, 0), (0, 1)] });
+        let island = sheet.pixel_island(&crate::islands::Island { cells: vec![(0, 0), (1, 0), (0, 1)] });
+        let crop = sheet.island_crop(&island);
         assert_eq!(crop.dimensions(), (8, 5));
         assert_eq!(crop.get_pixel(0, 0)[3], 255);
         assert_eq!(crop.get_pixel(5, 0)[3], 255);
@@ -2256,6 +2301,15 @@ mod tests {
         assert_eq!(crop.get_pixel(3, 0)[3], 0);
         assert_eq!(crop.get_pixel(0, 2)[3], 0);
         assert_eq!(crop.get_pixel(5, 3)[3], 0);
+        assert_eq!(island.rects, [[1, 1, 3, 2], [6, 1, 3, 2], [1, 4, 3, 2]]);
+        assert!(island.contains(1, 1));
+        assert!(island.contains(8, 2));
+        assert!(!island.contains(4, 1));
+        assert!(!island.contains(1, 3));
+        assert!(!island.contains(6, 4));
+        sheet.set_grid(&ctx, [2, 3], [0, 2], [-1, 0]);
+        assert_eq!(sheet.island_crop(&island), crop);
+        assert!(island.contains(8, 2));
     }
 
     #[test]
@@ -2272,14 +2326,14 @@ mod tests {
         };
         draw(&mut sheet, true);
         assert!(sheet.library_islands.is_none());
-        sheet.analyze();
+        sheet.detect_islands();
         draw(&mut sheet, false);
         draw(&mut sheet, true);
         assert!(sheet.library_islands.is_some());
         sheet.tile = [2, 4];
         draw(&mut sheet, true);
-        assert!(sheet.library_islands.is_none());
-        sheet.analyze();
+        assert!(sheet.library_islands.is_some());
+        sheet.detect_islands();
         sheet.img.put_pixel(0, 0, Rgba([255; 4]));
         sheet.upload_region(0, 0, 1, 1);
         draw(&mut sheet, true);

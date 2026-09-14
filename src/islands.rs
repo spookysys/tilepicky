@@ -12,18 +12,9 @@ pub struct Island {
 #[derive(Debug, PartialEq)]
 pub struct Islands {
     pub islands: Vec<Island>,
-    cells: Vec<Option<usize>>,
-    cols: u32,
 }
 
 type PixelRect = (u32, u32, u32, u32);
-
-impl Islands {
-    pub fn at(&self, x: u32, y: u32) -> Option<&Island> {
-        if x >= self.cols { return None; }
-        self.cells.get((y * self.cols + x) as usize).copied().flatten().map(|id| &self.islands[id])
-    }
-}
 
 /// Rectangles come from the sheet's grid geometry, including clipped cells and gaps.
 pub fn detect(img: &RgbaImage, cols: u32, rows: u32, rect: impl Fn(u32, u32) -> PixelRect) -> Islands {
@@ -34,13 +25,14 @@ pub fn detect(img: &RgbaImage, cols: u32, rows: u32, rect: impl Fn(u32, u32) -> 
     let occupied: Vec<_> = rects.iter().map(|&(x0, y0, x1, y1)| {
         (y0..y1).any(|y| (x0..x1).any(|x| img.get_pixel(x, y)[3] != 0))
     }).collect();
-    let mut result = Islands { islands: Vec::new(), cells: vec![None; rects.len()], cols };
+    let mut result = Islands { islands: Vec::new() };
+    let mut cells = vec![None; rects.len()];
     for start in 0..rects.len() {
-        if !occupied[start] || result.cells[start].is_some() { continue; }
+        if !occupied[start] || cells[start].is_some() { continue; }
         let id = result.islands.len();
         let mut island = Island { cells: Vec::new() };
         let mut pending = vec![start];
-        result.cells[start] = Some(id);
+        cells[start] = Some(id);
         while let Some(i) = pending.pop() {
             let (x, y) = (i as u32 % cols, i as u32 / cols);
             island.cells.push((x, y));
@@ -53,9 +45,9 @@ pub fn detect(img: &RgbaImage, cols: u32, rows: u32, rect: impl Fn(u32, u32) -> 
             for (cell, horizontal) in neighbors {
                 let Some((nx, ny)) = cell else { continue; };
                 let j = (ny * cols + nx) as usize;
-                if occupied[j] && result.cells[j].is_none()
+                if occupied[j] && cells[j].is_none()
                     && joins(img, rects[i.min(j)], rects[i.max(j)], horizontal) {
-                    result.cells[j] = Some(id);
+                    cells[j] = Some(id);
                     pending.push(j);
                 }
             }
@@ -117,7 +109,7 @@ mod tests {
         let found = grid(&img, [4, 4]);
         assert_eq!(found.islands.len(), 1);
         assert_eq!(found.islands[0].cells.len(), 4);
-        assert!(found.at(2, 0).is_none());
+        assert!(found.islands.iter().all(|i| !i.cells.contains(&(2, 0))));
         assert_eq!(found, grid(&img, [4, 4]));
     }
 

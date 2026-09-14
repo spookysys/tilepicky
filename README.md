@@ -63,15 +63,15 @@ pixels came from, and every pixel from that same pack lights up with it.
 Hover beside the sheet and it tells you about the sheet as a whole. Nothing
 selects or edits while the eye is on, and it starts off.
 
-Right-click a library file or its open sheet and choose **Analyze** to build
+Right-click a library file or its open sheet and choose **Detect islands** to build
 islands using the current grid. Opening a sheet detects its grid if none is
 saved. The library eye (`E`) highlights the island under the pointer.
 Transparent edges and sharp color changes separate islands; smooth edges
 join them. Seamless terrain can form one large island. Gaps and empty cells do not light up.
 
-Analysis stays with the open sheet in memory. Changing its image or grid
-clears the result. Choose **Analyze** again after a correction or reopening
-the sheet. Sheets with saved labels restore and check their islands on open.
+Analysis stays with the open sheet in memory. Changing its image
+clears the result. Choose **Detect islands** again after a correction or reopening
+the sheet. Sheets with saved labels restore their pixel regions on open.
 Switching the eye on or off does not run analysis.
 
 ## Label one library sheet
@@ -83,22 +83,39 @@ output. Use an OpenAI-compatible provider URL, such as
 variable. The Google and batch settings remain available for future work;
 this action uses only the instant OpenAI-compatible endpoint.
 
-Click **Label sheet** to send the image. Opening the panel sends nothing.
+Choose **Label with AI** in the AI panel, the sheet's right-click menu, or
+its library file's right-click menu. All three start the same operation.
+Opening a panel or menu sends nothing.
 The model first describes the sheet's asset type, setting, style, palette,
 and contents. It then labels groups of island crops with that description
-as context. Crops contain only the island's cells. The app waits until the
-operation finishes; each request has a 60-second timeout.
+as context. Crops contain only the island's cells. Progress appears in the
+AI panel, and you can keep browsing while requests run. One sheet can be
+labeled at a time; each request has a 60-second timeout.
 
 The library eye shows an island's caption and tags under the pointer. Hover
 outside the image for the whole-sheet description. Missing results, stale
 labels, and content the model could not identify are shown explicitly.
 Project provenance works as before.
 
-Labels are saved beside the image as `<image filename>.tilepicky-labels.json`.
-The file records the model and a fingerprint of the pixels, grid, and island
-layout. A changed fingerprint makes the saved labels stale. Valid partial
-results are saved if a later request fails. **Label sheet** starts again and
-replaces results as new responses arrive. Labels are not searched yet.
+Labels live in the sheet's entry in `tilepicky.json`, with the provider,
+model, and each island's pixel rectangles. As in the project provenance eye,
+hover and highlight use pixel regions directly. Grid edits leave the islands
+and their labels unchanged, including gaps and holes in each region.
+**Detect islands** or **Label with AI** explicitly builds new islands from the current
+grid. Detect islands keeps the sheet description; new islands need new labels.
+The image fingerprint covers decoded dimensions and pixel bytes only.
+Changed pixels make saved labels stale.
+
+Results stay in memory while requests run. When the operation ends, the
+book receives the results, including valid partial results if a later
+request failed. **Label with AI** starts again from the whole sheet.
+Old companion files are deleted on open and removal, without importing them.
+Labels are not searched yet.
+
+Choose **Remove saved AI labels...** in the panel or either context menu,
+then confirm the named sheet. This clears its saved label data from the book.
+The image, grid, and island highlight stay. Removal is unavailable while
+labeling runs, so an arriving response cannot restore deleted labels.
 
 This first version labels still images. Images larger than 2048 pixels on
 an edge are reduced for the model; the original image is not changed.

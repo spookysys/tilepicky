@@ -107,6 +107,8 @@ struct App {
     keys: ai::Keys,
     /// The AI assist panel of the library is open.
     ai_panel: bool,
+    label_run: Option<labels::Run>,
+    remove_labels: Option<(PathBuf, String)>,
     /// The settings popup was open at the last frame; both files are
     /// written when it closes.
     config_open: bool,
@@ -360,6 +362,8 @@ impl App {
             settings,
             keys: ai::Keys::load(),
             ai_panel: false,
+            label_run: None,
+            remove_labels: None,
             config_open: false,
             legend_prompt: false,
             library_eye: false,
@@ -670,7 +674,6 @@ impl App {
                 if let Some(prev) = &self.library_sheet {
                     s.zoom = prev.zoom;
                 }
-                s.load_labels();
                 self.library_sheet = Some(s);
                 self.library_sel = Some(i);
                 // The keys follow the file, however it was opened. A click
@@ -1201,7 +1204,8 @@ impl App {
 
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     fn dialog_open(&self, ctx: &egui::Context) -> bool {
-        self.prompt.is_some() || self.confirm.is_some() || self.pending.is_some() || self.legend_prompt || egui::Popup::is_any_open(ctx)
+        self.prompt.is_some() || self.confirm.is_some() || self.remove_labels.is_some()
+            || self.pending.is_some() || self.legend_prompt || egui::Popup::is_any_open(ctx)
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -1670,49 +1674,135 @@ impl App {
         clicked
     }
 
-    /// This action is foreground-only. Merely opening the panel sends nothing.
-    fn assist_panel(ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys, sheet: Option<&Sheet>) -> egui::Response {
-        ui.set_min_width(ui.available_width());
-        ui.strong("Label this sheet");
+    /// Configuration belongs in Settings; this panel shows the selected sheet's work.
+    fn assist_panel(
+        ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys, sheet: Option<&Sheet>, run: Option<&labels::Run>,
+    ) -> (Vec<egui::Response>, Option<labels::Action>) {
+        ui.strong("AI labels");
         let ready = match ai.chosen(ai::Mode::Instant) {
-            Some((p, m)) if p.kind == ai::Kind::OpenAi => {
-                ui.label(format!("{}: {}", p.name, m.id));
-                ui.weak(&p.url);
-                if p.key_source(keys) == ai::KeySource::None {
-                    ui.weak("Add the provider key in settings.");
-                    false
-                } else { true }
+            Some((p, m)) if p.kind == ai::Kind::OpenAi && p.key_source(keys) != ai::KeySource::None => {
+                ui.weak(format!("Ready: {}", m.id));
+                true
             }
-            _ => {
-                ui.weak("Choose an instant image model on an OpenAI-compatible endpoint in settings.");
-                false
-            }
+            _ => { ui.weak("Set an instant image model and key in Settings."); false }
         };
-        ui.label("Sends this sheet, then its island crops, to the selected provider. Saves captions and tags locally.");
-        ui.weak("Use a model with image input and structured JSON output. The app waits for this operation to finish.");
-        let button = ui.add_enabled(ready && sheet.is_some(), egui::Button::new("Label sheet"));
-        ui.data_mut(|d| d.insert_temp(Id::new("label button"), button.id));
-        if let Some(s) = sheet {
-            ui.separator();
-            ui.label(&s.rel);
-            s.label_info(ui, None);
-            if !s.label_notice.is_empty() { ui.label(&s.label_notice); }
+        if let Some(run) = run {
+            ui.horizontal(|ui| { ui.spinner(); ui.label(&run.progress); });
+            ui.weak(run.path.file_name().unwrap_or_default().to_string_lossy()).on_hover_text(run.path.display().to_string());
         }
-        button
+        if let Some(sheet) = sheet {
+            ui.label(sheet.label_summary());
+            if !sheet.label_notice.is_empty() { ui.label(&sheet.label_notice); }
+        } else { ui.weak("Select a library sheet."); }
+        let label = ui.add_enabled(ready && sheet.is_some() && run.is_none(), egui::Button::new("Label with AI"))
+            .on_hover_text("Sends this sheet and its island crops to the configured instant model.");
+        ui.data_mut(|d| d.insert_temp(Id::new("label button"), label.id));
+        let remove = ui.add_enabled(sheet.is_some() && run.is_none(), egui::Button::new("Remove saved AI labels..."));
+        let action = if label.clicked() { Some(labels::Action::Label) } else if remove.clicked() { Some(labels::Action::Remove) } else { None };
+        (vec![label, remove], action)
     }
 
-    fn label_library(&mut self) {
-        let Some((provider, model)) = self.settings.ai.chosen(ai::Mode::Instant) else { return };
-        if provider.kind != ai::Kind::OpenAi { return; }
-        let Some(key) = provider.key(&self.keys) else { return };
+    /// Every UI entry point reaches this operation after selecting its target sheet.
+    fn label_action(&mut self, ctx: &egui::Context, action: labels::Action) {
+        self.ai_panel = true;
+        if self.label_run.is_some() || self.remove_labels.is_some() {
+            self.status = "Finish the current labeling operation first.".into();
+            return;
+        }
         let Some(sheet) = &mut self.library_sheet else { return };
-        let result = labels::Endpoint::new(&provider.url, key)
-            .and_then(|endpoint| sheet.label_with(&provider.name, &model.id, |body| endpoint.send(body)));
-        sheet.label_notice = match result {
-            Ok(()) => "Labels saved. Use the eye (E) to inspect islands.".into(),
-            Err(error) => error,
+        if action == labels::Action::Remove {
+            self.remove_labels = Some((sheet.dir.clone(), sheet.rel.clone()));
+            ctx.request_repaint();
+            return;
+        }
+        let result = (|| {
+            let (provider, model) = self.settings.ai.chosen(ai::Mode::Instant).ok_or("Choose an instant model in Settings.")?;
+            if provider.kind != ai::Kind::OpenAi { return Err("Choose an OpenAI-compatible provider in Settings.".into()); }
+            let key = provider.key(&self.keys).ok_or("Set the provider key in Settings.")?;
+            let endpoint = labels::Endpoint::new(&provider.url, key)?;
+            let input = sheet.label_input()?;
+            let ctx = ctx.clone();
+            labels::Run::start(input, provider.name.clone(), model.id.clone(), move |body| endpoint.send(body), move || ctx.request_repaint())
+        })();
+        match result {
+            Ok(run) => { sheet.label_notice.clear(); self.label_run = Some(run); ctx.request_repaint(); }
+            Err(error) => { sheet.label_notice = error; self.status = sheet.label_notice.clone(); }
+        }
+    }
+
+    fn receive_labels(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(mut run) = self.label_run.take() else { return };
+        let result = loop {
+            match run.updates.try_recv() {
+                Ok(labels::Update::Saved(saved)) => {
+                    let count = saved.islands.iter().filter(|i| i.label.is_some()).count();
+                    run.progress = format!("Island results: {count}/{}", run.total);
+                    run.saved = Some(saved);
+                }
+                Ok(labels::Update::Finished(result)) => break Some(result),
+                Err(TryRecvError::Empty) => break None,
+                Err(TryRecvError::Disconnected) => break Some(Err("The labeling operation stopped unexpectedly.".into())),
+            }
         };
-        self.status = sheet.label_notice.clone();
+        if let Some(mut result) = result {
+            if let Some(saved) = run.saved {
+                match sidecar::store_labels(&run.dir, &run.rel, Some(saved.clone())) {
+                    Ok(()) => self.apply_labels(&run.path, Some(saved)),
+                    Err(error) => result = Err(format!("Could not save labels: {error}")),
+                }
+            }
+            let notice = match result {
+                Ok(()) => "Labels saved. Use the eye (E) to inspect them.".to_string(),
+                Err(error) => error,
+            };
+            if let Some(sheet) = self.library_sheet.as_mut().filter(|s| s.dir.join(&s.rel) == run.path) {
+                sheet.label_notice = notice.clone();
+            }
+            self.status = format!("{}: {notice}", run.path.file_name().unwrap_or_default().to_string_lossy());
+        } else { self.label_run = Some(run); }
+    }
+
+    fn apply_labels(&mut self, path: &Path, labels: Option<sidecar::Saved>) {
+        for index in [&mut self.library, &mut self.project] {
+            for entry in &mut index.entries {
+                if index.root.join(&entry.rel) == path { entry.side.labels = labels.clone(); }
+            }
+        }
+        for sheet in [&mut self.library_sheet, &mut self.project_sheet].into_iter().flatten() {
+            if sheet.dir.join(&sheet.rel) == path {
+                match &labels { Some(saved) => sheet.accept_labels(saved.clone()), None => sheet.clear_labels() }
+            }
+        }
+    }
+
+    fn remove_labels_dialog(&mut self, ctx: &egui::Context) {
+        let Some((dir, rel)) = self.remove_labels.clone() else { return };
+        let path = dir.join(&rel);
+        let mut choice = None;
+        egui::Modal::new(Id::new("remove AI labels")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Remove saved AI labels?");
+            ui.label(path.display().to_string());
+            ui.label("This removes the captions and tags. The image, grid, and islands stay.");
+            ui.horizontal(|ui| {
+                if ui.button("Remove labels").clicked() { choice = Some(true); }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) { choice = Some(false); }
+            });
+        });
+        if let Some(remove) = choice {
+            self.remove_labels = None;
+            if remove {
+                labels::delete_legacy(&path);
+                match sidecar::store_labels(&dir, &rel, None) {
+                    Ok(()) => {
+                        self.apply_labels(&path, None);
+                        self.status = "Saved AI labels removed.".into();
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+        }
     }
 
     /// `A` opens or closes the animation panel of the active panel. Storing
@@ -2263,6 +2353,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        self.receive_labels();
         // A right click first closes any open menu. egui closes a menu on any
         // click while it is open, and it does that after the same click has
         // opened the new menu; without this every second right click shows
@@ -2620,15 +2711,20 @@ impl eframe::App for App {
         }
         match library_action {
             Some(TreeAction::Open(i)) => self.open_library(ctx, i),
-            Some(TreeAction::Analyze(i)) => {
+            Some(TreeAction::DetectIslands(i)) => {
                 let rel = self.library.entries[i].rel.clone();
                 if !self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) {
                     self.open_library(ctx, i);
                 }
                 if let Some(s) = self.library_sheet.as_mut().filter(|s| s.rel == rel) {
-                    s.analyze();
-                    self.status = format!("Analyzed {rel}. Use the eye (E) to inspect islands.");
+                    s.detect_islands();
+                    self.status = format!("Detected islands in {rel}. Use the eye (E) to inspect islands.");
                 }
+            }
+            Some(TreeAction::Labels(i, action)) => {
+                let rel = self.library.entries[i].rel.clone();
+                if !self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) { self.open_library(ctx, i); }
+                if self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) { self.label_action(ctx, action); }
             }
             Some(TreeAction::Refresh) => self.rescan_library(),
             Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.library.root, &self.library.entries[i].rel)),
@@ -2740,7 +2836,7 @@ impl eframe::App for App {
                     focus: true,
                 });
             }
-            Some(TreeAction::Analyze(_)) | None => {}
+            Some(TreeAction::DetectIslands(_) | TreeAction::Labels(_, _)) | None => {}
         }
         // The sweep ends with the button, after this frame's marks are in;
         // clearing it earlier would let the last step mark one file only.
@@ -2750,6 +2846,7 @@ impl eframe::App for App {
         self.drop_files(ctx, hover_dir);
         self.name_dialog(ctx);
         self.confirm_dialog(ctx);
+        self.remove_labels_dialog(ctx);
         if create {
             self.request(ctx, Pending::Create);
         }
@@ -2788,12 +2885,12 @@ impl eframe::App for App {
             if self.ai_panel {
                 let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref())
+                        Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref(), self.label_run.as_ref())
                     }).inner
                 });
                 panes.push(((Panel::Library, Spot::Side), label.response.rect));
-                stops.push(((Panel::Library, Spot::Side), label.inner.id, label.inner.rect));
-                if label.inner.clicked() { self.label_library(); }
+                for button in &label.inner.0 { stops.push(((Panel::Library, Spot::Side), button.id, button.rect)); }
+                if let Some(action) = label.inner.1 { self.label_action(ctx, action); }
             }
             if let Some(s) = &mut self.library_sheet {
                 if s.anim_panel {
@@ -2805,6 +2902,7 @@ impl eframe::App for App {
                 let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false, eye, keys == (Panel::Library, Spot::Sheet)));
                 stops.push(((Panel::Library, Spot::Sheet), library_id(), out.response.rect));
                 let ev = out.inner;
+                if let Some(action) = ev.labels { self.label_action(ctx, action); }
                 if ev.interacted {
                     self.active = Panel::Library;
                 }
