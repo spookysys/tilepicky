@@ -63,6 +63,16 @@ pixels came from, and every pixel from that same pack lights up with it.
 Hover beside the sheet and it tells you about the sheet as a whole. Nothing
 selects or edits while the eye is on, and it starts off.
 
+Right-click a library file or its open sheet and choose **Analyze** to build
+islands using the current grid. Opening a sheet detects its grid if none is
+saved. The library eye (`E`) highlights the island under the pointer.
+Transparent edges and sharp color changes separate islands; smooth edges
+join them. Seamless terrain can form one large island. Gaps and empty cells do not light up.
+
+Analysis stays with the open sheet in memory. Changing its image or grid
+clears the result. Choose **Analyze** again after a correction or reopening
+the sheet. Switching the eye on or off does not run analysis.
+
 ## From the keyboard
 
 You can do the whole job without the mouse.

@@ -12,6 +12,7 @@
 mod ai;
 mod detect;
 mod index;
+mod islands;
 mod settings;
 mod sheet;
 mod sidecar;
@@ -24,10 +25,8 @@ use eframe::egui::{self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle,
 /// flag only hides the buttons and the settings section for a release
 /// before the features are finished.
 const AI_VISIBLE: bool = false;
-/// The library panel's eye shows only the whole-sheet tooltip today, since
-/// a library sheet carries no provenance; that is little enough to hide it
-/// for a release. The project panel's eye, which shows provenance, stays.
-const LIBRARY_EYE_VISIBLE: bool = false;
+/// Library islands are available independently of the AI features.
+const LIBRARY_EYE_VISIBLE: bool = true;
 
 /// A sheet's tile size, gap, and offset, as the header fields edit them.
 type Grid = ([u32; 2], [u32; 2], [i32; 2]);
@@ -2616,6 +2615,16 @@ impl eframe::App for App {
         }
         match library_action {
             Some(TreeAction::Open(i)) => self.open_library(ctx, i),
+            Some(TreeAction::Analyze(i)) => {
+                let rel = self.library.entries[i].rel.clone();
+                if !self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) {
+                    self.open_library(ctx, i);
+                }
+                if let Some(s) = self.library_sheet.as_mut().filter(|s| s.rel == rel) {
+                    s.analyze();
+                    self.status = format!("Analyzed {rel}. Use the eye (E) to inspect islands.");
+                }
+            }
             Some(TreeAction::Refresh) => self.rescan_library(),
             Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.library.root, &self.library.entries[i].rel)),
             Some(TreeAction::RevealDir(dir)) => reveal(&file_path(&self.library.root, &dir)),
@@ -2726,7 +2735,7 @@ impl eframe::App for App {
                     focus: true,
                 });
             }
-            None => {}
+            Some(TreeAction::Analyze(_)) | None => {}
         }
         // The sweep ends with the button, after this frame's marks are in;
         // clearing it earlier would let the last step mark one file only.

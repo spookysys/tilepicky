@@ -588,6 +588,7 @@ pub struct Sheet {
     /// The islands of the eye: the provenance rectangles by source, made
     /// once while the eye is on. Nothing changes the pixels meanwhile.
     eye_islands: Option<Vec<Provenance>>,
+    library_islands: Option<(crate::Grid, crate::islands::Islands)>,
     pub preview_zoom: Zoom,
     /// Screen pixels in one point, as the window reports them. The drawing
     /// needs it to keep the image pixels even.
@@ -749,6 +750,7 @@ impl Sheet {
             anim_panel: false,
             last_stored: None,
             eye_islands: None,
+            library_islands: None,
             preview_zoom: Zoom::new(2.0),
             ppp: 1.0,
             preview_hovered: false,
@@ -791,6 +793,7 @@ impl Sheet {
     /// past x1, y1), into the chunks it touches. Cheap for small edits on a
     /// large canvas.
     fn upload_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
+        self.library_islands = None;
         let (w, h) = self.img.dimensions();
         let (x1, y1) = (x1.min(w), y1.min(h));
         if x0 >= x1 || y0 >= y1 {
@@ -810,6 +813,7 @@ impl Sheet {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
+        self.library_islands = None;
         let (w, h) = self.img.dimensions();
         let side = CHUNK.min(ctx.input(|i| i.max_texture_side) as u32).max(64);
         self.chunks.clear();
@@ -944,6 +948,12 @@ impl Sheet {
         Some(((d.x / c.x).max(0.0) as u32, (d.y / c.y).max(0.0) as u32))
     }
 
+    /// Build islands on request. The result lasts until the image or grid changes.
+    pub fn analyze(&mut self) {
+        let islands = crate::islands::detect(&self.img, self.cols(), self.rows(), |x, y| self.cell_img_rect(x, y));
+        self.library_islands = Some(((self.tile, self.gap, self.offset), islands));
+    }
+
     /// Draws the sheet and handles pointer input. While a block drag is in
     /// progress (`dragging`), the sheet only draws. With the eye on, the
     /// sheet is for looking: hovering tells what a place is, and nothing
@@ -954,7 +964,13 @@ impl Sheet {
     /// answers which of the two sheets you are working in.
     pub fn view(&mut self, ui: &mut Ui, id: Id, dragging: bool, editable: bool, eye: bool, live: bool) -> ViewEvent {
         let mut event = ViewEvent::default();
+        let library = !editable;
+        let library_eye = eye && library;
         let editable = editable && !eye;
+        let grid = (self.tile, self.gap, self.offset);
+        if self.library_islands.as_ref().is_some_and(|(old, _)| *old != grid) {
+            self.library_islands = None;
+        }
         if !eye {
             self.eye_islands = None;
         }
@@ -1011,6 +1027,14 @@ impl Sheet {
             // The image starts on a whole screen pixel; see `even_pos`.
             let rect = Rect::from_min_size(even_pos(outer.min, self.ppp), size);
             let resp = ui.interact(outer, id, Sense::click_and_drag());
+            if library {
+                resp.context_menu(|ui| {
+                    if ui.button("Analyze").clicked() {
+                        self.analyze();
+                        ui.close();
+                    }
+                });
+            }
             ui.memory_mut(|m| m.set_focus_lock_filter(id, pane_focus()));
             self.screen = rect;
             self.clip = ui.clip_rect();
@@ -1110,6 +1134,19 @@ impl Sheet {
                 (snap_far(a.0, c.0, fw, cols - 1), snap_far(a.1, c.1, fh, rows - 1))
             };
             if eye {
+                if library_eye {
+                    if let Some(p) = resp.hover_pos() {
+                        let (x, y) = to_cell(p);
+                        let image_rect = Rect::from_min_size(rect.min, Vec2::new(self.img.width() as f32, self.img.height() as f32) * zoom);
+                        if image_rect.contains(p) && cell_rect(x, y).contains(p)
+                            && let Some(island) = self.library_islands.as_ref().and_then(|(_, islands)| islands.at(x, y)) {
+                            for &(x, y) in &island.cells {
+                                painter.rect_filled(cell_rect(x, y).intersect(image_rect), 0.0, tint);
+                            }
+                        }
+                    }
+                    return;
+                }
                 // The pixel under the pointer names its island: every pixel
                 // from the same source lights up, and the tooltip names the
                 // source.
@@ -2059,6 +2096,59 @@ fn checkerboard(painter: &egui::Painter, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analysis_is_explicit_and_survives_eye_toggles() {
+        let ctx = egui::Context::default();
+        let mut sheet = Sheet::new_empty(&ctx, Path::new(""), "test.png", [4, 4], 2, 1);
+        let draw = |sheet: &mut Sheet, eye| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    sheet.view(ui, Id::new("test sheet"), false, false, eye, true);
+                });
+            });
+            output.textures_delta.clear();
+        };
+        draw(&mut sheet, true);
+        assert!(sheet.library_islands.is_none());
+        sheet.analyze();
+        draw(&mut sheet, false);
+        draw(&mut sheet, true);
+        assert!(sheet.library_islands.is_some());
+        sheet.tile = [2, 4];
+        draw(&mut sheet, true);
+        assert!(sheet.library_islands.is_none());
+        sheet.analyze();
+        sheet.img.put_pixel(0, 0, Rgba([255; 4]));
+        sheet.upload_region(0, 0, 1, 1);
+        draw(&mut sheet, true);
+        assert!(sheet.library_islands.is_none());
+    }
+
+    #[test]
+    fn library_islands_use_sheet_geometry() {
+        let ctx = egui::Context::default();
+        let mut sheet = Sheet::new_empty(&ctx, Path::new(""), "test.png", [3, 2], 3, 3);
+        sheet.img = RgbaImage::new(10, 8);
+        sheet.gap = [2, 1];
+        for (offset, occupied) in [([1, 1], 6), ([-1, -1], 9)] {
+            sheet.offset = offset;
+            sheet.img.fill(0);
+            for y in 0..sheet.rows() {
+                for x in 0..sheet.cols() {
+                    let (x0, y0, x1, y1) = sheet.cell_img_rect(x, y);
+                    for py in y0..y1.min(sheet.img.height()) {
+                        for px in x0..x1.min(sheet.img.width()) {
+                            sheet.img.put_pixel(px, py, Rgba([80, 90, 100, 255]));
+                        }
+                    }
+                }
+            }
+            let found = crate::islands::detect(&sheet.img, sheet.cols(), sheet.rows(), |x, y| sheet.cell_img_rect(x, y));
+            assert_eq!(found.islands.len(), 1);
+            assert_eq!(found.islands[0].cells.len(), occupied);
+        }
+    }
 
     /// A changed tile size must survive save and reopen.
     #[test]

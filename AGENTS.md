@@ -41,8 +41,8 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: the AI providers, models, and keys (`keys.json`, mode 0600),
   and their settings page. The AI features themselves are not built yet, and
-  `AI_VISIBLE` and `LIBRARY_EYE_VISIBLE` in `src/main.rs` hide their UI for
-  a release. The code behind both flags stays; flip a flag to bring it back.
+  `AI_VISIBLE` in `src/main.rs` hides their UI for a release. The library
+  eye is available and uses local island detection in `src/islands.rs`.
 
 ## Folders that stay local
 
