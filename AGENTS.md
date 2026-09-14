@@ -39,10 +39,13 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
-- `src/ai.rs`: the AI providers, models, and keys (`keys.json`, mode 0600),
-  and their settings page. The AI features themselves are not built yet, and
-  `AI_VISIBLE` in `src/main.rs` hides their UI for a release. The library
-  eye is available and uses local island detection in `src/islands.rs`.
+- `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
+  and their settings page. Google and batch settings are retained; sheet
+  labeling uses the instant model on an OpenAI-compatible endpoint.
+- `src/islands.rs`: local island detection for the library eye.
+- `src/labels.rs`: structured labeling requests, validation, image identity,
+  and `<image filename>.tilepicky-labels.json`. Requests run only from the
+  explicit Label sheet action. Tests use synthetic images and fake responses.
 
 ## Folders that stay local
 

@@ -85,6 +85,12 @@ impl Provider {
         Provider { name: name.into(), kind, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
     }
 
+    /// Resolve the key only when the user starts a request.
+    pub fn key(&self, keys: &Keys) -> Option<String> {
+        keys.get(&self.name).map(str::to_string)
+            .or_else(|| self.key_env.iter().find_map(|name| std::env::var(name).ok().filter(|s| !s.trim().is_empty())))
+    }
+
     pub fn key_source(&self, keys: &Keys) -> KeySource {
         self.key_source_in(keys, |name| std::env::var(name).ok())
     }

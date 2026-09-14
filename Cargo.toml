@@ -16,6 +16,9 @@ include = ["src/**", "icon.png", "README.md", "LICENSE"]
 wgpu = ["eframe/wgpu"]
 
 [dependencies]
+base64 = "0.23.1"
+ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+sha2 = "0.10.9"
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp", "tga"] }
 png = "0.18.1"

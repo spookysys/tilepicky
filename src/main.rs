@@ -13,6 +13,7 @@ mod ai;
 mod detect;
 mod index;
 mod islands;
+mod labels;
 mod settings;
 mod sheet;
 mod sidecar;
@@ -20,11 +21,8 @@ mod tree;
 
 use eframe::egui::{self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle, Vec2};
 
-/// The AI features show in the UI only when this is `true`. The code
-/// (`src/ai.rs`, the assist panel, the batch popup) stays either way; this
-/// flag only hides the buttons and the settings section for a release
-/// before the features are finished.
-const AI_VISIBLE: bool = false;
+/// The per-sheet labeling panel and local AI settings are available.
+const AI_VISIBLE: bool = true;
 /// Library islands are available independently of the AI features.
 const LIBRARY_EYE_VISIBLE: bool = true;
 
@@ -672,6 +670,7 @@ impl App {
                 if let Some(prev) = &self.library_sheet {
                     s.zoom = prev.zoom;
                 }
+                s.load_labels();
                 self.library_sheet = Some(s);
                 self.library_sel = Some(i);
                 // The keys follow the file, however it was opened. A click
@@ -1671,28 +1670,49 @@ impl App {
         clicked
     }
 
-    /// The AI assist panel of the library. The research features land here;
-    /// for now it says which models are set up.
-    fn assist_panel(ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys) {
+    /// This action is foreground-only. Merely opening the panel sends nothing.
+    fn assist_panel(ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys, sheet: Option<&Sheet>) -> egui::Response {
         ui.set_min_width(ui.available_width());
-        ui.strong("AI assist");
-        ui.weak("Not here yet.");
-        ui.add_space(4.0);
-        for mode in [ai::Mode::Instant, ai::Mode::Batch] {
-            let line = match ai.chosen(mode) {
-                Some((p, m)) => {
-                    let key = match p.key_source(keys) {
-                        ai::KeySource::Typed => "typed key".to_string(),
-                        ai::KeySource::Env(name) => format!("key from ${name}"),
-                        ai::KeySource::None => "no key".to_string(),
-                    };
-                    format!("{}: {} {} ({key})", mode.label(), p.name, m.id)
-                }
-                None => format!("{}: no model chosen", mode.label()),
-            };
-            ui.weak(line);
+        ui.strong("Label this sheet");
+        let ready = match ai.chosen(ai::Mode::Instant) {
+            Some((p, m)) if p.kind == ai::Kind::OpenAi => {
+                ui.label(format!("{}: {}", p.name, m.id));
+                ui.weak(&p.url);
+                if p.key_source(keys) == ai::KeySource::None {
+                    ui.weak("Add the provider key in settings.");
+                    false
+                } else { true }
+            }
+            _ => {
+                ui.weak("Choose an instant image model on an OpenAI-compatible endpoint in settings.");
+                false
+            }
+        };
+        ui.label("Sends this sheet, then its island crops, to the selected provider. Saves captions and tags locally.");
+        ui.weak("Use a model with image input and structured JSON output. The app waits for this operation to finish.");
+        let button = ui.add_enabled(ready && sheet.is_some(), egui::Button::new("Label sheet"));
+        ui.data_mut(|d| d.insert_temp(Id::new("label button"), button.id));
+        if let Some(s) = sheet {
+            ui.separator();
+            ui.label(&s.rel);
+            s.label_info(ui, None);
+            if !s.label_notice.is_empty() { ui.label(&s.label_notice); }
         }
-        ui.weak("The settings, behind the gear at the right end of the status line, change these.");
+        button
+    }
+
+    fn label_library(&mut self) {
+        let Some((provider, model)) = self.settings.ai.chosen(ai::Mode::Instant) else { return };
+        if provider.kind != ai::Kind::OpenAi { return; }
+        let Some(key) = provider.key(&self.keys) else { return };
+        let Some(sheet) = &mut self.library_sheet else { return };
+        let result = labels::Endpoint::new(&provider.url, key)
+            .and_then(|endpoint| sheet.label_with(&provider.name, &model.id, |body| endpoint.send(body)));
+        sheet.label_notice = match result {
+            Ok(()) => "Labels saved. Use the eye (E) to inspect islands.".into(),
+            Err(error) => error,
+        };
+        self.status = sheet.label_notice.clone();
     }
 
     /// `A` opens or closes the animation panel of the active panel. Storing
@@ -1872,7 +1892,7 @@ impl App {
         match spot {
             Spot::Tree => true,
             Spot::Sheet => sheet.is_some(),
-            Spot::Side => sheet.is_some_and(|s| s.anim_panel && !s.sel.is_empty()),
+            Spot::Side => sheet.is_some_and(|s| (panel == Panel::Library && self.ai_panel) || (s.anim_panel && !s.sel.is_empty())),
             // One status bar, and it rides with the project half.
             Spot::Status => panel == Panel::Project,
             // Tab never walks into a dialog: it opens with a button, and it
@@ -1907,6 +1927,7 @@ impl App {
             Spot::Sheet => project_id(),
             // The frame field is where the work is; the title is always
             // there, even on the frame the panel opens.
+            Spot::Side if library && self.ai_panel => ctx.data(|d| d.get_temp(Id::new("label button")))?,
             Spot::Side => side_id(ctx, library).unwrap_or_else(|| anim_heading_id(library)),
             Spot::Status => gear_id(ctx)?,
             Spot::Dialog => return None,
@@ -1920,6 +1941,7 @@ impl App {
         Some(match at.1 {
             Spot::Tree => tree_heading_id(library),
             Spot::Sheet => heading_id(library),
+            Spot::Side if library && self.ai_panel => return None,
             Spot::Side => anim_heading_id(library),
             // Neither the status bar nor a dialog has a title.
             Spot::Status | Spot::Dialog => return None,
@@ -2400,23 +2422,6 @@ impl eframe::App for App {
                 .size_range(80.0..=f32::INFINITY)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if AI_VISIBLE {
-                            // The batch job over the library, in a popup under
-                            // the button. Not built yet: it says what it will
-                            // do, and with which model.
-                            let r = ui.add(egui::Button::new("✨").small()).on_hover_text("analyze the library: a batch job");
-                            egui::Popup::from_toggle_button_response(&r).show(|ui| {
-                                ui.set_max_width(360.0);
-                                ui.strong("Analyze the library");
-                                ui.label("A batch job over every sheet in the library: it finds the islands of each sheet and asks the batch model to label them, and the sheet as a whole.");
-                                let line = match self.settings.ai.chosen(ai::Mode::Batch) {
-                                    Some((p, m)) => format!("batch model: {} {}", p.name, m.id),
-                                    None => "no batch model chosen; see the settings".to_string(),
-                                };
-                                ui.weak(line);
-                                ui.add_enabled(false, egui::Button::new("Start")).on_disabled_hover_text("not built yet");
-                            });
-                        }
                         let head = ui.label(title_text(ui, tree_heading_id(true), "LIBRARY", keys == (Panel::Library, Spot::Tree)));
                         ui.interact(head.rect, tree_heading_id(true), egui::Sense::click());
                         stops.push(((Panel::Library, Spot::Tree), tree_heading_id(true), head.rect));
@@ -2781,7 +2786,14 @@ impl eframe::App for App {
             }
             let eye = self.library_eye;
             if self.ai_panel {
-                egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| Self::assist_panel(ui, &self.settings.ai, &self.keys));
+                let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref())
+                    }).inner
+                });
+                panes.push(((Panel::Library, Spot::Side), label.response.rect));
+                stops.push(((Panel::Library, Spot::Side), label.inner.id, label.inner.rect));
+                if label.inner.clicked() { self.label_library(); }
             }
             if let Some(s) = &mut self.library_sheet {
                 if s.anim_panel {

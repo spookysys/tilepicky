@@ -71,7 +71,38 @@ join them. Seamless terrain can form one large island. Gaps and empty cells do n
 
 Analysis stays with the open sheet in memory. Changing its image or grid
 clears the result. Choose **Analyze** again after a correction or reopening
-the sheet. Switching the eye on or off does not run analysis.
+the sheet. Sheets with saved labels restore and check their islands on open.
+Switching the eye on or off does not run analysis.
+
+## Label one library sheet
+
+Open a library sheet, then open **AI assist** with its header button or `I`.
+In settings, choose an instant model with image input and structured JSON
+output. Use an OpenAI-compatible provider URL, such as
+`https://openrouter.ai/api/v1`, and enter its key or set its key environment
+variable. The Google and batch settings remain available for future work;
+this action uses only the instant OpenAI-compatible endpoint.
+
+Click **Label sheet** to send the image. Opening the panel sends nothing.
+The model first describes the sheet's asset type, setting, style, palette,
+and contents. It then labels groups of island crops with that description
+as context. Crops contain only the island's cells. The app waits until the
+operation finishes; each request has a 60-second timeout.
+
+The library eye shows an island's caption and tags under the pointer. Hover
+outside the image for the whole-sheet description. Missing results, stale
+labels, and content the model could not identify are shown explicitly.
+Project provenance works as before.
+
+Labels are saved beside the image as `<image filename>.tilepicky-labels.json`.
+The file records the model and a fingerprint of the pixels, grid, and island
+layout. A changed fingerprint makes the saved labels stale. Valid partial
+results are saved if a later request fails. **Label sheet** starts again and
+replaces results as new responses arrive. Labels are not searched yet.
+
+This first version labels still images. Images larger than 2048 pixels on
+an edge are reduced for the model; the original image is not changed.
+Check the labels: models can misidentify pixel art or miss small details.
 
 ## From the keyboard
 
@@ -180,6 +211,7 @@ A new sheet starts at the tile size that library or project used last, or at
 | A | open or close the animation panel |
 | M | store the animation under the selection, or unmark a stored one |
 | E | switch the eye on or off |
+| I | open or close library AI assist |
 | Ctrl+F | jump to the search box |
 | Ctrl+Z, Ctrl+Y | undo, and take the step again |
 | Ctrl+S, Ctrl+Shift+S | save, save as |
