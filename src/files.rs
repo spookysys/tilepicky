@@ -39,6 +39,31 @@ pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
     sidecar::write_book(root, &book).and(result)
 }
 
+/// Drops the sources in the project's book that name the project itself.
+/// Older versions wrote one for every cell drawn in the project: the name
+/// of the project sheet, or an empty name for a sheet without one. Only the
+/// library is a source, so a name that the project holds and the library
+/// does not is one of those. Without a library, only the empty name goes.
+/// Returns how many entries changed.
+pub fn drop_own_sources(project: &Path, library: &Path) -> Result<usize, String> {
+    let mut book = sidecar::load_book(project)?;
+    let own = |source: &str| {
+        source.is_empty()
+            || (!library.as_os_str().is_empty() && project.join(source).is_file() && !library.join(source).exists())
+    };
+    let mut changed = 0;
+    for side in book.sheets.values_mut() {
+        let before = side.provenance.len();
+        side.provenance.retain(|p| !own(&p.source));
+        changed += usize::from(side.provenance.len() != before);
+    }
+    if changed > 0 {
+        book.sheets.retain(|_, side| !side.is_empty());
+        sidecar::write_book(project, &book)?;
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +106,33 @@ mod tests {
         assert!(remove(&dir.0, &["tree.png".into()]).is_err());
         assert!(dir.0.join("tree.png").exists());
         assert!(!dir.0.join("oak.png").exists());
+    }
+
+    /// Older versions named the project sheet itself, or an empty name, as
+    /// the source of cells drawn in the project. Those go; a source the
+    /// library holds stays, even when the project has a file of that name.
+    #[test]
+    fn sources_that_name_the_project_are_dropped() {
+        use crate::sidecar::Provenance;
+        let (project, library) = (Folder::new(), Folder::new());
+        for rel in ["mine.png", "both.png"] { std::fs::write(project.0.join(rel), b"image").unwrap(); }
+        std::fs::create_dir(library.0.join("pack")).unwrap();
+        for rel in ["pack/tree.png", "both.png"] { std::fs::write(library.0.join(rel), b"image").unwrap(); }
+        let from = |source: &str| Provenance { source: source.into(), rects: vec![[0, 0, 8, 8]] };
+        let side = Sidecar { provenance: ["", "mine.png", "pack/tree.png", "both.png"].map(from).into(), ..Default::default() };
+        sidecar::store_entry(&project.0, "mine.png", &side).unwrap();
+        let only_own = Sidecar { provenance: vec![from("mine.png")], ..Default::default() };
+        sidecar::store_entry(&project.0, "both.png", &only_own).unwrap();
+        assert_eq!(drop_own_sources(&project.0, &library.0), Ok(2));
+        let book = sidecar::load_book(&project.0).unwrap();
+        let sources: Vec<_> = book.sheets["mine.png"].provenance.iter().map(|p| p.source.as_str()).collect();
+        assert_eq!(sources, ["pack/tree.png", "both.png"]);
+        assert!(!book.sheets.contains_key("both.png"), "an entry with nothing left goes");
+        assert_eq!(drop_own_sources(&project.0, &library.0), Ok(0));
+        // Without a library, only the empty name is sure to be wrong.
+        sidecar::store_entry(&project.0, "mine.png", &side).unwrap();
+        assert_eq!(drop_own_sources(&project.0, Path::new("")), Ok(1));
+        assert_eq!(sidecar::load_book(&project.0).unwrap().sheets["mine.png"].provenance.len(), 3);
     }
 
     #[test]

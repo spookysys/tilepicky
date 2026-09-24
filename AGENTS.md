@@ -36,7 +36,8 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/half.rs`: one half of the window, the library or the project: its
   folder, its tree, the sheet open from it, and where the keys stand.
 - `src/dialogs.rs`: the dialogs that ask first: names, deletions, unsaved
-  changes, the removal of a label, and the legend.
+  changes, the removal of a label, the legend, and a damaged settings or
+  keys file.
 - `src/sheet.rs`: one sheet on screen: the grid, the selection, the copy
   and paste, the provenance map, the eye mode, and the animations.
 - `src/files.rs`: project file operations, separate from the UI.

@@ -322,6 +322,7 @@ impl App {
     /// `damaged` is why the settings file could not be read, if it could not.
     fn new(settings: settings::Settings, damaged: Option<String>) -> Self {
         let root = |s: &Option<PathBuf>| s.clone().unwrap_or_default();
+        let cleaned = drop_own_sources(&root(&settings.project.path), &root(&settings.library.path));
         let library = Index::scan(&root(&settings.library.path), settings.library.tile.map_or(TILE, Pair::xy));
         let mut project = Index::scan(&root(&settings.project.path), settings.project.tile.map_or(TILE, Pair::xy));
         migrate_sidecars(&mut project);
@@ -350,7 +351,7 @@ impl App {
             project_rect: Rect::NOTHING,
             confirm: None,
             pending: None,
-            status: library.error.clone().or_else(|| project.error.clone()).unwrap_or_default(),
+            status: library.error.clone().or_else(|| project.error.clone()).or(cleaned).unwrap_or_default(),
             library: Half::new(library, true),
             project: Half::new(project, false),
             query: String::new(),
@@ -443,9 +444,11 @@ impl App {
             }
         };
         self.remembered(panel).path = Some(dir.clone());
+        let cleaned = if panel == Panel::Project { drop_own_sources(&dir, &self.library.index.root) } else { None };
         let (query, search) = (self.qwords.clone(), self.settings.search);
         self.half_mut(panel).set_root(&dir, &query, search);
-        self.status = self.half(panel).index.error.clone().unwrap_or_else(|| format!("{name}: {}", self.half(panel).index.root.display()));
+        let index = &self.half(panel).index;
+        self.status = index.error.clone().or(cleaned).unwrap_or_else(|| format!("{name}: {}", index.root.display()));
         if let Err(e) = self.settings.save() { self.status = e; }
     }
 
@@ -2389,6 +2392,19 @@ impl eframe::App for App {
     }
 }
 
+/// Drops the sources that older versions wrote for cells drawn in the
+/// project; see `files::drop_own_sources`. It runs before the project is
+/// read, and says what it did. A broken book is left to the scan to report.
+fn drop_own_sources(project: &Path, library: &Path) -> Option<String> {
+    if project.as_os_str().is_empty() {
+        return None;
+    }
+    match files::drop_own_sources(project, library) {
+        Ok(0) | Err(_) => None,
+        Ok(n) => sidecar::count_text(n, "sheet").map(|n| format!("removed sources that named the project itself from {n}")),
+    }
+}
+
 /// Moves the old `name.json` files next to tilesheets into the book, once.
 fn migrate_sidecars(project: &mut Index) {
     for e in &mut project.entries {
@@ -3015,6 +3031,21 @@ mod tests {
         let app = App::new(settings::Settings::default(), Some("Cannot read settings.json".into()));
         assert!(matches!(app.damaged.first(), Some(Damaged::Settings(e)) if e == "Cannot read settings.json"));
         assert!(app.dialog_open(&egui::Context::default()));
+    }
+
+    #[test]
+    fn the_project_forgets_sources_that_name_itself_at_start() {
+        let (lib, proj) = (Folder::new(), Folder::new());
+        sheet_file(&proj.0, "mine.png");
+        let side = sidecar::Sidecar { provenance: vec![sidecar::Provenance { source: "mine.png".into(), rects: vec![[0, 0, 8, 8]] }],
+            tile: Some(Pair::of([8, 8])), ..Default::default() };
+        sidecar::store_entry(&proj.0, "mine.png", &side).unwrap();
+        let mut settings = settings::Settings::default();
+        settings.library.path = Some(lib.0.clone());
+        settings.project.path = Some(proj.0.clone());
+        let app = App::new(settings, None);
+        assert!(app.project.index.entries[0].side.provenance.is_empty());
+        assert!(app.status.ends_with("from 1 sheet"));
     }
 
     #[test]
