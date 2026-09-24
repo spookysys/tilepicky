@@ -351,8 +351,8 @@ impl App {
             confirm: None,
             pending: None,
             status: library.error.clone().or_else(|| project.error.clone()).unwrap_or_default(),
-            library: Half::new(library),
-            project: Half::new(project),
+            library: Half::new(library, true),
+            project: Half::new(project, false),
             query: String::new(),
             qwords: Vec::new(),
             active: Panel::Library,
@@ -759,11 +759,6 @@ impl App {
                 if let Err(e) = sheet.save() {
                     sheet.rel = old;
                     return Err(e);
-                }
-                // A block copied from the canvas before it had a name
-                // learns the name as well.
-                if old.is_empty() && let Some(clip) = &mut self.clip {
-                    clip.prov.rename("", &rel);
                 }
                 self.status = format!("saved as {rel}");
                 self.rescan_project();
@@ -3028,6 +3023,7 @@ mod tests {
         let i = b.app.library.index.position("c.png").unwrap();
         b.app.open_library(&b.ctx, i);
         assert_eq!(b.app.library.sel, Some(1));
+        assert!(b.app.library.sheet.as_ref().unwrap().library, "a library sheet is a source");
         assert_eq!(b.app.library.at, Some(tree::Row::File(1)));
         assert!(b.app.active == Panel::Library);
         sheet_file(&b.library.0, "b.png");
@@ -3041,6 +3037,7 @@ mod tests {
         let mut b = bench(&[], &["a.png", "b.png"]);
         b.open_project("b.png");
         assert_eq!(b.project_rel(), Some("b.png"));
+        assert!(!b.app.project.sheet.as_ref().unwrap().library, "a tilesheet is no source");
         assert_eq!((b.app.project.sel, b.app.tree_cursor), (Some(1), Some(1)));
         assert_eq!(b.app.project.at, Some(tree::Row::File(1)));
         assert!(b.app.active == Panel::Project);

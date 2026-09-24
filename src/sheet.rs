@@ -400,26 +400,6 @@ impl ProvMap {
         m
     }
 
-    /// Gives the pixels of one source another name. Where the new name is
-    /// in the table already, the two become one.
-    pub fn rename(&mut self, from: &str, to: &str) {
-        let Some(f) = self.sources.iter().position(|s| s == from) else { return };
-        let Some(t) = self.sources.iter().position(|s| s == to) else {
-            self.sources[f] = to.to_string();
-            return;
-        };
-        let (f, t) = (f as i32, t as i32);
-        for v in &mut self.idx {
-            if *v == f {
-                *v = t;
-            }
-            if *v > f {
-                *v -= 1;
-            }
-        }
-        self.sources.remove(f as usize);
-    }
-
     pub fn intern(&mut self, name: &str) -> i32 {
         match self.sources.iter().position(|s| s == name) {
             Some(i) => i as i32,
@@ -550,6 +530,9 @@ struct CanvasDrag {
 
 pub struct Sheet {
     pub rel: String,
+    /// A sheet of the library: a copy names it as the source of its cells.
+    /// A tilesheet of the project only passes on the sources it carries.
+    pub library: bool,
     /// The directory whose book describes this sheet.
     pub dir: PathBuf,
     /// The file format and color type as the loader saw them, such as
@@ -739,6 +722,7 @@ impl Sheet {
         let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
             rel: rel.to_string(),
+            library: false,
             dir: dir.to_path_buf(),
             kind: String::new(),
             tile,
@@ -1408,7 +1392,6 @@ impl Sheet {
         let [tw, th] = self.tile;
         let mut img = RgbaImage::new(b.cols() * tw, b.rows() * th);
         let mut prov = ProvMap::new(b.cols() * tw, b.rows() * th);
-        let own = self.rel.clone();
         let mut mask = Vec::new();
         for y in b.y0..=b.y1 {
             for x in b.x0..=b.x1 {
@@ -1434,9 +1417,11 @@ impl Sheet {
                         }
                     }
                 }
-                // A cell of this sheet itself, unless it is empty or traced.
-                if !empty {
-                    let v = prov.intern(&own);
+                // A cell of a library sheet comes from that sheet, unless
+                // it is empty or traced. A tilesheet of the project is no
+                // source: what it carries no trace for stays untraced.
+                if self.library && !empty {
+                    let v = prov.intern(&self.rel);
                     for py in 0..th {
                         for px in 0..tw {
                             let (bx, by) = ((x - b.x0) * tw + px, (y - b.y0) * th + py);
@@ -1488,8 +1473,10 @@ impl Sheet {
         let (fw, fh) = (b.cols() * tw, b.rows() * th);
         let mut img = RgbaImage::new(fw * n, fh);
         let mut prov = ProvMap::new(fw * n, fh);
-        let v = prov.intern(&self.rel);
-        prov.fill(0, 0, fw * n, fh, v);
+        if self.library {
+            let v = prov.intern(&self.rel);
+            prov.fill(0, 0, fw * n, fh, v);
+        }
         for (f, frame) in self.frames.iter().enumerate() {
             for y in b.y0..=b.y1 {
                 for x in b.x0..=b.x1 {
@@ -2053,8 +2040,6 @@ impl Sheet {
         })
         .map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
         self.side.tile = Some(Pair::of(self.tile));
-        // Cells this sheet gave itself before it had a name come from it.
-        self.prov.rename("", &self.rel);
         self.side.provenance = self.prov.extract();
         self.save_entry()
     }
@@ -2368,31 +2353,29 @@ mod prov_tests {
         assert!(side.iter().any(|p| p.source == "packs/b.png" && p.rects == vec![[32, 0, 64, 64]]));
     }
 
-    /// Tiles moved within a canvas that has no name yet come from it. The
-    /// first save gives them its name, not an empty one.
+    /// Only the library is a source. A copy inside the project keeps the
+    /// sources its cells carry, and a cell that carries none stays without.
     #[test]
-    fn an_unnamed_canvas_names_its_own_tiles_when_saved() {
+    fn only_the_library_names_itself_as_a_source() {
         let ctx = egui::Context::default();
         let dir = crate::storage::tests::Folder::new();
-        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "", [8, 8], 4, 4);
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "mine.png", [8, 8], 4, 4);
         sheet.img.put_pixel(0, 0, Rgba([200, 0, 0, 255]));
-        let mut block = sheet.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
-        assert_eq!(block.prov.sources, [""]);
-        sheet.paste(&ctx, (2, 2), &block);
-        sheet.rel = "fresh.png".into();
+        sheet.img.put_pixel(8, 0, Rgba([0, 200, 0, 255]));
+        let v = sheet.prov.intern("pack/tree.png");
+        sheet.prov.fill(8, 0, 8, 8, v);
+        let untraced = sheet.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
+        assert!(untraced.prov.sources.is_empty());
+        let traced = sheet.copy_sel(&Sel::rect((1, 0), (1, 0))).unwrap();
+        assert_eq!(traced.prov.get(0, 0), Some("pack/tree.png"));
+        sheet.paste(&ctx, (2, 2), &untraced);
         sheet.save().unwrap();
         let book = sidecar::load_book(&dir.0).unwrap();
-        let sources: Vec<_> = book.sheets["fresh.png"].provenance.iter().map(|p| p.source.as_str()).collect();
-        assert_eq!(sources, ["fresh.png"]);
-        // A block taken before the save learns the name too.
-        block.prov.rename("", "fresh.png");
-        assert_eq!(block.prov.sources, ["fresh.png"]);
-        let mut both = ProvMap::new(2, 1);
-        let (empty, named) = (both.intern(""), both.intern("fresh.png"));
-        both.set(0, 0, empty);
-        both.set(1, 0, named);
-        both.rename("", "fresh.png");
-        assert_eq!((both.get(0, 0), both.get(1, 0)), (Some("fresh.png"), Some("fresh.png")));
+        let sources: Vec<_> = book.sheets["mine.png"].provenance.iter().map(|p| p.source.as_str()).collect();
+        assert_eq!(sources, ["pack/tree.png"]);
+        sheet.library = true;
+        let from_library = sheet.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
+        assert_eq!(from_library.prov.get(0, 0), Some("mine.png"));
     }
 }
 

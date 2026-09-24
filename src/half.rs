@@ -11,6 +11,8 @@ use eframe::egui;
 use std::path::Path;
 
 pub struct Half {
+    /// The library half: its sheets are sources. See `Sheet::library`.
+    pub library: bool,
     pub index: Index,
     pub tree: Node,
     /// Which entries the search leaves visible; `None` shows every one.
@@ -29,8 +31,9 @@ pub struct Half {
 }
 
 impl Half {
-    pub fn new(index: Index) -> Self {
+    pub fn new(index: Index, library: bool) -> Self {
         Self {
+            library,
             tree: tree_of(&index),
             index,
             visible: None,
@@ -80,6 +83,7 @@ impl Half {
     pub fn open(&mut self, ctx: &egui::Context, i: usize) -> Result<(), String> {
         let e = &self.index.entries[i];
         let mut s = Sheet::open(ctx, &self.index.root, &e.rel, self.inherited_tile(), e.side.clone())?;
+        s.library = self.library;
         if let Some(prev) = &self.sheet {
             s.zoom = prev.zoom;
         }
