@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The dialogs that ask before something happens: names, deletions, unsaved
-//! changes, the removal of a label, and the legend. Each waits in a field of
+//! changes, the removal of a label, the legend, and a damaged settings file. Each waits in a field of
 //! the app until the user answers.
 
 use crate::{App, sidecar};
@@ -12,6 +12,12 @@ pub enum Pending {
     Open(usize),
     Create,
     Close,
+}
+
+/// A configuration file that could not be read, and why.
+pub enum Damaged {
+    Settings(String),
+    Keys(String),
 }
 
 /// What the name prompt is for.
@@ -45,6 +51,54 @@ impl App {
         }
         self.save_dialog(ctx);
         self.legend_dialog(ctx);
+        self.damaged_dialog(ctx);
+    }
+
+    /// A settings file that could not be read is written over with the
+    /// defaults, once the user agrees. Quit leaves it as it is, to mend by
+    /// hand.
+    fn damaged_dialog(&mut self, ctx: &egui::Context) {
+        if self.damaged.is_empty() {
+            return;
+        }
+        let mut choice = None;
+        egui::Modal::new(Id::new("damaged dialog")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("A settings file is damaged");
+            for d in &self.damaged {
+                let (Damaged::Settings(e) | Damaged::Keys(e)) = d;
+                ui.label(e);
+            }
+            ui.add_space(4.0);
+            ui.label("Tilepicky starts with the defaults and will write them over the damaged file. To mend the file by hand instead, quit now.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Continue").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Quit").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        match choice {
+            Some(true) => {
+                for d in std::mem::take(&mut self.damaged) {
+                    let written = match d {
+                        Damaged::Settings(_) => self.settings.rewrite(),
+                        Damaged::Keys(_) => self.keys.rewrite(),
+                    };
+                    if let Err(e) = written {
+                        self.status = e;
+                    }
+                }
+            }
+            Some(false) => {
+                self.damaged.clear();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
+        }
     }
 
     /// A click on the legend asks before it goes; the settings bring it back.
@@ -191,7 +245,7 @@ impl App {
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
         self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.library_batch.open()
-            || self.pending.is_some() || self.legend_prompt || egui::Popup::is_any_open(ctx)
+            || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || egui::Popup::is_any_open(ctx)
     }
 
     fn remove_label_dialog(&mut self, ctx: &egui::Context) {

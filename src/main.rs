@@ -36,7 +36,7 @@ use sidecar::{Animation, Pair};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use dialogs::{NameFor, NamePrompt, Pending};
+use dialogs::{Damaged, NameFor, NamePrompt, Pending};
 use half::Half;
 use tree::TreeAction;
 
@@ -71,6 +71,9 @@ struct Drag {
 }
 
 struct App {
+    /// Configuration files that could not be read, waiting for the user
+    /// to agree that they are written over.
+    damaged: Vec<Damaged>,
     drag: Option<Drag>,
     prompt: Option<NamePrompt>,
     /// Files marked with Ctrl+click in the PROJECT tree.
@@ -316,17 +319,16 @@ fn tree_panel(id: Id) -> Option<Panel> {
 }
 
 impl App {
-    /// `notice` is what loading the settings had to say, if anything.
-    fn new(settings: settings::Settings, notice: Option<String>) -> Self {
+    /// `damaged` is why the settings file could not be read, if it could not.
+    fn new(settings: settings::Settings, damaged: Option<String>) -> Self {
         let root = |s: &Option<PathBuf>| s.clone().unwrap_or_default();
         let library = Index::scan(&root(&settings.library.path), settings.library.tile.map_or(TILE, Pair::xy));
         let mut project = Index::scan(&root(&settings.project.path), settings.project.tile.map_or(TILE, Pair::xy));
         migrate_sidecars(&mut project);
-        let (keys, keys_notice) = ai::Keys::load();
-        // A damaged file of the user's comes first: nothing else explains
-        // why a setting did not stick.
-        let status = [notice, keys_notice, library.error.clone(), project.error.clone()].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        let (keys, damaged_keys) = ai::Keys::load();
+        let damaged = damaged.map(Damaged::Settings).into_iter().chain(damaged_keys.map(Damaged::Keys)).collect();
         Self {
+            damaged,
             settings,
             keys,
             ai_panel: false,
@@ -348,7 +350,7 @@ impl App {
             project_rect: Rect::NOTHING,
             confirm: None,
             pending: None,
-            status,
+            status: library.error.clone().or_else(|| project.error.clone()).unwrap_or_default(),
             library: Half::new(library),
             project: Half::new(project),
             query: String::new(),
@@ -2911,7 +2913,7 @@ fn main() -> eframe::Result {
         eprintln!("usage: tilepicky [--glow{}] [<library dir> [<project dir>]]", if WGPU { " | --wgpu" } else { "" });
         std::process::exit(2);
     }
-    let (mut settings, notice) = settings::Settings::load();
+    let (mut settings, damaged) = settings::Settings::load();
     // A folder named on the command line wins for this run, and is what the
     // tool offers next time.
     if let Some(d) = dirs.first() {
@@ -2948,7 +2950,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(App::new(settings, notice)))
+            Ok(Box::new(App::new(settings, damaged)))
         }),
     )
 }
@@ -3014,9 +3016,10 @@ mod tests {
     }
 
     #[test]
-    fn a_notice_from_loading_opens_the_status_line() {
-        let app = App::new(settings::Settings::default(), Some("settings.json is damaged.".into()));
-        assert!(app.status.starts_with("settings.json is damaged."));
+    fn a_damaged_settings_file_waits_for_the_user() {
+        let app = App::new(settings::Settings::default(), Some("Cannot read settings.json".into()));
+        assert!(matches!(app.damaged.first(), Some(Damaged::Settings(e)) if e == "Cannot read settings.json"));
+        assert!(app.dialog_open(&egui::Context::default()));
     }
 
     #[test]

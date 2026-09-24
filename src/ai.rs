@@ -233,8 +233,9 @@ impl Keys {
         crate::settings::dir().map(|d| d.join("keys.json"))
     }
 
-    /// The typed keys, and a notice when the file could not be read. The
-    /// tool then has no typed keys, and `save` refuses to overwrite the file.
+    /// The typed keys, and the error when the file could not be read. The
+    /// tool then has no typed keys, and `save` refuses to overwrite the file
+    /// until the user says yes; see `rewrite`.
     pub fn load() -> (Self, Option<String>) {
         Self::file().map_or_else(|| (Self::default(), None), |p| Self::load_from(&p))
     }
@@ -242,15 +243,26 @@ impl Keys {
     fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
         match crate::storage::read(path) {
             Ok(keys) => (Keys(keys), None),
-            Err(e) => (Self::default(), Some(format!("{e}. No typed key is in use, and keys are not saved until you mend or delete the file."))),
+            Err(e) => (Self::default(), Some(e)),
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::file().ok_or("No configuration directory available.")?;
-        crate::storage::read::<BTreeMap<String, String>>(&path)?;
+        self.save_to(&Self::file().ok_or("No configuration directory available.")?, false)
+    }
+
+    /// Writes the keys over a file that could not be read. The user agreed
+    /// to lose what it held.
+    pub fn rewrite(&self) -> Result<(), String> {
+        self.save_to(&Self::file().ok_or("No configuration directory available.")?, true)
+    }
+
+    fn save_to(&self, path: &std::path::Path, overwrite: bool) -> Result<(), String> {
+        if !overwrite {
+            crate::storage::read::<BTreeMap<String, String>>(path)?;
+        }
         let kept: BTreeMap<&String, &String> = self.0.iter().filter(|(_, v)| !v.trim().is_empty()).collect();
-        crate::storage::write_private(&path, &kept)
+        crate::storage::write_private(path, &kept)
     }
 
     pub fn get(&self, provider: &str) -> Option<&str> {
@@ -495,13 +507,17 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_key_file_says_so_and_stays() {
+    fn a_damaged_key_file_is_kept_until_the_user_says_yes() {
         let dir = crate::storage::tests::Folder::new();
         let path = dir.0.join("keys.json");
         std::fs::write(&path, b"[]").unwrap();
-        let (keys, notice) = Keys::load_from(&path);
-        assert!(notice.unwrap().contains("keys.json"));
+        let (keys, error) = Keys::load_from(&path);
+        assert!(error.unwrap().contains("keys.json"));
         assert!(keys.0.is_empty());
+        assert!(keys.save_to(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+        keys.save_to(&path, true).unwrap();
+        assert!(Keys::load_from(&path).1.is_none());
         std::fs::write(&path, br#"{"X": "k"}"#).unwrap();
         let (keys, notice) = Keys::load_from(&path);
         assert_eq!((keys.get("X"), notice), (Some("k"), None));
