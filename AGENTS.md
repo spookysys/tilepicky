@@ -31,8 +31,12 @@ the person who uses the tool; this file is for an agent that works on it.
 
 ## Where things are
 
-- `src/main.rs`: the app: the panels, the headers, the keys, the dialogs and
-  popups, and the drag of a block between the panels.
+- `src/main.rs`: the app: the panels, the headers, the keys, the popups,
+  and the drag of a block between the panels.
+- `src/half.rs`: one half of the window, the library or the project: its
+  folder, its tree, the sheet open from it, and where the keys stand.
+- `src/dialogs.rs`: the dialogs that ask first: names, deletions, unsaved
+  changes, the removal of a label, and the legend.
 - `src/sheet.rs`: one sheet on screen: the grid, the selection, the copy
   and paste, the provenance map, the eye mode, and the animations.
 - `src/files.rs`: project file operations, separate from the UI.
