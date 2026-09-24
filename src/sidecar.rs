@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! `tilepicky.json`: one file per directory that describes the sheets in it.
-//! Each entry holds the grid, cell origins, animations, and AI labels.
+//! Each entry holds the grid, cell origins, animations, and the AI label.
 //! The library and the project use the same format.
 
 use serde::{Deserialize, Serialize};
@@ -108,50 +108,22 @@ pub fn count_text(n: usize, noun: &str) -> Option<String> {
     }
 }
 
+/// Whether the model could say what the sheet shows.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Status { Labeled, Unlabelable }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// What a model said about a whole sheet, and about which pixels.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Label {
+    pub provider: String,
+    pub model: String,
+    /// The fingerprint of the pixels that the model saw; see `labels::identity`.
+    /// When the image changes, the label is stale.
+    pub identity: String,
     pub status: Status,
     pub caption: String,
     pub tags: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct StoredIsland {
-    /// Pixel rectangles [x, y, width, height], independent of the tile grid.
-    #[serde(default)]
-    pub rects: Vec<[u32; 4]>,
-    pub label: Option<Label>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Saved {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub model: String,
-    pub identity: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sheet: Option<Label>,
-    pub islands: Vec<StoredIsland>,
-}
-
-pub fn remove_labels(dir: &Path, rel: &str) -> Result<Option<Saved>, String> {
-    let mut book = load_book(dir)?;
-    let saved = book.sheets.get_mut(rel).and_then(|s| s.labels.as_mut());
-    if let Some(saved) = saved {
-        saved.provider.clear();
-        saved.model.clear();
-        saved.sheet = None;
-        for island in &mut saved.islands { island.label = None; }
-    }
-    let saved = book.sheets.get(rel).and_then(|s| s.labels.clone());
-    write_book(dir, &book)?;
-    Ok(saved)
 }
 
 /// What the book says about one sheet.
@@ -180,13 +152,13 @@ pub struct Sidecar {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animations: Vec<Animation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub labels: Option<Saved>,
+    pub label: Option<Label>,
 }
 
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
         self.tile.is_none() && self.gap.is_none() && self.offset.is_none() && self.provenance.is_empty() && self.animations.is_empty()
-            && self.labels.is_none()
+            && self.label.is_none()
     }
 }
 
@@ -203,8 +175,10 @@ pub struct Book {
 }
 
 /// A missing book is empty. Unreadable books must not be overwritten.
+/// An entry that holds only keys this version does not know is dropped.
 pub fn load_book(dir: &Path) -> Result<Book, String> {
-    let book = crate::storage::read(&dir.join(BOOK))?;
+    let mut book: Book = crate::storage::read(&dir.join(BOOK))?;
+    book.sheets.retain(|_, side| !side.is_empty());
     #[cfg(windows)]
     let book = normalize_windows_paths(book)?;
     Ok(book)
@@ -280,11 +254,11 @@ pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> 
     write_book(dir, &book)
 }
 
-/// Change labels without replacing grid edits made during a request.
-pub fn store_labels(dir: &Path, rel: &str, labels: Option<Saved>) -> Result<(), String> {
+/// Writes or removes the label of one sheet, and keeps the rest of its entry.
+pub fn store_label(dir: &Path, rel: &str, label: Option<Label>) -> Result<(), String> {
     let mut book = load_book(dir)?;
     let side = book.sheets.entry(rel.into()).or_default();
-    side.labels = labels;
+    side.label = label;
     if side.is_empty() { book.sheets.remove(rel); }
     write_book(dir, &book)
 }
@@ -307,36 +281,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_roundtrip_rename_and_remove_preserve_the_grid() {
-        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("tilepicky-book-{}-{unique}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let label = Label { status: Status::Labeled, caption: "Tree".into(), tags: vec!["forest".into()] };
-        let labels = Saved { provider: "test".into(), model: "instant".into(), identity: "pixels".into(), sheet: Some(label.clone()),
-            islands: vec![StoredIsland { rects: vec![[3, 5, 20, 10]], label: Some(label) },
-                StoredIsland { rects: vec![[33, 5, 10, 10]], label: None }] };
+    fn labels_roundtrip_rename_and_remove_keep_the_grid() {
+        let folder = crate::storage::tests::Folder::new();
+        let dir = &folder.0;
+        let label = Label { provider: "test".into(), model: "instant".into(), identity: "pixels".into(), status: Status::Labeled,
+            caption: "Tree".into(), tags: vec!["forest".into()] };
         let grid = Sidecar { tile: Some(Pair::Two([10, 20])), ..Sidecar::default() };
-        store_entry(&dir, "folder/sheet.png", &grid).unwrap();
-        store_labels(&dir, "folder/sheet.png", Some(labels.clone())).unwrap();
-        let loaded = load_book(&dir).unwrap().sheets.remove("folder/sheet.png").unwrap();
-        assert_eq!(loaded.labels, Some(labels.clone()));
+        store_entry(dir, "folder/sheet.png", &grid).unwrap();
+        store_label(dir, "folder/sheet.png", Some(label.clone())).unwrap();
+        let loaded = load_book(dir).unwrap().sheets.remove("folder/sheet.png").unwrap();
+        assert_eq!(loaded.label, Some(label.clone()));
         assert_eq!(loaded.tile, grid.tile);
-        move_entry(&dir, "folder/sheet.png", "folder/renamed.png", false).unwrap();
-        move_prefix(&dir, "folder", "assets").unwrap();
-        let book = load_book(&dir).unwrap();
+        move_entry(dir, "folder/sheet.png", "folder/renamed.png", false).unwrap();
+        move_prefix(dir, "folder", "assets").unwrap();
+        let book = load_book(dir).unwrap();
         assert_eq!(book.sheets.len(), 1);
         assert_eq!(book.sheets["assets/renamed.png"], loaded);
-        let removed = remove_labels(&dir, "assets/renamed.png").unwrap().unwrap();
-        assert!(removed.sheet.is_none());
-        assert!(removed.islands.iter().all(|i| i.label.is_none()));
-        assert_eq!(removed.islands.iter().map(|i| &i.rects).collect::<Vec<_>>(), labels.islands.iter().map(|i| &i.rects).collect::<Vec<_>>());
-        assert_eq!(load_book(&dir).unwrap().sheets["assets/renamed.png"].labels, Some(removed));
-        store_labels(&dir, "assets/renamed.png", None).unwrap();
-        assert_eq!(load_book(&dir).unwrap().sheets["assets/renamed.png"], grid);
-        store_labels(&dir, "only-labels.png", Some(labels)).unwrap();
-        store_labels(&dir, "only-labels.png", None).unwrap();
-        assert!(!load_book(&dir).unwrap().sheets.contains_key("only-labels.png"));
-        std::fs::remove_dir_all(dir).unwrap();
+        store_label(dir, "assets/renamed.png", None).unwrap();
+        assert_eq!(load_book(dir).unwrap().sheets["assets/renamed.png"], grid);
+        store_label(dir, "only-label.png", Some(label)).unwrap();
+        store_label(dir, "only-label.png", None).unwrap();
+        assert!(!load_book(dir).unwrap().sheets.contains_key("only-label.png"));
+    }
+
+    /// Books from before whole-sheet labels hold island regions under `labels`.
+    /// They read without an error, and the next write leaves them out.
+    #[test]
+    fn old_island_labels_are_dropped() {
+        let folder = crate::storage::tests::Folder::new();
+        std::fs::write(folder.0.join(BOOK), r#"{"sheets": {
+            "a.png": {"tile": 16, "labels": {"identity": "x", "islands": [{"rects": [[0, 0, 16, 16]], "label": null}]}},
+            "b.png": {"labels": {"identity": "x", "islands": []}}
+        }}"#).unwrap();
+        let book = load_book(&folder.0).unwrap();
+        assert_eq!(book.sheets.keys().collect::<Vec<_>>(), ["a.png"]);
+        write_book(&folder.0, &book).unwrap();
+        assert!(!std::fs::read_to_string(folder.0.join(BOOK)).unwrap().contains("islands"));
     }
 
     #[test]

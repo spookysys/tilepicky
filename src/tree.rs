@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 /// What the user did in the tree.
 pub enum TreeAction {
     Open(usize),
-    DetectIslands(usize),
+    /// A command from the AI label menu of a library file.
     Labels(usize, crate::labels::Action),
     /// Ctrl+click: add or remove the file from the marked set.
     Toggle(usize),
@@ -265,13 +265,8 @@ impl Node {
             let group = v.marked.is_some_and(|m| m.len() > 1 && m.contains(i));
             let count = v.marked.map_or(0, HashSet::len);
             r.context_menu(|ui| {
-                if !v.menus {
-                    if ui.button("Detect islands").clicked() {
-                        action = Some(TreeAction::DetectIslands(*i));
-                        ui.close();
-                    }
-                    if let Some(command) = crate::labels::menu(ui) { action = Some(TreeAction::Labels(*i, command)); }
-                    ui.separator();
+                if !v.menus && let Some(command) = crate::labels::menu(ui) {
+                    action = Some(TreeAction::Labels(*i, command));
                 }
                 // Only a tree the user owns offers the items that change files.
                 if v.menus && group {

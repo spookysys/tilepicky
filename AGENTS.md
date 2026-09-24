@@ -1,5 +1,7 @@
 # Tilepicky
 
+Visibility: publishable
+
 A desktop tool in Rust on egui/eframe: browse sprite sheets, search them,
 and copy tiles into tilesheets of your own. `README.md` is the document for
 the person who uses the tool; this file is for an agent that works on it.
@@ -36,37 +38,23 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/files.rs`: project file operations, separate from the UI.
 - `src/storage.rs`: strict JSON reads and complete-file replacement.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
-  grid, pixel origins, animations, labels, and saved island geometry.
-  The image fingerprint covers dimensions and pixel bytes only.
-  GIF detection, labeling, and fingerprints use the first frame.
-  Island regions use pixel rectangles, as project provenance does.
-  Grid changes leave them alone; Detect islands or Label with AI rebuilds them.
-- `src/index.rs`: the scan of a folder, and path search.
-- `src/search.rs`: local caption and tag search, image validation, and
-  temporary packed island sheets. One worker keeps decoding off the UI.
-  File results dim unmatched regions. Virtual results preserve source names.
-  Search has no network requests or saved results.
+  grid, pixel origins, animations, and AI label. The label holds a
+  fingerprint of the pixels; GIFs use their first frame.
+- `src/index.rs`: the scan of a folder, and the search of names, captions,
+  and tags. Search is local and synchronous.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
   and their settings page. Single-sheet labeling uses the instant model.
   Library batches use the configured Google or OpenRouter batch model.
-- `src/islands.rs`: local island detection for the library eye.
-  `src/islands/partition.rs` partitions grid cells into rectangles with reversible
-  cuts and joins, then merges continuous neighbors into irregular islands. Its tests include a local parameter search; see
-  `docs/island-detection.md` for the examples, score, and reproduction commands.
-- `src/labels.rs`: structured labeling requests, validation, image identity,
-  and pixel-region lookup. Single-sheet requests run from Label with AI.
-  One worker thread sends results to the UI; there is no single-sheet task queue.
-  Explicit island detection, label completion, removal, and existing sheet saves write the book.
-  Detection needs no AI label; the saved sheet label is optional. Opening a sheet deletes obsolete
-  companion files without importing them. Tests use synthetic images and fake responses.
-- `src/batch.rs`: local library preparation, job-size confirmation, and two
-  provider batch stages. Start batch authorizes sheet and island requests.
-  The configuration folder holds snapshots and an atomic journal with batch
-  IDs, never keys. Interrupted submissions require their provider ID before
-  resuming. Tests use fake transports and temporary libraries.
+- `src/labels.rs`: one labeling request per sheet: the request, the checks
+  on the reply, and the image fingerprint. Label with AI sends it from a
+  worker thread. Tests use synthetic images and fake responses.
+- `src/batch.rs`: library batches: local preparation, the confirmation, and
+  the provider batch API, one request per sheet. The configuration folder
+  holds a journal with batch IDs, never keys. An interrupted submission
+  needs its provider ID before it continues. Tests use fake transports.
 
 ## Folders that stay local
 

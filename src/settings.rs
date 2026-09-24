@@ -28,18 +28,13 @@ pub struct SearchIn {
     pub captions: bool,
     #[serde(default = "enabled")]
     pub tags: bool,
-    #[serde(default)]
-    pub view: SearchView,
 }
 
 fn enabled() -> bool { true }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SearchView { #[default] Files, Virtual }
-
 impl Default for SearchIn {
     fn default() -> Self {
-        SearchIn { folders: true, files: true, captions: true, tags: true, view: SearchView::Files }
+        SearchIn { folders: true, files: true, captions: true, tags: true }
     }
 }
 

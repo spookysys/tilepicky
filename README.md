@@ -70,104 +70,58 @@ pixels came from, and every pixel from that same pack lights up with it.
 Hover beside the sheet and it tells you about the sheet as a whole. Nothing
 selects or edits while the eye is on, and it starts off.
 
-Right-click a library file or its open sheet and choose **Detect islands** to build
-islands using the current grid. Opening a sheet detects its grid if none is
-saved. The library eye (`E`) highlights the island under the pointer.
-Detection groups cells into rectangles. It compares shared boundaries, then
-splits or joins regions. A join can undo an earlier cut, including part of a
-neighboring region. A final pass joins regions with net continuity across their
-shared boundary, allowing irregular islands. Keeping objects whole takes priority over separating every
-neighbor. Rectangles may include transparent cells; entirely empty regions are
-excluded. Configured grid gaps stay out of the crops and highlights.
-Some touching objects still merge, and some irregular objects can split.
-
-Detect islands saves pixel regions in `tilepicky.json`, even without AI labels.
-Reopening restores them. Grid changes leave them alone. Changing the image
-makes them stale; choose **Detect islands** again to rebuild them.
-Switching the eye on or off does not run analysis.
-
 ## Label one library sheet
 
 Open a library sheet, then open **AI assist** with its header button or `I`.
-In settings, choose an instant model with image input and structured JSON
+In Settings, choose an instant model with image input and structured JSON
 output. Use an OpenAI-compatible provider URL, such as
 `https://openrouter.ai/api/v1`, and enter its key or set its key environment
-variable. This action uses the instant OpenAI-compatible endpoint.
-Library batches use the separate batch model in Settings.
+variable.
 
-Choose **Label with AI** in the AI panel, the sheet's right-click menu, or
-its library file's right-click menu. All three start the same operation.
-Opening a panel or menu sends nothing.
-**Detect islands** is also available above **Label with AI** in the panel.
-It runs locally and reports the number of islands. Configured grid gaps are
-skipped when comparing tile edges; gap pixels cannot join or separate islands.
+Choose **Label with AI** in the AI panel, in the sheet's right-click menu, or
+in its file's right-click menu. The tool sends the whole sheet to the model,
+and the model returns a caption and up to 12 tags. Opening a panel or a menu
+sends nothing. You can keep browsing while the request runs. One sheet is
+labeled at a time, and the request stops after 60 seconds.
 
-The model first describes the sheet's asset type, setting, style, palette,
-and contents. It then labels groups of island crops with that description
-as context. Crops contain only the island's cells. Progress appears in the
-AI panel, with the current request, elapsed wait, and received results.
-Failures remain visible in the panel after the operation ends, even if you change sheets.
-You can keep browsing while requests run. One sheet can be
-labeled at a time; each request has a 60-second timeout.
+The AI panel shows the caption and the tags of the open sheet. The label goes
+into the sheet's entry in `tilepicky.json`, with the provider, the model, and
+a fingerprint of the pixels. When the pixels change, the panel says that the
+label is stale. A grid change does not make a label stale.
 
-The library eye shows an island's caption and tags under the pointer. Hover
-outside the image for the whole-sheet description. Missing results, stale
-labels, and content the model could not identify are shown explicitly.
-Project provenance works as before.
+Choose **Remove AI label...** to remove the caption and the tags. You confirm
+the sheet first. The image and the grid stay.
 
-Labels live in the sheet's entry in `tilepicky.json`, with the provider,
-model, and each island's pixel rectangles. As in the project provenance eye,
-hover and highlight use pixel regions directly. Grid edits leave the islands
-and their labels unchanged, including gaps and holes in each region.
-**Detect islands** or **Label with AI** explicitly builds new islands from the current
-grid. Detect islands keeps the sheet description; new islands need new labels.
-The image fingerprint covers decoded dimensions and pixel bytes only.
-Changed pixels make saved labels stale.
-
-Results stay in memory while requests run. When the operation ends, the
-book receives the results, including valid partial results if a later
-request failed. **Label with AI** starts again from the whole sheet.
-Old companion files are deleted on open and removal, without importing them.
-Search can match saved captions and tags.
-
-Choose **Remove saved AI labels...** in the panel or either context menu,
-then confirm the named sheet. This clears its saved label data from the book.
-The image, grid, and island highlight stay. Removal is unavailable while
-labeling runs, so an arriving response cannot restore deleted labels.
-
-GIFs use their first frame for labels and island detection. The library eye
-shows that frame; normal browsing still plays the animation.
-Images larger than 2048 pixels on
-an edge are reduced for the model; the original image is not changed.
-Check the labels: models can misidentify pixel art or miss small details.
+A GIF is labeled by its first frame. An image larger than 2048 pixels on an
+edge is made smaller for the model; the file does not change. Check the
+labels: a model can misidentify pixel art or miss small details.
 
 ## Label an entire library
 
 Open the library folder, open **AI assist** (`I`), and choose
-**Label entire library with AI...**. No sheet needs to be opened first.
+**Label entire library with AI...**. You do not have to open a sheet first.
 Choose the batch model and provider key in Settings. Library batches support
-Google Gemini and OpenRouter; the selected model must accept images and
-structured JSON output.
+Google Gemini and OpenRouter; the model must accept images and structured
+JSON output.
 
-Preparation scans all supported files, including subfolders. It reads missing
-grids and detects islands locally. The confirmation shows sheets to label,
-current sheets skipped, excluded files, islands, image inputs, request count,
-and approximate request size. It also shows the maximum requested output tokens.
-These numbers describe the job size; they are not a price quote. Pricing is
-not stored in Settings, so the dialog does not show a currency estimate.
-Nothing is sent until you choose **Start batch**, which authorizes both stages.
+The tool reads every image in the library, subfolders included, and sends
+nothing yet. Sheets that already have a current label are skipped. The
+confirmation shows the number of sheets to label, the sheets skipped, the
+files it could not read, the approximate request size, and the maximum
+output tokens. These numbers describe the size of the job; they are not a
+price quote. Nothing is sent until you choose **Start batch**.
 
-The batch labels whole sheets first, then groups of islands with each sheet's
-caption and tags as context. It splits large libraries into provider batches.
-Progress and errors appear in AI assist. Valid results go into `tilepicky.json`.
-The app keeps batch IDs and image snapshots under its configuration folder,
-so reopening the library resumes the existing jobs. Keys stay in key storage.
+Each sheet is one request, the same one that **Label with AI** sends. A large
+library goes out in more than one provider batch. Progress and errors show in
+AI assist, and each label goes into `tilepicky.json` when it arrives. The
+batch IDs are kept under the configuration folder, so a batch continues when
+you open the library again. Keys stay in key storage.
 
-Run the action again to retry incomplete work. Current, successful sheets and
-island labels are reused. Changed images need new labels. GIFs use their first
-frame, including the image fingerprint. A submission interrupted before its ID arrives is not repeated:
-check the provider's batch list and attach its ID in AI assist. Single-sheet
-labeling and label removal are unavailable while a library batch is active.
+Run the action again to retry the sheets that failed. A sheet that changes
+after you start the batch is not sent. If a submission is interrupted before
+its ID arrives, the tool does not send it again: find the batch in the
+provider's batch list and attach its ID in AI assist. While a library batch
+runs, you cannot label or remove the label of a single sheet.
 
 ## From the keyboard
 
@@ -262,7 +216,7 @@ A new sheet starts at the tile size that library or project used last, or at
 | Ctrl+click | add or remove one tile |
 | Ctrl+shift+click | add that rectangle to the selection |
 | Ctrl+A | select the whole sheet |
-| right click | clear the selection; inside the selection it clears the tiles |
+| right click | clear the selection; inside the selection it clears the tiles; on a library sheet it opens the AI label menu |
 | arrows | step the selection out of itself on the side you press |
 | Shift+arrows | hold one corner and walk the other |
 | Ctrl+arrows | jump to the end of the filled tiles, or across a gap to the next of them |
@@ -275,7 +229,7 @@ A new sheet starts at the tile size that library or project used last, or at
 | Right, Left in a file tree | unfold and fold the folder you stand on |
 | A | open or close the animation panel |
 | M | store the animation under the selection, or unmark a stored one |
-| E | switch the eye on or off |
+| E | switch the eye of your tilesheet on or off |
 | I | open or close library AI assist |
 | Ctrl+F | jump to the search box |
 | Ctrl+Z, Ctrl+Y | undo, and take the step again |
@@ -333,27 +287,12 @@ survives its own file moving.
 ## Search
 
 Type words in the box. Each word matches a prefix: `gra` finds `grass`.
-Open the menu beside the box to choose file names, folder names, captions,
-and tags. All words must match. Sheet context and one island's label can
-supply different words. Labels from changed images do not match.
-Project sheets still match file and folder names only.
+All words must match, and the tree shows the files that match. Open the menu
+beside the box to choose what the words match: folder names, file names,
+captions, and tags. The captions and the tags come from **Label with AI**.
 
-The menu also selects the library result view:
-
-- **Filter files** shows matching files in the tree. Open a file to see
-  matching islands at full brightness, with other areas dimmed.
-- **Virtual tilesheet** packs matching islands into one temporary sheet.
-  Select and copy tiles into your project as usual. Copies retain their
-  source names. Eye mode shows each island's label.
-
-Search runs locally, with no model requests or embeddings. Sheets without
-current labels can match their paths; their islands are detected locally.
-GIFs use their first frame. A virtual sheet keeps original pixels and uses
-one common grid. Large results require a narrower query.
-Right-click an island to select it. In a virtual sheet, **Show source sheet**
-opens its original file. **Back to search** returns to the latest result,
-with its selection and zoom intact. A new search replaces that result.
-Virtual sheets are temporary and are not saved.
+Search runs on your machine and sends nothing to a model. A stale label
+still matches, because the tool does not read every image to check it.
 
 ## tilepicky.json
 

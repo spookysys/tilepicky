@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! One library batch, prepared locally and advanced through two provider stages.
+//! One library batch: prepared locally, then sent through the provider's batch API.
+//! Each sheet is one request, the same one that Label with AI sends.
 
-use crate::{ai::{Kind, Provider}, index::Index, islands, labels, sidecar::{Label, Saved, Status, StoredIsland}};
+use crate::{ai::{Kind, Provider}, index::Index, labels, sidecar::{Label, Status}};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, time::Duration};
@@ -11,37 +12,26 @@ const MAX_BYTES: usize = 18_000_000;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Sheet {
     pub rel: String,
+    /// The fingerprint at preparation. A sheet that changes before it is
+    /// sent is not sent.
     pub identity: String,
-    pub grid: crate::Grid,
-    pub islands: Vec<StoredIsland>,
     pub label: Option<Label>,
     pub error: String,
+    /// The label is in the book.
     pub imported: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Request {
-    pub sheet: usize,
-    pub first: usize,
-    pub count: usize,
-}
-
-impl Request {
-    fn key(&self) -> String { format!("s{}-i{}-n{}", self.sheet, self.first, self.count) }
-    fn ids(&self) -> Vec<String> {
-        if self.count == 0 { vec!["sheet".into()] }
-        else { (self.first..self.first + self.count).map(|i| format!("island-{i}")).collect() }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub enum Remote { Ready, Submitting, Waiting(String), Done }
 
+/// The sheets that go to the provider in one batch.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Group {
-    pub requests: Vec<Request>,
+    pub sheets: Vec<usize>,
     pub remote: Remote,
 }
+
+fn key(sheet: usize) -> String { format!("sheet-{sheet}") }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -49,33 +39,22 @@ pub struct Job {
     pub model: String,
     pub sheets: Vec<Sheet>,
     pub groups: Vec<Group>,
-    pub island_stage: bool,
     pub started: bool,
     pub skipped: usize,
     pub excluded: Vec<String>,
-    pub images: usize,
-    pub requests: usize,
     pub bytes: usize,
 }
 
 impl Job {
-    pub fn done(&self) -> bool { self.island_stage && self.groups.iter().all(|g| g.remote == Remote::Done) }
+    pub fn done(&self) -> bool { self.groups.iter().all(|g| g.remote == Remote::Done) }
     pub fn uncertain(&self) -> bool { self.groups.iter().any(|g| g.remote == Remote::Submitting) }
-    pub fn result(&self, i: usize) -> Option<Saved> {
-        let sheet = &self.sheets[i];
-        Some(Saved { provider: self.provider.name.clone(), model: self.model.clone(), identity: sheet.identity.clone(),
-            sheet: Some(sheet.label.clone()?), islands: sheet.islands.clone() })
-    }
     pub fn summary(&self) -> String {
-        let completed = self.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)
-            && s.islands.iter().all(|i| i.label.as_ref().is_some_and(|l| l.status == Status::Labeled))).count();
+        let completed = self.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
         let failed = self.sheets.iter().filter(|s| !s.error.is_empty()).count();
         format!("{completed}/{} sheets complete; {failed} need attention", self.sheets.len())
     }
     pub fn save(&self, dir: &Path) -> Result<(), String> {
-        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("state.tmp"), bytes).map_err(|e| e.to_string())?;
-        std::fs::rename(dir.join("state.tmp"), dir.join("state.json")).map_err(|e| e.to_string())
+        crate::storage::write(&dir.join("state.json"), self)
     }
     pub fn load(dir: &Path) -> Result<Option<Self>, String> {
         match std::fs::read(dir.join("state.json")) {
@@ -86,6 +65,7 @@ impl Job {
     }
 }
 
+/// The folder of one library's batch journal, in the configuration folder.
 pub fn directory(root: &Path) -> Result<PathBuf, String> {
     use sha2::{Digest, Sha256};
     let root = root.canonicalize().map_err(|e| e.to_string())?;
@@ -93,14 +73,14 @@ pub fn directory(root: &Path) -> Result<PathBuf, String> {
     Ok(crate::settings::dir().ok_or("No configuration directory is available.")?.join("batches").join(format!("{hash:x}")))
 }
 
-fn snapshot(dir: &Path, i: usize) -> PathBuf { dir.join(format!("sheet-{i}.png")) }
-
-fn complete(saved: &Saved, identity: &str) -> bool {
-    saved.current(identity) && saved.sheet.as_ref().is_some_and(|l| l.status == Status::Labeled)
-        && saved.islands.iter().all(|i| !i.rects.is_empty() && i.label.as_ref().is_some_and(|l| l.status == Status::Labeled))
+/// The request body for one sheet, in the format of the provider.
+fn body(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
+    let body = labels::request(&job.model, img)?;
+    Ok(if job.provider.kind == Kind::Gemini { gemini_request(&body) } else { body })
 }
 
-/// No provider calls or book writes occur during preparation.
+/// Reads the sheets and sizes the requests. Nothing goes to the provider,
+/// and nothing is written to the book.
 pub fn prepare(root: &Path, dir: &Path, provider: Provider, model: String) -> Result<Job, String> {
     endpoint(&provider)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -111,84 +91,32 @@ pub fn prepare(root: &Path, dir: &Path, provider: Provider, model: String) -> Re
     let index = Index::scan(root, [16, 16]);
     if let Some(error) = index.error { return Err(error); }
     let mut job = Job { provider, model: model.trim_end_matches(":batch").into(), sheets: vec![], groups: vec![],
-        island_stage: false, started: false, skipped: 0, excluded: vec![], images: 0, requests: 0, bytes: 0 };
+        started: false, skipped: 0, excluded: vec![], bytes: 0 };
+    let (mut group, mut group_bytes) = (Vec::new(), 0);
     for entry in index.entries {
         let result = (|| {
             let img = image::open(root.join(&entry.rel)).map_err(|e| format!("Could not decode image: {e}"))?.to_rgba8();
             let identity = labels::identity(&img);
-            if entry.side.labels.as_ref().is_some_and(|s| complete(s, &identity)) { job.skipped += 1; return Ok(()); }
-            let grid = islands::grid(&img, &entry.side, index.tile);
-            if grid.0.contains(&0) { return Err("Invalid tile size".into()); }
-            let previous = entry.side.labels.as_ref().filter(|s| s.current(&identity));
-            let valid_regions = previous.is_some_and(|s| s.islands.iter().all(|i| !i.rects.is_empty() && i.rects.iter().all(|&[x, y, w, h]| {
-                w > 0 && h > 0 && x.checked_add(w).is_some_and(|r| r <= img.width()) && y.checked_add(h).is_some_and(|b| b <= img.height())
-            })));
-            let regions = if valid_regions { previous.unwrap().islands.clone() } else { islands::regions(&img, grid) };
-            let label = previous.and_then(|s| s.sheet.clone()).filter(|l| l.status == Status::Labeled);
-            let sheet = Sheet { rel: entry.rel.clone(), identity, grid, islands: regions, label, error: String::new(), imported: true };
-            img.save(snapshot(dir, job.sheets.len())).map_err(|e| e.to_string())?;
-            job.sheets.push(sheet);
+            if entry.side.label.as_ref().is_some_and(|l| l.identity == identity && l.status == Status::Labeled) {
+                job.skipped += 1;
+                return Ok(());
+            }
+            let size = serde_json::to_vec(&body(&job, &img)?).unwrap().len() + 512;
+            if size > MAX_BYTES { return Err("The image request is too large.".into()); }
+            if !group.is_empty() && (group_bytes + size > MAX_BYTES || group.len() == 100) {
+                job.groups.push(Group { sheets: std::mem::take(&mut group), remote: Remote::Ready });
+                group_bytes = 0;
+            }
+            group.push(job.sheets.len());
+            group_bytes += size;
+            job.bytes += size;
+            job.sheets.push(Sheet { rel: entry.rel.clone(), identity, label: None, error: String::new(), imported: true });
             Ok::<_, String>(())
         })();
         if let Err(error) = result { job.excluded.push(format!("{}: {error}", entry.rel)); }
     }
-    job.groups = groups(&job, dir, false)?;
-    // Context is not known yet. Reserve space for its bounded caption and tags.
-    let island_groups = groups(&job, dir, true)?;
-    for group in job.groups.iter().chain(&island_groups) {
-        for spec in &group.requests {
-            job.bytes += serde_json::to_vec(&body(&job, dir, spec, true)?).unwrap().len();
-            job.requests += 1;
-            job.images += spec.count.max(1);
-        }
-    }
+    if !group.is_empty() { job.groups.push(Group { sheets: group, remote: Remote::Ready }); }
     Ok(job)
-}
-
-fn body(job: &Job, dir: &Path, spec: &Request, estimate: bool) -> Result<Value, String> {
-    let sheet = &job.sheets[spec.sheet];
-    let img = image::open(snapshot(dir, spec.sheet)).map_err(|e| e.to_string())?.to_rgba8();
-    let placeholder = Label { status: Status::Labeled, caption: "x".repeat(320), tags: vec!["x".repeat(40); 12] };
-    let context = if spec.count == 0 { None } else if estimate { Some(&placeholder) } else { sheet.label.as_ref() };
-    if spec.count != 0 && context.is_none() { return Err("Missing sheet context.".into()); }
-    let ids = spec.ids();
-    let images = if spec.count == 0 { vec![(ids[0].clone(), img)] } else {
-        ids.into_iter().zip(&sheet.islands[spec.first..spec.first + spec.count]).map(|(id, i)| (id, labels::crop(&img, i))).collect()
-    };
-    let body = labels::request(&job.model, context, &images)?;
-    Ok(if job.provider.kind == Kind::Gemini { gemini_request(&body) } else { body })
-}
-
-fn groups(job: &Job, dir: &Path, island_stage: bool) -> Result<Vec<Group>, String> {
-    let mut groups = Vec::new();
-    let mut requests = Vec::new();
-    let mut bytes = 0;
-    for (i, sheet) in job.sheets.iter().enumerate() {
-        if island_stage && job.started && sheet.label.as_ref().is_none_or(|l| l.status != Status::Labeled) { continue; }
-        let mut specs = Vec::new();
-        if island_stage {
-            let mut first = 0;
-            while first < sheet.islands.len() {
-                if sheet.islands[first].label.as_ref().is_some_and(|l| l.status == Status::Labeled) { first += 1; continue; }
-                let count = sheet.islands[first..].iter().take(8)
-                    .take_while(|i| i.label.as_ref().is_none_or(|l| l.status != Status::Labeled)).count();
-                specs.push(Request { sheet: i, first, count });
-                first += count;
-            }
-        } else if sheet.label.is_none() { specs.push(Request { sheet: i, first: 0, count: 0 }); }
-        for spec in specs {
-            let size = serde_json::to_vec(&body(job, dir, &spec, !job.started)?).unwrap().len() + 512;
-            if size > MAX_BYTES { return Err(format!("{} has an oversized image request.", sheet.rel)); }
-            if !requests.is_empty() && (bytes + size > MAX_BYTES || requests.len() == 100) {
-                groups.push(Group { requests: std::mem::take(&mut requests), remote: Remote::Ready });
-                bytes = 0;
-            }
-            bytes += size;
-            requests.push(spec);
-        }
-    }
-    if !requests.is_empty() { groups.push(Group { requests, remote: Remote::Ready }); }
-    Ok(groups)
 }
 
 fn gemini_request(chat: &Value) -> Value {
@@ -204,13 +132,10 @@ fn gemini_request(chat: &Value) -> Value {
 }
 
 pub fn endpoint(provider: &Provider) -> Result<String, String> {
-    let url = provider.url.trim().trim_end_matches('/');
+    let url = labels::checked_url(&provider.url)?;
     let uri: ureq::http::Uri = url.parse().map_err(|_| "Invalid batch endpoint URL.")?;
-    if uri.scheme_str() != Some("https") || uri.authority().is_none_or(|a| a.as_str().contains('@')) || uri.query().is_some() || url.contains('#') {
-        return Err("Use an HTTPS batch endpoint without credentials, query, or fragment.".into());
-    }
     match provider.kind {
-        Kind::Gemini => Ok(url.into()),
+        Kind::Gemini => Ok(url),
         Kind::OpenAi if uri.host() == Some("openrouter.ai") => Ok("https://openrouter.ai/api/beta".into()),
         _ => Err("Library batches support Google Gemini and OpenRouter. Select one in Settings.".into()),
     }
@@ -306,27 +231,19 @@ fn outputs(kind: Kind, value: &Value) -> Result<Option<Vec<(String, Value)>>, St
 
 fn accept(job: &mut Job, group: usize, values: Vec<(String, Value)>) -> Result<(), String> {
     let mut values: BTreeMap<_, _> = values.into_iter().collect();
-    if values.keys().any(|key| !job.groups[group].requests.iter().any(|r| r.key() == *key)) {
+    if values.keys().any(|k| !job.groups[group].sheets.iter().any(|&i| key(i) == *k)) {
         return Err("The batch returned an unknown request ID.".into());
     }
-    for spec in &job.groups[group].requests {
-        let sheet = &mut job.sheets[spec.sheet];
-        let result = values.remove(&spec.key()).ok_or("No result returned for this request.".into())
-            .and_then(|v| labels::response(&v, &spec.ids()));
+    let (provider, model) = (job.provider.name.clone(), job.model.clone());
+    for &i in &job.groups[group].sheets {
+        let sheet = &mut job.sheets[i];
+        let result = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v| labels::response(&v));
         match result {
-            Ok(mut labels) => {
+            Ok(reply) => {
+                let label = reply.into_label(&provider, &model, &sheet.identity);
+                if label.status == Status::Unlabelable { sheet.error = "The model could not label the sheet.".into(); }
+                sheet.label = Some(label);
                 sheet.imported = false;
-                if spec.count == 0 {
-                    sheet.label = labels.remove("sheet");
-                    if sheet.label.as_ref().is_some_and(|l| l.status == Status::Unlabelable) { sheet.error = "The model could not label the sheet.".into(); }
-                } else {
-                    for i in spec.first..spec.first + spec.count {
-                        sheet.islands[i].label = labels.remove(&format!("island-{i}"));
-                        if sheet.islands[i].label.as_ref().is_none_or(|l| l.status != Status::Labeled) {
-                            sheet.error = "Some islands need labeling again.".into();
-                        }
-                    }
-                }
             }
             Err(error) => sheet.error = error,
         }
@@ -336,23 +253,26 @@ fn accept(job: &mut Job, group: usize, values: Vec<(String, Value)>) -> Result<(
 
 /// Advance one network operation. Persist submission intent before the POST.
 /// An interrupted POST stays uncertain and is never silently submitted twice.
-pub fn advance(mut job: Job, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, String>) -> Result<Job, String> {
+pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, String>) -> Result<Job, String> {
     if !job.started { return Err("Confirm Start batch before sending requests.".into()); }
     if job.uncertain() { return Err("Submission outcome is unknown. Attach its provider batch ID before continuing.".into()); }
     let next = job.groups.iter().position(|g| g.remote == Remote::Ready)
         .or_else(|| job.groups.iter().position(|g| matches!(g.remote, Remote::Waiting(_))));
-    let Some(i) = next else {
-        if !job.island_stage {
-            job.island_stage = true;
-            job.groups = groups(&job, dir, true)?;
-            job.save(dir)?;
-        }
-        return Ok(job);
-    };
+    let Some(i) = next else { return Ok(job) };
     match job.groups[i].remote.clone() {
         Remote::Ready => {
-            let requests = job.groups[i].requests.iter().map(|r| Ok((r.key(), body(&job, dir, r, false)?)))
-                .collect::<Result<Vec<_>, String>>()?;
+            let mut requests = Vec::new();
+            for &s in &job.groups[i].sheets.clone() {
+                let sheet = &mut job.sheets[s];
+                let img = image::open(root.join(&sheet.rel)).map_err(|e| e.to_string())?.to_rgba8();
+                if labels::identity(&img) == sheet.identity { requests.push((key(s), body(&job, &img)?)); }
+                else { sheet.error = "The image changed after the batch was prepared.".into(); }
+            }
+            if requests.is_empty() {
+                job.groups[i].remote = Remote::Done;
+                job.save(dir)?;
+                return Ok(job);
+            }
             let path = match job.provider.kind {
                 Kind::Gemini => format!("models/{}:batchGenerateContent", job.model),
                 Kind::OpenAi => "batches".into(),
@@ -362,7 +282,7 @@ pub fn advance(mut job: Job, dir: &Path, mut send: impl FnMut(&str, Option<&Valu
             job.save(dir)?;
             let response = send(&path, Some(&body))?;
             if let Some(status) = response["submission_rejected"].as_u64() {
-                for spec in &job.groups[i].requests { job.sheets[spec.sheet].error = format!("Batch submission rejected (HTTP {status})."); }
+                for &s in &job.groups[i].sheets { job.sheets[s].error = format!("Batch submission rejected (HTTP {status})."); }
                 job.groups[i].remote = Remote::Done;
             } else { job.groups[i].remote = Remote::Waiting(remote_id(job.provider.kind, &response)?); }
         }
@@ -373,7 +293,7 @@ pub fn advance(mut job: Job, dir: &Path, mut send: impl FnMut(&str, Option<&Valu
             match outputs(job.provider.kind, &response) {
                 Ok(None) => { job.groups.rotate_left(i + 1); job.save(dir)?; return Ok(job); }
                 Ok(Some(values)) => accept(&mut job, i, values)?,
-                Err(error) => for spec in &job.groups[i].requests { job.sheets[spec.sheet].error = error.clone(); },
+                Err(error) => for &s in &job.groups[i].sheets { job.sheets[s].error = error.clone(); },
             }
             job.groups[i].remote = Remote::Done;
         }
@@ -454,8 +374,8 @@ impl Panel {
                     .and_then(|key| Transport::new(&job.provider, key).map_err(|_| "Invalid batch provider endpoint.")) {
                     Ok(transport) => {
                         let job = job.clone();
-                        let dir = self.dir.clone();
-                        self.spawn(ctx, move || advance(job, &dir, |path, body| transport.send(path, body)));
+                        let (root, dir) = (self.root.clone(), self.dir.clone());
+                        self.spawn(ctx, move || advance(job, &root, &dir, |path, body| transport.send(path, body)));
                     }
                     Err(e) => { self.error = e.into(); self.paused = true; }
                 }
@@ -473,7 +393,6 @@ impl Panel {
         if let Some(job) = &self.job && job.started {
             ui.label(self.root.display().to_string());
             ui.label(job.summary());
-            if !job.done() { ui.weak(if job.island_stage { "Labeling islands" } else { "Labeling whole sheets" }); }
             egui::CollapsingHeader::new("Details").show(ui, |ui| {
                 for s in &job.sheets { if !s.error.is_empty() { ui.label(format!("{}: {}", s.rel, s.error)); } }
                 for group in &job.groups { if let Remote::Waiting(id) = &group.remote { ui.monospace(id); } }
@@ -530,12 +449,10 @@ impl Panel {
             ui.heading("Label this entire library?");
             ui.label(self.root.display().to_string());
             ui.weak(format!("{} / {} (from Settings)", job.provider.name, job.model));
-            ui.label(format!("{} sheets to label; {} already current; {} excluded", job.sheets.len(), job.skipped, job.excluded.len()));
-            ui.label(format!("{} islands; {} image inputs", job.sheets.iter().map(|s| s.islands.len()).sum::<usize>(), job.images));
-            ui.label(format!("Up to {} requests across the sheet and island stages", job.requests));
-            ui.label(format!("About {:.1} MB of request data; at most {} output tokens requested", job.bytes as f64 / 1_000_000.0, job.requests * 4096));
+            ui.label(format!("{} sheets to label, one request each; {} already current; {} excluded", job.sheets.len(), job.skipped, job.excluded.len()));
+            ui.label(format!("About {:.1} MB of request data; at most {} output tokens requested", job.bytes as f64 / 1_000_000.0, job.sheets.len() * 4096));
             ui.weak("Price estimate unavailable. Image token charges and model output vary; these counts are not a price quote.");
-            ui.weak("No images have been sent. Start batch authorizes both stages. You can close the app and resume later.");
+            ui.weak("No images have been sent. You can close the app and resume later.");
             eframe::egui::CollapsingHeader::new("Excluded files").show(ui, |ui| {
                 eframe::egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| { for error in &job.excluded { ui.label(error); } });
             });
@@ -558,7 +475,7 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sidecar::{Pair, Sidecar};
+    use crate::labels::tests::{completion, labeled};
     use image::{Rgba, RgbaImage};
 
     struct Files { base: PathBuf, root: PathBuf, spool: PathBuf }
@@ -572,6 +489,9 @@ mod tests {
             Self { base, root, spool }
         }
         fn prepare(&self) -> Job { prepare(&self.root, &self.spool, provider(Kind::OpenAi), "test:batch".into()).unwrap() }
+        fn advance(&self, job: Job, send: impl FnMut(&str, Option<&Value>) -> Result<Value, String>) -> Result<Job, String> {
+            advance(job, &self.root, &self.spool, send)
+        }
     }
     impl Drop for Files { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.base); } }
     fn provider(kind: Kind) -> Provider {
@@ -580,14 +500,9 @@ mod tests {
             Kind::OpenAi => "https://openrouter.ai/api/v1".into(),
         } }
     }
-    fn label(caption: &str) -> Label { Label { status: Status::Labeled, caption: caption.into(), tags: vec!["forest".into()] } }
-    fn completion(ids: &[String], caption: &str) -> Value {
-        json!({"choices":[{"finish_reason":"stop", "message":{"content":json!({"results":ids.iter()
-            .map(|id| json!({"id":id, "label":label(caption)})).collect::<Vec<_>>()}).to_string()}}]})
-    }
     fn result(job: &Job, caption: &str) -> Value {
-        json!({"status":"completed", "results":job.groups[0].requests.iter().rev().map(|r| {
-            json!({"custom_id":r.key(), "response":{"status_code":200, "body":completion(&r.ids(), caption)}})
+        json!({"status":"completed", "results":job.groups[0].sheets.iter().rev().map(|&i| {
+            json!({"custom_id":key(i), "response":{"status_code":200, "body":completion(labeled(caption))}})
         }).collect::<Vec<_>>()})
     }
 
@@ -607,12 +522,9 @@ mod tests {
         assert!(job.excluded.is_empty());
         let i = job.sheets.iter().position(|s| s.rel == "animated.gif").unwrap();
         assert_eq!(job.sheets[i].identity, labels::identity(&first));
-        assert_eq!(image::open(snapshot(&files.spool, i)).unwrap().to_rgba8(), first);
         let ctx = eframe::egui::Context::default();
-        let mut sheet = crate::sheet::Sheet::open(&ctx, &files.root, "animated.gif", [4, 4], Sidecar::default()).unwrap();
-        let input = sheet.label_input().unwrap();
-        assert_eq!(input.img, first);
-        assert_eq!(input.identity, job.sheets[i].identity);
+        let sheet = crate::sheet::Sheet::open(&ctx, &files.root, "animated.gif", [4, 4], Default::default()).unwrap();
+        assert_eq!(sheet.label_input().identity, job.sheets[i].identity);
     }
 
     #[test]
@@ -623,55 +535,38 @@ mod tests {
         assert_eq!(job.sheets.len(), 1);
         assert_eq!(job.excluded.len(), 1);
         assert_eq!(job.sheets[0].rel, "folder/sheet.png");
-        assert!(!job.sheets[0].islands.is_empty());
-        assert_eq!(job.requests, 2);
-        assert_eq!(job.images, 1 + job.sheets[0].islands.len());
         assert!(job.bytes > 0);
         assert!(!files.root.join(crate::sidecar::BOOK).exists());
         assert!(!files.spool.join("state.json").exists());
-        assert!(advance(job, &files.spool, |_, _| panic!("must not send before confirmation")).is_err());
+        assert!(files.advance(job, |_, _| panic!("must not send before confirmation")).is_err());
     }
 
     #[test]
-    fn two_stages_resume_by_id_and_keep_sheet_context_and_geometry() {
+    fn a_batch_submits_resumes_by_id_and_skips_current_labels() {
         let files = Files::new();
         let mut job = files.prepare();
-        let geometry = job.sheets[0].islands.clone();
         job.started = true;
-        job = advance(job, &files.spool, |path, request| {
+        job = files.advance(job, |path, request| {
             assert_eq!(path, "batches");
             assert!(Job::load(&files.spool).unwrap().unwrap().uncertain());
             let request = request.unwrap();
             assert_eq!(request["model"], "test");
             assert_eq!(request["endpoint"], "/v1/chat/completions");
-            assert!(!request.to_string().contains("Sheet context"));
             Ok(json!({"id":"batch-sheet"}))
         }).unwrap();
         let reply = result(&job, "Forest assets");
         let restored = Job::load(&files.spool).unwrap().unwrap();
-        job = advance(restored, &files.spool, |path, request| {
+        job = files.advance(restored, |path, request| {
             assert_eq!(path, "batches/batch-sheet");
             assert!(request.is_none());
             Ok(reply.clone())
         }).unwrap();
-        assert_eq!(job.sheets[0].label.as_ref().unwrap().caption, "Forest assets");
-        assert!(!job.sheets[0].imported);
-        assert!(!job.done());
-        job = advance(job, &files.spool, |_, _| panic!("stage transition is local")).unwrap();
-        assert!(job.island_stage);
-        job = advance(job, &files.spool, |_, request| {
-            let text = request.unwrap().to_string();
-            assert!(text.contains("Forest assets"));
-            assert!(text.contains("island-0"));
-            Ok(json!({"id":"batch-islands"}))
-        }).unwrap();
-        let reply = result(&job, "Tree");
-        job = advance(job, &files.spool, |_, request| { assert!(request.is_none()); Ok(reply.clone()) }).unwrap();
         assert!(job.done());
-        let saved = job.result(0).unwrap();
-        assert_eq!(saved.islands[0].rects, geometry[0].rects);
-        assert_eq!(saved.islands[0].label.as_ref().unwrap().caption, "Tree");
-        crate::sidecar::store_labels(&files.root, &job.sheets[0].rel, Some(saved.clone())).unwrap();
+        let label = job.sheets[0].label.clone().unwrap();
+        assert_eq!(label.caption, "Forest assets");
+        assert_eq!(label.identity, job.sheets[0].identity);
+        assert!(!job.sheets[0].imported);
+        crate::sidecar::store_label(&files.root, &job.sheets[0].rel, Some(label.clone())).unwrap();
         let again = files.prepare();
         assert_eq!(again.skipped, 1);
         assert!(again.sheets.is_empty());
@@ -679,27 +574,17 @@ mod tests {
         image.put_pixel(0, 0, Rgba([255; 4]));
         image.save(files.root.join("folder/sheet.png")).unwrap();
         assert_eq!(files.prepare().sheets.len(), 1);
-        assert!(!saved.current(&labels::identity(&image)));
     }
 
     #[test]
-    fn retry_keeps_successful_sheet_and_islands() {
+    fn a_sheet_that_changed_after_preparation_is_not_sent() {
         let files = Files::new();
-        let img = image::open(files.root.join("folder/sheet.png")).unwrap().to_rgba8();
-        let saved = Saved { provider: "test".into(), model: "test".into(), identity: labels::identity(&img), sheet: Some(label("Forest")),
-            islands: vec![StoredIsland { rects: vec![[0, 0, 4, 4]], label: Some(label("Tree")) },
-                StoredIsland { rects: vec![[4, 0, 4, 4]], label: None }] };
-        let side = Sidecar { tile: Some(Pair::One(4)), labels: Some(saved), ..Sidecar::default() };
-        crate::sidecar::store_entry(&files.root, "folder/sheet.png", &side).unwrap();
         let mut job = files.prepare();
-        assert!(job.groups.is_empty());
-        assert_eq!(job.requests, 1);
-        assert_eq!(job.images, 1);
-        assert_eq!(job.sheets[0].islands[0].label.as_ref().unwrap().caption, "Tree");
         job.started = true;
-        let job = advance(job, &files.spool, |_, _| panic!("no whole-sheet retry")).unwrap();
-        assert_eq!(job.groups[0].requests[0].first, 1);
-        assert_eq!(job.groups[0].requests[0].count, 1);
+        RgbaImage::new(8, 4).save(files.root.join("folder/sheet.png")).unwrap();
+        let job = files.advance(job, |_, _| panic!("nothing left to send")).unwrap();
+        assert!(job.done());
+        assert!(job.sheets[0].error.contains("changed"));
     }
 
     #[test]
@@ -707,47 +592,44 @@ mod tests {
         let files = Files::new();
         let mut job = files.prepare();
         job.started = true;
-        assert!(advance(job, &files.spool, |_, _| Err("timeout".into())).is_err());
+        assert!(files.advance(job, |_, _| Err("timeout".into())).is_err());
         let job = Job::load(&files.spool).unwrap().unwrap();
         assert!(job.uncertain());
-        assert!(advance(job, &files.spool, |_, _| panic!("duplicate paid submission")).is_err());
+        assert!(files.advance(job, |_, _| panic!("duplicate paid submission")).is_err());
     }
 
     #[test]
     fn request_ids_ignore_order_and_missing_results_stay_missing() {
         let files = Files::new();
         let mut job = files.prepare();
-        let first = Request { sheet: 0, first: 0, count: 0 };
         job.sheets.push(job.sheets[0].clone());
-        job.groups[0].requests = vec![first.clone(), Request { sheet: 1, ..first }];
-        let values = vec![(job.groups[0].requests[1].key(), completion(&["sheet".into()], "Second"))];
-        accept(&mut job, 0, values).unwrap();
+        job.groups[0].sheets = vec![0, 1];
+        accept(&mut job, 0, vec![(key(1), completion(labeled("Second")))]).unwrap();
         assert!(job.sheets[0].label.is_none());
         assert!(!job.sheets[0].error.is_empty());
         assert_eq!(job.sheets[1].label.as_ref().unwrap().caption, "Second");
-        assert!(accept(&mut job, 0, vec![("unknown".into(), completion(&["sheet".into()], "Wrong"))]).is_err());
+        assert!(accept(&mut job, 0, vec![("unknown".into(), completion(labeled("Wrong")))]).is_err());
     }
 
     #[test]
-    fn gemini_request_and_response_use_the_same_structured_labels() {
-        let request = labels::request("test", Some(&label("Forest")), &[("island-0".into(), RgbaImage::new(2, 2))]).unwrap();
+    fn gemini_request_and_response_use_the_same_structured_label() {
+        let request = labels::request("test", &RgbaImage::new(2, 2)).unwrap();
         let gemini = gemini_request(&request);
         assert_eq!(gemini["generationConfig"]["responseMimeType"], "application/json");
         assert!(gemini["generationConfig"]["responseJsonSchema"].is_object());
         assert!(gemini.to_string().contains("inlineData"));
-        assert!(gemini.to_string().contains("Forest"));
         let response = json!({"done":true, "response":{"inlinedResponses":{"inlinedResponses":[{
-            "metadata":{"key":"request-1"}, "response":{"candidates":[{"finishReason":"STOP", "content":{"parts":[{
-                "text":completion(&["island-0".into()], "Tree")["choices"][0]["message"]["content"]
+            "metadata":{"key":"sheet-0"}, "response":{"candidates":[{"finishReason":"STOP", "content":{"parts":[{
+                "text":completion(labeled("Tree"))["choices"][0]["message"]["content"]
             }]}}]}
         }]}}});
         let out = outputs(Kind::Gemini, &response).unwrap().unwrap();
-        assert_eq!(out[0].0, "request-1");
-        assert_eq!(labels::response(&out[0].1, &["island-0".into()]).unwrap()["island-0"].caption, "Tree");
+        assert_eq!(out[0].0, "sheet-0");
+        assert_eq!(labels::response(&out[0].1).unwrap().into_label("", "", "").caption, "Tree");
         let mut bad = response.clone();
         bad["response"]["inlinedResponses"]["inlinedResponses"][0]["response"]["candidates"][0]["finishReason"] = json!("SAFETY");
         let out = outputs(Kind::Gemini, &bad).unwrap().unwrap();
-        assert!(labels::response(&out[0].1, &["island-0".into()]).is_err());
+        assert!(labels::response(&out[0].1).is_err());
         assert!(outputs(Kind::Gemini, &json!({"done":false})).unwrap().is_none());
         assert!(outputs(Kind::OpenAi, &json!({"status":"completed", "results":[{"custom_id":"a"},{"custom_id":"a"}]})).is_err());
     }
@@ -757,11 +639,10 @@ mod tests {
         let files = Files::new();
         let mut job = files.prepare();
         job.started = true;
-        job = advance(job, &files.spool, |_, _| Ok(json!({"submission_rejected":401}))).unwrap();
+        job = files.advance(job, |_, _| Ok(json!({"submission_rejected":401}))).unwrap();
         assert!(!job.uncertain());
         assert!(job.sheets[0].error.contains("401"));
         assert!(job.sheets[0].label.is_none());
-        job = advance(job, &files.spool, |_, _| panic!("failed sheets do not start islands")).unwrap();
         assert!(job.done());
     }
 
@@ -772,12 +653,12 @@ mod tests {
         job.started = true;
         job.groups.push(job.groups[0].clone());
         job.groups[0].remote = Remote::Waiting("first".into());
-        job = advance(job, &files.spool, |path, body| {
+        job = files.advance(job, |path, body| {
             assert_eq!(path, "batches");
             assert!(body.is_some());
             Ok(json!({"id":"second"}))
         }).unwrap();
-        job = advance(job, &files.spool, |path, body| {
+        job = files.advance(job, |path, body| {
             assert_eq!(path, "batches/first");
             assert!(body.is_none());
             Ok(json!({"status":"in_progress"}))

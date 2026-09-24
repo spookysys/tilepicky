@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Scans a directory of sheets and searches their file and folder names.
+//! Scans a directory of sheets and searches their names, captions, and tags.
 
 use crate::settings::SearchIn;
 use crate::sidecar::{self, Pair, Sidecar};
@@ -8,14 +8,12 @@ use std::path::{Path, PathBuf};
 /// The formats the tool reads. It always writes 32 bit RGBA PNG.
 pub const IMAGE_EXTS: [&str; 7] = ["png", "gif", "jpg", "jpeg", "webp", "bmp", "tga"];
 
-#[derive(Clone)]
 pub struct Entry {
     pub rel: String,
-    /// The words of the path, lower case.
-    /// The words of the folders on the path, and of the file name.
+    /// The words of the folders on the path, and of the file name, lower case.
     pub dir_words: Vec<String>,
     pub name_words: Vec<String>,
-    /// The book entry: grid, origins, animations.
+    /// The book entry: grid, origins, animations, AI label.
     pub side: Sidecar,
 }
 
@@ -89,10 +87,16 @@ impl Index {
         self.entries.binary_search_by(|e| e.rel.as_str().cmp(rel)).ok()
     }
 
-    /// True when every query word is the prefix of a word in the file path.
+    /// True when every query word is the prefix of a word in the fields
+    /// that `search` names. A stale label still matches: checking it would
+    /// mean reading every image.
     pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn) -> bool {
         let starts = |ws: &[String], q: &str| ws.iter().any(|w| w.starts_with(q));
-        matches(query, |q| (search.folders && starts(&e.dir_words, q)) || (search.files && starts(&e.name_words, q)))
+        let label = e.side.label.as_ref();
+        let caption = label.filter(|_| search.captions).map(|l| words(&l.caption)).unwrap_or_default();
+        let tags = label.filter(|_| search.tags).map(|l| words(&l.tags.join(" "))).unwrap_or_default();
+        matches(query, |q| (search.folders && starts(&e.dir_words, q)) || (search.files && starts(&e.name_words, q))
+            || starts(&caption, q) || starts(&tags, q))
     }
 
     pub fn visible(&self, query: &[String], search: SearchIn) -> Option<Vec<bool>> {
