@@ -56,6 +56,29 @@ enum Panel {
     Project,
 }
 
+/// What a sheet panel asked for while it drew. The app does it once both
+/// panels are drawn.
+struct PanelOut {
+    /// A new grid from the header fields.
+    grid: Option<Grid>,
+    /// A stored animation changed, or the reason a change was refused.
+    anim: Result<bool, String>,
+    /// A hold on this cell lifted a block.
+    drag: Option<(u32, u32)>,
+    /// A click on the empty panel asks for the folder.
+    ask: bool,
+    /// A canvas edge drag ended.
+    resized: bool,
+    /// A right click deleted the content of the selection.
+    deleted: bool,
+}
+
+impl Default for PanelOut {
+    fn default() -> Self {
+        Self { grid: None, anim: Ok(false), drag: None, ask: false, resized: false, deleted: false }
+    }
+}
+
 /// A block on its way from one place to another, under the pointer.
 struct Drag {
     block: Block,
@@ -1773,6 +1796,142 @@ impl App {
         ui.ctx().request_repaint_after(Duration::from_millis(a.ms.max(16) as u64));
     }
 
+    /// The upper sheet panel: the library sheet, its header, and its side
+    /// panels. What it asks for is done in `after_panel`.
+    fn library_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, keys: (Panel, Spot), dragging: bool) -> PanelOut {
+        let mut out = PanelOut::default();
+        set_pane(ui, (Panel::Library, Spot::Sheet));
+        ui.horizontal(|ui| {
+            let live = keys == (Panel::Library, Spot::Sheet);
+            let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
+            let clicked;
+            (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), ai, None);
+            // A header button does not keep the keys: they go to the grid.
+            if clicked {
+                self.active = Panel::Library;
+                if self.library.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(library_id())); }
+            }
+        });
+        if self.ai_panel {
+            let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
+                set_pane(ui, (Panel::Library, Spot::Side));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let out = Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library.sheet.as_ref(),
+                        self.label_run.as_ref(), self.label_outcome.as_deref());
+                    self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys);
+                    out
+                }).inner
+            });
+            if let Some(action) = label.inner { self.label_action(ctx, action); }
+        }
+        if let Some(s) = &mut self.library.sheet {
+            if s.anim_panel {
+                egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                    set_pane(ui, (Panel::Library, Spot::Side));
+                    out.anim = Self::animation_panel(ui, s, true, keys == (Panel::Library, Spot::Side));
+                });
+            }
+            set_pane(ui, (Panel::Library, Spot::Sheet));
+            stop_id(ui.ctx(), library_id());
+            let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false, false, keys == (Panel::Library, Spot::Sheet))).inner;
+            if let Some(action) = ev.labels { self.label_action(ctx, action); }
+            if ev.interacted {
+                self.active = Panel::Library;
+            }
+            out.drag = ev.drag_block;
+        } else {
+            // Fill the panel, so that it keeps its height and can be dragged.
+            egui::CentralPanel::default().show(ui, |ui| {
+                let hint = if self.library.is_set() {
+                    "Open a sheet on the left, or press Ctrl+F to search."
+                } else {
+                    "Click to open your asset library."
+                };
+                let r = ui.interact(ui.max_rect(), Id::new("library empty"), egui::Sense::click());
+                ui.weak(hint);
+                if !self.library.is_set() && r.clicked() {
+                    out.ask = true;
+                }
+            });
+        }
+        out
+    }
+
+    /// The lower sheet panel: your tilesheet, its header, and its animation
+    /// panel. What it asks for is done in `after_panel`.
+    fn project_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, keys: (Panel, Spot), dragging: bool) -> PanelOut {
+        let mut out = PanelOut::default();
+        self.project_rect = ui.max_rect();
+        set_pane(ui, (Panel::Project, Spot::Sheet));
+        let live = keys == (Panel::Project, Spot::Sheet);
+        let clicked;
+        (out.grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye));
+        if clicked {
+            self.active = Panel::Project;
+            if self.project.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(project_id())); }
+        }
+        let eye = self.project_eye;
+        if let Some(s) = &mut self.project.sheet {
+            if s.anim_panel {
+                egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                    set_pane(ui, (Panel::Project, Spot::Side));
+                    out.anim = Self::animation_panel(ui, s, false, keys == (Panel::Project, Spot::Side));
+                });
+            }
+            set_pane(ui, (Panel::Project, Spot::Sheet));
+            stop_id(ui.ctx(), project_id());
+            let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, project_id(), dragging, true, eye, keys == (Panel::Project, Spot::Sheet))).inner;
+            if ev.interacted {
+                self.active = Panel::Project;
+            }
+            out.resized = ev.resized;
+            out.drag = ev.drag_block;
+            if ev.delete {
+                s.clear_selection();
+                out.deleted = true;
+            }
+        } else {
+            // The same frame as the library pane, so both hints sit alike.
+            egui::CentralPanel::default().show(ui, |ui| {
+                let hint = if self.project.is_set() {
+                    "Create or open a tilesheet on the left. Then select tiles in the library, Ctrl+C, click a tile here, Ctrl+V."
+                } else {
+                    "Click to open your project folder."
+                };
+                let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
+                ui.weak(hint);
+                if !self.project.is_set() && r.clicked() {
+                    out.ask = true;
+                }
+            });
+        }
+        out
+    }
+
+    /// Does what a sheet panel asked for while it drew.
+    fn after_panel(&mut self, ctx: &egui::Context, panel: Panel, out: PanelOut) {
+        if let Some(g) = out.grid {
+            self.change_grid(ctx, panel, g);
+        }
+        if out.deleted {
+            self.after_edit();
+        }
+        if out.resized {
+            if let Some(s) = &self.project.sheet {
+                self.status = format!("resized to {}x{} tiles", s.cols(), s.rows());
+            }
+            self.after_edit();
+        }
+        match out.anim {
+            Ok(true) => self.after_animation_edit(panel),
+            Ok(false) => {}
+            Err(e) => self.status = e,
+        }
+        if let Some(grab) = out.drag {
+            self.start_drag(ctx, panel, grab);
+        }
+    }
+
     /// What a click or a menu in the LIBRARY tree asks for.
     fn library_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
         match action {
@@ -1975,7 +2134,6 @@ impl eframe::App for App {
         let mut hover_dir: Option<String> = None;
         let mut library_rows: Vec<tree::Row> = Vec::new();
         let mut project_rows: Vec<tree::Row> = Vec::new();
-        let mut delete_in_mine = false;
         let mut create = false;
         if self.settings.hide_legend {
             self.status_bar(ctx, ui);
@@ -2213,12 +2371,6 @@ impl eframe::App for App {
         self.dialogs(ctx);
 
         let dragging = self.drag.is_some();
-        let mut drag_from = None;
-        let mut anim_changed = Ok(false);
-        let mut library_anim = Ok(false);
-        let mut library_tile = None;
-        let mut project_tile = None;
-        let mut resized = false;
         // The split is kept as a fraction of the height, so that it stays in
         // place when the window changes size. The panel state is written from
         // it each frame and read back after the user drags the divider.
@@ -2226,151 +2378,22 @@ impl eframe::App for App {
         let panel_id = Id::new("library panel");
         let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
         ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
-        egui::Panel::top("library panel").resizable(true).show(ui, |ui| {
-            set_pane(ui, (Panel::Library, Spot::Sheet));
-            ui.horizontal(|ui| {
-                let live = keys == (Panel::Library, Spot::Sheet);
-                let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
-                let clicked;
-                (library_tile, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), ai, None);
-                // A header button does not keep the keys: they go to the grid.
-                if clicked {
-                    self.active = Panel::Library;
-                    if self.library.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(library_id())); }
-                }
-            });
-            if self.ai_panel {
-                let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
-                    set_pane(ui, (Panel::Library, Spot::Side));
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let out = Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library.sheet.as_ref(),
-                            self.label_run.as_ref(), self.label_outcome.as_deref());
-                        self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys);
-                        out
-                    }).inner
-                });
-                if let Some(action) = label.inner { self.label_action(ctx, action); }
-            }
-            if let Some(s) = &mut self.library.sheet {
-                if s.anim_panel {
-                    egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
-                        set_pane(ui, (Panel::Library, Spot::Side));
-                        library_anim = Self::animation_panel(ui, s, true, keys == (Panel::Library, Spot::Side));
-                    });
-                }
-                set_pane(ui, (Panel::Library, Spot::Sheet));
-                stop_id(ui.ctx(), library_id());
-                let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false, false, keys == (Panel::Library, Spot::Sheet)));
-                let ev = out.inner;
-                if let Some(action) = ev.labels { self.label_action(ctx, action); }
-                if ev.interacted {
-                    self.active = Panel::Library;
-                }
-                if let Some(grab) = ev.drag_block {
-                    drag_from = Some((Panel::Library, grab));
-                }
-            } else {
-                // Fill the panel, so that it keeps its height and can be dragged.
-                egui::CentralPanel::default().show(ui, |ui| {
-                    let hint = if library_set {
-                        "Open a sheet on the left, or press Ctrl+F to search."
-                    } else {
-                        "Click to open your asset library."
-                    };
-                    let r = ui.interact(ui.max_rect(), Id::new("library empty"), egui::Sense::click());
-                    ui.weak(hint);
-                    if !library_set && r.clicked() {
-                        ask = Some(Panel::Library);
-                    }
-                });
-            }
-        });
+        let library_out = egui::Panel::top("library panel").resizable(true).show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner;
         if let Some(state) = egui::PanelState::load(ctx, panel_id) && total > 0.0 {
             self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
         }
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.project_rect = ui.max_rect();
-            set_pane(ui, (Panel::Project, Spot::Sheet));
-            let live = keys == (Panel::Project, Spot::Sheet);
-            let clicked;
-            (project_tile, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye));
-            if clicked {
-                self.active = Panel::Project;
-                if self.project.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(project_id())); }
+        let project_out = egui::CentralPanel::default().show(ui, |ui| self.project_panel(ctx, ui, keys, dragging)).inner;
+        for (panel, out) in [(Panel::Library, &library_out), (Panel::Project, &project_out)] {
+            if out.ask {
+                ask = Some(panel);
             }
-            let eye = self.project_eye;
-            if let Some(s) = &mut self.project.sheet {
-                if s.anim_panel {
-                    egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
-                        set_pane(ui, (Panel::Project, Spot::Side));
-                        anim_changed = Self::animation_panel(ui, s, false, keys == (Panel::Project, Spot::Side));
-                    });
-                }
-                set_pane(ui, (Panel::Project, Spot::Sheet));
-                stop_id(ui.ctx(), project_id());
-                let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, project_id(), dragging, true, eye, keys == (Panel::Project, Spot::Sheet)));
-                let ev = out.inner;
-                if ev.interacted {
-                    self.active = Panel::Project;
-                }
-                if ev.resized {
-                    resized = true;
-                }
-                if let Some(grab) = ev.drag_block {
-                    drag_from = Some((Panel::Project, grab));
-                }
-                if ev.delete {
-                    s.clear_selection();
-                    delete_in_mine = true;
-                }
-            } else {
-                // The same frame as the library pane, so both hints sit alike.
-                egui::CentralPanel::default().show(ui, |ui| {
-                    let hint = if project_set {
-                        "Create or open a tilesheet on the left. Then select tiles in the library, Ctrl+C, click a tile here, Ctrl+V."
-                    } else {
-                        "Click to open your project folder."
-                    };
-                    let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
-                    ui.weak(hint);
-                    if !project_set && r.clicked() {
-                        ask = Some(Panel::Project);
-                    }
-                });
-            }
-        });
-        match anim_changed {
-            Ok(true) => self.after_animation_edit(Panel::Project),
-            Ok(false) => {}
-            Err(e) => self.status = e,
         }
         if let Some(panel) = ask {
             self.ask_folder(panel);
         }
         self.poll_folder(ctx);
-        if let Some(g) = library_tile {
-            self.change_grid(ctx, Panel::Library, g);
-        }
-        if let Some(g) = project_tile {
-            self.change_grid(ctx, Panel::Project, g);
-        }
-        if delete_in_mine {
-            self.after_edit();
-        }
-        if resized {
-            if let Some(s) = &self.project.sheet {
-                self.status = format!("resized to {}x{} tiles", s.cols(), s.rows());
-            }
-            self.after_edit();
-        }
-        match library_anim {
-            Ok(true) => self.after_animation_edit(Panel::Library),
-            Ok(false) => {}
-            Err(e) => self.status = e,
-        }
-        if let Some((from, grab)) = drag_from {
-            self.start_drag(ctx, from, grab);
-        }
+        self.after_panel(ctx, Panel::Library, library_out);
+        self.after_panel(ctx, Panel::Project, project_out);
         // The stops of this frame, in reading order: pane by pane, and in
         // each pane in the order they drew. The next frame's Tab walks them.
         let mut stops = ctx.data_mut(|d| d.remove_temp::<Vec<((Panel, Spot), Id)>>(Id::new("stops"))).unwrap_or_default();
