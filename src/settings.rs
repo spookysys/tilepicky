@@ -69,7 +69,7 @@ impl Settings {
     pub fn save(&self) -> Result<(), String> {
         let path = file().ok_or("No configuration directory available.")?;
         crate::storage::read::<Self>(&path)?;
-        crate::storage::write(&path, self)
+        crate::storage::write_private(&path, self)
     }
 }
 

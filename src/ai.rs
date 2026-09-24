@@ -242,7 +242,7 @@ impl Keys {
         let path = Self::file().ok_or("No configuration directory available.")?;
         crate::storage::read::<BTreeMap<String, String>>(&path)?;
         let kept: BTreeMap<&String, &String> = self.0.iter().filter(|(_, v)| !v.trim().is_empty()).collect();
-        crate::storage::write(&path, &kept)
+        crate::storage::write_private(&path, &kept)
     }
 
     pub fn get(&self, provider: &str) -> Option<&str> {

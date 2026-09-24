@@ -669,14 +669,19 @@ impl Sheet {
     pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], side: Sidecar) -> Result<Self, String> {
         let path = dir.join(rel);
         let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
-        let fail = |e: image::ImageError| format!("{rel}: {e}");
-        let reader = image::ImageReader::open(&path).and_then(image::ImageReader::with_guessed_format).map_err(|e| format!("{rel}: {e}"))?;
-        let format = reader.format();
-        let decoder = reader.into_decoder().map_err(fail)?;
-        let kind = file_kind(&path, format, decoder.original_color_type());
-        let img = match frames.first() {
-            Some(f) => f.clone(),
-            None => image::DynamicImage::from_decoder(decoder).map_err(fail)?.to_rgba8(),
+        // A GIF that decoded has its frames already. Anything else, a GIF
+        // that did not decode included, goes through the loader, which
+        // says what is wrong with it.
+        let (img, kind) = match frames.first() {
+            Some(f) => (f.clone(), file_kind(&path, Some(image::ImageFormat::Gif), image::ExtendedColorType::Rgba8)),
+            None => {
+                let fail = |e: image::ImageError| format!("{rel}: {e}");
+                let reader = image::ImageReader::open(&path).and_then(image::ImageReader::with_guessed_format).map_err(|e| format!("{rel}: {e}"))?;
+                let format = reader.format();
+                let decoder = reader.into_decoder().map_err(fail)?;
+                let kind = file_kind(&path, format, decoder.original_color_type());
+                (image::DynamicImage::from_decoder(decoder).map_err(fail)?.to_rgba8(), kind)
+            }
         };
         let read = side.tile.is_none();
         let mut sheet = Self::from_image(ctx, dir, rel, tile, img, side);
@@ -2013,6 +2018,9 @@ impl Sheet {
     /// Writes the image and the book entry. A tilesheet's entry always names
     /// its grid, so it is never lost between runs.
     pub fn save(&mut self) -> Result<(), String> {
+        if !is_png(&self.rel) {
+            return Err(format!("{}: a tilesheet saves as a PNG, which keeps every pixel and the alpha", self.rel));
+        }
         sidecar::load_book(&self.dir)?;
         // The image is written whole or not at all: a crash halfway must
         // not leave half a tilesheet.
@@ -2043,6 +2051,11 @@ impl Sheet {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// Whether a file name ends in `.png`, in any case.
+pub fn is_png(rel: &str) -> bool {
+    rel.to_ascii_lowercase().ends_with(".png")
 }
 
 /// Light and lighter squares behind transparent pixels, drawn only where visible.

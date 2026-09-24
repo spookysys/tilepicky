@@ -786,10 +786,13 @@ impl App {
         let Some(sheet) = &mut self.project.sheet else {
             return;
         };
-        if sheet.rel.is_empty() {
+        // A sheet with no name asks for one. A sheet from a GIF or a JPEG
+        // asks for a PNG name: those formats would lose frames or alpha.
+        if sheet.rel.is_empty() || !sheet::is_png(&sheet.rel) {
+            let value = if sheet.rel.is_empty() { String::new() } else { Path::new(&sheet.rel).with_extension("png").to_string_lossy().into() };
             self.prompt = Some(NamePrompt {
                 title: "Save as".into(),
-                value: String::new(),
+                value,
                 what: NameFor::SaveAs,
                 focus: true,
             });
@@ -1301,7 +1304,8 @@ impl App {
             }
             here.push(r);
             if let Some(eye) = eye {
-                let r = ui.add_enabled(open, egui::Button::new("👁").small().selected(*eye)).on_hover_text("view information about the sheet, no editing (E)");
+                let r = ui.add_enabled(open, egui::Button::new("👁").small().selected(*eye))
+                    .on_hover_text("view information about the sheet, no editing (E)");
                 if r.clicked() {
                     *eye = !*eye;
                     clicked = true;
@@ -2012,7 +2016,8 @@ impl eframe::App for App {
                     let legend = format!(
                         "click and drag: select tiles | click and hold: lift and move (ctrl: copy) | \
                          ctrl+c, ctrl+v: copy/paste | drag an edge of the selection: resize it | right click: clear it, or delete inside it | \
-                         ctrl+tab: next panel | tab: next field | arrows: move the selection, shift: extend | {ai_key}ctrl+f: search | ctrl+wheel: zoom | ctrl+z, ctrl+y: undo, redo | ctrl+s: save"
+                         ctrl+tab: next panel | tab: next field | arrows: move the selection, shift: extend | \
+                         {ai_key}ctrl+f: search | ctrl+wheel: zoom | ctrl+z, ctrl+y: undo, redo | ctrl+s: save"
                     );
                     let text = egui::RichText::new(legend).weak();
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("click: hide the legend").clicked() {
@@ -2035,7 +2040,10 @@ impl eframe::App for App {
                         if !library_set {
                             ui.weak("No library folder yet.");
                             ui.add_space(4.0);
-                            ui.weak("This is your library of tilesheets and packs. I'll help you browse and search them, and to transfer what you need into your own tilesheets. I'll track details about your assets in a tilepicky.json.");
+                            ui.weak(
+                                "This is your library of tilesheets and packs. I'll help you browse and search them, and to transfer what you \
+                                 need into your own tilesheets. I'll track details about your assets in a tilepicky.json.",
+                            );
                             ui.add_space(6.0);
                             ui.weak("Click here to choose it.");
                             if bg.clicked() {
@@ -2152,7 +2160,8 @@ impl eframe::App for App {
                         }
                         if project_set {
                             if ui.button("New folder…").clicked() {
-                                self.prompt = Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(String::new()), focus: true });
+                                self.prompt =
+                                    Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(String::new()), focus: true });
                                 ui.close();
                             }
                             if ui.button("Refresh").clicked() {
@@ -3079,6 +3088,26 @@ mod tests {
         b.app.pending = None;
         b.app.apply_name(&b.ctx, &NameFor::DuplicateFile("c.png".into()), "e").unwrap();
         assert_eq!(b.project_rel(), Some("e.png"));
+    }
+
+    /// A GIF would keep one frame and a JPEG no alpha, so a sheet from
+    /// another format saves as a PNG beside it.
+    #[test]
+    fn a_sheet_that_is_no_png_saves_as_one() {
+        let mut b = bench(&[], &["walk.gif"]);
+        let before = std::fs::read(b.project.0.join("walk.gif")).unwrap();
+        b.open_project("walk.gif");
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        b.app.save();
+        let prompt = b.app.prompt.take().unwrap();
+        assert!(prompt.what == NameFor::SaveAs);
+        assert_eq!(prompt.value, "walk.png");
+        assert_eq!(std::fs::read(b.project.0.join("walk.gif")).unwrap(), before);
+        assert!(b.app.project.sheet.as_mut().unwrap().save().is_err());
+        b.app.apply_name(&b.ctx, &prompt.what, &prompt.value).unwrap();
+        assert_eq!(b.project_rel(), Some("walk.png"));
+        assert!(b.project.0.join("walk.png").is_file());
+        assert_eq!(std::fs::read(b.project.0.join("walk.gif")).unwrap(), before);
     }
 
     #[test]

@@ -12,9 +12,19 @@ pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
     }
 }
 
+/// Writes a file that travels with the folder it describes, such as a book.
 pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    write_json(path, false, value)
+}
+
+/// Writes a file of the configuration folder: the owner alone reads it.
+pub fn write_private<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    write_json(path, true, value)
+}
+
+fn write_json<T: Serialize>(path: &Path, private: bool, value: &T) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
-    replace(path, true, |file| file.write_all(&bytes)).map_err(|e| format!("Cannot save {}: {e}", path.display()))
+    replace(path, private, |file| file.write_all(&bytes)).map_err(|e| format!("Cannot save {}: {e}", path.display()))
 }
 
 /// Writes a new file beside `path` and renames it over `path`, so that a
@@ -85,13 +95,13 @@ pub mod tests {
     fn writes_replace_complete_files_and_failed_writes_preserve_them() {
         let dir = Folder::new();
         let path = dir.0.join("data.json");
-        write(&path, &vec![1, 2]).unwrap();
-        write(&path, &vec![3]).unwrap();
+        write_private(&path, &vec![1, 2]).unwrap();
+        write_private(&path, &vec![3]).unwrap();
         assert_eq!(read::<Vec<u32>>(&path).unwrap(), [3]);
         // A temporary file that a crash left behind blocks nothing.
         let temp = dir.0.join(format!("data.json.{}.0.tmp", std::process::id()));
         std::fs::write(&temp, b"already here").unwrap();
-        write(&path, &vec![4]).unwrap();
+        write_private(&path, &vec![4]).unwrap();
         assert_eq!(read::<Vec<u32>>(&path).unwrap(), [4]);
         assert_eq!(std::fs::read(&temp).unwrap(), b"already here");
         // A write that fails leaves the old file whole.

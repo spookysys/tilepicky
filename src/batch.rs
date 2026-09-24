@@ -66,7 +66,7 @@ impl Job {
         format!("Labeled: {labeled} of {}. Failed: {failed}.", self.sheets.len())
     }
     pub fn save(&self, dir: &Path) -> Result<(), String> {
-        crate::storage::write(&dir.join("state.json"), self)
+        crate::storage::write_private(&dir.join("state.json"), self)
     }
     fn load(dir: &Path) -> Result<Option<Self>, String> {
         crate::storage::read(&dir.join("state.json"))
