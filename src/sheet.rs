@@ -582,9 +582,6 @@ pub struct Sheet {
     /// The islands of the eye: the provenance rectangles by source, made
     /// once while the eye is on. Nothing changes the pixels meanwhile.
     eye_islands: Option<Vec<Provenance>>,
-    /// The AI label in the entry describes these pixels. Checked when the
-    /// sheet opens and when the label changes: a library sheet is not edited.
-    label_current: bool,
     pub preview_zoom: Zoom,
     /// Screen pixels in one point, as the window reports them. The drawing
     /// needs it to keep the image pixels even.
@@ -694,7 +691,6 @@ impl Sheet {
             sheet.side.read = true;
             let _ = sidecar::store_entry(dir, rel, &sheet.side);
         }
-        sheet.check_label();
         Ok(sheet)
     }
 
@@ -747,7 +743,6 @@ impl Sheet {
             anim_panel: false,
             last_stored: None,
             eye_islands: None,
-            label_current: false,
             preview_zoom: Zoom::new(2.0),
             ppp: 1.0,
             preview_hovered: false,
@@ -946,29 +941,8 @@ impl Sheet {
     /// A GIF label describes the first frame, whichever frame plays.
     fn label_image(&self) -> &RgbaImage { self.frames.first().unwrap_or(&self.img) }
 
-    fn check_label(&mut self) {
-        self.label_current = self.side.label.as_ref().is_some_and(|l| l.identity == crate::labels::identity(self.label_image()));
-    }
-
-    /// The label as the AI panel shows it, or why there is none.
-    pub fn label_info(&self, ui: &mut Ui) {
-        match &self.side.label {
-            None => { ui.weak("No AI label yet."); }
-            Some(_) if !self.label_current => { ui.weak("The image changed after it was labeled. Label it again."); }
-            Some(label) => label.show(ui),
-        }
-    }
-
     pub fn label_input(&self) -> crate::labels::Input {
-        crate::labels::Input {
-            path: self.dir.join(&self.rel), dir: self.dir.clone(), rel: self.rel.clone(), img: self.label_image().clone(),
-            identity: crate::labels::identity(self.label_image()),
-        }
-    }
-
-    pub fn set_label(&mut self, label: Option<sidecar::Label>) {
-        self.side.label = label;
-        self.check_label();
+        crate::labels::Input { path: self.dir.join(&self.rel), dir: self.dir.clone(), rel: self.rel.clone(), img: self.label_image().clone() }
     }
 
     /// Draws the sheet and handles pointer input. While a block drag is in
@@ -2116,35 +2090,20 @@ mod tests {
 
     use super::*;
 
-    fn label(identity: String) -> sidecar::Label {
-        sidecar::Label { provider: "test".into(), model: "test".into(), identity, status: sidecar::Status::Labeled,
-            caption: "Village".into(), tags: vec!["village".into()] }
-    }
-
     #[test]
-    fn a_label_survives_grid_changes_and_undo_but_not_new_pixels() {
+    fn a_label_survives_grid_changes_and_undo() {
         let ctx = egui::Context::default();
         let folder = crate::storage::tests::Folder::new();
-        let dir = &folder.0;
-        let mut sheet = Sheet::new_empty(&ctx, dir, "sheet.png", [4, 4], 2, 1);
-        sheet.img = RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255]));
+        let mut sheet = Sheet::new_empty(&ctx, &folder.0, "sheet.png", [4, 4], 2, 1);
         sheet.save().unwrap();
         let before = sheet.step(false);
-        sheet.set_label(Some(label(sheet.label_input().identity)));
-        assert!(sheet.label_current);
-        sheet.save_entry().unwrap();
-        let stored = sheet.side.label.clone();
+        sheet.side.label = Some(sidecar::Label { provider: "test".into(), model: "test".into(), status: sidecar::Status::Labeled,
+            caption: "Village".into(), tags: vec![] });
+        let label = sheet.side.label.clone();
         sheet.set_grid(&ctx, [2, 4], [0, 0], [0, 0]);
-        assert_eq!(sheet.side.label, stored);
+        assert_eq!(sheet.side.label, label);
         sheet.restore(&ctx, before);
-        assert_eq!(sheet.side.label, stored);
-        let book = sidecar::load_book(dir).unwrap();
-        let reopened = Sheet::open(&ctx, dir, "sheet.png", sheet.tile, book.sheets["sheet.png"].clone()).unwrap();
-        assert!(reopened.label_current);
-        sheet.img.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
-        sheet.img.save(dir.join("sheet.png")).unwrap();
-        let changed = Sheet::open(&ctx, dir, "sheet.png", sheet.tile, book.sheets["sheet.png"].clone()).unwrap();
-        assert!(!changed.label_current);
+        assert_eq!(sheet.side.label, label);
     }
 
     #[test]
@@ -2154,10 +2113,7 @@ mod tests {
         let first = RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255]));
         sheet.frames = vec![first.clone(), RgbaImage::from_pixel(8, 4, Rgba([200, 10, 20, 255]))];
         sheet.img = sheet.frames[1].clone();
-        let input = sheet.label_input();
-        assert_eq!(input.img, first);
-        sheet.set_label(Some(label(input.identity)));
-        assert!(sheet.label_current);
+        assert_eq!(sheet.label_input().img, first);
     }
 
     /// A changed tile size must survive save and reopen.

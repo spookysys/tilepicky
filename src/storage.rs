@@ -61,7 +61,7 @@ pub mod tests {
         assert!(crate::sidecar::load_book(&dir.0).is_err());
         assert!(crate::sidecar::store_tile(&dir.0, [16, 16]).is_err());
         assert!(crate::sidecar::store_entry(&dir.0, "a.png", &Default::default()).is_err());
-        assert!(crate::sidecar::store_label(&dir.0, "a.png", None).is_err());
+        assert!(crate::sidecar::store_labels(&dir.0, [("a.png", None)]).is_err());
         assert!(crate::sidecar::move_entry(&dir.0, "a.png", "b.png", false).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
     }

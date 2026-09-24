@@ -515,6 +515,12 @@ impl App {
     fn refresh_query(&mut self) {
         self.qwords = index::query_words(&self.query);
         self.open_trees = true;
+        self.refresh_visible();
+    }
+
+    /// Filters the trees again after the entries changed. The folders stay
+    /// open or closed as they are.
+    fn refresh_visible(&mut self) {
         self.library_visible = self.library.visible(&self.qwords, self.settings.search);
         self.project_visible = self.project.visible(&self.qwords, self.settings.search);
     }
@@ -1131,7 +1137,7 @@ impl App {
 
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     fn dialog_open(&self, ctx: &egui::Context) -> bool {
-        self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.library_batch.review
+        self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.library_batch.open()
             || self.pending.is_some() || self.legend_prompt || egui::Popup::is_any_open(ctx)
     }
 
@@ -1574,18 +1580,21 @@ impl App {
             }
             _ => { ui.weak("Set an instant image model and key in Settings."); false }
         };
+        let mut cancel = None;
         if let Some(run) = run {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(format!("Waiting for the model: {}s of 60s.", run.started.elapsed().as_secs()));
             });
-            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             ui.weak(run.path.file_name().unwrap_or_default().to_string_lossy()).on_hover_text(run.path.display().to_string());
+            cancel = Some(stopped(ui.button("Cancel").on_hover_text("Stops waiting. The provider may still bill the request.")));
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         } else if let Some(outcome) = outcome {
             ui.label(outcome);
         }
-        match sheet {
-            Some(sheet) => sheet.label_info(ui),
+        match sheet.map(|s| &s.side.label) {
+            Some(Some(label)) => label.show(ui),
+            Some(None) => { ui.weak("No AI label yet."); }
             None => { ui.weak("Select a library sheet."); }
         }
         let label = ui.add_enabled(ready && sheet.is_some() && run.is_none(), egui::Button::new("Label with AI"))
@@ -1593,14 +1602,20 @@ impl App {
         let remove = ui.add_enabled(sheet.is_some_and(|s| s.side.label.is_some()) && run.is_none(), egui::Button::new("Remove AI label..."));
         stop(&label);
         stop(&remove);
-        if label.clicked() { Some(labels::Action::Label) } else if remove.clicked() { Some(labels::Action::Remove) } else { None }
+        if label.clicked() { Some(labels::Action::Label) } else if remove.clicked() { Some(labels::Action::Remove) }
+            else if cancel.as_ref().is_some_and(egui::Response::clicked) { Some(labels::Action::Cancel) } else { None }
     }
 
     /// Every UI entry point reaches this operation after it opens the target sheet.
     fn label_action(&mut self, ctx: &egui::Context, action: labels::Action) {
         self.ai_panel = true;
-        if self.label_run.is_some() || self.remove_label.is_some() || self.library_batch.busy() {
-            self.status = "Finish the current labeling operation first.".into();
+        if action == labels::Action::Cancel {
+            self.label_run = None;
+            self.label_outcome = Some("Cancelled. The provider may still bill the request.".into());
+            return;
+        }
+        if self.label_run.is_some() {
+            self.status = "Wait for the current label, or cancel it.".into();
             return;
         }
         let Some(sheet) = &self.library_sheet else { return };
@@ -1634,8 +1649,10 @@ impl App {
         };
         let run = self.label_run.take().unwrap();
         let result = result.and_then(|label| {
-            sidecar::store_label(&run.dir, &run.rel, Some(label.clone())).map_err(|e| format!("Could not save the label: {e}"))?;
-            self.apply_label(&run.path, Some(label));
+            let labels = [(run.rel.clone(), Some(label))];
+            sidecar::store_labels(&run.dir, labels.iter().map(|(rel, label)| (rel.as_str(), label.clone())))
+                .map_err(|e| format!("Could not save the label: {e}"))?;
+            self.apply_labels(&run.dir, &labels);
             Ok(())
         });
         let notice = match result {
@@ -1646,38 +1663,18 @@ impl App {
         self.label_outcome = Some(self.status.clone());
     }
 
-    fn import_batch_labels(&mut self) {
-        let Some(job) = &self.library_batch.job else { return; };
-        if !job.started { return; }
-        let root = self.library_batch.root.clone();
-        let results: Vec<_> = job.sheets.iter().enumerate().filter(|(_, s)| !s.imported)
-            .filter_map(|(i, s)| Some((i, s.rel.clone(), s.label.clone()?))).collect();
-        for (i, rel, label) in results {
-            if !root.join(&rel).is_file() {
-                if let Some(job) = &mut self.library_batch.job { job.sheets[i].error = "Source file moved or was removed.".into(); }
-                continue;
-            }
-            if let Err(e) = sidecar::store_label(&root, &rel, Some(label.clone())) {
-                self.library_batch.pause(format!("Could not save {rel}: {e}"));
-                return;
-            }
-            self.apply_label(&root.join(&rel), Some(label));
-            if let Some(job) = &mut self.library_batch.job { job.sheets[i].imported = true; }
-        }
-        if let Some(job) = &self.library_batch.job && let Err(e) = job.save(&self.library_batch.dir) { self.library_batch.pause(e); }
-    }
-
-    /// Puts a label that the book now holds into the open sheets and the search.
-    fn apply_label(&mut self, path: &Path, label: Option<sidecar::Label>) {
-        for index in [&mut self.library, &mut self.project] {
-            for entry in &mut index.entries {
-                if index.root.join(&entry.rel) == path { entry.side.label = label.clone(); }
+    /// Puts labels that the book now holds into the open sheets and the search.
+    fn apply_labels(&mut self, dir: &Path, labels: &[(String, Option<sidecar::Label>)]) {
+        if labels.is_empty() { return; }
+        for index in [&mut self.library, &mut self.project].into_iter().filter(|i| i.root == dir) {
+            for (rel, label) in labels {
+                if let Some(i) = index.position(rel) { index.entries[i].side.label = label.clone(); }
             }
         }
-        for sheet in [&mut self.library_sheet, &mut self.project_sheet].into_iter().flatten() {
-            if sheet.dir.join(&sheet.rel) == path { sheet.set_label(label.clone()); }
+        for sheet in [&mut self.library_sheet, &mut self.project_sheet].into_iter().flatten().filter(|s| s.dir == dir) {
+            if let Some((_, label)) = labels.iter().find(|(rel, _)| *rel == sheet.rel) { sheet.side.label = label.clone(); }
         }
-        self.refresh_query();
+        self.refresh_visible();
     }
 
     fn remove_label_dialog(&mut self, ctx: &egui::Context) {
@@ -1697,9 +1694,9 @@ impl App {
         if let Some(remove) = choice {
             self.remove_label = None;
             if remove {
-                match sidecar::store_label(&dir, &rel, None) {
+                match sidecar::store_labels(&dir, [(rel.as_str(), None)]) {
                     Ok(()) => {
-                        self.apply_label(&path, None);
+                        self.apply_labels(&dir, &[(rel, None)]);
                         self.status = "AI label removed.".into();
                     }
                     Err(error) => self.status = error,
@@ -2088,8 +2085,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         self.receive_label();
-        if self.label_run.is_none() && self.remove_label.is_none() && self.library_batch.tick(ctx, &self.library.root, &self.keys) {
-            self.import_batch_labels();
+        if self.library_batch.tick(ctx, &self.library.root, &self.keys) {
+            let root = self.library_batch.root.clone();
+            let labels = self.library_batch.import();
+            self.apply_labels(&root, &labels);
         }
         // A right click first closes any open menu. egui closes a menu on any
         // click while it is open, and it does that after the same click has
@@ -2229,6 +2228,7 @@ impl eframe::App for App {
                             open_dir: self.library_open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                             sweeping: false,
                             lifting: false,
+                            entries: &self.library.entries,
                         };
                         library_action = self.library_tree.show(ui, &view, "", &mut Vec::new(), &mut library_rows, &mut None);
                         claim_on_press(ui, library_tree_id());
@@ -2309,6 +2309,7 @@ impl eframe::App for App {
                         open_dir: self.project_open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                         sweeping: self.sweep.is_some(),
                         lifting: self.file_drag.is_some(),
+                        entries: &self.project.entries,
                     };
                     // The tree area itself is the root folder; the tree names
                     // a folder inside it when the pointer is over one.
@@ -2519,12 +2520,9 @@ impl eframe::App for App {
                 let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
                     set_pane(ui, (Panel::Library, Spot::Side));
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let out = ui.add_enabled_ui(!self.library_batch.busy(), |ui| {
-                            Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref(),
-                                self.label_run.as_ref(), self.label_outcome.as_deref())
-                        }).inner;
-                        self.library_batch.ui(ui, &self.library.root, &self.settings.ai, &self.keys,
-                            self.label_run.is_some() || self.remove_label.is_some());
+                        let out = Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref(),
+                            self.label_run.as_ref(), self.label_outcome.as_deref());
+                        self.library_batch.ui(ui, &self.library, &self.settings.ai, &self.keys);
                         out
                     }).inner
                 });

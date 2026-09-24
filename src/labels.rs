@@ -6,11 +6,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use image::RgbaImage;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{io::Cursor, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action { Label, Remove }
+pub enum Action { Label, Remove, Cancel }
 
 /// The same commands appear on the library sheet and its file-tree row.
 pub fn menu(ui: &mut eframe::egui::Ui) -> Option<Action> {
@@ -60,9 +59,8 @@ impl Reply {
         Ok(self)
     }
 
-    pub fn into_label(self, provider: &str, model: &str, identity: &str) -> Label {
-        Label { provider: provider.into(), model: model.into(), identity: identity.into(),
-            status: self.status, caption: self.caption, tags: self.tags }
+    pub fn into_label(self, provider: &str, model: &str) -> Label {
+        Label { provider: provider.into(), model: model.into(), status: self.status, caption: self.caption, tags: self.tags }
     }
 }
 
@@ -77,15 +75,6 @@ impl Label {
     }
 }
 
-/// Only decoded dimensions and pixel bytes determine whether a label is current.
-pub fn identity(img: &RgbaImage) -> String {
-    let mut hash = Sha256::new();
-    hash.update(img.width().to_le_bytes());
-    hash.update(img.height().to_le_bytes());
-    hash.update(img.as_raw());
-    format!("{:x}", hash.finalize())
-}
-
 /// An owned copy of the sheet, so that the request does not depend on what
 /// the user opens or edits while it runs.
 pub struct Input {
@@ -93,11 +82,11 @@ pub struct Input {
     pub dir: PathBuf,
     pub rel: String,
     pub img: RgbaImage,
-    pub identity: String,
 }
 
 /// One request that the user started. A worker thread sends it, and the
-/// result arrives on `result`.
+/// result arrives on `result`. To cancel, drop the `Run`: the result then
+/// has nowhere to go. The provider may still bill the request.
 pub struct Run {
     pub path: PathBuf,
     pub dir: PathBuf,
@@ -118,7 +107,7 @@ impl Run {
             let label = request(&model, &input.img)
                 .and_then(|body| send(&body))
                 .and_then(|reply| response(&reply))
-                .map(|reply| reply.into_label(&provider, &model, &input.identity));
+                .map(|reply| reply.into_label(&provider, &model));
             let _ = tx.send(label);
             wake();
         }).map_err(|_| "Could not start the labeling thread.")?;
@@ -234,7 +223,7 @@ pub mod tests {
     #[test]
     fn worker_returns_while_the_request_waits() {
         use std::sync::mpsc;
-        let input = Input { path: "sheet.png".into(), dir: "".into(), rel: "sheet.png".into(), img: RgbaImage::new(2, 2), identity: "pixels".into() };
+        let input = Input { path: "sheet.png".into(), dir: "".into(), rel: "sheet.png".into(), img: RgbaImage::new(2, 2) };
         let (started, waiting) = mpsc::channel();
         let (release, gate) = mpsc::channel::<()>();
         let run = Run::start(input, "test".into(), "model".into(), move |body| {
@@ -248,7 +237,7 @@ pub mod tests {
         assert!(matches!(run.result.try_recv(), Err(mpsc::TryRecvError::Empty)));
         release.send(()).unwrap();
         let label = run.result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        assert_eq!((label.provider.as_str(), label.model.as_str(), label.identity.as_str()), ("test", "model", "pixels"));
+        assert_eq!((label.provider.as_str(), label.model.as_str()), ("test", "model"));
         assert_eq!(label.caption, "Village assets");
         assert_eq!(label.tags, ["pixel art", "tree"]);
     }
@@ -299,16 +288,5 @@ pub mod tests {
         let data = content[1]["image_url"]["url"].as_str().unwrap().strip_prefix("data:image/png;base64,").unwrap();
         assert_eq!(image::load_from_memory(&STANDARD.decode(data).unwrap()).unwrap().to_rgba8(), img);
         assert!(!body.to_string().contains("Authorization"));
-    }
-
-    #[test]
-    fn identity_tracks_only_pixels_and_dimensions() {
-        let img = RgbaImage::new(8, 4);
-        let original = identity(&img);
-        assert_eq!(original, identity(&img.clone()));
-        let mut changed = img.clone();
-        changed.put_pixel(0, 0, image::Rgba([1, 2, 3, 255]));
-        assert_ne!(original, identity(&changed));
-        assert_ne!(original, identity(&RgbaImage::new(4, 8)));
     }
 }
