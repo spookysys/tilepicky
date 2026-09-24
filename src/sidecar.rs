@@ -113,14 +113,11 @@ pub fn count_text(n: usize, noun: &str) -> Option<String> {
 #[serde(rename_all = "snake_case")]
 pub enum Status { Labeled, Unlabelable }
 
-/// What a model said about a whole sheet, and about which pixels.
+/// What a model said about a whole sheet.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Label {
     pub provider: String,
     pub model: String,
-    /// The fingerprint of the pixels that the model saw; see `labels::identity`.
-    /// When the image changes, the label is stale.
-    pub identity: String,
     pub status: Status,
     pub caption: String,
     pub tags: Vec<String>,
@@ -254,12 +251,15 @@ pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> 
     write_book(dir, &book)
 }
 
-/// Writes or removes the label of one sheet, and keeps the rest of its entry.
-pub fn store_label(dir: &Path, rel: &str, label: Option<Label>) -> Result<(), String> {
+/// Writes or removes the labels of some sheets, in one write of the book.
+/// The rest of each entry stays.
+pub fn store_labels<'a>(dir: &Path, labels: impl IntoIterator<Item = (&'a str, Option<Label>)>) -> Result<(), String> {
     let mut book = load_book(dir)?;
-    let side = book.sheets.entry(rel.into()).or_default();
-    side.label = label;
-    if side.is_empty() { book.sheets.remove(rel); }
+    for (rel, label) in labels {
+        let side = book.sheets.entry(rel.into()).or_default();
+        side.label = label;
+        if side.is_empty() { book.sheets.remove(rel); }
+    }
     write_book(dir, &book)
 }
 
@@ -284,11 +284,11 @@ mod tests {
     fn labels_roundtrip_rename_and_remove_keep_the_grid() {
         let folder = crate::storage::tests::Folder::new();
         let dir = &folder.0;
-        let label = Label { provider: "test".into(), model: "instant".into(), identity: "pixels".into(), status: Status::Labeled,
+        let label = Label { provider: "test".into(), model: "instant".into(), status: Status::Labeled,
             caption: "Tree".into(), tags: vec!["forest".into()] };
         let grid = Sidecar { tile: Some(Pair::Two([10, 20])), ..Sidecar::default() };
         store_entry(dir, "folder/sheet.png", &grid).unwrap();
-        store_label(dir, "folder/sheet.png", Some(label.clone())).unwrap();
+        store_labels(dir, [("folder/sheet.png", Some(label.clone()))]).unwrap();
         let loaded = load_book(dir).unwrap().sheets.remove("folder/sheet.png").unwrap();
         assert_eq!(loaded.label, Some(label.clone()));
         assert_eq!(loaded.tile, grid.tile);
@@ -297,11 +297,12 @@ mod tests {
         let book = load_book(dir).unwrap();
         assert_eq!(book.sheets.len(), 1);
         assert_eq!(book.sheets["assets/renamed.png"], loaded);
-        store_label(dir, "assets/renamed.png", None).unwrap();
-        assert_eq!(load_book(dir).unwrap().sheets["assets/renamed.png"], grid);
-        store_label(dir, "only-label.png", Some(label)).unwrap();
-        store_label(dir, "only-label.png", None).unwrap();
-        assert!(!load_book(dir).unwrap().sheets.contains_key("only-label.png"));
+        store_labels(dir, [("assets/renamed.png", None), ("a.png", Some(label.clone())), ("b.png", Some(label))]).unwrap();
+        let book = load_book(dir).unwrap();
+        assert_eq!(book.sheets["assets/renamed.png"], grid);
+        assert_eq!(book.sheets.len(), 3);
+        store_labels(dir, [("a.png", None)]).unwrap();
+        assert!(!load_book(dir).unwrap().sheets.contains_key("a.png"));
     }
 
     /// Books from before whole-sheet labels hold island regions under `labels`.

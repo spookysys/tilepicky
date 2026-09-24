@@ -77,6 +77,8 @@ pub struct View<'a> {
     pub sweeping: bool,
     /// Files are in the air, looking for a folder to land in.
     pub lifting: bool,
+    /// The entries of the index, for the AI label in a file's tooltip.
+    pub entries: &'a [crate::index::Entry],
 }
 
 #[derive(Default)]
@@ -220,6 +222,9 @@ impl Node {
             // colour, and this pale band says only where the keys stand.
             let band = ui.painter().add(egui::Shape::Noop);
             let mut r = ui.selectable_label(v.selected == Some(*i) || is_marked, name);
+            if let Some(label) = v.entries.get(*i).and_then(|e| e.side.label.as_ref()) {
+                r = r.on_hover_ui(|ui| { ui.set_max_width(320.0); label.show(ui); });
+            }
             if v.cursor == Some(&Row::File(*i)) {
                 let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.4);
                 ui.painter().set(band, egui::Shape::rect_filled(r.rect, 2.0, fill));
@@ -332,6 +337,7 @@ mod tests {
                     open_dir: open,
                     sweeping: false,
                     lifting: false,
+                    entries: &[],
                 };
                 tree.show(ui, &v, "", &mut Vec::new(), &mut rows, &mut None);
             }

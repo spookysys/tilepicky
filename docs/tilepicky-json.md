@@ -33,16 +33,14 @@ A sheet that was labeled with AI also has a `label`:
     "label": {
       "provider": "OpenRouter",
       "model": "google/gemini-2.5-flash",
-      "identity": "3f1c...",
       "status": "labeled",
       "caption": "Top-down village tiles: grass, dirt paths, wooden houses",
       "tags": ["grass", "house", "pixel art", "village"]
     }
 
-`identity` is a SHA-256 fingerprint of the image dimensions and the decoded
-pixels, from the first frame of a GIF. When the pixels change, the label is
-stale. `status` is `unlabelable` when the model could not say what the sheet
-shows; the caption and the tags are then empty.
+The label describes the whole image, or the first frame of a GIF. `status`
+is `unlabelable` when the model could not say what the sheet shows; the
+caption and the tags are then empty.
 
 Books from before this format kept island regions under `labels`. The tool
 ignores that key and leaves it out the next time it writes the book.

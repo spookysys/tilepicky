@@ -38,8 +38,7 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/files.rs`: project file operations, separate from the UI.
 - `src/storage.rs`: strict JSON reads and complete-file replacement.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
-  grid, pixel origins, animations, and AI label. The label holds a
-  fingerprint of the pixels; GIFs use their first frame.
+  grid, pixel origins, animations, and AI label.
 - `src/index.rs`: the scan of a folder, and the search of names, captions,
   and tags. Search is local and synchronous.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
@@ -48,13 +47,14 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
   and their settings page. Single-sheet labeling uses the instant model.
   Library batches use the configured Google or OpenRouter batch model.
-- `src/labels.rs`: one labeling request per sheet: the request, the checks
-  on the reply, and the image fingerprint. Label with AI sends it from a
-  worker thread. Tests use synthetic images and fake responses.
-- `src/batch.rs`: library batches: local preparation, the confirmation, and
-  the provider batch API, one request per sheet. The configuration folder
-  holds a journal with batch IDs, never keys. An interrupted submission
-  needs its provider ID before it continues. Tests use fake transports.
+- `src/labels.rs`: one labeling request per sheet, and the checks on the
+  reply. GIFs send their first frame. Label with AI sends it from a worker
+  thread; to cancel, drop the `Run`. Tests use fake responses.
+- `src/batch.rs`: library batches through the provider batch API, one
+  request per sheet. A worker thread does one network operation at a time,
+  and a journal in the configuration folder holds the state, never keys.
+  Single labeling and a batch run independently: both write the book from
+  the UI thread. Tests use fake transports.
 
 ## Folders that stay local
 

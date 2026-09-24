@@ -88,8 +88,7 @@ impl Index {
     }
 
     /// True when every query word is the prefix of a word in the fields
-    /// that `search` names. A stale label still matches: checking it would
-    /// mean reading every image.
+    /// that `search` names.
     pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn) -> bool {
         let starts = |ws: &[String], q: &str| ws.iter().any(|w| w.starts_with(q));
         let label = e.side.label.as_ref();

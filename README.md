@@ -81,13 +81,15 @@ variable.
 Choose **Label with AI** in the AI panel, in the sheet's right-click menu, or
 in its file's right-click menu. The tool sends the whole sheet to the model,
 and the model returns a caption and up to 12 tags. Opening a panel or a menu
-sends nothing. You can keep browsing while the request runs. One sheet is
-labeled at a time, and the request stops after 60 seconds.
+sends nothing. You can keep browsing while the request runs, and a library
+batch can run at the same time. One sheet is labeled at a time. The request
+stops after 60 seconds, and **Cancel** stops the wait earlier; the provider
+may still bill a cancelled request.
 
-The AI panel shows the caption and the tags of the open sheet. The label goes
-into the sheet's entry in `tilepicky.json`, with the provider, the model, and
-a fingerprint of the pixels. When the pixels change, the panel says that the
-label is stale. A grid change does not make a label stale.
+The AI panel shows the caption and the tags of the open sheet, and the file
+tree shows them when you hover over a file. The label goes into the sheet's
+entry in `tilepicky.json`, with the provider and the model. If you replace a
+pack with a new version, label it again.
 
 Choose **Remove AI label...** to remove the caption and the tags. You confirm
 the sheet first. The image and the grid stay.
@@ -104,24 +106,30 @@ Choose the batch model and provider key in Settings. Library batches support
 Google Gemini and OpenRouter; the model must accept images and structured
 JSON output.
 
-The tool reads every image in the library, subfolders included, and sends
-nothing yet. Sheets that already have a current label are skipped. The
-confirmation shows the number of sheets to label, the sheets skipped, the
-files it could not read, the approximate request size, and the maximum
-output tokens. These numbers describe the size of the job; they are not a
-price quote. Nothing is sent until you choose **Start batch**.
+The confirmation shows how many sheets have no label yet; sheets with a label
+are skipped. It also shows the maximum output tokens. These numbers describe
+the size of the job; they are not a price quote. Nothing is sent until you
+choose **Start batch**.
 
-Each sheet is one request, the same one that **Label with AI** sends. A large
-library goes out in more than one provider batch. Progress and errors show in
-AI assist, and each label goes into `tilepicky.json` when it arrives. The
-batch IDs are kept under the configuration folder, so a batch continues when
-you open the library again. Keys stay in key storage.
+Each sheet is one request, the same one that **Label with AI** sends. The tool
+reads the images while it sends them, up to 100 in one provider batch. AI
+assist shows what the batch does now, for example "Waiting for the provider",
+and how many sheets are labeled. Each label goes into `tilepicky.json` when it
+arrives. A provider can take up to 24 hours. The batch IDs are kept under the
+configuration folder, so a batch continues when you open the library again.
+Keys stay in key storage.
 
-Run the action again to retry the sheets that failed. A sheet that changes
-after you start the batch is not sent. If a submission is interrupted before
-its ID arrives, the tool does not send it again: find the batch in the
-provider's batch list and attach its ID in AI assist. While a library batch
-runs, you cannot label or remove the label of a single sheet.
+When the network or the provider fails, the tool tries again by itself, and
+it waits longer after each failure, up to 8 minutes. **Try again now** does not
+wait. **Cancel batch** asks the provider to cancel and forgets the batch here;
+labels that arrived already stay. Run the action again to retry the sheets that
+failed. A sheet that the model could not label keeps that answer; use **Label
+with AI** to try it again.
+
+If the connection breaks while a submission goes out, the tool cannot know if
+the provider made the batch, so it does not send it again by itself. Find the
+batch in the provider's batch list and attach its ID. If there is none, choose
+**Send again**.
 
 ## From the keyboard
 
@@ -291,8 +299,7 @@ All words must match, and the tree shows the files that match. Open the menu
 beside the box to choose what the words match: folder names, file names,
 captions, and tags. The captions and the tags come from **Label with AI**.
 
-Search runs on your machine and sends nothing to a model. A stale label
-still matches, because the tool does not read every image to check it.
+Search runs on your machine and sends nothing to a model.
 
 ## tilepicky.json
 
