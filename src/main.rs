@@ -559,6 +559,9 @@ impl App {
         if step == 0 && grow == 0 && fold == 0 && !enter {
             return;
         }
+        // The tree has drawn already in this frame. Without a new frame the
+        // screen shows the cursor one key late.
+        ctx.request_repaint();
         let rows = if library { library_rows } else { project_rows };
         let at = if library {
             self.library_at.clone().or(self.library_sel.map(tree::Row::File))
@@ -1200,8 +1203,10 @@ impl App {
         if ctx.text_edit_focused() {
             return;
         }
+        // A frame in which nothing holds the keys, such as the frame in
+        // which a text field lets go of them, fires no command.
         let focus = ctx.memory(|m| m.focused());
-        if !focus.is_none_or(|id| self.pane_of(id).is_some()) {
+        if !focus.is_some_and(|id| self.pane_of(id).is_some()) {
             return;
         }
         // The status bar lies in neither half. A command that asks which
@@ -2059,9 +2064,10 @@ impl App {
 
 impl eframe::App for App {
     /// Keeps the Tab and arrow keys away from egui, which would walk the
-    /// focus with them on its own. `ui` puts them back into the input, for
-    /// the handlers of the app. A dialog or a popup gets them as egui gives
-    /// them. A text field keeps Left and Right for its cursor, and loses Up
+    /// focus with them on its own, and Escape, which would drop the focus.
+    /// `ui` puts them back into the input, for the handlers of the app. A
+    /// dialog or a popup gets them as egui gives them. A text field keeps
+    /// Left and Right for its cursor, and Escape to stop typing. It loses Up
     /// and Down, which have nothing to do in one line.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if self.dialog_open(ctx) {
@@ -2074,7 +2080,7 @@ impl eframe::App for App {
             match key {
                 Key::Tab => nav.push(e.clone()),
                 Key::ArrowUp | Key::ArrowDown if typing && modifiers.is_none() => {}
-                Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight if !typing => nav.push(e.clone()),
+                Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Escape if !typing => nav.push(e.clone()),
                 _ => return true,
             }
             false
@@ -2097,18 +2103,12 @@ impl eframe::App for App {
         if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
             egui::Popup::close_all(ctx);
         }
-        // The Tab and arrow keys that `raw_input_hook` kept from egui go back
-        // into the input, for the handlers below. Stops from the last frame
-        // are in `self.stops`; this frame collects them anew.
+        // The keys that `raw_input_hook` kept from egui go back into the
+        // input, for the handlers below. Stops from the last frame are in
+        // `self.stops`; this frame collects them anew.
         let nav = std::mem::take(&mut self.nav);
         ctx.input_mut(|i| i.events.extend(nav));
         ctx.data_mut(|d| d.remove_temp::<Vec<((Panel, Spot), Id)>>(Id::new("stops")));
-        // When nothing holds the keys, they go back to the body of the pane
-        // in use: after Escape, after Enter in a text field, and after a
-        // click on something that does not take the keys itself.
-        if !self.dialog_open(ctx) && ctx.memory(|m| m.focused()).is_none() && let Some(id) = self.body(self.pane) {
-            ctx.memory_mut(|m| m.request_focus(id));
-        }
         self.handle_keys(ctx);
         // The preview sets this flag while drawing; clear it first, so that
         // a closed preview does not keep it.
@@ -2657,6 +2657,14 @@ impl eframe::App for App {
         self.stops = stops;
         self.library_rows = library_rows;
         self.project_rows = project_rows;
+        // When nothing holds the keys, they go back to the body of the pane
+        // in use: after Escape or Enter in a text field, and after a click
+        // on something that does not take the keys itself. This waits for
+        // the end of the frame, so that the field sees its Escape first.
+        if !self.dialog_open(ctx) && ctx.memory(|m| m.focused()).is_none() && let Some(id) = self.body(self.pane) {
+            ctx.memory_mut(|m| m.request_focus(id));
+            ctx.request_repaint();
+        }
         self.update_drag(ctx);
     }
 }
