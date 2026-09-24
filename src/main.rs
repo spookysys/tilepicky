@@ -3270,6 +3270,152 @@ mod tests {
         assert_eq!(home_path(Path::new("/opt/a.png")), "/opt/a.png");
     }
 
+    use crate::storage::tests::Folder;
+    use image::{Rgba, RgbaImage};
+
+    /// A library and a project on disk, and the app that shows them. No
+    /// test here writes the settings, which live in the user's own folder.
+    struct Bench {
+        ctx: egui::Context,
+        app: App,
+        library: Folder,
+        project: Folder,
+    }
+
+    fn sheet_file(dir: &Path, rel: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        RgbaImage::from_pixel(16, 16, Rgba([90, 120, 30, 255])).save(path).unwrap();
+    }
+
+    fn bench(library: &[&str], project: &[&str]) -> Bench {
+        let (lib, proj) = (Folder::new(), Folder::new());
+        library.iter().for_each(|rel| sheet_file(&lib.0, rel));
+        project.iter().for_each(|rel| sheet_file(&proj.0, rel));
+        let mut settings = settings::Settings::default();
+        settings.library.path = Some(lib.0.clone());
+        settings.project.path = Some(proj.0.clone());
+        Bench { ctx: egui::Context::default(), app: App::new(settings), library: lib, project: proj }
+    }
+
+    impl Bench {
+        fn project_rel(&self) -> Option<&str> {
+            self.app.project_sheet.as_ref().map(|s| s.rel.as_str())
+        }
+        /// The index entry the project side says is open.
+        fn project_sel_rel(&self) -> Option<&str> {
+            self.app.project_sel.map(|i| self.app.project.entries[i].rel.as_str())
+        }
+        fn open_project(&mut self, rel: &str) {
+            let i = self.app.project.position(rel).unwrap();
+            self.app.open_project(&self.ctx, i);
+        }
+    }
+
+    #[test]
+    fn the_open_sheet_keeps_its_place_through_a_rescan() {
+        let mut b = bench(&["a.png", "c.png"], &[]);
+        let i = b.app.library.position("c.png").unwrap();
+        b.app.open_library(&b.ctx, i);
+        assert_eq!(b.app.library_sel, Some(1));
+        assert_eq!(b.app.library_at, Some(tree::Row::File(1)));
+        assert!(b.app.active == Panel::Library);
+        sheet_file(&b.library.0, "b.png");
+        b.app.rescan_library();
+        assert_eq!(b.app.library_sel, Some(2));
+        assert_eq!(b.app.library_sheet.as_ref().unwrap().rel, "c.png");
+    }
+
+    #[test]
+    fn opening_a_project_file_moves_the_cursor_to_it() {
+        let mut b = bench(&[], &["a.png", "b.png"]);
+        b.open_project("b.png");
+        assert_eq!(b.project_rel(), Some("b.png"));
+        assert_eq!((b.app.project_sel, b.app.tree_cursor), (Some(1), Some(1)));
+        assert_eq!(b.app.project_at, Some(tree::Row::File(1)));
+        assert!(b.app.active == Panel::Project);
+    }
+
+    #[test]
+    fn renames_take_the_open_sheet_along() {
+        let mut b = bench(&[], &["pack/tree.png", "rock.png"]);
+        b.open_project("pack/tree.png");
+        b.app.apply_name(&b.ctx, &NameFor::RenameFolder("pack".into()), "plants").unwrap();
+        assert_eq!(b.project_rel(), Some("plants/tree.png"));
+        assert_eq!(b.project_sel_rel(), Some("plants/tree.png"));
+        b.app.apply_name(&b.ctx, &NameFor::RenameFile("plants/tree.png".into()), "plants/oak").unwrap();
+        assert_eq!(b.project_rel(), Some("plants/oak.png"));
+        assert_eq!(b.project_sel_rel(), Some("plants/oak.png"));
+        assert!(b.project.0.join("plants/oak.png").is_file());
+    }
+
+    #[test]
+    fn deleting_the_open_file_closes_it() {
+        let mut b = bench(&[], &["a.png", "b.png"]);
+        b.open_project("b.png");
+        b.app.delete_paths(&["a.png".into()]).unwrap();
+        assert_eq!(b.project_sel_rel(), Some("b.png"));
+        b.app.delete_paths(&["b.png".into()]).unwrap();
+        assert!(b.app.project_sheet.is_none());
+        assert!(b.app.project.entries.is_empty());
+    }
+
+    #[test]
+    fn a_new_sheet_never_replaces_one_or_leaves_the_project() {
+        let mut b = bench(&[], &["tree.png"]);
+        let before = std::fs::read(b.project.0.join("tree.png")).unwrap();
+        for name in ["tree", "tree.png", "../outside"] {
+            b.app.new_name = name.into();
+            b.app.create_project(&b.ctx);
+            assert!(b.app.project_sheet.is_none(), "{name}");
+        }
+        assert_eq!(std::fs::read(b.project.0.join("tree.png")).unwrap(), before);
+        assert!(!b.project.0.parent().unwrap().join("outside.png").exists());
+        b.app.new_name = "pack/fresh".into();
+        b.app.create_project(&b.ctx);
+        assert_eq!(b.project_rel(), Some("pack/fresh.png"));
+        assert_eq!(b.project_sel_rel(), Some("pack/fresh.png"));
+        assert!(b.app.new_name.is_empty());
+    }
+
+    #[test]
+    fn unsaved_changes_hold_an_open_until_asked() {
+        let mut b = bench(&[], &["a.png", "b.png", "c.png"]);
+        b.open_project("a.png");
+        b.app.project_sheet.as_mut().unwrap().dirty = true;
+        b.app.request(&b.ctx, Pending::Open(1));
+        assert!(b.app.pending == Some(Pending::Open(1)));
+        assert_eq!(b.project_rel(), Some("a.png"));
+        // A duplicate opens as any file does: it waits too.
+        b.app.pending = None;
+        b.app.apply_name(&b.ctx, &NameFor::DuplicateFile("c.png".into()), "d").unwrap();
+        assert!(b.project.0.join("d.png").is_file());
+        assert_eq!(b.project_rel(), Some("a.png"));
+        assert!(b.app.pending.is_some());
+        // Without changes, it opens at once.
+        b.app.project_sheet.as_mut().unwrap().dirty = false;
+        b.app.pending = None;
+        b.app.apply_name(&b.ctx, &NameFor::DuplicateFile("c.png".into()), "e").unwrap();
+        assert_eq!(b.project_rel(), Some("e.png"));
+    }
+
+    #[test]
+    fn labels_reach_the_index_the_open_sheet_and_the_search() {
+        let mut b = bench(&["a.png", "b.png"], &[]);
+        let i = b.app.library.position("b.png").unwrap();
+        b.app.open_library(&b.ctx, i);
+        b.app.query = "mossy".into();
+        b.app.refresh_query();
+        assert_eq!(b.app.library_visible, Some(vec![false, false]));
+        let label = sidecar::Label { provider: "p".into(), model: "m".into(), status: sidecar::Status::Labeled,
+            caption: "Mossy stones".into(), tags: vec![] };
+        let root = b.library.0.clone();
+        b.app.apply_labels(&root, &[("b.png".into(), Some(label.clone()))]);
+        assert_eq!(b.app.library.entries[1].side.label.as_ref(), Some(&label));
+        assert_eq!(b.app.library_sheet.as_ref().unwrap().side.label.as_ref(), Some(&label));
+        assert_eq!(b.app.library_visible, Some(vec![false, true]));
+    }
+
     #[test]
     fn tab_walks_the_stops_and_wraps() {
         let [a, b, c] = [Id::new("a"), Id::new("b"), Id::new("c")];
