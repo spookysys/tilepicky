@@ -233,9 +233,17 @@ impl Keys {
         crate::settings::dir().map(|d| d.join("keys.json"))
     }
 
-    /// An unreadable file gives no keys; `save` then refuses to overwrite it.
-    pub fn load() -> Self {
-        Keys(Self::file().and_then(|p| crate::storage::read(&p).ok()).unwrap_or_default())
+    /// The typed keys, and a notice when the file could not be read. The
+    /// tool then has no typed keys, and `save` refuses to overwrite the file.
+    pub fn load() -> (Self, Option<String>) {
+        Self::file().map_or_else(|| (Self::default(), None), |p| Self::load_from(&p))
+    }
+
+    fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
+        match crate::storage::read(path) {
+            Ok(keys) => (Keys(keys), None),
+            Err(e) => (Self::default(), Some(format!("{e}. No typed key is in use, and keys are not saved until you mend or delete the file."))),
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -484,6 +492,19 @@ mod tests {
         assert_eq!((m.id.as_str(), m.mode()), ("x:batch", Mode::Batch));
         m.set_batch(false);
         assert_eq!((m.id.as_str(), m.mode()), ("x", Mode::Instant));
+    }
+
+    #[test]
+    fn a_damaged_key_file_says_so_and_stays() {
+        let dir = crate::storage::tests::Folder::new();
+        let path = dir.0.join("keys.json");
+        std::fs::write(&path, b"[]").unwrap();
+        let (keys, notice) = Keys::load_from(&path);
+        assert!(notice.unwrap().contains("keys.json"));
+        assert!(keys.0.is_empty());
+        std::fs::write(&path, br#"{"X": "k"}"#).unwrap();
+        let (keys, notice) = Keys::load_from(&path);
+        assert_eq!((keys.get("X"), notice), (Some("k"), None));
     }
 
     #[test]

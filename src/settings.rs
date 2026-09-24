@@ -58,12 +58,20 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// An unreadable file gives the defaults; `save` then refuses to
-    /// overwrite it.
-    pub fn load() -> Self {
-        let mut s: Settings = file().and_then(|p| crate::storage::read(&p).ok()).unwrap_or_default();
+    /// The settings, and a notice when the file could not be read. The
+    /// tool then runs on the defaults, and `save` refuses to overwrite the
+    /// file, so a person can mend it by hand.
+    pub fn load() -> (Self, Option<String>) {
+        file().map_or_else(|| (Self::default(), None), |p| Self::load_from(&p))
+    }
+
+    fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
+        let (mut s, notice) = match crate::storage::read::<Settings>(path) {
+            Ok(s) => (s, None),
+            Err(e) => (Self::default(), Some(format!("{e}. The defaults are in use, and settings are not saved until you mend or delete the file."))),
+        };
         s.ai.heal();
-        s
+        (s, notice)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -98,5 +106,17 @@ mod tests {
         assert_eq!(s.ai, crate::ai::Ai::default());
         let s: Settings = serde_json::from_str(r#"{"ai": {"providers": []}}"#).unwrap();
         assert!(s.ai.providers.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_file_says_so_and_stays() {
+        let dir = crate::storage::tests::Folder::new();
+        let path = dir.0.join("settings.json");
+        assert!(Settings::load_from(&path).1.is_none());
+        std::fs::write(&path, b"{broken").unwrap();
+        let (s, notice) = Settings::load_from(&path);
+        assert!(notice.unwrap().contains("settings.json"));
+        assert_eq!(s.ai, crate::ai::Ai::default());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
     }
 }

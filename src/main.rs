@@ -316,14 +316,19 @@ fn tree_panel(id: Id) -> Option<Panel> {
 }
 
 impl App {
-    fn new(settings: settings::Settings) -> Self {
+    /// `notice` is what loading the settings had to say, if anything.
+    fn new(settings: settings::Settings, notice: Option<String>) -> Self {
         let root = |s: &Option<PathBuf>| s.clone().unwrap_or_default();
         let library = Index::scan(&root(&settings.library.path), settings.library.tile.map_or(TILE, Pair::xy));
         let mut project = Index::scan(&root(&settings.project.path), settings.project.tile.map_or(TILE, Pair::xy));
         migrate_sidecars(&mut project);
+        let (keys, keys_notice) = ai::Keys::load();
+        // A damaged file of the user's comes first: nothing else explains
+        // why a setting did not stick.
+        let status = [notice, keys_notice, library.error.clone(), project.error.clone()].into_iter().flatten().collect::<Vec<_>>().join(" ");
         Self {
             settings,
-            keys: ai::Keys::load(),
+            keys,
             ai_panel: false,
             label_run: None,
             label_outcome: None,
@@ -343,7 +348,7 @@ impl App {
             project_rect: Rect::NOTHING,
             confirm: None,
             pending: None,
-            status: library.error.clone().or_else(|| project.error.clone()).unwrap_or_default(),
+            status,
             library: Half::new(library),
             project: Half::new(project),
             query: String::new(),
@@ -752,6 +757,11 @@ impl App {
                 if let Err(e) = sheet.save() {
                     sheet.rel = old;
                     return Err(e);
+                }
+                // A block copied from the canvas before it had a name
+                // learns the name as well.
+                if old.is_empty() && let Some(clip) = &mut self.clip {
+                    clip.prov.rename("", &rel);
                 }
                 self.status = format!("saved as {rel}");
                 self.rescan_project();
@@ -2901,7 +2911,7 @@ fn main() -> eframe::Result {
         eprintln!("usage: tilepicky [--glow{}] [<library dir> [<project dir>]]", if WGPU { " | --wgpu" } else { "" });
         std::process::exit(2);
     }
-    let mut settings = settings::Settings::load();
+    let (mut settings, notice) = settings::Settings::load();
     // A folder named on the command line wins for this run, and is what the
     // tool offers next time.
     if let Some(d) = dirs.first() {
@@ -2938,7 +2948,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(App::new(settings)))
+            Ok(Box::new(App::new(settings, notice)))
         }),
     )
 }
@@ -2986,7 +2996,7 @@ mod tests {
         let mut settings = settings::Settings::default();
         settings.library.path = Some(lib.0.clone());
         settings.project.path = Some(proj.0.clone());
-        Bench { ctx: egui::Context::default(), app: App::new(settings), library: lib, project: proj }
+        Bench { ctx: egui::Context::default(), app: App::new(settings, None), library: lib, project: proj }
     }
 
     impl Bench {
@@ -3001,6 +3011,12 @@ mod tests {
             let i = self.app.project.index.position(rel).unwrap();
             self.app.open_project(&self.ctx, i);
         }
+    }
+
+    #[test]
+    fn a_notice_from_loading_opens_the_status_line() {
+        let app = App::new(settings::Settings::default(), Some("settings.json is damaged.".into()));
+        assert!(app.status.starts_with("settings.json is damaged."));
     }
 
     #[test]
