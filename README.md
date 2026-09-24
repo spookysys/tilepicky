@@ -1,350 +1,271 @@
 # Tilepicky
 
-You have a folder of sprite packs, and a map that needs a fence, three trees
-and a house. Tilepicky is a small desktop tool for getting those out of the
-packs and into a tilesheet of your own.
+Tilepicky is a desktop tool to extract tiles from sprite sheets and assemble them into custom tilesets. You browse your sprite library, select tiles, and place them on an editable canvas.
 
 <https://github.com/spookysys/tilepicky>
 
 ![A tilesheet of your own is built from two packs, found through the search box](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/demo.gif)
 
-That is the whole loop: open a sheet of your own, search the packs for what
-the map needs, select the tiles, hold the button until they lift, and carry
-them over.
+Open a project sheet, search the library for the tiles you need, select a region, and drag or copy the tiles onto the canvas.
 
-## The library and the project
+## Library and project folders
 
-Two folders: the packs you collected, and the tilesheets you make. Tilepicky
-reads each one with all its subfolders.
+Tilepicky organizes your work into two directories:
 
-It never changes anything in your **library**. It only writes a
-`tilepicky.json` there, which remembers grids, animations, and AI labels
-for each sheet, so it can show them the same way next time. Your **project**
-is where it writes tilesheets, with a `tilepicky.json` of its own beside
-them.
+- **Library**: Holds your collected sprite sheets. Tilepicky treats this directory as read-only. It creates only a `tilepicky.json` metadata file to record grids, animations, and labels.
+- **Project**: Holds the tilesheets you create and edit. Tilepicky writes output image files here, along with a project-specific `tilepicky.json`.
 
-Start the tool without folders and each panel will ask for one; click it, or
-use the right-click menu of either tree, and pick a different one whenever
-you like. Both paths are kept in `~/.config/tilepicky/settings.json`. You can
-also name them on the command line:
+If you start Tilepicky without directory arguments, both panels prompt you to select a folder. You can change folders through the context menu in either file tree. Both paths are stored in `~/.config/tilepicky/settings.json`.
+
+You can also pass paths as command line arguments:
 
     tilepicky <library dir> <project dir>
 
-It draws with OpenGL, which every machine has. The binaries on the releases
-page can draw with wgpu as well, with `--wgpu`; a build of your own leaves
-wgpu out, because it is half the compile time. Add it with
-`cargo install tilepicky --features wgpu` if you want it.
+Tilepicky renders with OpenGL by default. Release builds also support WGPU with the `--wgpu` flag. To build with WGPU support from source, install with:
+
+    cargo install tilepicky --features wgpu
 
 ## Install
 
-[Download a release](https://github.com/spookysys/tilepicky/releases/latest)
-for Linux, Windows, or macOS. Extract the archive first.
-On Windows, open `tilepicky.exe`. On Linux or macOS, run `./tilepicky`
-from the extracted folder. The Mac download supports Intel and Apple Silicon.
+Download binary releases for Linux, Windows, or macOS from the [releases page](https://github.com/spookysys/tilepicky/releases/latest). Extract the archive before running.
 
-For Linux desktop integration, install the extracted files:
+- On Windows, run `tilepicky.exe`.
+- On Linux or macOS, run `./tilepicky` from the extracted directory. The macOS release supports both Intel and Apple Silicon hardware.
+
+To install on Linux with desktop environment integration:
 
     install -Dm755 tilepicky ~/.local/bin/tilepicky
     install -Dm644 tilepicky.desktop ~/.local/share/applications/tilepicky.desktop
     install -Dm644 icon.png ~/.local/share/icons/hicolor/128x128/apps/tilepicky.png
 
-The desktop entry runs `tilepicky` from your PATH. If your desktop cannot find
-it, set `Exec=` in that entry to the binary's full path.
+The desktop launcher assumes `tilepicky` exists in your `PATH`. If your system cannot find the binary, update `Exec=` in `tilepicky.desktop` with the absolute path.
 
-To build from a source checkout, use `cargo install --locked --path .`.
+To compile and install from source, run:
+
+    cargo install --locked --path .
 
 ## Layout
 
-Files on the left, sheets on the right: **Source** above is the pack sheet
-you opened, **Canvas** below is the tilesheet you are building.
+The window splits into two main columns:
+
+- **Left column**: File trees. The library tree sits above, and the project tree sits below.
+- **Right column**: Sheet viewports. The source sheet from the library sits above, and your project canvas sits below.
 
 ![The left column with both trees, the source sheet above, and the tilesheet being built below](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/screenshot.png)
 
-Each panel has a header line with its grid fields, its zoom, what you have
-selected, the name of the sheet, and the tile under the pointer. The buttons
-at its right end open the side panels.
+Each sheet viewport includes a header toolbar. The toolbar displays grid parameters (tile size, gap, offset), current zoom level, selection coordinates, sheet filename, and hover tile coordinates. Buttons on the right edge open side panels.
 
-Your tilesheet has an eye, `E`. Switch it on when you want to ask questions
-rather than make changes: hover over a tile and a tooltip names the pack its
-pixels came from, and every pixel from that same pack lights up with it.
-Hover beside the sheet and it tells you about the sheet as a whole. Nothing
-selects or edits while the eye is on, and it starts off.
+### Inspector mode (Eye)
 
-## Label one library sheet
+Press `E` to toggle inspector mode on the project canvas. When inspector mode is active:
 
-Open a library sheet, then open **AI assist** with its header button or `I`.
-In Settings, choose an instant model with image input and structured JSON
-output. Use an OpenAI-compatible provider URL, such as
-`https://openrouter.ai/api/v1`, and enter its key or set its key environment
-variable.
+- Hovering over any tile displays a tooltip with the original source sheet path.
+- All tiles derived from that same source sheet highlight across the canvas.
+- Hovering over empty space displays general sheet properties.
+- Selection and editing actions are disabled while inspector mode remains active.
 
-Choose **Label with AI** in the AI panel, in the sheet's right-click menu, or
-in its file's right-click menu. The tool sends the whole sheet to the model,
-and the model returns a caption and up to 12 tags. Opening a panel or a menu
-sends nothing. You can keep browsing while the request runs, and a library
-batch can run at the same time. One sheet is labeled at a time. The request
-stops after 60 seconds, and **Cancel** stops the wait earlier; the provider
-may still bill a cancelled request.
+## Search
 
-The AI panel shows the caption and the tags of the open sheet, and the file
-tree shows them when you hover over a file. The label goes into the sheet's
-entry in `tilepicky.json`, with the provider and the model. If you replace a
-pack with a new version, label it again.
+The search input sits above the library tree. Press `Ctrl+F` to focus the search field.
 
-Choose **Remove AI label...** to remove the caption and the tags. You confirm
-the sheet first. The image and the grid stay.
+Search matches query terms as prefixes against sheet metadata:
 
-A GIF is labeled by its first frame. An image larger than 2048 pixels on an
-edge is made smaller for the model; the file does not change. Check the
-labels: a model can misidentify pixel art or miss small details.
+- Entering `gra` matches `grass`.
+- Multiple terms require all words to match.
+- The filter menu beside the input toggles target fields: folder names, file names, AI captions, and AI tags.
 
-## Label an entire library
+Search runs locally and synchronously on your machine. It makes no network requests.
 
-Open the library folder, open **AI assist** (`I`), and choose
-**Label entire library with AI...**. You do not have to open a sheet first.
-Choose the batch model and provider key in Settings. Library batches support
-Google Gemini and OpenRouter; the model must accept images and structured
-JSON output.
+## Labeling sheets with AI
 
-The confirmation shows how many sheets have no label yet; sheets with a label
-are skipped. It also shows the maximum output tokens. These numbers describe
-the size of the job; they are not a price quote. Nothing is sent until you
-choose **Start batch**.
+Tilepicky can generate searchable captions and tags for library sheets using multimodal vision models.
 
-Each sheet is one request, the same one that **Label with AI** sends. The tool
-reads the images while it sends them, up to 100 in one provider batch. AI
-assist shows what the batch does now, for example "Waiting for the provider",
-and how many sheets are labeled. Each label goes into `tilepicky.json` when it
-arrives. A provider can take up to 24 hours. The batch IDs are kept under the
-configuration folder, so a batch continues when you open the library again.
-Keys stay in key storage.
+### Label a single sheet
 
-When the network or the provider fails, the tool tries again by itself, and
-it waits longer after each failure, up to 8 minutes. **Try again now** does not
-wait. **Cancel batch** asks the provider to cancel and forgets the batch here;
-labels that arrived already stay. Run the action again to retry the sheets that
-failed. A sheet that the model could not label keeps that answer; use **Label
-with AI** to try it again.
+1. Open a library sheet.
+2. Open the **AI assist** panel with `I` or the header toolbar button.
+3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output.
+4. Select **Label with AI** in the panel or from the sheet context menu.
 
-If the connection breaks while a submission goes out, the tool cannot know if
-the provider made the batch, so it does not send it again by itself. Find the
-batch in the provider's batch list and attach its ID. If there is none, choose
-**Send again**.
+The model returns one caption and up to 12 tags. Tilepicky writes this label to `tilepicky.json`. You can continue working while the request runs in the background. Requests abort after 60 seconds, or when you click **Cancel**.
 
-## From the keyboard
+To delete existing labels, select **Remove AI label...** from the context menu and confirm.
 
-You can do the whole job without the mouse.
+GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixels are scaled down before submission.
 
-`Ctrl+Tab` goes to the next panel. It walks the window one column at a
-time: the two file trees, then the two sheets, then the side panels. So the
-same panel in the other half is always one step away: `Ctrl+Tab` goes down,
-and `Ctrl+Shift+Tab` goes up. `Tab` walks every field and button on the
-way, in the same order.
+### Label an entire library
 
-Inside a panel the arrows do the work: in a sheet they move the selection,
-and `Shift` makes it bigger; in a file tree they move a cursor, where `Enter`
-opens the file and Right and Left open and close a folder. The arrows never
-leave the panel. Then `Ctrl+C` there and `Ctrl+V` here.
+To label multiple library sheets in bulk:
 
-`Enter` or `Space` presses the button you are on, and `Enter` on a field
-lets you type in it. `Escape` or `Enter` in a field gives the keys back to
-the panel.
+1. Open the library folder.
+2. Open **AI assist** (`I`) and select **Label entire library with AI...**.
+3. Choose a Google Gemini or OpenRouter batch model and provider key in Settings.
+4. Review the unlabeled sheet count and token limits, then click **Start batch**.
 
-The panel your keys are in has a blue title, and so does its selection.
+Tilepicky submits requests in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`.
+
+Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
+
+API keys are stored separately in `~/.config/tilepicky/keys.json` with restricted file permissions (`0600`).
+
+## Keyboard navigation
+
+Tilepicky supports complete operation using the keyboard.
 
 ![Picking a whole house, and then a column of trees, out of a pack and into a tilesheet of your own, without touching the mouse](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
 
-The legend at the foot of the window lists the keys worth knowing. Hide it in
-the settings when you no longer need it.
+### Pane and widget navigation
+
+- `Ctrl+Tab` / `Ctrl+Shift+Tab`: Moves focus between pane bodies. Navigation cycles column by column: library tree, project tree, source sheet, project canvas, side panels, and status bar.
+- `Tab` / `Shift+Tab`: Cycles through every interactive input and button in the same column order.
+- `Ctrl+Tab` from the source sheet into an empty project canvas creates a new tilesheet initialized with that source tile size.
+- The active pane displays a highlighted blue title.
+
+### File tree controls
+
+- `Up` / `Down`: Moves cursor between rows without opening files.
+- `Right` / `Left`: Expands or collapses the selected folder.
+- `Enter` or `Space`: Opens the selected file, or toggles folder expansion.
+- `Shift+Up` / `Shift+Down` (Project tree only): Extends multi-file selection.
+
+### Sheet controls
+
+- `Arrows`: Steps the selection boundary in the pressed direction.
+- `Shift+Arrows`: Expands or shrinks the selection rectangle.
+- `Ctrl+Arrows`: Jumps cursor to the boundary of filled tiles or across gaps.
+- `Alt+Arrows`: Moves the selection rectangle without moving tile contents.
+- `Enter`: Begins editing a focused text field.
+- `Escape` or `Enter`: Exits text field editing and returns keyboard control to the pane.
 
 ## Animations
 
-Mark a strip of tiles as an animation and the sheet remembers it: which
-tiles, how big one frame is, and how fast it plays.
+You can define tile animations directly on a sheet:
 
-Select the tiles and press `A`. The panel opens on the right and plays them
-straight away. The `cell` field says how many tiles make one frame, `1x1` for
-a row of single tiles or `2x2` for something drawn two tiles across, and `ms`
-is how long each frame is on screen. Tiles that no whole frame reaches turn
-grey and are left out.
-
-Press `M`, or the Store button, to keep it. The same key on a stored one
-removes it, and `A` closes the panel.
+1. Select a sequence of tiles.
+2. Press `A` to open the animation panel and preview playback.
+3. Set the `cell` parameter to specify frame size in tiles (such as `1x1` or `2x2`).
+4. Set the `ms` parameter to configure frame duration in milliseconds.
+5. Press `M` or click **Store** to save the animation. Pressing `M` again removes the definition.
 
 ![Two blocks of water tiles become animations: paste, A, set the frames, Store](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation-panel.gif)
 
-A stored animation travels with the tiles when you copy or drag them, and
-selecting it again brings its numbers back into the fields. It is remembered
-in pixels, so changing the sheet's tile size leaves it alone; if the new
-tiles no longer divide its frames, the `cell` field says their size in pixels
-instead.
+Stored animations are saved in `tilepicky.json` using pixel coordinates. Changing a sheet's tile size preserves existing animations. Stored animations transfer automatically when copying or dragging tiles.
 
-An animated GIF plays in the library panel. When you copy a region that moves
-between the frames, the frames unroll into one strip, marked as an
-animation. A region that stands still gives one picture.
+Animated GIFs play directly in the library panel. Copying an animated region extracts moving frames into an unrolled strip with an animation definition applied. Static regions copy as single frames.
 
 ![A waterfall is taken out of an animated GIF and lands as a marked strip](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation.gif)
 
 ## Formats
 
-Tilepicky reads PNG, GIF, JPEG, WebP, BMP and TGA. It writes one format:
-32 bit RGBA PNG with straight alpha.
+Tilepicky reads PNG, GIF, JPEG, WebP, BMP, and TGA image formats.
 
-## The grid
+Tilepicky exports sheets exclusively as 32-bit RGBA PNG files with straight alpha transparency.
 
-Every sheet is read through a grid, and each sheet keeps its own.
+## Grid configuration
 
-| Field | Meaning |
+Each sheet maintains independent grid parameters:
+
+| Field | Description | Examples |
+| --- | --- | --- |
+| `tile` | Width and height of one tile in pixels | `32`, `32x48` |
+| `gap` | Pixel spacing between adjacent tiles | `1`, `1x2` |
+| `offset` | Pixel margin before the first tile row and column | `4`, `4x8`, `-3` |
+
+You can modify each grid field with three input methods:
+
+- Drag horizontally to adjust width.
+- Rotate the mouse wheel over the field to adjust height.
+- Click to enter numeric values directly.
+
+Entering a single value sets uniform width and height.
+
+Tilepicky analyzes new sheets automatically to detect repeating pixel pitch. Images without repeating patterns default to a single tile covering the full image dimensions.
+
+Auto-detected grids are saved immediately to `tilepicky.json`. Manual grid adjustments override detected values and clear the auto-detected flag.
+
+## Shortcuts
+
+### Sheet operations
+
+| Shortcut | Action |
 | --- | --- |
-| tile | the size of one tile, `32` or `32x48` |
-| gap | pixels between neighbouring tiles, `1` or `1x2` (Kenney sheets use 1) |
-| offset | pixels before the first tile, `4` or `4x8`; `-3` when the first tile starts before the edge |
+| Click | Select single tile |
+| Drag | Select rectangular tile region; scrolls near viewport edges |
+| Click and hold (~250 ms) | Lift selection and begin drag operation |
+| Double click and drag | Lift selection immediately and begin drag |
+| Drag selection edge | Resize selection boundary |
+| Shift+Click | Select rectangular range from previous selection anchor |
+| Ctrl+Click | Toggle single tile in selection |
+| Ctrl+Shift+Click | Add rectangular region to active selection |
+| Ctrl+A | Select entire sheet |
+| Right-click | Clear selection; clears tile contents if clicked inside selection; opens AI menu on library sheet |
+| Ctrl+C, Ctrl+X, Ctrl+V | Copy, cut, and paste tiles (cut and paste apply to project canvas only) |
+| Delete / Backspace | Clear selected tiles on project canvas |
+| Ctrl+T | Trim empty outer rows and columns on project canvas |
+| Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z | Undo and redo operations |
+| Ctrl+S, Ctrl+Shift+S | Save, save as |
+| Ctrl+Scroll, `+` / `-` | Adjust zoom |
+| Escape | Clear selection, cancel active drag, or leave text field |
 
-All three fields answer the same three gestures. Drag one sideways for the
-width, turn the wheel over it for the height, or click it and type. A field
-showing a single `32` means both, and changing the height alone makes it
-`32x48`.
+### Drag modifiers
 
-Open a sheet the tool has never seen and it works the tile size out from
-the picture itself, by finding the pitch at which the picture repeats. A
-picture that does not repeat, a title screen or a mockup, is read as one
-whole tile. It does not find a gap or an offset yet, so set those yourself
-for a pack that uses them.
+While dragging tiles:
 
-Reading a grid means walking the whole sheet, so the answer goes into
-`tilepicky.json` at once and is never worked out twice. It is marked there
-as read rather than chosen, and setting the grid yourself clears the mark:
-what you choose always wins, and the tool never mistakes its own guess for
-your decision.
+- Hold `Ctrl` to duplicate tiles instead of moving them.
+- Hold `Alt` to swap tiles between source and destination positions.
+- A cursor badge indicates the active mode. Library tiles can only be duplicated.
 
-A new sheet starts at the tile size that library or project used last, or at
-32 px.
+Dragging tiles onto an empty project canvas creates a new tilesheet matching the source tile dimensions.
 
-## Keys
+## File operations
 
-| Key | Effect |
+File trees accept the following mouse and keyboard actions:
+
+| Action | Result |
 | --- | --- |
-| click | select one tile |
-| drag | select a range of tiles; near the edge of the view it scrolls |
-| press and hold ~250 ms | lift the tile under the pointer, or the whole selection, and drag it |
-| double click and drag | lift at once, without the wait |
-| drag an edge of the selection | move that edge; outwards adds tiles, inwards removes them |
-| shift+click | select the rectangle from the last clicked tile to this one |
-| Ctrl+click | add or remove one tile |
-| Ctrl+shift+click | add that rectangle to the selection |
-| Ctrl+A | select the whole sheet |
-| right click | clear the selection; inside the selection it clears the tiles; on a library sheet it opens the AI label menu |
-| arrows | step the selection out of itself on the side you press |
-| Shift+arrows | hold one corner and walk the other |
-| Ctrl+arrows | jump to the end of the filled tiles, or across a gap to the next of them |
-| Alt+arrows | walk the whole selection, shape and all; the tiles stay put |
-| Tab, Shift+Tab | the next field or button, or the one before |
-| Ctrl+Tab, Ctrl+Shift+Tab | the next panel, or the one before; from the upper half this is the lower half, and back |
-| Ctrl+C, Ctrl+X, Ctrl+V | copy, cut, paste; cut and paste work on your tilesheet only |
-| Delete | clear the selected tiles of your tilesheet |
-| Enter or Space in a file tree | open the file under the cursor, or unfold the folder |
-| Right, Left in a file tree | unfold and fold the folder you stand on |
-| A | open or close the animation panel |
-| M | store the animation under the selection, or unmark a stored one |
-| E | switch the eye of your tilesheet on or off |
-| I | open or close library AI assist |
-| Ctrl+F | jump to the search box |
-| Ctrl+Z, Ctrl+Y | undo, and take the step again |
-| Ctrl+S, Ctrl+Shift+S | save, save as |
-| Ctrl+T | trim empty columns on the right and empty rows at the bottom |
-| drag the right or bottom edge of the canvas | resize your tilesheet |
-| Ctrl+wheel, `+` / `-` | zoom |
-| Escape | clear the selection, or cancel a drag |
+| Click | Open file |
+| Up / Down | Move cursor without opening file |
+| Right / Left | Expand or collapse selected folder |
+| Enter / Space | Open selected file or toggle folder expansion |
+| Shift+Up / Shift+Down | Extend marked file group (project tree only) |
+| Ctrl+Click, Shift+Click | Select single file or range of files |
+| Drag across rows | Select all crossed files |
+| Click, hold (~250 ms), and drag | Move selected files into destination folder |
+| Ctrl+Drag files | Duplicate selected files into destination folder |
+| Right-click file | Context menu: rename, duplicate, delete, reveal in file manager, copy path |
+| Right-click folder | Context menu: new folder, rename, delete, reveal in file manager, copy path |
+| Right-click empty area | Context menu: new folder, refresh tree |
 
-Undo keeps the last 64 steps of a sheet, and a step is more than a change of
-pixels: the tile size, the gap, the offset and every animation you store or
-change are all on the same list. The library sheet has a list of its own,
-since its grid and its animations are yours to change even though its pixels
-are not.
-
-While you drag a block, two keys change what the drop does. Ctrl copies, and
-leaves the tiles it came from where they are. Alt swaps: whatever lies where
-the block lands goes back to the place the block came from. A sign on the
-block says which is in force. A block from the library can only be copied,
-because the library never changes.
-
-Drop a block on an empty tilesheet panel and it starts a new tilesheet, at
-the tile size of the block, and asks for a name when you first save it.
-`Ctrl+Tab` down from the source sheet does the same when the canvas is empty,
-at the tile size of the sheet you come from.
+Library files are read-only and cannot be moved, renamed, or deleted within Tilepicky. Moving project files updates references in `tilepicky.json`.
 
 ## Settings
 
-The gear at the right end of the status line, or `Ctrl+,`, opens the
-settings. There is one so far: whether to show the legend of keys in the
-corner. Clicking the legend hides it too, after asking. Settings go to
-`~/.config/tilepicky/settings.json`.
+Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
 
-## Files
+Settings configure:
 
-Both trees answer the same actions, but only the project tree changes
-anything: the library is read and never written.
+- AI provider endpoints, API keys, and model selections for instant labeling and batch jobs.
+- Visibility of the keyboard shortcut legend in the status bar.
+- Target fields for search matching (folders, files, captions, tags).
 
-| Action | Effect |
-| --- | --- |
-| click | open the file |
-| arrows | move the cursor; nothing opens until you press Enter |
-| Shift+up, Shift+down | grow the marked group in the project |
-| Ctrl+click, shift+click | mark one file, or a range |
-| drag across the files | mark every file the pointer crosses |
-| press and hold ~250 ms, then drag | carry the file, or the marked group, into a folder |
-| right click a file | rename, duplicate, delete; open its location; copy its path |
-| right click a folder | new folder, rename, delete; open its location; copy its path |
-| right click the free space | new folder, refresh |
-
-A carried file moves into the folder under the pointer; hold Ctrl to copy it
-instead. Its grid and animations go with it, and a tilesheet you have open
-survives its own file moving.
-
-## Search
-
-Type words in the box. Each word matches a prefix: `gra` finds `grass`.
-All words must match, and the tree shows the files that match. Open the menu
-beside the box to choose what the words match: folder names, file names,
-captions, and tags. The captions and the tags come from **Label with AI**.
-
-Search runs on your machine and sends nothing to a model.
-
-## tilepicky.json
-
-Each folder's book remembers grids, animations, pixel origins, and AI labels.
-The images stay ordinary image files. See the [file format](docs/tilepicky-json.md)
-if you want to read or change the metadata yourself.
-
-## Tile sizes
-
-A pack and your tilesheet need not agree on tile size. A copy is pixel for
-pixel: the block lands with its top left corner on the tile you chose, and
-transparent pixels pad it out to whole tiles. Changing a sheet's tile size
-moves no pixels at all; it changes the grid you see and the tiles you can
-pick.
+Settings are stored in `~/.config/tilepicky/settings.json`.
 
 ## Provenance tracking
 
-Your tilesheet remembers where each of its pixels came from. Copy a block
-out of a pack and it carries the name of that pack; copy it on from one
-tilesheet to another and the original name goes with it. Switch on the eye
-and hover, and a tooltip tells you:
+Tilepicky tracks the origin of pixels pasted into project sheets. When you copy tiles from a library sheet, the pixel data retains the source filename. If you copy tiles between project sheets, the original source path is preserved.
+
+Activate inspector mode (`E`) and hover over any tile to view its source pack and filename in a tooltip:
 
     kenney_tiny-town/Tilemap/tilemap_packed.png
 
-Six months later, when you want three more tiles in that style, you can ask
-the sheet where it got them.
-
 ## Credits
 
-The packs in the pictures are [Kenney](https://kenney.nl)'s and
-[ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites)'s,
-both public domain (CC0). The animated scene is a mockup from the
-[Epic RPG World](https://rafaelmatos.itch.io/epic-rpg-world-collection) packs
-by RafaelMatos, from a purchased copy.
+Sample packs shown in documentation media:
 
-## Licence
+- [Kenney](https://kenney.nl) (CC0)
+- [ArMM1998](https://opengameart.org/content/zelda-like-tilesets-and-sprites) (CC0)
+- [Epic RPG World](https://rafaelmatos.itch.io/epic-rpg-world-collection) by RafaelMatos (licensed copy)
 
-Tilepicky is free software under the GNU General Public License, version 3.
-The whole text is in `LICENSE`.
+## License
+
+Tilepicky is free software distributed under the GNU General Public License, version 3. See `LICENSE` for the complete license text.
