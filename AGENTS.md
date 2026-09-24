@@ -119,9 +119,9 @@ Drive the app with XTEST through python-xlib. Stop the instance you started
 last: the driver takes the first window it finds that is named Tilepicky, so
 a stray one takes every key while the screenshot shows the window on top of
 it. Prepare the state off camera and record only the part worth watching. Do not count the rows of a tree: the
-keys begin on the title of a pane, so one Down is spent entering it, and the
-count is wrong by one in a way that opens the wrong file. Walk to the end,
-where a tree holds the keys, and step back from there.
+keys arrive on the file that is open, else on the first row, so a count from
+the top opens the wrong file as soon as a file is open. Walk to the end,
+where the cursor stops, and step back from there.
 
 ```
 DISPLAY=:77 ffmpeg -y -f x11grab -draw_mouse 0 -framerate 15 \

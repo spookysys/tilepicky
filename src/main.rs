@@ -163,44 +163,92 @@ struct App {
     status: String,
     /// Set when the query changes, so that the trees expand once to show the matches.
     open_trees: bool,
-    /// Where the split between the library and the project sits, as a fraction of the height.
-    /// Which pane holds the keyboard. The panes own the keyboard, so this
-    /// always names one of them, and a focus that goes astray comes back
-    /// here.
+    /// The pane of the last stop that held the keys. When nothing holds
+    /// them, they go back to the body of this pane.
     pane: (Panel, Spot),
-    /// Where each pane lay when it last drew. A focused widget inside one of
-    /// these belongs to that pane.
-    pane_rects: Vec<((Panel, Spot), egui::Rect)>,
-    /// Every place the arrow keys can stand, with the pane it belongs to and
-    /// where it lay when it last drew. The arrows walk these, and only ever
-    /// within one pane: leaving a pane is Tab's work, never an arrow's.
-    stops: Vec<((Panel, Spot), Id, egui::Rect)>,
-    /// Where the keys last stood inside each pane, so that Tab gives a pane
-    /// back as you left it.
-    inner: Vec<((Panel, Spot), Id)>,
+    /// The places that Tab stops at, in reading order, as the last frame
+    /// drew them.
+    stops: Vec<((Panel, Spot), Id)>,
+    /// The Tab and arrow keys that `raw_input_hook` kept away from egui.
+    /// They go back into the input at the start of the frame.
+    nav: Vec<egui::Event>,
 
+    /// Where the split between the library and the project sits, as a fraction of the height.
     split: f32,
     /// The status as last shown, and when it changed; it fades after a while.
     shown_status: String,
     status_at: std::time::Instant,
 }
 
-/// The panes of one half of the window, from left to right. Tab walks them
-/// and wraps; Shift+Tab swaps the halves and stays in the same pane.
+/// The panes of one half of the window.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Spot {
     Tree,
     Sheet,
-    /// The animation panel, which is there only while it is open.
+    /// The side panel: the animation panel, or AI assist in the library.
     Side,
     /// The status bar along the foot of the window, with the gear on it. It
     /// belongs to neither half, so it rides with the project half and comes
-    /// last in the walk, which is where it lies.
+    /// last, which is where it lies.
     Status,
-    /// A dialog standing in front of the window. While one is open it is the
-    /// whole world of the arrow keys, and Tab does nothing at all. Only one
-    /// can be open at a time, so one name is enough for all of them.
-    Dialog,
+}
+
+/// The panes, one column of the window after the other, and in each column
+/// the upper half before the lower half. Tab walks the stops in this order,
+/// and Ctrl+Tab walks the panes. So the same pane in the other half is
+/// always one step away: Ctrl+Tab goes down, Ctrl+Shift+Tab goes up.
+const PANES: [(Panel, Spot); 7] = [
+    (Panel::Library, Spot::Tree),
+    (Panel::Project, Spot::Tree),
+    (Panel::Library, Spot::Sheet),
+    (Panel::Project, Spot::Sheet),
+    (Panel::Library, Spot::Side),
+    (Panel::Project, Spot::Side),
+    (Panel::Project, Spot::Status),
+];
+
+/// Says in which pane the stops that draw next belong.
+fn set_pane(ui: &egui::Ui, pane: (Panel, Spot)) {
+    ui.data_mut(|d| d.insert_temp(Id::new("drawing pane"), pane));
+}
+
+/// Makes a widget a place that Tab stops at, in the pane that `set_pane`
+/// named last. A widget that cannot take the focus now is left out: egui
+/// drops the focus of a disabled widget at once.
+fn stop(r: &egui::Response) {
+    if !r.enabled() || !r.sense.is_focusable() {
+        return;
+    }
+    stop_id(&r.ctx, r.id);
+}
+
+/// Makes a widget a stop, as `stop` does, and hands it back.
+fn stopped(r: egui::Response) -> egui::Response {
+    stop(&r);
+    r
+}
+
+/// Makes the widget with this name a stop, as `stop` does. For a body that
+/// draws deeper down, where the response is out of reach.
+fn stop_id(ctx: &egui::Context, id: Id) {
+    ctx.data_mut(|d| {
+        let pane = d.get_temp::<(Panel, Spot)>(Id::new("drawing pane")).unwrap_or((Panel::Library, Spot::Tree));
+        d.get_temp_mut_or_default::<Vec<((Panel, Spot), Id)>>(Id::new("stops")).push((pane, id));
+    });
+}
+
+/// The stop after `from` in the list, or before it when `step` is negative.
+/// The walk wraps at both ends. A place that is not in the list starts the
+/// walk at `home`.
+fn next_stop(stops: &[Id], from: Option<Id>, home: Option<Id>, step: i32) -> Option<Id> {
+    if stops.is_empty() {
+        return None;
+    }
+    let n = stops.len() as i32;
+    match from.and_then(|f| stops.iter().position(|s| *s == f)) {
+        Some(i) => Some(stops[(i as i32 + step).rem_euclid(n) as usize]),
+        None => home.filter(|h| stops.contains(h)).or(Some(stops[0])),
+    }
 }
 
 /// What an arrow key does to the selection: grow it from a held corner,
@@ -214,21 +262,17 @@ enum Move {
 }
 
 /// Names a place for the trace below.
-fn place_name(app: &App, ctx: &egui::Context, id: Id) -> String {
+fn place_name(app: &App, id: Id) -> String {
     let named = [
         (library_tree_id(), "library tree"),
         (project_tree_id(), "project tree"),
         (library_id(), "library grid"),
         (project_id(), "project grid"),
-        (tree_heading_id(true), "LIBRARY title"),
-        (tree_heading_id(false), "PROJECT title"),
-        (heading_id(true), "Source title"),
-        (heading_id(false), "Canvas title"),
         (search_id(), "search"),
         (new_name_id(), "new name"),
     ];
     let name = named.iter().find(|(k, _)| *k == id).map(|(_, n)| (*n).to_string());
-    let pane = match app.spot_of(ctx, id) {
+    let pane = match app.pane_of(id) {
         Some((p, s)) => format!("{}/{s:?}", if p == Panel::Library { "library" } else { "project" }),
         None => "no pane".into(),
     };
@@ -241,26 +285,10 @@ fn trace(app: &App, ctx: &egui::Context, what: &str) {
         return;
     }
     let here = match ctx.memory(|m| m.focused()) {
-        Some(id) => place_name(app, ctx, id),
+        Some(id) => place_name(app, id),
         None => "nothing".into(),
     };
     eprintln!("[keys] {what}: on {here}");
-}
-
-/// Takes a Tab away from a text field, and says which way it walks: forward,
-/// back, or across to the other half. `handle_keys` never sees these, because
-/// typing beats every shortcut while a text field holds the keys.
-fn taken_tab(ui: &egui::Ui) -> Option<i32> {
-    let take = |m, k| ui.input_mut(|i| i.consume_key(m, k));
-    if take(Modifiers::COMMAND, Key::Tab) {
-        Some(0)
-    } else if take(Modifiers::SHIFT, Key::Tab) {
-        Some(-1)
-    } else if take(Modifiers::NONE, Key::Tab) {
-        Some(1)
-    } else {
-        None
-    }
 }
 
 fn library_id() -> Id {
@@ -269,70 +297,33 @@ fn library_id() -> Id {
 fn project_id() -> Id {
     Id::new("project sheet")
 }
-/// The free space behind each file tree. It is a widget of its own, so it can
-/// hold the keyboard focus: with it, the arrows walk the tree; with a sheet
-/// focused, they move that sheet's selection.
-/// The places of an open dialog: everything in it, and the button it hangs
-/// from. While it is open these are the whole world of the arrow keys, which
-/// cannot leave it, and Tab does nothing at all. The button belongs to the
-/// dialog because that is the way out: walk to it and press it again.
-///
-/// Returns whether the dialog should close.
-fn dialog_stops(ui: &egui::Ui, button: &egui::Response, places: &[&egui::Response]) -> bool {
-    let mut all: Vec<(Id, egui::Rect)> = vec![(button.id, button.rect)];
-    all.extend(places.iter().map(|r| (r.id, r.rect)));
-    // The keys land in the dialog when it opens, on the first thing in it.
-    if !all.iter().any(|(id, _)| ui.memory(|m| m.has_focus(*id))) && let Some(first) = places.first() {
+
+/// The keys of a popup that hangs from a button. While the popup is open,
+/// the keys stay in it: when they are anywhere else, they go to `first`,
+/// the first control of the popup. So they land there when the popup opens,
+/// and a Tab past its last control comes back to the start. egui closes the
+/// popup on Escape, and the keys then go back to the body of the pane.
+fn popup_keys(ui: &egui::Ui, button: &egui::Response, first: &egui::Response) {
+    let layer = ui.layer_id();
+    let inside = |id: Id| id == button.id || ui.ctx().read_response(id).is_some_and(|r| r.layer_id == layer);
+    if !ui.memory(|m| m.focused()).is_some_and(inside) {
         first.request_focus();
     }
-    ui.data_mut(|d| d.insert_temp(Id::new("dialog stops"), all));
-    ui.input(|i| i.key_pressed(egui::Key::Escape))
 }
 
-/// The gear on the status bar. It writes its own name while it draws.
-fn gear_id(ctx: &egui::Context) -> Option<Id> {
-    ctx.data(|d| d.get_temp::<Id>(Id::new("gear button")))
+/// A press anywhere in a tree gives its body the keys. The rows lie on top
+/// of the body and take the click themselves, so the body never sees it.
+fn claim_on_press(ui: &egui::Ui, id: Id) {
+    if ui.input(|i| i.pointer.primary_pressed()) && ui.rect_contains_pointer(ui.clip_rect()) {
+        ui.memory_mut(|m| m.request_focus(id));
+    }
 }
 
-/// Where Tab lands in an open animation panel: the frame field, which writes
-/// its own widget id while it draws.
-fn side_id(ctx: &egui::Context, library: bool) -> Option<Id> {
-    field_stop(ctx, Id::new(("cell field", library))).map(|(id, _)| id)
-}
-
-/// Where a pair field's button lies, once it has drawn at least once.
-fn field_stop(ctx: &egui::Context, field: Id) -> Option<(Id, egui::Rect)> {
-    ctx.data(|d| d.get_temp::<(Id, egui::Rect)>(field.with("widget")))
-}
-
-/// The title of a pane. It says two things at once, and they are not the
-/// same thing. The colour says which pane holds the keys: deep blue for it,
-/// faint grey for the rest. The ground behind the letters says the keys are
-/// standing on the title itself, and not somewhere else in that pane.
-///
-/// The spaces are always there, so that the title keeps its width when the
-/// ground comes and goes.
-fn title_text(ui: &egui::Ui, id: Id, title: &str, keys: bool) -> egui::RichText {
+/// The title of a pane. The colour says which pane holds the keys: deep
+/// blue for it, faint grey for the rest.
+fn title_text(title: &str, keys: bool) -> egui::RichText {
     let t = egui::RichText::new(format!(" {title} ")).strong();
-    let t = if keys { t.color(egui::Color32::from_rgb(20, 90, 190)) } else { t.color(egui::Color32::from_gray(180)) };
-    if ui.memory(|m| m.has_focus(id)) { t.background_color(egui::Color32::from_rgb(214, 230, 250)) } else { t }
-}
-
-/// The title of an animation panel. Like the other titles, it is a place,
-/// and it is where Tab leaves you the first time you go there.
-fn anim_heading_id(library: bool) -> Id {
-    Id::new(("animation title", library))
-}
-
-/// The field that names a new tilesheet, above the PROJECT tree. Up from the
-/// first row of that tree lands here, and Down goes back.
-/// The title of a sheet pane. It is a place the keyboard can stand: the row
-/// of fields and buttons beside it is reached with Right and Left from here,
-/// and the grid below with Down.
-/// The title over a file tree, LIBRARY or PROJECT. It is a place to stand,
-/// so that the arrow keys walk the left column the way the eye does.
-fn tree_heading_id(library: bool) -> Id {
-    Id::new(("tree heading", library))
+    if keys { t.color(egui::Color32::from_rgb(20, 90, 190)) } else { t.color(egui::Color32::from_gray(180)) }
 }
 
 /// The search field, at the top of the left column.
@@ -340,14 +331,14 @@ fn search_id() -> Id {
     Id::new("search field")
 }
 
-fn heading_id(library: bool) -> Id {
-    Id::new(("sheet heading", library))
-}
-
+/// The field that names a new tilesheet, above the PROJECT tree.
 fn new_name_id() -> Id {
     Id::new("new tilesheet name")
 }
 
+/// The free space behind each file tree. It is a widget of its own, so it can
+/// hold the keyboard focus: with it, the arrows walk the tree; with a sheet
+/// focused, they move that sheet's selection.
 fn library_tree_id() -> Id {
     Id::new("library free space")
 }
@@ -406,9 +397,8 @@ impl App {
             project_sel: None,
             active: Panel::Library,
             pane: (Panel::Library, Spot::Tree),
-            pane_rects: Vec::new(),
             stops: Vec::new(),
-            inner: Vec::new(),
+            nav: Vec::new(),
             clip: None,
             new_name: String::new(),
             open_trees: false,
@@ -545,17 +535,12 @@ impl App {
     /// folder it stands on. In the PROJECT tree, Shift and the arrows grow
     /// the marked group over the files.
     ///
-    /// The trees hold the arrows until you click a sheet, and a click in a
-    /// tree takes them back. Nothing clicked yet leaves them here.
+    /// The keys go to a tree only while its body holds the focus.
     fn tree_keys(&mut self, ctx: &egui::Context, library_rows: &[tree::Row], project_rows: &[tree::Row], project_order: &[usize]) {
-        let focus = ctx.memory(|m| m.focused());
-        if !focus.is_none_or(|id| id == library_tree_id() || id == project_tree_id()) {
-            return;
-        }
-        // The tree that holds the keys, which is not always the panel in use.
-        let library = match focus {
-            Some(id) => id == library_tree_id(),
-            None => self.active == Panel::Library,
+        let library = match ctx.memory(|m| m.focused()) {
+            Some(id) if id == library_tree_id() => true,
+            Some(id) if id == project_tree_id() => false,
+            _ => return,
         };
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k)) as i32;
         // Shift first: `consume_key` ignores an extra Shift, so the plain
@@ -606,14 +591,6 @@ impl App {
             return;
         }
         let dir = step + grow;
-        // At the end of the rows the keys leave the tree for whatever lies
-        // that way: the title above it, or the half of the column below.
-        let edge = if dir < 0 { rows.first() } else { rows.last() };
-        if edge.is_some_and(|r| Some(r) == at.as_ref()) {
-            let id = if library { library_tree_id() } else { project_tree_id() };
-            self.step_from(ctx, id, (0, dir.signum()));
-            return;
-        }
         let Some(row) = walk_rows(rows, at.as_ref(), dir) else { return };
         self.stand_on(ctx, if library { Panel::Library } else { Panel::Project }, row);
     }
@@ -1094,7 +1071,7 @@ impl App {
     /// disappears ten seconds after it last changed. With the legend hidden
     /// it runs under the whole window; with the legend shown it stays under
     /// the sheet panels, so the trees keep their height.
-    fn status_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, stops: &mut Vec<((Panel, Spot), Id, egui::Rect)>) {
+    fn status_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         const STATUS_SECS: u64 = 10;
         if self.status != self.shown_status {
             self.shown_status = self.status.clone();
@@ -1104,8 +1081,8 @@ impl App {
         egui::Panel::bottom("status").show_separator_line(true).show(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let gear = ui.small_button("⚙").on_hover_text("settings (Ctrl+,)");
-                stops.push(((Panel::Project, Spot::Status), gear.id, gear.rect));
-                ui.data_mut(|d| d.insert_temp(Id::new("gear button"), gear.id));
+                set_pane(ui, (Panel::Project, Spot::Status));
+                stop(&gear);
                 self.settings_popup(&gear, ui);
                 if age.as_secs() < STATUS_SECS {
                     ui.colored_label(egui::Color32::from_rgb(190, 40, 30), egui::RichText::new(&self.status).strong());
@@ -1122,7 +1099,6 @@ impl App {
     /// are written when the popup closes.
     fn settings_popup(&mut self, gear: &egui::Response, ui: &egui::Ui) {
         let id = Id::new("settings popup");
-        let mut shut = false;
         egui::Popup::new(id, ui.ctx().clone(), gear, ui.layer_id())
             .open_memory(gear.clicked().then_some(egui::SetOpenCommand::Toggle))
             .align(egui::RectAlign::TOP_END)
@@ -1137,7 +1113,7 @@ impl App {
                 if first.changed() {
                     self.settings.hide_legend = !legend;
                 }
-                shut = dialog_stops(ui, gear, &[&first]);
+                popup_keys(ui, gear, &first);
                 if AI_VISIBLE {
                     ui.add_space(8.0);
                     egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
@@ -1145,11 +1121,7 @@ impl App {
                     });
                 }
             });
-        if shut {
-            egui::Popup::close_id(ui.ctx(), id);
-            gear.request_focus();
-        }
-        let open = egui::Popup::is_id_open(ui.ctx(), id) && !shut;
+        let open = egui::Popup::is_id_open(ui.ctx(), id);
         if self.config_open && !open {
             if let Err(e) = self.settings.save() { self.status = e; }
             if let Err(e) = self.keys.save() { self.status = e; }
@@ -1164,21 +1136,9 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() {
-            return;
-        }
-        // A dialog standing in front of the window is the whole world while
-        // it is open: the arrows walk its places, Tab does nothing, and no
+        // A dialog or a popup takes the keys as egui gives them, and no
         // command of the window behind it fires.
         if self.dialog_open(ctx) {
-            let Some(id) = ctx.memory(|m| m.focused()) else { return };
-            if self.spot_of(ctx, id) == Some((Panel::Library, Spot::Dialog)) {
-                let dirs = [(Key::ArrowRight, (1, 0)), (Key::ArrowLeft, (-1, 0)), (Key::ArrowDown, (0, 1)), (Key::ArrowUp, (0, -1))];
-                let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-                if let Some((_, d)) = dirs.into_iter().find(|(k, _)| key(Modifiers::NONE, *k)) {
-                    self.step_from(ctx, id, d);
-                }
-            }
             return;
         }
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
@@ -1218,8 +1178,24 @@ impl App {
         if key(cmd, Key::Comma) {
             egui::Popup::toggle_id(ctx, Id::new("settings popup"));
         }
+        // Tab walks the stops, and Ctrl+Tab walks the panes. They work from
+        // a text field too. The most modifiers go first: `consume_key` lets
+        // a plain Tab eat a shifted one.
+        if key(cmd | Modifiers::SHIFT, Key::Tab) {
+            self.press_pane(ctx, -1);
+        } else if key(cmd, Key::Tab) {
+            self.press_pane(ctx, 1);
+        } else if key(Modifiers::SHIFT, Key::Tab) {
+            self.press_tab(ctx, -1);
+        } else if key(Modifiers::NONE, Key::Tab) {
+            self.press_tab(ctx, 1);
+        }
+        // Typing beats every shortcut below.
+        if ctx.text_edit_focused() {
+            return;
+        }
         let focus = ctx.memory(|m| m.focused());
-        if !focus.is_none_or(|id| self.is_pane(ctx, id)) {
+        if !focus.is_none_or(|id| self.pane_of(id).is_some()) {
             return;
         }
         // The status bar lies in neither half. A command that asks which
@@ -1306,18 +1282,6 @@ impl App {
         if in_half && self.active == Panel::Project && key(Modifiers::NONE, Key::E) {
             self.project_eye = !self.project_eye;
         }
-        // Tab walks the panes to the right and down, Shift+Tab the other way,
-        // and Ctrl+Tab swaps the halves of the window. The most modifiers go
-        // first: `consume_key` lets a plain Tab eat a shifted one.
-        if key(cmd, Key::Tab) {
-            if in_half {
-                self.press_tab(ctx, 0);
-            }
-        } else if key(Modifiers::SHIFT, Key::Tab) {
-            self.press_tab(ctx, -1);
-        } else if key(Modifiers::NONE, Key::Tab) {
-            self.press_tab(ctx, 1);
-        }
         // The arrows move the selection of the sheet that holds the focus.
         // Shift walks one corner and keeps the other; Ctrl steps from one
         // block of filled cells to the next; Alt walks the whole selection.
@@ -1328,6 +1292,8 @@ impl App {
                 Panel::Library => library_id(),
                 Panel::Project => project_id(),
             });
+        // An arrow never leaves the body it is in. On any other stop the
+        // arrows do nothing.
         if !eye && sheet_keys {
             const DIRS: [(Key, (i32, i32)); 4] = [
                 (Key::ArrowRight, (1, 0)),
@@ -1343,32 +1309,12 @@ impl App {
                 (Modifiers::NONE, Move::Step(false)),
             ];
             let hit = combos.into_iter().find_map(|(m, what)| DIRS.into_iter().find(|(k, _)| key(m, *k)).map(|(_, d)| (d, what)));
-            // A grid against its top row hands the keys up to the title of
-            // its own pane, where the header row starts. Every other edge
-            // holds them: an arrow never leaves a pane.
-            let library = self.active == Panel::Library;
-            let at_top = self.sheet_mut(self.active).and_then(|s| s.sel.bounds()).is_some_and(|b| b.y0 == 0);
-            match hit {
-                Some(((0, -1), Move::Step(false))) if at_top => self.go(ctx, heading_id(library)),
-                Some((d, what)) => {
-                    if let Some(s) = self.sheet_mut(self.active) {
-                        match what {
-                            Move::Grow(ctrl) => s.arrow(d, true, ctrl),
-                            Move::Step(ctrl) => s.arrow(d, false, ctrl),
-                            Move::Whole => s.nudge(d),
-                        }
-                    }
+            if let Some((d, what)) = hit && let Some(s) = self.sheet_mut(self.active) {
+                match what {
+                    Move::Grow(ctrl) => s.arrow(d, true, ctrl),
+                    Move::Step(ctrl) => s.arrow(d, false, ctrl),
+                    Move::Whole => s.nudge(d),
                 }
-                None => {}
-            }
-        }
-        // Not on a grid and not in a tree: the arrows walk from place to
-        // place, by where each one lies on screen.
-        let trees = [library_tree_id(), project_tree_id()];
-        if let Some(id) = focus.filter(|id| !sheet_keys && !trees.contains(id)) {
-            let dirs = [(Key::ArrowRight, (1, 0)), (Key::ArrowLeft, (-1, 0)), (Key::ArrowDown, (0, 1)), (Key::ArrowUp, (0, -1))];
-            if let Some((_, d)) = dirs.into_iter().find(|(k, _)| key(Modifiers::NONE, *k)) {
-                self.step_from(ctx, id, d);
             }
         }
         if in_half && key(Modifiers::NONE, Key::Escape) && let Some(s) = self.sheet_mut(self.active) {
@@ -1526,11 +1472,8 @@ impl App {
     ) -> (Option<Grid>, bool) {
         let mut new_grid = None;
         let mut clicked = false;
-        let mut places: Vec<(Id, egui::Rect)> = Vec::new();
         ui.horizontal(|ui| {
-            let head = ui.label(title_text(ui, heading_id(library), title, keys));
-            ui.interact(head.rect, heading_id(library), egui::Sense::click());
-            places.push((heading_id(library), head.rect));
+            ui.label(title_text(title, keys));
             let Some(s) = sheet else {
                 ui.weak("nothing open");
                 clicked = Self::header_tail(ui, None, ai, eye, String::new(), None);
@@ -1561,14 +1504,7 @@ impl App {
             let name = if s.dirty { format!("{name} *") } else { name.to_string() };
             let cell = s.hover.map(|(x, y)| format!("tile {x},{y}"));
             clicked = Self::header_tail(ui, Some(s), ai, eye, name, cell);
-            places.extend(ui.data(|d| d.get_temp::<Vec<(Id, egui::Rect)>>(Id::new("tail stops"))).unwrap_or_default());
         });
-        // The fields of the row, gathered after they drew: the arrows walk
-        // them like every other place in the window.
-        for field in ["tile field", "gap field", "offset field"] {
-            places.extend(field_stop(ui.ctx(), Id::new((field, library))));
-        }
-        ui.data_mut(|d| d.insert_temp(Id::new(("header stops", library)), places));
         (new_grid, clicked)
     }
 
@@ -1578,21 +1514,22 @@ impl App {
     /// Returns whether one of the three buttons was clicked.
     fn header_tail(ui: &mut egui::Ui, sheet: Option<&mut Sheet>, ai: Option<&mut bool>, eye: Option<&mut bool>, name: String, cell: Option<String>) -> bool {
         let mut clicked = false;
-        let mut here: Vec<(Id, egui::Rect)> = Vec::new();
+        // The buttons draw from the right, so they are kept here and become
+        // stops from the left, in the order you read them.
+        let mut here: Vec<egui::Response> = Vec::new();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // The buttons of the sheet wait, greyed out, for a sheet.
             let open = sheet.is_some();
             if let Some(ai) = ai {
                 let r = ui.add(egui::Button::new("✨").small().selected(*ai)).on_hover_text("AI assist panel (I)");
-                here.push((r.id, r.rect));
                 if r.clicked() {
                     *ai = !*ai;
                     clicked = true;
                 }
+                here.push(r);
             }
             let anim = sheet.as_ref().is_some_and(|s| s.anim_panel);
             let r = ui.add_enabled(open, egui::Button::new("🎬").small().selected(anim)).on_hover_text("animation panel (A)");
-            here.push((r.id, r.rect));
             if r.clicked() {
                 clicked = true;
                 if let Some(s) = sheet {
@@ -1603,13 +1540,14 @@ impl App {
                     }
                 }
             }
+            here.push(r);
             if let Some(eye) = eye {
                 let r = ui.add_enabled(open, egui::Button::new("👁").small().selected(*eye)).on_hover_text("view information about the sheet, no editing (E)");
-                here.push((r.id, r.rect));
                 if r.clicked() {
                     *eye = !*eye;
                     clicked = true;
                 }
+                here.push(r);
             }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(egui::Label::new(name).truncate());
@@ -1618,14 +1556,16 @@ impl App {
                 }
             });
         });
-        ui.data_mut(|d| d.insert_temp(Id::new("tail stops"), here));
+        for r in here.iter().rev() {
+            stop(r);
+        }
         clicked
     }
 
     /// Configuration belongs in Settings; this panel shows the label of the open sheet.
     fn assist_panel(
         ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys, sheet: Option<&Sheet>, run: Option<&labels::Run>, outcome: Option<&str>,
-    ) -> (Vec<egui::Response>, Option<labels::Action>) {
+    ) -> Option<labels::Action> {
         ui.strong("AI label");
         let ready = match ai.chosen(ai::Mode::Instant) {
             Some((p, m)) if p.kind == ai::Kind::OpenAi && p.key_source(keys) != ai::KeySource::None => {
@@ -1650,10 +1590,10 @@ impl App {
         }
         let label = ui.add_enabled(ready && sheet.is_some() && run.is_none(), egui::Button::new("Label with AI"))
             .on_hover_text("Sends this sheet to the configured instant model.");
-        ui.data_mut(|d| d.insert_temp(Id::new("label button"), label.id));
         let remove = ui.add_enabled(sheet.is_some_and(|s| s.side.label.is_some()) && run.is_none(), egui::Button::new("Remove AI label..."));
-        let action = if label.clicked() { Some(labels::Action::Label) } else if remove.clicked() { Some(labels::Action::Remove) } else { None };
-        (vec![label, remove], action)
+        stop(&label);
+        stop(&remove);
+        if label.clicked() { Some(labels::Action::Label) } else if remove.clicked() { Some(labels::Action::Remove) } else { None }
     }
 
     /// Every UI entry point reaches this operation after it opens the target sheet.
@@ -1840,56 +1780,42 @@ impl App {
         }
     }
 
-    /// The pane that holds the keys, read from the keyboard focus. A widget
-    /// of a pane counts as that pane, a header field as much as the grid, so
-    /// the title stays lit while you work along the header. A focus on
-    /// nothing of ours leaves the answer where it was.
-    fn spot(&self, ctx: &egui::Context) -> (Panel, Spot) {
-        let Some(id) = ctx.memory(|m| m.focused()) else {
-            return self.pane;
-        };
-        self.spot_of(ctx, id).unwrap_or(self.pane)
+    /// The pane of a stop. The bodies have fixed names, so they answer even
+    /// on the frame before they first draw. Every other stop answers from
+    /// the list that the last frame drew.
+    fn pane_of(&self, id: Id) -> Option<(Panel, Spot)> {
+        let fixed = [
+            (library_tree_id(), (Panel::Library, Spot::Tree)),
+            (project_tree_id(), (Panel::Project, Spot::Tree)),
+            (library_id(), (Panel::Library, Spot::Sheet)),
+            (project_id(), (Panel::Project, Spot::Sheet)),
+        ];
+        if let Some((_, p)) = fixed.iter().find(|(i, _)| *i == id) {
+            return Some(*p);
+        }
+        self.stops.iter().find(|(_, i)| *i == id).map(|(p, _)| *p)
     }
 
-    /// The pane a widget belongs to. A title counts as its pane, and so does
-    /// any other widget that lies inside one, a header field as much as the
-    /// grid, so the title stays lit while you work along the header.
-    fn spot_of(&self, ctx: &egui::Context, id: Id) -> Option<(Panel, Spot)> {
-        for (panel, library) in [(Panel::Library, true), (Panel::Project, false)] {
-            if id == if library { library_tree_id() } else { project_tree_id() } || id == tree_heading_id(library) {
-                return Some((panel, Spot::Tree));
-            }
-            if id == if library { library_id() } else { project_id() } || id == heading_id(library) {
-                return Some((panel, Spot::Sheet));
-            }
-            if Some(id) == side_id(ctx, library) || id == anim_heading_id(library) {
-                return Some((panel, Spot::Side));
-            }
+    /// Where the keys land in a pane: the rows of a tree, the grid of a
+    /// sheet, else the first stop of the pane.
+    fn body(&self, pane: (Panel, Spot)) -> Option<Id> {
+        let library = pane.0 == Panel::Library;
+        match pane.1 {
+            Spot::Tree => return Some(if library { library_tree_id() } else { project_tree_id() }),
+            Spot::Sheet if library && self.library_sheet.is_some() => return Some(library_id()),
+            Spot::Sheet if !library && self.project_sheet.is_some() => return Some(project_id()),
+            _ => {}
         }
-        // A registered place says which pane it belongs to, whether or not
-        // it lies inside that pane's own rectangle: the search field and the
-        // name field sit above their trees, not in them.
-        if let Some(&(at, _, _)) = self.stops.iter().find(|(_, sid, _)| *sid == id) {
-            return Some(at);
-        }
-        // Anything else belongs to the pane it lies in. The rectangles are
-        // last frame's, which is where the widget drew.
-        let area = |r: &egui::Rect| r.width() * r.height();
-        let rect = ctx.read_response(id).map(|r| r.rect)?;
-        let hit = self.pane_rects.iter().filter(|(_, r)| r.contains(rect.center())).min_by(|a, b| area(&a.1).total_cmp(&area(&b.1)));
-        hit.map(|&(at, _)| at)
+        self.stops.iter().find(|(p, _)| *p == pane).map(|(_, id)| *id)
     }
 
-    /// Gives the keys to a widget, and says so: the pane it belongs to is
-    /// the pane in use from now on. Every key that moves the focus goes
-    /// through here, or `self.active` drifts away from where the keys are
-    /// and the panels start answering for one another.
+    /// Gives the keys to a stop, and makes its pane the pane in use.
     fn go(&mut self, ctx: &egui::Context, id: Id) {
         if std::env::var_os("TILEPICKY_KEYS").is_some() {
-            eprintln!("[keys]   -> {}", place_name(self, ctx, id));
+            eprintln!("[keys]   -> {}", place_name(self, id));
         }
         ctx.memory_mut(|m| m.request_focus(id));
-        if let Some(at) = self.spot_of(ctx, id) {
+        if let Some(at) = self.pane_of(id) {
             self.pane = at;
             // The status bar belongs to neither half, so it leaves the panel
             // in use as it was: `A`, `M` and copying still mean that panel.
@@ -1899,7 +1825,7 @@ impl App {
         }
         // A tree with no row under the keys, or a grid with nothing
         // selected, shows nothing at all. Arriving puts that right at once.
-        self.enter_tree(ctx, id, (0, 1));
+        self.enter_tree(ctx, id);
         if let Some(panel) = [(library_id(), Panel::Library), (project_id(), Panel::Project)].iter().find(|(k, _)| *k == id).map(|(_, p)| *p)
             && let Some(sheet) = self.sheet_mut(panel)
         {
@@ -1907,9 +1833,9 @@ impl App {
         }
     }
 
-    /// Puts the keys on a row when they arrive in a tree with none. Coming
-    /// up from below takes the last row, going down takes the first.
-    fn enter_tree(&mut self, ctx: &egui::Context, id: Id, d: (i32, i32)) {
+    /// Puts the keys on a row when they arrive in a tree with none: the file
+    /// on show, else the first row.
+    fn enter_tree(&mut self, ctx: &egui::Context, id: Id) {
         let library = if id == library_tree_id() {
             true
         } else if id == project_tree_id() {
@@ -1924,213 +1850,45 @@ impl App {
         if here.as_ref().is_some_and(|r| rows.contains(r)) {
             return;
         }
-        // The file on show is the friendliest place to start.
         let open = if library { self.library_sel } else { self.project_sel };
-        let row = open
-            .map(tree::Row::File)
-            .filter(|r| rows.contains(r))
-            .or_else(|| if d.1 < 0 { rows.last().cloned() } else { rows.first().cloned() });
+        let row = open.map(tree::Row::File).filter(|r| rows.contains(r)).or_else(|| rows.first().cloned());
         if let Some(row) = row {
             self.stand_on(ctx, panel, row);
         }
     }
 
-    /// Whether a pane is there to walk to. An empty panel has no sheet, and
-    /// the animation panel needs cells to work on.
-    fn has_spot(&self, panel: Panel, spot: Spot) -> bool {
-        let sheet = match panel {
-            Panel::Library => self.library_sheet.as_ref(),
-            Panel::Project => self.project_sheet.as_ref(),
-        };
-        match spot {
-            Spot::Tree => true,
-            Spot::Sheet => sheet.is_some(),
-            Spot::Side => (panel == Panel::Library && self.ai_panel) || sheet.is_some_and(|s| s.anim_panel && !s.sel.is_empty()),
-            // One status bar, and it rides with the project half.
-            Spot::Status => panel == Panel::Project,
-            // Tab never walks into a dialog: it opens with a button, and it
-            // holds the keys by itself until it closes.
-            Spot::Dialog => false,
-        }
-    }
-
-    /// The panes that are there, left to right and then down: the two file
-    /// trees, the two sheets, and the two animation panels when they are
-    /// open. Tab walks this list, and a file tree is always in it.
-    fn stations(&self) -> Vec<(Panel, Spot)> {
-        let mut all = Vec::with_capacity(6);
-        for panel in [Panel::Library, Panel::Project] {
-            for spot in [Spot::Tree, Spot::Sheet, Spot::Side, Spot::Status] {
-                if self.has_spot(panel, spot) {
-                    all.push((panel, spot));
-                }
-            }
-        }
-        all
-    }
-
-    /// Where the work happens in a pane: the rows of a tree, the grid of a
-    /// sheet, the fields of an animation panel.
-    fn spot_id(&self, ctx: &egui::Context, at: (Panel, Spot)) -> Option<Id> {
-        let library = at.0 == Panel::Library;
-        Some(match at.1 {
-            Spot::Tree if library => library_tree_id(),
-            Spot::Tree => project_tree_id(),
-            Spot::Sheet if library => library_id(),
-            Spot::Sheet => project_id(),
-            // The frame field is where the work is; the title is always
-            // there, even on the frame the panel opens.
-            Spot::Side if library && self.ai_panel => {
-                if self.library_sheet.is_none() {
-                    ctx.data(|d| d.get_temp::<(Id, egui::Rect)>(Id::new("batch button")))?.0
-                } else { ctx.data(|d| d.get_temp(Id::new("label button")))? }
-            }
-            Spot::Side => side_id(ctx, library).unwrap_or_else(|| anim_heading_id(library)),
-            Spot::Status => gear_id(ctx)?,
-            Spot::Dialog => return None,
-        })
-    }
-
-    /// The title of a pane: where Tab leaves you the first time you visit,
-    /// because a title says where you are and takes nothing back.
-    fn spot_head(&self, at: (Panel, Spot)) -> Option<Id> {
-        let library = at.0 == Panel::Library;
-        Some(match at.1 {
-            Spot::Tree => tree_heading_id(library),
-            Spot::Sheet => heading_id(library),
-            Spot::Side if library && self.ai_panel => return None,
-            Spot::Side => anim_heading_id(library),
-            // Neither the status bar nor a dialog has a title.
-            Spot::Status | Spot::Dialog => return None,
-        })
-    }
-
-    /// The place the keys last stood in a pane, if it is still on screen.
-    fn spot_last(&self, ctx: &egui::Context, at: (Panel, Spot)) -> Option<Id> {
-        let id = self.inner.iter().find(|(p, _)| *p == at).map(|(_, id)| *id)?;
-        ctx.read_response(id).map(|_| id)
-    }
-
-    /// The place nearest to `from` in the direction `d`, of all the places
-    /// the arrow keys can stand. A place that shares the other axis with
-    /// `from`, and so lies straight that way on screen, comes before one
-    /// that sits off to a side.
-    fn step_stop(&self, pane: (Panel, Spot), from: egui::Rect, d: (i32, i32)) -> Option<Id> {
-        // Distance goes between the edges that face each other, not between
-        // the middles. A file tree is tall and its title is a thin strip, and
-        // by middles the title loses to whatever lies further up.
-        let gap = |a: (f32, f32), b: (f32, f32)| (b.0 - a.1).max(a.0 - b.1).max(0.0);
-        let mut best: Option<(f32, Id)> = None;
-        for &(_, id, r) in self.stops.iter().filter(|(at, _, _)| *at == pane) {
-            let (ahead, aside, straight) = if d.1 != 0 {
-                let ahead = if d.1 > 0 { r.min.y - from.max.y } else { from.min.y - r.max.y };
-                (ahead, gap((from.min.x, from.max.x), (r.min.x, r.max.x)), r.min.x < from.max.x && from.min.x < r.max.x)
-            } else {
-                let ahead = if d.0 > 0 { r.min.x - from.max.x } else { from.min.x - r.max.x };
-                (ahead, gap((from.min.y, from.max.y), (r.min.y, r.max.y)), r.min.y < from.max.y && from.min.y < r.max.y)
-            };
-            // A place must lie beyond the edge, not across it: a rectangle
-            // that holds `from`, or that `from` holds, is no step at all.
-            if ahead < -1.0 {
-                continue;
-            }
-            // A place off to the side loses to any place straight ahead.
-            let score = ahead.max(0.0) + aside + if straight { 0.0 } else { 100_000.0 };
-            if best.is_none_or(|(s, _)| score < s) {
-                best = Some((score, id));
-            }
-        }
-        best.map(|(_, id)| id)
-    }
-
-    /// Moves the keys one place in a direction, inside the pane they are in.
-    /// Nothing happens when that pane has no place that way.
-    fn step_from(&mut self, ctx: &egui::Context, id: Id, d: (i32, i32)) {
-        let Some(rect) = ctx.read_response(id).map(|r| r.rect) else { return };
-        let Some(pane) = self.spot_of(ctx, id) else { return };
-        if let Some(to) = self.step_stop(pane, rect, d) {
-            self.go(ctx, to);
-            self.enter_tree(ctx, to, d);
-        }
-    }
-
-    /// A click anywhere inside a pane gives it the keys. A click that lands
-    /// on a widget which wants the keyboard itself, a text field for one,
-    /// keeps them, because that widget has just taken the focus.
-    fn take_pane(&mut self, ctx: &egui::Context, panes: &[((Panel, Spot), egui::Rect)]) {
-        if self.dialog_open(ctx) || !ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
-            return;
-        }
-        if !ctx.memory(|m| m.focused()).is_none_or(|id| self.is_pane(ctx, id)) {
-            return;
-        }
-        let Some(p) = ctx.input(|i| i.pointer.interact_pos()) else { return };
-        let area = |r: &egui::Rect| r.width() * r.height();
-        let hit = panes.iter().filter(|(_, r)| r.contains(p)).min_by(|a, b| area(&a.1).total_cmp(&area(&b.1)));
-        if let Some(&(at, _)) = hit {
-            self.focus_pane(ctx, at, false);
-        }
-    }
-
-    /// Whether the keyboard focus sits inside one of the panes.
-    fn is_pane(&self, ctx: &egui::Context, id: Id) -> bool {
-        self.spot_of(ctx, id).is_some()
-    }
-
-    /// Gives the keys to a pane. A pane that is not open passes them to the
-    /// sheet of its half, and then to the file tree, which is always there.
-    ///
-    /// `back` means Tab, which returns you where you were in that pane, and
-    /// leaves you on its title the first time you ever go there. Without it
-    /// the keys land where the work is: the grid of a sheet, the rows of a
-    /// tree.
-    fn focus_pane(&mut self, ctx: &egui::Context, at: (Panel, Spot), back: bool) {
-        let spot = [at.1, Spot::Sheet, Spot::Tree].into_iter().find(|&s| self.has_spot(at.0, s));
-        let at = (at.0, spot.unwrap_or(Spot::Tree));
-        let id = if back {
-            // Back to where you were, else the title, else the work: the
-            // status bar has no title, only a gear.
-            self.spot_last(ctx, at).or_else(|| self.spot_head(at)).or_else(|| self.spot_id(ctx, at))
-        } else {
-            self.spot_id(ctx, at)
-        };
-        let Some(id) = id else { return };
-        self.go(ctx, id);
-        self.pane = at;
-        self.active = at.0;
-        if let Some(s) = self.sheet_mut(at.0) {
-            s.end_run();
-        }
-    }
-
-    /// Tab walks the panes to the right and down, and wraps; Shift+Tab walks
-    /// them the other way. Ctrl+Tab swaps the halves of the window and keeps
-    /// the pane, so a tree meets a tree and a sheet meets a sheet.
+    /// Tab: the next stop in reading order, or the one before it. The walk
+    /// wraps at both ends.
     fn press_tab(&mut self, ctx: &egui::Context, step: i32) {
-        let now = self.spot(ctx);
-        let all = self.stations();
-        let at = all.iter().position(|&x| x == now).unwrap_or(0);
-        let to = if step == 0 {
-            // The other half, on the same pane, and only that one: a sheet
-            // meets a sheet or nothing. Landing somewhere else would answer
-            // a question nobody asked.
-            let other = if now.0 == Panel::Library { Panel::Project } else { Panel::Library };
-            if !self.has_spot(other, now.1) {
-                // The canvas is the one pane you can make on the way. A cross
-                // from the source sheet starts a tilesheet there, as a dropped
-                // block does, at the tile size of the sheet you come from.
-                if now != (Panel::Library, Spot::Sheet) || !self.is_set(Panel::Project) {
-                    return;
+        let ids: Vec<Id> = self.stops.iter().map(|(_, id)| *id).collect();
+        let from = ctx.memory(|m| m.focused());
+        if let Some(to) = next_stop(&ids, from, self.body(self.pane), step) {
+            self.go(ctx, to);
+        }
+    }
+
+    /// Ctrl+Tab: the body of the next pane, or of the one before it. A pane
+    /// with nothing to stop at is passed over.
+    fn press_pane(&mut self, ctx: &egui::Context, step: i32) {
+        let here = PANES.iter().position(|p| *p == self.pane).unwrap_or(0);
+        // The canvas is the one pane you can make on the way. A step down
+        // from the source sheet starts a tilesheet there, as a dropped block
+        // does, at the tile size of the sheet you come from.
+        if step > 0 && self.pane == (Panel::Library, Spot::Sheet) && self.project_sheet.is_none() && self.is_set(Panel::Project) {
+            let tile = self.inherited_tile(Panel::Library);
+            self.start_canvas(ctx, tile);
+        }
+        let n = PANES.len() as i32;
+        for k in 1..n {
+            let pane = PANES[(here as i32 + k * step).rem_euclid(n) as usize];
+            if let Some(id) = self.body(pane) {
+                self.go(ctx, id);
+                if let Some(s) = self.sheet_mut(pane.0) {
+                    s.end_run();
                 }
-                let tile = self.inherited_tile(Panel::Library);
-                self.start_canvas(ctx, tile);
+                return;
             }
-            (other, now.1)
-        } else {
-            all[(at as i32 + step).rem_euclid(all.len() as i32) as usize]
-        };
-        // Ctrl+Tab crosses to work; Tab walks the panes, and remembers.
-        self.focus_pane(ctx, to, step != 0);
+        }
     }
 
     fn sheet_mut(&mut self, panel: Panel) -> Option<&mut Sheet> {
@@ -2176,15 +1934,9 @@ impl App {
         if sheet.preview_hovered {
             sheet.preview_zoom.wheel(ui);
         }
-        let head = ui.label(title_text(ui, anim_heading_id(library), "Animation", keys));
-        ui.interact(head.rect, anim_heading_id(library), egui::Sense::click());
-        let mut places: Vec<(Id, egui::Rect)> = vec![(anim_heading_id(library), head.rect)];
-        let stash = |ui: &egui::Ui, places: Vec<(Id, egui::Rect)>| {
-            ui.data_mut(|d| d.insert_temp(Id::new(("side stops", library)), places));
-        };
+        ui.label(title_text("Animation", keys));
         let Some(b) = sheet.sel.bounds() else {
             ui.weak("Select tiles to play them.");
-            stash(ui, places);
             return Ok(false);
         };
 
@@ -2205,9 +1957,6 @@ impl App {
             None => sheet.draft().map(|d| (d.frame, d.ms)).unwrap_or(([1, 1], 100)),
         };
         let mut changed = false;
-        for field in ["cell field", "ms field"] {
-            places.extend(field_stop(ui.ctx(), Id::new((field, library))));
-        }
         egui::Grid::new("animation fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("cell");
             let field = if in_tiles { cell_field(library) } else { frame_px_field(library) };
@@ -2223,11 +1972,6 @@ impl App {
             }
             ui.end_row();
         });
-        // Tab reaches this panel here, so the field holds the keys as a pane
-        // does; without that egui would walk the focus out of it.
-        if let Some(id) = side_id(ui.ctx(), library) {
-            ui.memory_mut(|m| m.set_focus_lock_filter(id, sheet::pane_focus()));
-        }
         // The fields apply before the panel reads what they made, so a number
         // just typed or dragged shows in the same repaint, not the next one.
         let mut result = Ok(false);
@@ -2271,14 +2015,13 @@ impl App {
             let can_store = stored.is_some() || anim.as_ref().is_some_and(|a| a.count() > 1);
             let label = if stored.is_some() { "Unmark (M)" } else { "Store (M)" };
             let r = ui.add_enabled(can_store, egui::Button::new(label));
-            places.push((r.id, r.rect));
+            stop(&r);
             if !can_store {
                 r.on_disabled_hover_text("an animation needs more than one frame");
             } else if r.clicked() {
                 result = sheet.toggle_animation().map(|()| true);
             }
         });
-        stash(ui, places);
         if let Some(a) = anim {
             egui::CentralPanel::default().show(ui, |ui| {
                 egui::ScrollArea::both()
@@ -2318,6 +2061,30 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Keeps the Tab and arrow keys away from egui, which would walk the
+    /// focus with them on its own. `ui` puts them back into the input, for
+    /// the handlers of the app. A dialog or a popup gets them as egui gives
+    /// them. A text field keeps Left and Right for its cursor, and loses Up
+    /// and Down, which have nothing to do in one line.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.dialog_open(ctx) {
+            return;
+        }
+        let typing = ctx.text_edit_focused();
+        let mut nav = Vec::new();
+        raw_input.events.retain(|e| {
+            let egui::Event::Key { key, modifiers, .. } = e else { return true };
+            match key {
+                Key::Tab => nav.push(e.clone()),
+                Key::ArrowUp | Key::ArrowDown if typing && modifiers.is_none() => {}
+                Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight if !typing => nav.push(e.clone()),
+                _ => return true,
+            }
+            false
+        });
+        self.nav.extend(nav);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         self.receive_label();
@@ -2331,13 +2098,17 @@ impl eframe::App for App {
         if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
             egui::Popup::close_all(ctx);
         }
-        // The panes own the keyboard. egui walks the focus with Tab and with
-        // the bare arrows unless the widget that holds it claims them, and a
-        // pane can claim them only while it holds the focus. So the keys go
-        // back to the pane they were in as soon as nothing else holds them.
-        if !self.dialog_open(ctx) && ctx.memory(|m| m.focused()).is_none() {
-            let back = self.pane;
-            self.focus_pane(ctx, back, true);
+        // The Tab and arrow keys that `raw_input_hook` kept from egui go back
+        // into the input, for the handlers below. Stops from the last frame
+        // are in `self.stops`; this frame collects them anew.
+        let nav = std::mem::take(&mut self.nav);
+        ctx.input_mut(|i| i.events.extend(nav));
+        ctx.data_mut(|d| d.remove_temp::<Vec<((Panel, Spot), Id)>>(Id::new("stops")));
+        // When nothing holds the keys, they go back to the body of the pane
+        // in use: after Escape, after Enter in a text field, and after a
+        // click on something that does not take the keys itself.
+        if !self.dialog_open(ctx) && ctx.memory(|m| m.focused()).is_none() && let Some(id) = self.body(self.pane) {
+            ctx.memory_mut(|m| m.request_focus(id));
         }
         self.handle_keys(ctx);
         // The preview sets this flag while drawing; clear it first, so that
@@ -2347,113 +2118,61 @@ impl eframe::App for App {
         }
 
         // Which pane holds the keys. Read once, after the keys of this frame
-        // moved it, so that every title agrees.
-        let keys = self.spot(ctx);
-        self.pane = keys;
-        // A tree draws its cursor only while the keys are on its rows. The
-        // title of the tree and the fields above it belong to the same pane,
-        // but standing on one of those is not standing in the tree.
-        let on_rows = (ctx.memory(|m| m.has_focus(library_tree_id())), ctx.memory(|m| m.has_focus(project_tree_id())));
-        if let Some(id) = ctx.memory(|m| m.focused()) {
-            match self.inner.iter_mut().find(|(p, _)| *p == keys) {
-                Some(seat) => seat.1 = id,
-                None => self.inner.push((keys, id)),
+        // moved them, so that every title agrees.
+        if let Some(at) = ctx.memory(|m| m.focused()).and_then(|id| self.pane_of(id)) {
+            self.pane = at;
+            if at.1 != Spot::Status {
+                self.active = at.0;
             }
         }
-        // Where each pane lies, filled in as they draw. A click inside one
-        // gives it the keys; the smallest pane under the pointer wins, so
-        // an animation panel beats the half it sits in.
-        let mut panes: Vec<((Panel, Spot), egui::Rect)> = Vec::new();
+        let keys = self.pane;
+        // A tree draws its cursor only while the keys are on its rows.
+        let on_rows = (ctx.memory(|m| m.has_focus(library_tree_id())), ctx.memory(|m| m.has_focus(project_tree_id())));
         let mut library_action = None;
         let mut project_action = None;
         // A click in an empty pane asks for that side's folder.
         let (library_set, project_set) = (self.is_set(Panel::Library), self.is_set(Panel::Project));
         let mut ask: Option<Panel> = None;
         let mut hover_dir: Option<String> = None;
-        let mut to_tree = false;
-        let mut to_heading = false;
-        let mut leave_search = false;
-        let mut to_search_in = false;
-        let mut shut_search_in = false;
-        let mut to_new_button = false;
-        let mut tab_out: Option<i32> = None;
-        let mut new_button: Option<Id> = None;
-        let mut search_in: Option<Id> = None;
-        // Every place the arrow keys can stand, and where it lies. The
-        // arrows walk these by direction, so the keyboard moves the way the
-        // eye does. Inside the panes nothing of egui's own walking runs; the
-        // titles, the header fields and the buttons are all places here.
-        let mut stops: Vec<((Panel, Spot), Id, egui::Rect)> = Vec::new();
         let mut library_rows: Vec<tree::Row> = Vec::new();
         let mut project_rows: Vec<tree::Row> = Vec::new();
         let mut delete_in_mine = false;
         let mut create = false;
         if self.settings.hide_legend {
-            self.status_bar(ctx, ui, &mut stops);
+            self.status_bar(ctx, ui);
         }
         egui::Panel::left("left").resizable(true).default_size(340.0).size_range(240.0..=800.0).show(ui, |ui| {
             ui.add_space(4.0);
             // One row: the filter button at the left, the box in the rest.
+            set_pane(ui, (Panel::Library, Spot::Tree));
             ui.horizontal(|ui| {
-                {
-                    // What the search matches on, in a popup under the button.
-                    let r = ui.small_button("☰").on_hover_text("search in… (Left from the search field)");
-                    if shut_search_in {
-                        // The popup of a toggle button is named after it.
-                        egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(&r));
-                        r.request_focus();
-                    }
-                    // The button has no name of its own; keep the one egui
-                    // gave it, so the keys can come back to it.
-                    search_in = Some(r.id);
-                    stops.push(((Panel::Library, Spot::Tree), r.id, r.rect));
-                    egui::Popup::from_toggle_button_response(&r).show(|ui| {
-                        ui.set_min_width(220.0);
-                        ui.strong("Search in");
-                        let first = ui.checkbox(&mut self.settings.search.folders, "folder names");
-                        let second = ui.checkbox(&mut self.settings.search.files, "file names");
-                        let third = ui.checkbox(&mut self.settings.search.captions, "captions");
-                        let fourth = ui.checkbox(&mut self.settings.search.tags, "tags");
-                        let changed = [&first, &second, &third, &fourth].iter().any(|r| r.changed());
-                        if dialog_stops(ui, &r, &[&first, &second, &third, &fourth]) {
-                            shut_search_in = true;
-                        }
-                        if changed {
-                            self.refresh_query();
-                            if let Err(e) = self.settings.save() { self.status = e; }
-                        }
-                        ui.weak("Words match by prefix. All words must match.\nCaptions and tags come from Label with AI.");
-                    });
-                    // Down leaves the search field for the files below. It
-                    // is taken before the field draws, because a text field
-                    // eats an arrow first.
-                    if ui.memory(|m| m.has_focus(search_id())) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
-                        leave_search = true;
-                    }
-                    if ui.memory(|m| m.has_focus(search_id())) {
-                        tab_out = tab_out.or(taken_tab(ui));
-                    }
-                    let search = egui::TextEdit::singleline(&mut self.query)
-                        .id(search_id())
-                        .hint_text("search: rock wall")
-                        .desired_width(ui.available_width());
-                    let out = search.show(ui);
-                    let r = out.response;
-                    // Left with the writing cursor at the start of the text
-                    // leaves the field for the button beside it.
-                    let at_start = out.cursor_range.is_none_or(|c| c.is_empty() && c.primary.index.0 == 0);
-                    if r.has_focus() && at_start && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft)) {
-                        to_search_in = true;
-                    }
-                    // The field keeps the up and down arrows, or egui walks
-                    // the focus off with them on its own.
-                    ui.memory_mut(|m| {
-                        m.set_focus_lock_filter(search_id(), egui::EventFilter { tab: true, escape: true, horizontal_arrows: true, vertical_arrows: true })
-                    });
-                    stops.push(((Panel::Library, Spot::Tree), search_id(), r.rect));
-                    if r.changed() {
+                // What the search matches on, in a popup under the button.
+                let r = ui.small_button("☰").on_hover_text("search in…");
+                stop(&r);
+                egui::Popup::from_toggle_button_response(&r).show(|ui| {
+                    ui.set_min_width(220.0);
+                    ui.strong("Search in");
+                    let first = ui.checkbox(&mut self.settings.search.folders, "folder names");
+                    let second = ui.checkbox(&mut self.settings.search.files, "file names");
+                    let third = ui.checkbox(&mut self.settings.search.captions, "captions");
+                    let fourth = ui.checkbox(&mut self.settings.search.tags, "tags");
+                    let changed = [&first, &second, &third, &fourth].iter().any(|r| r.changed());
+                    popup_keys(ui, &r, &first);
+                    if changed {
                         self.refresh_query();
+                        if let Err(e) = self.settings.save() { self.status = e; }
                     }
+                    ui.weak("Words match by prefix. All words must match.\nCaptions and tags come from Label with AI.");
+                });
+                let r = egui::TextEdit::singleline(&mut self.query)
+                    .id(search_id())
+                    .hint_text("search: rock wall")
+                    .desired_width(ui.available_width())
+                    .show(ui)
+                    .response;
+                stop(&r);
+                if r.changed() {
+                    self.refresh_query();
                 }
             });
             ui.add_space(4.0);
@@ -2468,7 +2187,7 @@ impl eframe::App for App {
                     let legend = format!(
                         "click and drag: select tiles | click and hold: lift and move (ctrl: copy) | \
                          ctrl+c, ctrl+v: copy/paste | drag an edge of the selection: resize it | right click: clear it, or delete inside it | \
-                         tab: next panel | ctrl+tab: library vs project | arrows: move the selection, shift: extend | {ai_key}ctrl+f: search | ctrl+wheel: zoom | ctrl+z, ctrl+y: undo, redo | ctrl+s: save"
+                         ctrl+tab: next panel | tab: next field | arrows: move the selection, shift: extend | {ai_key}ctrl+f: search | ctrl+wheel: zoom | ctrl+z, ctrl+y: undo, redo | ctrl+s: save"
                     );
                     let text = egui::RichText::new(legend).weak();
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("click: hide the legend").clicked() {
@@ -2481,19 +2200,13 @@ impl eframe::App for App {
                 .default_size(ui.available_height() * if project_set { 0.6 } else { 0.45 })
                 .size_range(80.0..=f32::INFINITY)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let head = ui.label(title_text(ui, tree_heading_id(true), "LIBRARY", keys == (Panel::Library, Spot::Tree)));
-                        ui.interact(head.rect, tree_heading_id(true), egui::Sense::click());
-                        stops.push(((Panel::Library, Spot::Tree), tree_heading_id(true), head.rect));
-                    });
+                    ui.label(title_text("LIBRARY", keys == (Panel::Library, Spot::Tree)));
                     egui::ScrollArea::vertical().id_salt("library scroll").auto_shrink([false, false]).show(ui, |ui| {
                         // The whole visible area answers, before the tree
                         // draws: the files and folders lie on top of it, so
                         // every place that is not one of them is free space.
                         let bg = ui.interact(ui.clip_rect(), library_tree_id(), egui::Sense::click());
-                        panes.push(((Panel::Library, Spot::Tree), ui.clip_rect()));
-                        stops.push(((Panel::Library, Spot::Tree), library_tree_id(), ui.clip_rect()));
-                        ui.memory_mut(|m| m.set_focus_lock_filter(library_tree_id(), sheet::pane_focus()));
+                        stop(&bg);
                         if !library_set {
                             ui.weak("No library folder yet.");
                             ui.add_space(4.0);
@@ -2518,6 +2231,7 @@ impl eframe::App for App {
                             lifting: false,
                         };
                         library_action = self.library_tree.show(ui, &view, "", &mut Vec::new(), &mut library_rows, &mut None);
+                        claim_on_press(ui, library_tree_id());
                         bg.context_menu(|ui| {
                             let label = if library_set { "Change library folder…" } else { "Set library folder…" };
                             if ui.button(label).clicked() {
@@ -2532,10 +2246,9 @@ impl eframe::App for App {
                     });
                 });
             egui::CentralPanel::default().show(ui, |ui| {
-                let title = title_text(ui, tree_heading_id(false), "PROJECT", keys == (Panel::Project, Spot::Tree));
+                set_pane(ui, (Panel::Project, Spot::Tree));
+                let title = title_text("PROJECT", keys == (Panel::Project, Spot::Tree));
                 let heading = ui.add(egui::Label::new(title).sense(egui::Sense::click()));
-                ui.interact(heading.rect, tree_heading_id(false), egui::Sense::click());
-                stops.push(((Panel::Project, Spot::Tree), tree_heading_id(false), heading.rect));
                 heading.context_menu(|ui| {
                     if ui.button("New folder…").clicked() {
                         self.prompt = Some(NamePrompt {
@@ -2552,38 +2265,19 @@ impl eframe::App for App {
                 if project_set {
                 ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let new = ui.button("New");
-                    stops.push(((Panel::Project, Spot::Tree), new.id, new.rect));
                     if new.clicked() {
                         create = true;
                     }
-                    new_button = Some(new.id);
-                    // Down goes back to the tree. It is taken before the
-                    // field draws, because the field would eat it first.
-                    if ui.memory(|m| m.has_focus(new_name_id())) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
-                        to_tree = true;
-                    }
-                    if ui.memory(|m| m.has_focus(new_name_id())) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
-                        to_heading = true;
-                    }
-                    if ui.memory(|m| m.has_focus(new_name_id())) {
-                        tab_out = tab_out.or(taken_tab(ui));
-                    }
-                    let field = egui::TextEdit::singleline(&mut self.new_name)
+                    let r = egui::TextEdit::singleline(&mut self.new_name)
                         .id(new_name_id())
                         .hint_text("new tilesheet name")
-                        .desired_width(ui.available_width());
-                    let out = field.show(ui);
-                    let r = out.response;
-                    stops.push(((Panel::Project, Spot::Tree), new_name_id(), r.rect));
-                    // Right with the writing cursor at the end of the text
-                    // leaves the field for the New button beside it.
-                    let at_end = out.cursor_range.is_none_or(|c| c.is_empty() && c.primary.index.0 >= self.new_name.chars().count());
-                    if r.has_focus() && at_end && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight)) {
-                        to_new_button = true;
-                    }
-                    // The field keeps the up and down arrows, so that egui
-                    // does not walk the focus away with them.
-                    ui.memory_mut(|m| m.set_focus_lock_filter(new_name_id(), egui::EventFilter { tab: true, escape: true, horizontal_arrows: true, vertical_arrows: true }));
+                        .desired_width(ui.available_width())
+                        .show(ui)
+                        .response;
+                    // The button draws first, at the right; the field comes
+                    // first when you read.
+                    stop(&r);
+                    stop(&new);
                     if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         create = true;
                     }
@@ -2592,9 +2286,7 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().id_salt("project scroll").auto_shrink([false, false]).show(ui, |ui| {
                     // The free space around the tree offers the folder menu.
                     let bg = ui.interact(ui.clip_rect(), project_tree_id(), egui::Sense::click());
-                    panes.push(((Panel::Project, Spot::Tree), ui.clip_rect()));
-                    stops.push(((Panel::Project, Spot::Tree), project_tree_id(), ui.clip_rect()));
-                    ui.memory_mut(|m| m.set_focus_lock_filter(project_tree_id(), sheet::pane_focus()));
+                    stop(&bg);
                     if !project_set {
                         ui.weak("No project folder yet.");
                         ui.add_space(4.0);
@@ -2624,6 +2316,7 @@ impl eframe::App for App {
                         hover_dir = Some(String::new());
                     }
                     project_action = self.project_tree.show(ui, &view, "", &mut Vec::new(), &mut project_rows, &mut hover_dir);
+                    claim_on_press(ui, project_tree_id());
                     bg.context_menu(|ui| {
                         let label = if project_set { "Change project folder…" } else { "Set project folder…" };
                         if ui.button(label).clicked() {
@@ -2645,7 +2338,7 @@ impl eframe::App for App {
             });
         });
         if !self.settings.hide_legend {
-            self.status_bar(ctx, ui, &mut stops);
+            self.status_bar(ctx, ui);
         }
         self.open_trees = false;
         self.library_scroll = None;
@@ -2656,28 +2349,6 @@ impl eframe::App for App {
         // marked group runs over.
         let project_order: Vec<usize> = project_rows.iter().filter_map(|r| if let tree::Row::File(i) = r { Some(*i) } else { None }).collect();
         self.tree_keys(ctx, &library_rows, &project_rows, &project_order);
-        if leave_search {
-            self.step_from(ctx, search_id(), (0, 1));
-        }
-        if let (true, Some(id)) = (to_search_in, search_in) {
-            self.go(ctx, id);
-        }
-        if let (true, Some(id)) = (to_new_button, new_button) {
-            self.go(ctx, id);
-        }
-        if let Some(step) = tab_out {
-            self.press_tab(ctx, step);
-        }
-        if to_heading {
-            self.go(ctx, tree_heading_id(false));
-        }
-        // Down from the name field goes to the first row of the PROJECT tree.
-        if to_tree {
-            self.focus_pane(ctx, (Panel::Project, Spot::Tree), false);
-            if let Some(row) = project_rows.first() {
-                self.stand_on(ctx, Panel::Project, row.clone());
-            }
-        }
         match library_action {
             Some(TreeAction::Open(i)) => self.open_library(ctx, i),
             Some(TreeAction::Labels(i, action)) => {
@@ -2832,16 +2503,21 @@ impl eframe::App for App {
         let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
         ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
         egui::Panel::top("library panel").resizable(true).show(ui, |ui| {
-            panes.push(((Panel::Library, Spot::Sheet), ui.max_rect()));
+            set_pane(ui, (Panel::Library, Spot::Sheet));
             ui.horizontal(|ui| {
                 let live = keys == (Panel::Library, Spot::Sheet);
                 let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
                 let clicked;
                 (library_tile, clicked) = Self::sheet_header(ui, "Source", live, true, self.library_sheet.as_mut(), ai, None);
-                if clicked { self.active = Panel::Library; }
+                // A header button does not keep the keys: they go to the grid.
+                if clicked {
+                    self.active = Panel::Library;
+                    if self.library_sheet.is_some() { ctx.memory_mut(|m| m.request_focus(library_id())); }
+                }
             });
             if self.ai_panel {
                 let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
+                    set_pane(ui, (Panel::Library, Spot::Side));
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let out = ui.add_enabled_ui(!self.library_batch.busy(), |ui| {
                             Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref(),
@@ -2852,22 +2528,18 @@ impl eframe::App for App {
                         out
                     }).inner
                 });
-                panes.push(((Panel::Library, Spot::Side), label.response.rect));
-                for button in &label.inner.0 { stops.push(((Panel::Library, Spot::Side), button.id, button.rect)); }
-                if let Some((id, rect)) = ctx.data(|d| d.get_temp::<(Id, egui::Rect)>(Id::new("batch button"))) {
-                    stops.push(((Panel::Library, Spot::Side), id, rect));
-                }
-                if let Some(action) = label.inner.1 { self.label_action(ctx, action); }
+                if let Some(action) = label.inner { self.label_action(ctx, action); }
             }
             if let Some(s) = &mut self.library_sheet {
                 if s.anim_panel {
-                    let side = egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                    egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                        set_pane(ui, (Panel::Library, Spot::Side));
                         library_anim = Self::animation_panel(ui, s, true, keys == (Panel::Library, Spot::Side));
                     });
-                    panes.push(((Panel::Library, Spot::Side), side.response.rect));
                 }
+                set_pane(ui, (Panel::Library, Spot::Sheet));
+                stop_id(ui.ctx(), library_id());
                 let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false, false, keys == (Panel::Library, Spot::Sheet)));
-                stops.push(((Panel::Library, Spot::Sheet), library_id(), out.response.rect));
                 let ev = out.inner;
                 if let Some(action) = ev.labels { self.label_action(ctx, action); }
                 if ev.interacted {
@@ -2897,23 +2569,25 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().show(ui, |ui| {
             self.project_rect = ui.max_rect();
-            panes.push(((Panel::Project, Spot::Sheet), ui.max_rect()));
+            set_pane(ui, (Panel::Project, Spot::Sheet));
             let live = keys == (Panel::Project, Spot::Sheet);
             let clicked;
             (project_tile, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project_sheet.as_mut(), None, Some(&mut self.project_eye));
             if clicked {
                 self.active = Panel::Project;
+                if self.project_sheet.is_some() { ctx.memory_mut(|m| m.request_focus(project_id())); }
             }
             let eye = self.project_eye;
             if let Some(s) = &mut self.project_sheet {
                 if s.anim_panel {
-                    let side = egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                    egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                        set_pane(ui, (Panel::Project, Spot::Side));
                         anim_changed = Self::animation_panel(ui, s, false, keys == (Panel::Project, Spot::Side));
                     });
-                    panes.push(((Panel::Project, Spot::Side), side.response.rect));
                 }
+                set_pane(ui, (Panel::Project, Spot::Sheet));
+                stop_id(ui.ctx(), project_id());
                 let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, project_id(), dragging, true, eye, keys == (Panel::Project, Spot::Sheet)));
-                stops.push(((Panel::Project, Spot::Sheet), project_id(), out.response.rect));
                 let ev = out.inner;
                 if ev.interacted {
                     self.active = Panel::Project;
@@ -2976,39 +2650,15 @@ impl eframe::App for App {
         if let Some((from, grab)) = drag_from {
             self.start_drag(ctx, from, grab);
         }
-        // Where everything ended up this frame: the panes, the places the
-        // arrow keys can stand, and the header rows. The keys of the next
-        // frame read these, so they must wait until the last pane has drawn.
-        self.pane_rects = panes.clone();
-        // A dialog that drew this frame owns its places, the button it hangs
-        // from included. They go in front, so that button answers as part of
-        // the dialog while it is open and as part of its pane when it is not.
-        let dialog = ctx.data_mut(|d| d.remove_temp::<Vec<(Id, egui::Rect)>>(Id::new("dialog stops"))).unwrap_or_default();
-        stops.splice(0..0, dialog.into_iter().map(|(id, r)| ((Panel::Library, Spot::Dialog), id, r)));
-        // The places of the header rows and the animation panels, gathered
-        // by the code that draws them.
-        for library in [true, false] {
-            let panel = if library { Panel::Library } else { Panel::Project };
-            for (key, spot) in [("header stops", Spot::Sheet), ("side stops", Spot::Side)] {
-                let here = ctx.data(|d| d.get_temp::<Vec<(Id, egui::Rect)>>(Id::new((key, library)))).unwrap_or_default();
-                stops.extend(here.into_iter().map(|(id, r)| ((panel, spot), id, r)));
-            }
-        }
+        // The stops of this frame, in reading order: pane by pane, and in
+        // each pane in the order they drew. The next frame's Tab walks them.
+        let mut stops = ctx.data_mut(|d| d.remove_temp::<Vec<((Panel, Spot), Id)>>(Id::new("stops"))).unwrap_or_default();
+        stops.sort_by_key(|(p, _)| PANES.iter().position(|q| q == p));
+        let mut seen = HashSet::new();
+        stops.retain(|(_, id)| seen.insert(*id));
         self.stops = stops;
         self.library_rows = library_rows;
         self.project_rows = project_rows;
-        self.take_pane(ctx, &panes);
-        // Whatever holds the keys inside a pane claims them from egui, which
-        // would otherwise walk the focus with the arrows and with Tab behind
-        // our back, and land on things like a panel's resize bar. A header
-        // row keeps its sideways walk, because egui does that one well: it
-        // steps between the fields by where they lie.
-        if let Some(id) = ctx.memory(|m| m.focused())
-            && !ctx.text_edit_focused()
-            && self.spot_of(ctx, id).is_some()
-        {
-            ctx.memory_mut(|m| m.set_focus_lock_filter(id, sheet::pane_focus()));
-        }
         self.update_drag(ctx);
     }
 }
@@ -3209,27 +2859,31 @@ impl<T: Copy + PartialEq> PairField<T> {
         if let Some(buf) = &mut edit.text {
             // The text box wears the button's own name. Without that the
             // button stops drawing the moment you type in it, egui drops the
-            // focus of a widget that has gone, and the panes hand the keys
-            // straight back to a button that is not there: a loop with
-            // nowhere to stand.
+            // focus of a widget that has gone, and the keys go back to the
+            // body of the pane. With one name, Tab also walks on from the
+            // text box as it does from the button.
             let mut box_ = egui::TextEdit::singleline(buf).desired_width(56.0);
             if let Some((id, _)) = ui.data(|d| d.get_temp::<(egui::Id, egui::Rect)>(self.id.with("widget"))) {
                 box_ = box_.id(id);
             }
             let r = ui.add(box_);
+            stop(&r);
             if edit.focus {
                 r.request_focus();
                 edit.focus = false;
             }
+            // The button comes back in the next frame, so ask for one.
             if ui.input(|i| i.key_pressed(Key::Escape)) {
                 edit.text = None;
                 shut_text_box(ui, r.id);
+                ui.ctx().request_repaint();
                 return None;
             }
             if r.lost_focus() {
                 let v = (self.parse)(buf);
                 edit.text = None;
                 shut_text_box(ui, r.id);
+                ui.ctx().request_repaint();
                 return v.filter(|n| *n != value);
             }
             return None;
@@ -3240,8 +2894,8 @@ impl<T: Copy + PartialEq> PairField<T> {
                 .sense(egui::Sense::click_and_drag()),
         );
         let r = r.on_hover_text(self.hover);
-        // The arrows walk from place to place by where each one lies, and
-        // only the widget itself knows that.
+        stop(&r);
+        // The text box takes this name when it opens.
         ui.data_mut(|d| d.insert_temp(self.id.with("widget"), (r.id, r.rect)));
         let mut new = value;
         if r.hovered() {
@@ -3586,5 +3240,18 @@ mod tests {
         unsafe { std::env::set_var("HOME", "/home/x") };
         assert_eq!(home_path(Path::new("/home/x/work/a.png")), "~/work/a.png");
         assert_eq!(home_path(Path::new("/opt/a.png")), "/opt/a.png");
+    }
+
+    #[test]
+    fn tab_walks_the_stops_and_wraps() {
+        let [a, b, c] = [Id::new("a"), Id::new("b"), Id::new("c")];
+        let stops = [a, b, c];
+        assert_eq!(next_stop(&stops, Some(a), None, 1), Some(b));
+        assert_eq!(next_stop(&stops, Some(c), None, 1), Some(a));
+        assert_eq!(next_stop(&stops, Some(a), None, -1), Some(c));
+        // A place that is not a stop starts the walk at the body of the pane.
+        assert_eq!(next_stop(&stops, Some(Id::new("x")), Some(b), 1), Some(b));
+        assert_eq!(next_stop(&stops, None, None, 1), Some(a));
+        assert_eq!(next_stop(&[], Some(a), None, 1), None);
     }
 }

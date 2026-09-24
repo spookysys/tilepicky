@@ -403,7 +403,7 @@ impl Panel {
         if !ready { ui.weak("Set a Google or OpenRouter batch model and key in Settings."); }
         let button = ui.add_enabled(ready && !single_busy && !self.busy() && !root.as_os_str().is_empty(),
             egui::Button::new("Label entire library with AI..."));
-        ui.data_mut(|d| d.insert_temp(egui::Id::new("batch button"), (button.id, button.rect)));
+        crate::stop(&button);
         if button.clicked() {
             let (provider, model) = configured.unwrap();
             let (provider, model, root) = (provider.clone(), model.id.clone(), root.to_path_buf());
@@ -416,13 +416,13 @@ impl Panel {
             }
         }
         if self.paused && self.job.as_ref().is_some_and(|j| j.started && !j.uncertain())
-            && ui.button("Resume batch / retry save").clicked() {
+            && crate::stopped(ui.button("Resume batch / retry save")).clicked() {
             self.paused = false; self.next_check = None; self.error.clear(); self.retry_import = true;
         }
         if let Some(job) = &mut self.job && job.uncertain() {
             ui.weak("Submission was interrupted. Check the provider's batch list and attach its ID. Nothing will be submitted again automatically.");
-            ui.text_edit_singleline(&mut self.attach_id);
-            if ui.button("Attach batch ID").clicked() {
+            crate::stopped(ui.text_edit_singleline(&mut self.attach_id));
+            if crate::stopped(ui.button("Attach batch ID")).clicked() {
                 match validate_id(job.provider.kind, self.attach_id.trim()) {
                     Ok(()) => {
                         if let Some(group) = job.groups.iter_mut().find(|g| g.remote == Remote::Submitting) {

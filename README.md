@@ -127,11 +127,20 @@ runs, you cannot label or remove the label of a single sheet.
 
 You can do the whole job without the mouse.
 
-`Tab` goes to the next panel, `Ctrl+Tab` jumps between the library and your
-own tilesheets. Inside a panel the arrows do the work: in a sheet they move
-the selection, and `Shift` makes it bigger; in a file tree they move a cursor,
-where `Enter` opens the file and Right and Left open and close a folder. Then
-`Ctrl+C` there and `Ctrl+V` here.
+`Ctrl+Tab` goes to the next panel. It walks the window one column at a
+time: the two file trees, then the two sheets, then the side panels. So the
+same panel in the other half is always one step away: `Ctrl+Tab` goes down,
+and `Ctrl+Shift+Tab` goes up. `Tab` walks every field and button on the
+way, in the same order.
+
+Inside a panel the arrows do the work: in a sheet they move the selection,
+and `Shift` makes it bigger; in a file tree they move a cursor, where `Enter`
+opens the file and Right and Left open and close a folder. The arrows never
+leave the panel. Then `Ctrl+C` there and `Ctrl+V` here.
+
+`Enter` or `Space` presses the button you are on, and `Enter` on a field
+lets you type in it. `Escape` or `Enter` in a field gives the keys back to
+the panel.
 
 The panel your keys are in has a blue title, and so does its selection.
 
@@ -221,8 +230,8 @@ A new sheet starts at the tile size that library or project used last, or at
 | Shift+arrows | hold one corner and walk the other |
 | Ctrl+arrows | jump to the end of the filled tiles, or across a gap to the next of them |
 | Alt+arrows | walk the whole selection, shape and all; the tiles stay put |
-| Tab, Shift+Tab | the next panel, or the one before |
-| Ctrl+Tab | the other half of the window, on the same kind of panel |
+| Tab, Shift+Tab | the next field or button, or the one before |
+| Ctrl+Tab, Ctrl+Shift+Tab | the next panel, or the one before; from the upper half this is the lower half, and back |
 | Ctrl+C, Ctrl+X, Ctrl+V | copy, cut, paste; cut and paste work on your tilesheet only |
 | Delete | clear the selected tiles of your tilesheet |
 | Enter or Space in a file tree | open the file under the cursor, or unfold the folder |
@@ -253,7 +262,7 @@ because the library never changes.
 
 Drop a block on an empty tilesheet panel and it starts a new tilesheet, at
 the tile size of the block, and asks for a name when you first save it.
-`Ctrl+Tab` out of the source sheet does the same when the canvas is empty,
+`Ctrl+Tab` down from the source sheet does the same when the canvas is empty,
 at the tile size of the sheet you come from.
 
 ## Settings

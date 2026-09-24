@@ -24,14 +24,6 @@ const SELECTED_FILL: Color32 = Color32::from_rgba_unmultiplied_const(80, 160, 25
 pub const SPARE: Color32 = Color32::from_rgb(150, 150, 150);
 const SPARE_FILL: Color32 = Color32::from_rgba_unmultiplied_const(150, 150, 150, 50);
 
-/// egui walks the keyboard focus with the arrows and with Tab, from one
-/// widget to the next. The panes of the window answer both themselves: the
-/// arrows move a selection, and Tab steps to the next pane. So each pane
-/// claims them while it holds the focus. Escape still reaches the sheet.
-pub fn pane_focus() -> egui::EventFilter {
-    egui::EventFilter { tab: true, escape: false, horizontal_arrows: true, vertical_arrows: true }
-}
-
 /// The zoom that keeps the pixels even. One image pixel must cover a whole
 /// number of screen pixels, or a whole number of image pixels must cover one
 /// screen pixel. With nearest sampling any other factor makes some rows and
@@ -1050,7 +1042,6 @@ impl Sheet {
             if library {
                 resp.context_menu(|ui| event.labels = crate::labels::menu(ui));
             }
-            ui.memory_mut(|m| m.set_focus_lock_filter(id, pane_focus()));
             self.screen = rect;
             self.clip = ui.clip_rect();
             let painter = ui.painter_at(rect);
