@@ -9,7 +9,7 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The end of a model id that marks a batch model.
 const BATCH: &str = ":batch";
@@ -164,9 +164,9 @@ pub struct Ai {
     pub batch: Option<ModelRef>,
 }
 
-/// What a fresh install offers: OpenRouter for instant answers and for
-/// batch jobs, with the free router and a cheap model; and Google, whose
-/// batch endpoint takes images, which OpenRouter's does not yet. No keys.
+/// A fresh install offers OpenRouter and Google models, without keys.
+/// Instant labeling uses the OpenAI-compatible endpoint. Library batches
+/// use OpenRouter's batch endpoint or Google's Gemini batch endpoint.
 impl Default for Ai {
     fn default() -> Self {
         let mut openrouter = Provider::new("OpenRouter", Kind::OpenAi);
@@ -237,18 +237,11 @@ impl Keys {
             .unwrap_or_default()
     }
 
-    /// Writes the keys that are not empty. A failure is silent, like the
-    /// settings.
-    pub fn save(&self) {
-        let Some(path) = Self::file() else { return };
+    pub fn save(&self) -> Result<(), String> {
+        let path = Self::file().ok_or("No configuration directory available.")?;
+        crate::storage::read::<BTreeMap<String, String>>(&path)?;
         let kept: BTreeMap<&String, &String> = self.0.iter().filter(|(_, v)| !v.is_empty()).collect();
-        let Ok(json) = serde_json::to_string_pretty(&kept) else {
-            return;
-        };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = write_private(&path, &json);
+        crate::storage::write(&path, &kept)
     }
 
     pub fn get(&self, provider: &str) -> Option<&str> {
@@ -266,25 +259,6 @@ impl Keys {
             self.0.insert(new.to_string(), v);
         }
     }
-}
-
-/// Writes a file that only its owner can read.
-fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)?.write_all(text.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 /// The settings page: the providers, the models, and the two defaults.

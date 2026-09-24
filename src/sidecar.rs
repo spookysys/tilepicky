@@ -130,11 +130,28 @@ pub struct StoredIsland {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Saved {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     pub identity: String,
-    pub sheet: Label,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<Label>,
     pub islands: Vec<StoredIsland>,
+}
+
+pub fn remove_labels(dir: &Path, rel: &str) -> Result<Option<Saved>, String> {
+    let mut book = load_book(dir)?;
+    let saved = book.sheets.get_mut(rel).and_then(|s| s.labels.as_mut());
+    if let Some(saved) = saved {
+        saved.provider.clear();
+        saved.model.clear();
+        saved.sheet = None;
+        for island in &mut saved.islands { island.label = None; }
+    }
+    let saved = book.sheets.get(rel).and_then(|s| s.labels.clone());
+    write_book(dir, &book)?;
+    Ok(saved)
 }
 
 /// What the book says about one sheet.
@@ -185,22 +202,32 @@ pub struct Book {
     pub sheets: BTreeMap<String, Sidecar>,
 }
 
-/// Reads the book. A missing or unreadable file is an empty book.
-pub fn load_book(dir: &Path) -> Book {
-    std::fs::read_to_string(dir.join(BOOK))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+/// A missing book is empty. Unreadable books must not be overwritten.
+pub fn load_book(dir: &Path) -> Result<Book, String> {
+    let book = crate::storage::read(&dir.join(BOOK))?;
+    #[cfg(windows)]
+    let book = normalize_windows_paths(book)?;
+    Ok(book)
 }
 
-fn write_book(dir: &Path, book: &Book) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(book).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join(BOOK), json).map_err(|e| e.to_string())
+#[cfg(any(windows, test))]
+fn normalize_windows_paths(mut book: Book) -> Result<Book, String> {
+    let old = std::mem::take(&mut book.sheets);
+    for (path, mut side) in old {
+        let path = path.replace('\\', "/");
+        for p in &mut side.provenance { p.source = p.source.replace('\\', "/"); }
+        if book.sheets.insert(path.clone(), side).is_some() { return Err(format!("Duplicate book entry: {path}")); }
+    }
+    Ok(book)
+}
+
+pub fn write_book(dir: &Path, book: &Book) -> Result<(), String> {
+    crate::storage::write(&dir.join(BOOK), book)
 }
 
 /// Remembers the tile size of a directory, for the sheets that name none.
 pub fn store_tile(dir: &Path, tile: [u32; 2]) -> Result<(), String> {
-    let mut book = load_book(dir);
+    let mut book = load_book(dir)?;
     let want = Some(Pair::of(tile));
     if book.tile == want {
         return Ok(());
@@ -212,7 +239,7 @@ pub fn store_tile(dir: &Path, tile: [u32; 2]) -> Result<(), String> {
 /// Moves or copies one entry to a new path, for a renamed or duplicated
 /// sheet.
 pub fn move_entry(dir: &Path, old: &str, new: &str, keep_old: bool) -> Result<(), String> {
-    let mut book = load_book(dir);
+    let mut book = load_book(dir)?;
     if let Some(e) = book.sheets.get(old).cloned() {
         if !keep_old {
             book.sheets.remove(old);
@@ -225,7 +252,7 @@ pub fn move_entry(dir: &Path, old: &str, new: &str, keep_old: bool) -> Result<()
 
 /// Re-keys every entry under a renamed folder.
 pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
-    let mut book = load_book(dir);
+    let mut book = load_book(dir)?;
     book.sheets = book
         .sheets
         .into_iter()
@@ -244,7 +271,7 @@ fn not(b: &bool) -> bool {
 }
 
 pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> {
-    let mut book = load_book(dir);
+    let mut book = load_book(dir)?;
     if side.is_empty() {
         book.sheets.remove(rel);
     } else {
@@ -255,7 +282,7 @@ pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> 
 
 /// Change labels without replacing grid edits made during a request.
 pub fn store_labels(dir: &Path, rel: &str, labels: Option<Saved>) -> Result<(), String> {
-    let mut book = load_book(dir);
+    let mut book = load_book(dir)?;
     let side = book.sheets.entry(rel.into()).or_default();
     side.labels = labels;
     if side.is_empty() { book.sheets.remove(rel); }
@@ -264,6 +291,19 @@ pub fn store_labels(dir: &Path, rel: &str, labels: Option<Saved>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_windows_paths_keep_entries_and_sources() {
+        let side = Sidecar { provenance: vec![Provenance { source: r"pack\tree.png".into(), rects: vec![[0, 0, 8, 8]] }],
+            ..Sidecar::default() };
+        let mut book = Book::default();
+        book.sheets.insert(r"folder\sheet.png".into(), side);
+        let normalized = normalize_windows_paths(book).unwrap();
+        assert_eq!(normalized.sheets["folder/sheet.png"].provenance[0].source, "pack/tree.png");
+        let mut duplicate = normalized;
+        duplicate.sheets.insert(r"folder\sheet.png".into(), Sidecar::default());
+        assert!(normalize_windows_paths(duplicate).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -272,25 +312,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tilepicky-book-{}-{unique}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let label = Label { status: Status::Labeled, caption: "Tree".into(), tags: vec!["forest".into()] };
-        let labels = Saved { provider: "test".into(), model: "instant".into(), identity: "pixels".into(), sheet: label.clone(),
+        let labels = Saved { provider: "test".into(), model: "instant".into(), identity: "pixels".into(), sheet: Some(label.clone()),
             islands: vec![StoredIsland { rects: vec![[3, 5, 20, 10]], label: Some(label) },
                 StoredIsland { rects: vec![[33, 5, 10, 10]], label: None }] };
         let grid = Sidecar { tile: Some(Pair::Two([10, 20])), ..Sidecar::default() };
         store_entry(&dir, "folder/sheet.png", &grid).unwrap();
         store_labels(&dir, "folder/sheet.png", Some(labels.clone())).unwrap();
-        let loaded = load_book(&dir).sheets.remove("folder/sheet.png").unwrap();
+        let loaded = load_book(&dir).unwrap().sheets.remove("folder/sheet.png").unwrap();
         assert_eq!(loaded.labels, Some(labels.clone()));
         assert_eq!(loaded.tile, grid.tile);
         move_entry(&dir, "folder/sheet.png", "folder/renamed.png", false).unwrap();
         move_prefix(&dir, "folder", "assets").unwrap();
-        let book = load_book(&dir);
+        let book = load_book(&dir).unwrap();
         assert_eq!(book.sheets.len(), 1);
         assert_eq!(book.sheets["assets/renamed.png"], loaded);
+        let removed = remove_labels(&dir, "assets/renamed.png").unwrap().unwrap();
+        assert!(removed.sheet.is_none());
+        assert!(removed.islands.iter().all(|i| i.label.is_none()));
+        assert_eq!(removed.islands.iter().map(|i| &i.rects).collect::<Vec<_>>(), labels.islands.iter().map(|i| &i.rects).collect::<Vec<_>>());
+        assert_eq!(load_book(&dir).unwrap().sheets["assets/renamed.png"].labels, Some(removed));
         store_labels(&dir, "assets/renamed.png", None).unwrap();
-        assert_eq!(load_book(&dir).sheets["assets/renamed.png"], grid);
+        assert_eq!(load_book(&dir).unwrap().sheets["assets/renamed.png"], grid);
         store_labels(&dir, "only-labels.png", Some(labels)).unwrap();
         store_labels(&dir, "only-labels.png", None).unwrap();
-        assert!(!load_book(&dir).sheets.contains_key("only-labels.png"));
+        assert!(!load_book(&dir).unwrap().sheets.contains_key("only-labels.png"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

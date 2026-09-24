@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 /// The formats the tool reads. It always writes 32 bit RGBA PNG.
 pub const IMAGE_EXTS: [&str; 7] = ["png", "gif", "jpg", "jpeg", "webp", "bmp", "tga"];
 
+#[derive(Clone)]
 pub struct Entry {
     pub rel: String,
     /// The words of the path, lower case.
@@ -21,6 +22,7 @@ pub struct Entry {
 pub struct Index {
     /// The folder this side reads. Empty when none is chosen yet.
     pub root: PathBuf,
+    pub error: Option<String>,
     pub entries: Vec<Entry>,
     /// Every directory under the root, so that empty folders show too.
     pub dirs: Vec<String>,
@@ -35,6 +37,7 @@ impl Index {
         if root.as_os_str().is_empty() {
             return Self {
                 root: PathBuf::new(),
+                error: None,
                 entries: Vec::new(),
                 dirs: Vec::new(),
                 tile: default_tile,
@@ -43,7 +46,7 @@ impl Index {
         let mut rels: Vec<String> = Vec::new();
         let mut dirs: Vec<String> = Vec::new();
         for e in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            let Some(rel) = e.path().strip_prefix(root).ok().map(|p| p.to_string_lossy().into_owned()) else {
+            let Some(rel) = e.path().strip_prefix(root).ok().map(relative_path) else {
                 continue;
             };
             if rel.is_empty() {
@@ -60,7 +63,9 @@ impl Index {
         }
         rels.sort();
         dirs.sort();
-        let mut book = sidecar::load_book(root);
+        let (mut book, error) = match sidecar::load_book(root) {
+            Ok(book) => (book, None), Err(e) => (sidecar::Book::default(), Some(e)),
+        };
         let entries = rels
             .into_iter()
             .map(|rel| {
@@ -73,6 +78,7 @@ impl Index {
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
         Self {
             root: root.to_path_buf(),
+            error,
             entries,
             dirs,
             tile,
@@ -126,4 +132,9 @@ pub fn query_words(q: &str) -> Vec<String> {
 
 pub fn matches(query: &[String], has: impl Fn(&str) -> bool) -> bool {
     query.iter().all(|q| has(q))
+}
+
+/// Book keys and tree paths use one separator on every platform.
+fn relative_path(path: &Path) -> String {
+    path.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
 }

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Cursor, path::{Path, PathBuf}, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action { Label, Remove }
+pub enum Action { Detect, Label, Remove }
 
 /// The same commands appear on the library sheet and its file-tree row.
 pub fn menu(ui: &mut eframe::egui::Ui) -> Option<Action> {
@@ -95,6 +95,18 @@ impl StoredIsland {
     }
 }
 
+/// Copy only an island's pixel regions. Holes and gaps stay transparent.
+pub fn crop(img: &RgbaImage, island: &StoredIsland) -> RgbaImage {
+    let [x0, y0, width, height] = island.bounds();
+    let mut crop = RgbaImage::new(width, height);
+    for &[left, top, w, h] in &island.rects {
+        for y in top..top + h {
+            for x in left..left + w { crop.put_pixel(x - x0, y - y0, *img.get_pixel(x, y)); }
+        }
+    }
+    crop
+}
+
 /// An owned snapshot keeps requests independent of navigation and later edits.
 pub struct Input {
     pub path: PathBuf,
@@ -114,7 +126,7 @@ impl Input {
         label(&self.img, &self.islands, model, send, |sheet, islands| {
             let saved = Saved {
                 identity: self.identity.clone(), provider: provider.into(), model: model.into(),
-                sheet: sheet.clone(), islands: self.geometry.iter().zip(&self.islands).map(|(geometry, (id, _))| {
+                sheet: Some(sheet.clone()), islands: self.geometry.iter().zip(&self.islands).map(|(geometry, (id, _))| {
                     StoredIsland { label: islands.get(id).cloned(), ..geometry.clone() }
                 }).collect(),
             };
@@ -124,6 +136,7 @@ impl Input {
 }
 
 pub enum Update {
+    Progress(String),
     Saved(Saved),
     Finished(Result<(), String>),
 }
@@ -134,6 +147,7 @@ pub struct Run {
     pub dir: PathBuf,
     pub rel: String,
     pub progress: String,
+    pub request_started: std::time::Instant,
     pub total: usize,
     pub saved: Option<Saved>,
     pub updates: std::sync::mpsc::Receiver<Update>,
@@ -142,14 +156,26 @@ pub struct Run {
 impl Run {
     pub fn start(
         input: Input, provider: String, model: String,
-        send: impl FnMut(&Value) -> Result<Value, String> + Send + 'static,
+        mut send: impl FnMut(&Value) -> Result<Value, String> + Send + 'static,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, String> {
         let (tx, updates) = std::sync::mpsc::channel();
         let run = Self { path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(), total: input.islands.len(),
-            saved: None, progress: "Labeling whole sheet...".into(), updates };
+            saved: None, progress: "Preparing whole-sheet request...".into(), request_started: std::time::Instant::now(), updates };
         std::thread::Builder::new().name("label sheet".into()).spawn(move || {
-            let result = input.run(&provider, &model, send, |saved| {
+            let mut request = 0;
+            let requests = 1 + input.islands.len().div_ceil(8);
+            let result = input.run(&provider, &model, |body| {
+                request += 1;
+                let stage = if request == 1 { "Whole sheet".to_string() } else {
+                    let first = (request - 2) * 8 + 1;
+                    format!("Islands {first}-{}", (first + 7).min(input.islands.len()))
+                };
+                tx.send(Update::Progress(format!("{stage} (request {request}/{requests})")))
+                    .map_err(|_| "The labeling window was closed.")?;
+                wake();
+                send(body)
+            }, |saved| {
                 tx.send(Update::Saved(saved)).map_err(|_| "The labeling window was closed.")?;
                 wake();
                 Ok(())
@@ -224,6 +250,9 @@ pub fn request(model: &str, context: Option<&Label>, images: &[(String, RgbaImag
 pub fn response(value: &Value, expected: &[String]) -> Result<BTreeMap<String, Label>, String> {
     let choice = value.get("choices").and_then(Value::as_array).filter(|c| c.len() == 1).and_then(|c| c.first())
         .ok_or("The endpoint returned no single completion.")?;
+    if choice["finish_reason"] == "length" {
+        return Err("The model reached its response limit before completing the labels. Choose an instant image model and retry.".into());
+    }
     if choice["finish_reason"] != "stop" { return Err("The response was incomplete or filtered.".into()); }
     let message = &choice["message"];
     if !message["refusal"].is_null() { return Err("The model refused the request.".into()); }
@@ -356,12 +385,14 @@ mod tests {
         let ctx = eframe::egui::Context::default();
         let mut output = ctx.run_ui(eframe::egui::RawInput::default(), |ui| { ui.label(&run.progress); });
         output.textures_delta.clear();
+        assert!(matches!(run.updates.try_recv(), Ok(Update::Progress(p)) if p == "Whole sheet (request 1/2)"));
         assert!(matches!(run.updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
         release.send(()).unwrap();
         let mut counts = Vec::new();
         let mut latest = None;
         loop {
             match run.updates.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Update::Progress(p) => assert_eq!(p, "Islands 1-2 (request 2/2)"),
                 Update::Saved(saved) => {
                     counts.push(saved.islands.iter().filter(|i| i.label.is_some()).count());
                     latest = Some(saved);
@@ -475,7 +506,7 @@ mod tests {
         assert_ne!(original, identity(&changed));
         assert_ne!(original, identity(&RgbaImage::new(4, 8)));
         let saved = Saved { identity: original.clone(), provider: "test".into(), model: "test".into(),
-            sheet: Label { status: Status::Unlabelable, caption: String::new(), tags: vec![] }, islands: vec![] };
+            sheet: None, islands: vec![] };
         assert!(saved.current(&original));
         assert!(!saved.current("different"));
     }

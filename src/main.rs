@@ -14,6 +14,10 @@ mod detect;
 mod index;
 mod islands;
 mod labels;
+mod batch;
+mod search;
+mod storage;
+mod files;
 mod settings;
 mod sheet;
 mod sidecar;
@@ -108,6 +112,10 @@ struct App {
     /// The AI assist panel of the library is open.
     ai_panel: bool,
     label_run: Option<labels::Run>,
+    label_outcome: Option<String>,
+    library_batch: batch::Panel,
+    search: search::Engine,
+    last_result: Option<Sheet>,
     remove_labels: Option<(PathBuf, String)>,
     /// The settings popup was open at the last frame; both files are
     /// written when it closes.
@@ -363,6 +371,10 @@ impl App {
             keys: ai::Keys::load(),
             ai_panel: false,
             label_run: None,
+            label_outcome: None,
+            library_batch: batch::Panel::default(),
+            search: search::Engine::default(),
+            last_result: None,
             remove_labels: None,
             config_open: false,
             legend_prompt: false,
@@ -389,7 +401,7 @@ impl App {
             pending: None,
             library_tree: Node::build(&library.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &library.dirs),
             project_tree: Node::build(&project.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &project.dirs),
-            status: String::new(),
+            status: library.error.clone().or_else(|| project.error.clone()).unwrap_or_default(),
             library,
             project,
             query: String::new(),
@@ -489,12 +501,12 @@ impl App {
                 self.rescan_project();
             }
         }
-        self.settings.save();
         let name = match panel {
             Panel::Library => "library",
             Panel::Project => "project",
         };
-        self.status = format!("{name}: {}", self.index(panel).root.display());
+        self.status = self.index(panel).error.clone().unwrap_or_else(|| format!("{name}: {}", self.index(panel).root.display()));
+        if let Err(e) = self.settings.save() { self.status = e; }
     }
 
     /// Remembers the tile size a side used last, in the folder's own book and
@@ -504,7 +516,7 @@ impl App {
             return;
         }
         let root = self.index(panel).root.clone();
-        let _ = sidecar::store_tile(&root, tile);
+        if let Err(e) = sidecar::store_tile(&root, tile) { self.status = e; return; }
         match panel {
             Panel::Library => {
                 self.library.tile = tile;
@@ -515,10 +527,15 @@ impl App {
                 self.settings.project.tile = Some(Pair::of(tile));
             }
         }
-        self.settings.save();
+        if let Err(e) = self.settings.save() { self.status = e; }
     }
 
     fn refresh_query(&mut self) {
+        self.last_result = None;
+        self.search.invalidate();
+        self.status = if self.query.trim().is_empty() { String::new() } else { "Searching...".into() };
+        if self.library_sheet.as_ref().is_some_and(|s| s.virtual_sheet) { self.library_sheet = None; }
+        if let Some(s) = &mut self.library_sheet { s.search_matches = None; }
         self.qwords = index::query_words(&self.query);
         self.open_trees = true;
         self.library_visible = self.library.visible(&self.qwords, self.settings.search);
@@ -674,6 +691,13 @@ impl App {
                 if let Some(prev) = &self.library_sheet {
                     s.zoom = prev.zoom;
                 }
+                if let Some(output) = &self.search.output {
+                    s.search_matches = Some(output.hits.iter().filter(|h| h.rel == s.rel).flat_map(|h| h.island.rects.clone()).collect());
+                }
+                if self.library_sheet.as_ref().is_some_and(|s| s.virtual_sheet) {
+                    self.last_result = self.library_sheet.take();
+                    if let Some(result) = &mut self.last_result { result.remember_view(); }
+                }
                 self.library_sheet = Some(s);
                 self.library_sel = Some(i);
                 // The keys follow the file, however it was opened. A click
@@ -735,34 +759,24 @@ impl App {
     }
 
     fn rescan_library(&mut self) {
+        self.last_result = None;
+        self.search.invalidate();
         self.library = Index::scan(&self.library.root, self.library.tile);
         self.library_tree = Node::build(&self.library.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.library.dirs);
         self.library_visible = self.library.visible(&self.qwords, self.settings.search);
         self.library_sel = self.library_sheet.as_ref().and_then(|s| self.library.position(&s.rel));
-        self.status = format!("{} files in the library", self.library.entries.len());
+        self.status = self.library.error.clone().unwrap_or_else(|| format!("{} files in the library", self.library.entries.len()));
     }
 
     fn rescan_project(&mut self) {
         self.marked.clear();
         self.project = Index::scan(&self.project.root, self.project.tile);
+        if let Some(e) = &self.project.error { self.status = e.clone(); }
         self.project_tree = Node::build(&self.project.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.project.dirs);
         self.project_visible = self.project.visible(&self.qwords, self.settings.search);
         if let Some(rel) = self.project_sheet.as_ref().map(|s| s.rel.clone()) {
             self.project_sel = self.project.position(&rel);
         }
-    }
-
-    /// A clean relative path from a typed name; `ext` is added when missing.
-    fn normalize_name(name: &str, ext: Option<&str>) -> Option<String> {
-        let name = name.trim().trim_matches('/');
-        if name.is_empty() || name.split('/').any(|p| p.trim().is_empty() || p == "." || p == "..") {
-            return None;
-        }
-        let mut rel = name.to_string();
-        if let Some(ext) = ext && !rel.to_ascii_lowercase().ends_with(ext) {
-            rel.push_str(ext);
-        }
-        Some(rel)
     }
 
     /// A click on the legend asks before it goes; the settings bring it back.
@@ -779,7 +793,7 @@ impl App {
             ui.horizontal(|ui| {
                 if ui.button("Hide").clicked() {
                     self.settings.hide_legend = true;
-                    self.settings.save();
+                    if let Err(e) = self.settings.save() { self.status = e; }
                     done = true;
                 }
                 if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -834,25 +848,8 @@ impl App {
     /// book entries. Runs only after the confirm dialog.
     fn delete_paths(&mut self, rels: &[String]) -> Result<(), String> {
         let root = self.project.root.clone();
-        let mut book = sidecar::load_book(&root);
-        for rel in rels {
-            let path = root.join(rel);
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
-                book.sheets.retain(|k, _| k != rel && !k.starts_with(&format!("{rel}/")));
-                if let Some(sheet) = &self.project_sheet && sheet.rel.starts_with(&format!("{rel}/")) {
-                    self.project_sheet = None;
-                }
-            } else {
-                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-                book.sheets.remove(rel);
-                if self.project_sheet.as_ref().is_some_and(|s| s.rel == *rel) {
-                    self.project_sheet = None;
-                }
-            }
-        }
-        let json = serde_json::to_string_pretty(&book).map_err(|e| e.to_string())?;
-        std::fs::write(root.join(sidecar::BOOK), json).map_err(|e| e.to_string())?;
+        files::remove(&root, rels)?;
+        if self.project_sheet.as_ref().is_some_and(|sheet| !root.join(&sheet.rel).exists()) { self.project_sheet = None; }
         self.status = format!("deleted {}", rels.join(", "));
         self.rescan_project();
         Ok(())
@@ -943,48 +940,28 @@ impl App {
     /// Moves or copies one file of the PROJECT tree, with its book entry. The
     /// open sheet follows its own file.
     fn relocate(&mut self, old: &str, new: &str, copy: bool) -> Result<(), String> {
-        let root = self.project.root.clone();
-        if new == old {
-            return Ok(());
-        }
-        if root.join(new).exists() {
-            return Err(format!("{new} exists"));
-        }
-        if let Some(parent) = root.join(new).parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        if copy {
-            std::fs::copy(root.join(old), root.join(new)).map_err(|e| e.to_string())?;
-        } else {
-            std::fs::rename(root.join(old), root.join(new)).map_err(|e| e.to_string())?;
-            if let Some(sheet) = &mut self.project_sheet && sheet.rel == old {
-                sheet.rel = new.to_string();
-            }
-        }
-        sidecar::move_entry(&root, old, new, copy)
+        files::relocate(&self.project.root, old, new, copy)?;
+        if !copy && let Some(sheet) = &mut self.project_sheet && sheet.rel == old { sheet.rel = new.to_string(); }
+        Ok(())
     }
 
     fn apply_name(&mut self, ctx: &egui::Context, what: &NameFor, name: &str) -> Result<(), String> {
         let root = self.project.root.clone();
         match what {
             NameFor::NewFolder(parent) => {
-                let rel = Self::normalize_name(name, None).ok_or("that is not a usable name")?;
+                let rel = files::normalize_name(name, None).ok_or("that is not a usable name")?;
                 let dir = if parent.is_empty() { rel } else { format!("{parent}/{rel}") };
                 std::fs::create_dir_all(root.join(&dir)).map_err(|e| e.to_string())?;
                 self.rescan_project();
             }
             NameFor::RenameFolder(old) => {
-                let rel = Self::normalize_name(name, None).ok_or("that is not a usable name")?;
+                let rel = files::normalize_name(name, None).ok_or("that is not a usable name")?;
                 let new = match old.rsplit_once('/') {
                     Some((parent, _)) => format!("{parent}/{rel}"),
                     None => rel,
                 };
                 if new != *old {
-                    if root.join(&new).exists() {
-                        return Err(format!("{new} exists"));
-                    }
-                    std::fs::rename(root.join(old), root.join(&new)).map_err(|e| e.to_string())?;
-                    sidecar::move_prefix(&root, old, &new)?;
+                    files::relocate(&root, old, &new, false)?;
                     if let Some(sheet) = &mut self.project_sheet
                         && let Some(rest) = sheet.rel.strip_prefix(&format!("{old}/")) {
                         sheet.rel = format!("{new}/{rest}");
@@ -993,7 +970,7 @@ impl App {
                 }
             }
             NameFor::SaveAs => {
-                let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
+                let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
                 if root.join(&rel).exists() {
                     return Err(format!("{rel} exists"));
                 }
@@ -1009,14 +986,14 @@ impl App {
                 self.rescan_project();
             }
             NameFor::RenameFile(old) => {
-                let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
+                let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
                 if rel != *old {
                     self.relocate(old, &rel, false)?;
                     self.rescan_project();
                 }
             }
             NameFor::DuplicateFile(old) => {
-                let rel = Self::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
+                let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
                 self.relocate(old, &rel, true)?;
                 self.rescan_project();
                 if let Some(i) = self.project.position(&rel) {
@@ -1196,15 +1173,15 @@ impl App {
         }
         let open = egui::Popup::is_id_open(ui.ctx(), id) && !shut;
         if self.config_open && !open {
-            self.settings.save();
-            self.keys.save();
+            if let Err(e) = self.settings.save() { self.status = e; }
+            if let Err(e) = self.keys.save() { self.status = e; }
         }
         self.config_open = open;
     }
 
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     fn dialog_open(&self, ctx: &egui::Context) -> bool {
-        self.prompt.is_some() || self.confirm.is_some() || self.remove_labels.is_some()
+        self.prompt.is_some() || self.confirm.is_some() || self.remove_labels.is_some() || self.library_batch.review
             || self.pending.is_some() || self.legend_prompt || egui::Popup::is_any_open(ctx)
     }
 
@@ -1588,6 +1565,11 @@ impl App {
                 clicked = Self::header_tail(ui, None, ai, eye, String::new(), None);
                 return;
             };
+            if s.virtual_sheet {
+                ui.label(&s.rel);
+                clicked = Self::header_tail(ui, Some(s), None, eye, "Virtual search result".into(), None);
+                return;
+            }
             ui.weak(format!("{}x{} tiles", s.cols(), s.rows()));
             ui.label("tile");
             if let Some(t) = tile_field(library).ui(ui, s.tile) {
@@ -1635,7 +1617,7 @@ impl App {
             // The buttons of the sheet wait, greyed out, for a sheet.
             let open = sheet.is_some();
             if let Some(ai) = ai {
-                let r = ui.add_enabled(open, egui::Button::new("✨").small().selected(*ai)).on_hover_text("AI assist panel (I)");
+                let r = ui.add(egui::Button::new("✨").small().selected(*ai)).on_hover_text("AI assist panel (I)");
                 here.push((r.id, r.rect));
                 if r.clicked() {
                     *ai = !*ai;
@@ -1676,8 +1658,9 @@ impl App {
 
     /// Configuration belongs in Settings; this panel shows the selected sheet's work.
     fn assist_panel(
-        ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys, sheet: Option<&Sheet>, run: Option<&labels::Run>,
+        ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys, sheet: Option<&Sheet>, run: Option<&labels::Run>, outcome: Option<&str>,
     ) -> (Vec<egui::Response>, Option<labels::Action>) {
+        let sheet = sheet.filter(|s| !s.virtual_sheet);
         ui.strong("AI labels");
         let ready = match ai.chosen(ai::Mode::Instant) {
             Some((p, m)) if p.kind == ai::Kind::OpenAi && p.key_source(keys) != ai::KeySource::None => {
@@ -1688,28 +1671,52 @@ impl App {
         };
         if let Some(run) = run {
             ui.horizontal(|ui| { ui.spinner(); ui.label(&run.progress); });
+            ui.weak(format!("Waiting for model reply: {}s. Request timeout: 60s.", run.request_started.elapsed().as_secs()));
+            if let Some(saved) = &run.saved {
+                let count = saved.islands.iter().filter(|i| i.label.is_some()).count();
+                ui.weak(format!("Whole sheet received; {count}/{} island results received.", run.total));
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             ui.weak(run.path.file_name().unwrap_or_default().to_string_lossy()).on_hover_text(run.path.display().to_string());
         }
         if let Some(sheet) = sheet {
-            ui.label(sheet.label_summary());
-            if !sheet.label_notice.is_empty() { ui.label(&sheet.label_notice); }
+            if !run.is_some_and(|r| r.path == sheet.dir.join(&sheet.rel)) { ui.label(sheet.label_summary()); }
+            if outcome.is_none() && !sheet.label_notice.is_empty() { ui.label(&sheet.label_notice); }
         } else { ui.weak("Select a library sheet."); }
+        if run.is_none() && let Some(outcome) = outcome { ui.label(outcome); }
+        let detect = ui.add_enabled(sheet.is_some() && run.is_none(), egui::Button::new("Detect islands"))
+            .on_hover_text("Builds island regions locally. Sends nothing to a model.");
         let label = ui.add_enabled(ready && sheet.is_some() && run.is_none(), egui::Button::new("Label with AI"))
             .on_hover_text("Sends this sheet and its island crops to the configured instant model.");
         ui.data_mut(|d| d.insert_temp(Id::new("label button"), label.id));
         let remove = ui.add_enabled(sheet.is_some() && run.is_none(), egui::Button::new("Remove saved AI labels..."));
-        let action = if label.clicked() { Some(labels::Action::Label) } else if remove.clicked() { Some(labels::Action::Remove) } else { None };
-        (vec![label, remove], action)
+        let action = if detect.clicked() { Some(labels::Action::Detect) } else if label.clicked() { Some(labels::Action::Label) }
+            else if remove.clicked() { Some(labels::Action::Remove) } else { None };
+        (vec![detect, label, remove], action)
     }
 
     /// Every UI entry point reaches this operation after selecting its target sheet.
     fn label_action(&mut self, ctx: &egui::Context, action: labels::Action) {
-        self.ai_panel = true;
-        if self.label_run.is_some() || self.remove_labels.is_some() {
+        if action != labels::Action::Detect { self.ai_panel = true; }
+        if self.label_run.is_some() || self.remove_labels.is_some() || self.library_batch.busy() {
             self.status = "Finish the current labeling operation first.".into();
             return;
         }
         let Some(sheet) = &mut self.library_sheet else { return };
+        if sheet.virtual_sheet { self.status = "Open a source file to label it.".into(); return; }
+        if action == labels::Action::Detect {
+            let path = sheet.dir.join(&sheet.rel);
+            match sheet.save_islands() {
+                Ok(saved) => {
+                    self.status = format!("Saved {} islands.", saved.islands.len());
+                    sheet.label_notice = self.status.clone();
+                    self.apply_labels(&path, Some(saved));
+                }
+                Err(error) => { self.status = error.clone(); sheet.label_notice = error; }
+            }
+            self.label_outcome = None;
+            return;
+        }
         if action == labels::Action::Remove {
             self.remove_labels = Some((sheet.dir.clone(), sheet.rel.clone()));
             ctx.request_repaint();
@@ -1725,8 +1732,8 @@ impl App {
             labels::Run::start(input, provider.name.clone(), model.id.clone(), move |body| endpoint.send(body), move || ctx.request_repaint())
         })();
         match result {
-            Ok(run) => { sheet.label_notice.clear(); self.label_run = Some(run); ctx.request_repaint(); }
-            Err(error) => { sheet.label_notice = error; self.status = sheet.label_notice.clone(); }
+            Ok(run) => { sheet.label_notice.clear(); self.label_outcome = None; self.label_run = Some(run); ctx.request_repaint(); }
+            Err(error) => { self.label_outcome = Some(error.clone()); sheet.label_notice = error; self.status = sheet.label_notice.clone(); }
         }
     }
 
@@ -1735,11 +1742,11 @@ impl App {
         let Some(mut run) = self.label_run.take() else { return };
         let result = loop {
             match run.updates.try_recv() {
-                Ok(labels::Update::Saved(saved)) => {
-                    let count = saved.islands.iter().filter(|i| i.label.is_some()).count();
-                    run.progress = format!("Island results: {count}/{}", run.total);
-                    run.saved = Some(saved);
+                Ok(labels::Update::Progress(progress)) => {
+                    run.progress = progress;
+                    run.request_started = std::time::Instant::now();
                 }
+                Ok(labels::Update::Saved(saved)) => { run.saved = Some(saved); }
                 Ok(labels::Update::Finished(result)) => break Some(result),
                 Err(TryRecvError::Empty) => break None,
                 Err(TryRecvError::Disconnected) => break Some(Err("The labeling operation stopped unexpectedly.".into())),
@@ -1754,16 +1761,53 @@ impl App {
             }
             let notice = match result {
                 Ok(()) => "Labels saved. Use the eye (E) to inspect them.".to_string(),
-                Err(error) => error,
+                Err(error) => format!("Labeling failed: {error}"),
             };
             if let Some(sheet) = self.library_sheet.as_mut().filter(|s| s.dir.join(&s.rel) == run.path) {
                 sheet.label_notice = notice.clone();
             }
             self.status = format!("{}: {notice}", run.path.file_name().unwrap_or_default().to_string_lossy());
+            self.label_outcome = Some(self.status.clone());
         } else { self.label_run = Some(run); }
     }
 
+    fn import_batch_labels(&mut self) {
+        let Some(job) = &self.library_batch.job else { return; };
+        if !job.started { return; }
+        let root = self.library_batch.root.clone();
+        let results: Vec<_> = job.sheets.iter().enumerate().filter(|(_, s)| !s.imported)
+            .filter_map(|(i, s)| job.result(i).map(|labels| (i, s.rel.clone(), s.grid, labels))).collect();
+        if results.is_empty() { return; }
+        let mut book = match sidecar::load_book(&root) {
+            Ok(book) => book, Err(e) => { self.library_batch.pause(e); return; }
+        };
+        for (i, rel, grid, labels) in results {
+            if !root.join(&rel).is_file() {
+                if let Some(job) = &mut self.library_batch.job { job.sheets[i].error = "Source file moved or was removed.".into(); }
+                continue;
+            }
+            let side = book.sheets.entry(rel.clone()).or_default();
+            if side.labels.as_ref() != Some(&labels) {
+                side.labels = Some(labels.clone());
+                if side.tile.is_none() {
+                    side.tile = Some(Pair::of(grid.0));
+                    side.gap = Some(Pair::of(grid.1));
+                    side.offset = Some(Pair::of(grid.2));
+                    side.read = true;
+                }
+                if let Err(e) = sidecar::store_entry(&root, &rel, side) {
+                    self.library_batch.pause(format!("Could not save {rel}: {e}"));
+                    return;
+                }
+                self.apply_labels(&root.join(&rel), Some(labels));
+            }
+            if let Some(job) = &mut self.library_batch.job { job.sheets[i].imported = true; }
+        }
+        if let Some(job) = &self.library_batch.job && let Err(e) = job.save(&self.library_batch.dir) { self.library_batch.pause(e); }
+    }
+
     fn apply_labels(&mut self, path: &Path, labels: Option<sidecar::Saved>) {
+        self.search.invalidate();
         for index in [&mut self.library, &mut self.project] {
             for entry in &mut index.entries {
                 if index.root.join(&entry.rel) == path { entry.side.labels = labels.clone(); }
@@ -1794,9 +1838,9 @@ impl App {
             self.remove_labels = None;
             if remove {
                 labels::delete_legacy(&path);
-                match sidecar::store_labels(&dir, &rel, None) {
-                    Ok(()) => {
-                        self.apply_labels(&path, None);
+                match sidecar::remove_labels(&dir, &rel) {
+                    Ok(saved) => {
+                        self.apply_labels(&path, saved);
                         self.status = "Saved AI labels removed.".into();
                     }
                     Err(error) => self.status = error,
@@ -1873,6 +1917,7 @@ impl App {
                 if let (Some(i), Some(sheet)) = (self.library_sel, &self.library_sheet) {
                     self.library.entries[i].side = sheet.side.clone();
                 }
+                self.search.invalidate();
             }
         }
     }
@@ -1982,7 +2027,7 @@ impl App {
         match spot {
             Spot::Tree => true,
             Spot::Sheet => sheet.is_some(),
-            Spot::Side => sheet.is_some_and(|s| (panel == Panel::Library && self.ai_panel) || (s.anim_panel && !s.sel.is_empty())),
+            Spot::Side => (panel == Panel::Library && self.ai_panel) || sheet.is_some_and(|s| s.anim_panel && !s.sel.is_empty()),
             // One status bar, and it rides with the project half.
             Spot::Status => panel == Panel::Project,
             // Tab never walks into a dialog: it opens with a button, and it
@@ -2017,7 +2062,11 @@ impl App {
             Spot::Sheet => project_id(),
             // The frame field is where the work is; the title is always
             // there, even on the frame the panel opens.
-            Spot::Side if library && self.ai_panel => ctx.data(|d| d.get_temp(Id::new("label button")))?,
+            Spot::Side if library && self.ai_panel => {
+                if self.library_sheet.is_none() {
+                    ctx.data(|d| d.get_temp::<(Id, egui::Rect)>(Id::new("batch button")))?.0
+                } else { ctx.data(|d| d.get_temp(Id::new("label button")))? }
+            }
             Spot::Side => side_id(ctx, library).unwrap_or_else(|| anim_heading_id(library)),
             Spot::Status => gear_id(ctx)?,
             Spot::Dialog => return None,
@@ -2354,6 +2403,27 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         self.receive_labels();
+        if self.search.tick(ctx, &self.library, &self.query, self.settings.search) {
+            if let Some(output) = &mut self.search.output {
+                self.library_visible = Some(output.visible.clone());
+                self.open_trees = true;
+                self.status = format!("{} matching islands in {} files", output.hits.len(), output.visible.iter().filter(|&&v| v).count());
+                if let Some(notice) = output.notices.first() { self.status.push_str(&format!(". {notice}")); }
+                if self.settings.search.view == settings::SearchView::Virtual {
+                    self.last_result = None;
+                    self.library_sheet = output.packed.take().map(|p| Sheet::from_search(ctx, &self.library.root, &self.query, p));
+                    self.library_sel = None;
+                } else if let Some(s) = &mut self.library_sheet {
+                    s.search_matches = Some(output.hits.iter().filter(|h| h.rel == s.rel).flat_map(|h| h.island.rects.clone()).collect());
+                }
+            } else {
+                self.library_visible = None;
+                if let Some(s) = &mut self.library_sheet { s.search_matches = None; }
+            }
+        }
+        if self.label_run.is_none() && self.remove_labels.is_none() && self.library_batch.tick(ctx, &self.library.root, &self.keys) {
+            self.import_batch_labels();
+        }
         // A right click first closes any open menu. egui closes a menu on any
         // click while it is open, and it does that after the same click has
         // opened the new menu; without this every second right click shows
@@ -2442,18 +2512,22 @@ impl eframe::App for App {
                         ui.strong("Search in");
                         let first = ui.checkbox(&mut self.settings.search.folders, "folder names");
                         let second = ui.checkbox(&mut self.settings.search.files, "file names");
-                        let mut changed = first.changed();
-                        changed |= second.changed();
-                        if dialog_stops(ui, &r, &[&first, &second]) {
+                        let third = ui.checkbox(&mut self.settings.search.captions, "captions");
+                        let fourth = ui.checkbox(&mut self.settings.search.tags, "tags");
+                        ui.separator();
+                        ui.strong("Library results");
+                        let files = ui.radio_value(&mut self.settings.search.view, settings::SearchView::Files, "Filter files");
+                        let virtual_sheet = ui.radio_value(&mut self.settings.search.view, settings::SearchView::Virtual, "Virtual tilesheet");
+                        let changed = [&first, &second, &third, &fourth].iter().any(|r| r.changed())
+                            || files.clicked() || virtual_sheet.clicked();
+                        if dialog_stops(ui, &r, &[&first, &second, &third, &fourth, &files, &virtual_sheet]) {
                             shut_search_in = true;
                         }
                         if changed {
                             self.refresh_query();
-                            self.settings.save();
+                            if let Err(e) = self.settings.save() { self.status = e; }
                         }
-                        if AI_VISIBLE {
-                            ui.weak("The captions and tags the AI writes join this list later.");
-                        }
+                        ui.weak("Words match by prefix. All words must match.\nProject search uses file and folder names.");
                     });
                     // Down leaves the search field for the files below. It
                     // is taken before the field draws, because a text field
@@ -2716,10 +2790,7 @@ impl eframe::App for App {
                 if !self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) {
                     self.open_library(ctx, i);
                 }
-                if let Some(s) = self.library_sheet.as_mut().filter(|s| s.rel == rel) {
-                    s.detect_islands();
-                    self.status = format!("Detected islands in {rel}. Use the eye (E) to inspect islands.");
-                }
+                if self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) { self.label_action(ctx, labels::Action::Detect); }
             }
             Some(TreeAction::Labels(i, action)) => {
                 let rel = self.library.entries[i].rel.clone();
@@ -2847,6 +2918,7 @@ impl eframe::App for App {
         self.name_dialog(ctx);
         self.confirm_dialog(ctx);
         self.remove_labels_dialog(ctx);
+        self.library_batch.confirmation(ctx);
         if create {
             self.request(ctx, Pending::Create);
         }
@@ -2873,23 +2945,41 @@ impl eframe::App for App {
         ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
         egui::Panel::top("library panel").resizable(true).show(ui, |ui| {
             panes.push(((Panel::Library, Spot::Sheet), ui.max_rect()));
-            let live = keys == (Panel::Library, Spot::Sheet);
-            let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
-            let eye = LIBRARY_EYE_VISIBLE.then_some(&mut self.library_eye);
-            let clicked;
-            (library_tile, clicked) = Self::sheet_header(ui, "Source", live, true, self.library_sheet.as_mut(), ai, eye);
-            if clicked {
-                self.active = Panel::Library;
-            }
+            ui.horizontal(|ui| {
+                if self.last_result.is_some() {
+                    let back = ui.small_button("Back to search");
+                    stops.push(((Panel::Library, Spot::Sheet), back.id, back.rect));
+                    if back.clicked() {
+                        self.library_sheet = self.last_result.take();
+                        self.library_sel = None;
+                        self.active = Panel::Library;
+                    }
+                }
+                let live = keys == (Panel::Library, Spot::Sheet);
+                let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
+                let eye = LIBRARY_EYE_VISIBLE.then_some(&mut self.library_eye);
+                let clicked;
+                (library_tile, clicked) = Self::sheet_header(ui, "Source", live, true, self.library_sheet.as_mut(), ai, eye);
+                if clicked { self.active = Panel::Library; }
+            });
             let eye = self.library_eye;
             if self.ai_panel {
                 let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref(), self.label_run.as_ref())
+                        let out = ui.add_enabled_ui(!self.library_batch.busy(), |ui| {
+                            Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref(),
+                                self.label_run.as_ref(), self.label_outcome.as_deref())
+                        }).inner;
+                        self.library_batch.ui(ui, &self.library.root, &self.settings.ai, &self.keys,
+                            self.label_run.is_some() || self.remove_labels.is_some());
+                        out
                     }).inner
                 });
                 panes.push(((Panel::Library, Spot::Side), label.response.rect));
                 for button in &label.inner.0 { stops.push(((Panel::Library, Spot::Side), button.id, button.rect)); }
+                if let Some((id, rect)) = ctx.data(|d| d.get_temp::<(Id, egui::Rect)>(Id::new("batch button"))) {
+                    stops.push(((Panel::Library, Spot::Side), id, rect));
+                }
                 if let Some(action) = label.inner.1 { self.label_action(ctx, action); }
             }
             if let Some(s) = &mut self.library_sheet {
@@ -2902,6 +2992,11 @@ impl eframe::App for App {
                 let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false, eye, keys == (Panel::Library, Spot::Sheet)));
                 stops.push(((Panel::Library, Spot::Sheet), library_id(), out.response.rect));
                 let ev = out.inner;
+                if ev.selected_island { self.library_eye = false; }
+                if let Some(source) = ev.source {
+                    if let Some(i) = self.library.position(&source) { self.open_library(ctx, i); }
+                    else { self.status = format!("Source file is no longer in the library: {source}"); }
+                }
                 if let Some(action) = ev.labels { self.label_action(ctx, action); }
                 if ev.interacted {
                     self.active = Panel::Library;
@@ -3577,7 +3672,7 @@ fn main() -> eframe::Result {
     }
     // A folder given here is what the tool offers next time, so it is
     // written before the window opens.
-    settings.save();
+    if let Err(e) = settings.save() { eprintln!("{e}"); }
     let icon = image::load_from_memory(include_bytes!("../icon.png")).expect("icon.png").to_rgba8();
     let icon = egui::IconData {
         width: icon.width(),

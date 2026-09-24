@@ -56,7 +56,7 @@ jobs:
       # the OpenGL Apple deprecated.
       - name: Build
         if: matrix.os != 'macos-latest'
-        run: cargo build --release --features wgpu
+        run: cargo build --locked --release --features wgpu
 
       # One download for both kinds of Mac, rather than asking a person
       # which processor they have.
@@ -64,8 +64,8 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --features wgpu --target aarch64-apple-darwin
-          cargo build --release --features wgpu --target x86_64-apple-darwin
+          cargo build --locked --release --features wgpu --target aarch64-apple-darwin
+          cargo build --locked --release --features wgpu --target x86_64-apple-darwin
           mkdir -p target/release
           lipo -create -output target/release/tilepicky \
             target/aarch64-apple-darwin/release/tilepicky \
@@ -111,6 +111,7 @@ jobs:
           dir="tilepicky-$tag-${{ matrix.name }}"
           mkdir "$dir"
           cp target/release/tilepicky README.md LICENSE "$dir"/
+          cp -r docs "$dir"/
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
             cp tilepicky.desktop icon.png "$dir"/
           fi
@@ -125,6 +126,7 @@ jobs:
           $dir = "tilepicky-$tag-${{ matrix.name }}"
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item target/release/tilepicky.exe, README.md, LICENSE $dir
+          Copy-Item -Recurse docs $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 

@@ -3,6 +3,8 @@
 
 use image::{Rgba, RgbaImage};
 
+mod partition;
+
 /// Geometry of one island. Future labels can refer to its index in `Islands`.
 #[derive(Debug, PartialEq)]
 pub struct Island {
@@ -18,6 +20,11 @@ type PixelRect = (u32, u32, u32, u32);
 
 /// Rectangles come from the sheet's grid geometry, including clipped cells and gaps.
 pub fn detect(img: &RgbaImage, cols: u32, rows: u32, rect: impl Fn(u32, u32) -> PixelRect) -> Islands {
+    partition::detect(img, cols, rows, rect)
+}
+
+#[cfg(test)]
+fn detect_connected(img: &RgbaImage, cols: u32, rows: u32, rect: impl Fn(u32, u32) -> PixelRect) -> Islands {
     let rects: Vec<_> = (0..rows).flat_map(|y| (0..cols).map(move |x| (x, y))).map(|(x, y)| {
         let (x0, y0, x1, y1) = rect(x, y);
         (x0.min(img.width()), y0.min(img.height()), x1.min(img.width()), y1.min(img.height()))
@@ -57,8 +64,47 @@ pub fn detect(img: &RgbaImage, cols: u32, rows: u32, rect: impl Fn(u32, u32) -> 
     result
 }
 
+/// Read a missing grid using the same geometry as an opened sheet.
+pub fn grid(img: &RgbaImage, side: &crate::sidecar::Sidecar, fallback: [u32; 2]) -> crate::Grid {
+    use crate::sidecar::Pair;
+    let read = side.tile.is_none().then(|| crate::detect::grid(img));
+    let tile = side.tile.map(Pair::xy).unwrap_or_else(|| read.map_or(fallback, |(x, y)| [x.tile, y.tile]));
+    let gap = side.gap.map(Pair::xy).unwrap_or_else(|| read.map_or([0, 0], |(x, y)| [x.gap, y.gap]));
+    let found = read.map_or([0, 0], |(x, y)| [x.offset, y.offset]);
+    let offset = crate::sheet::clamp_offset(side.offset.map(Pair::xy).unwrap_or(found), tile, gap);
+    (tile, gap, offset)
+}
+
+pub fn pixel_rect(img: &RgbaImage, (tile, gap, offset): crate::Grid, x: u32, y: u32) -> PixelRect {
+    let left = offset[0] as i64 + x as i64 * (tile[0] as i64 + gap[0] as i64);
+    let top = offset[1] as i64 + y as i64 * (tile[1] as i64 + gap[1] as i64);
+    (left.clamp(0, img.width() as i64) as u32, top.clamp(0, img.height() as i64) as u32,
+        (left + tile[0] as i64).clamp(0, img.width() as i64) as u32,
+        (top + tile[1] as i64).clamp(0, img.height() as i64) as u32)
+}
+
+pub fn region(img: &RgbaImage, grid: crate::Grid, island: &Island) -> crate::sidecar::StoredIsland {
+    let rects = island.cells.iter().map(|&(x, y)| {
+        let (left, top, right, bottom) = pixel_rect(img, grid, x, y);
+        [left, top, right - left, bottom - top]
+    }).collect();
+    crate::sidecar::StoredIsland { rects, label: None }
+}
+
+pub fn regions(img: &RgbaImage, grid: crate::Grid) -> Vec<crate::sidecar::StoredIsland> {
+    let (tile, gap, offset) = grid;
+    let cols = crate::sheet::span(img.width(), offset[0], gap[0], tile[0] + gap[0]);
+    let rows = crate::sheet::span(img.height(), offset[1], gap[1], tile[1] + gap[1]);
+    detect(img, cols, rows, |x, y| pixel_rect(img, grid, x, y)).islands.iter().map(|i| region(img, grid, i)).collect()
+}
+
 fn difference(a: &Rgba<u8>, b: &Rgba<u8>) -> u64 {
-    (0..3).map(|c| a[c].abs_diff(b[c]) as u64).sum()
+    // Premultiply RGB so hidden colors do not affect the comparison.
+    (0..3).map(|c| {
+        let a = u64::from(a[c]) * u64::from(a[3]) / 255;
+        let b = u64::from(b[c]) * u64::from(b[3]) / 255;
+        a.abs_diff(b)
+    }).sum::<u64>() + u64::from(a[3].abs_diff(b[3]))
 }
 
 fn joins(img: &RgbaImage, a: PixelRect, b: PixelRect, horizontal: bool) -> bool {
@@ -67,29 +113,27 @@ fn joins(img: &RgbaImage, a: PixelRect, b: PixelRect, horizontal: bool) -> bool 
     } else {
         (a.1, a.3, b.1, b.3, a.0.max(b.0), a.2.min(b.2))
     };
-    if a0 >= a1 || b0 >= b1 { return false; }
-    let mut pairs = 0;
-    let mut edge = 0;
-    let mut inside = 0;
-    let mut samples = 0;
-    for t in start..end {
-        let pixel = |n| if horizontal { img.get_pixel(n, t) } else { img.get_pixel(t, n) };
-        let (left, right) = (pixel(a1 - 1), pixel(b0));
-        // Any visible alpha counts. Hidden RGB must never bridge transparent space.
-        if left[3] == 0 || right[3] == 0 { continue; }
-        pairs += 1;
-        edge += difference(left, right);
-        for (outer, inner) in [(left, (a1 - a0 > 1).then(|| pixel(a1 - 2))),
-                               (right, (b1 - b0 > 1).then(|| pixel(b0 + 1)))] {
-            if let Some(inner) = inner.filter(|p| p[3] != 0) {
-                inside += difference(outer, inner);
-                samples += 1;
-            }
-        }
-    }
-    // Cut when the mean RGB jump exceeds twice the local variation plus 16
-    // levels per channel. Integer sums keep the decision deterministic.
-    pairs > 0 && edge * samples.max(1) <= pairs * (48 * samples.max(1) + 2 * inside)
+    if a0 >= a1 || b0 >= b1 || start >= end { return false; }
+    let pixel = |n, t| if horizontal { img.get_pixel(n, t) } else { img.get_pixel(t, n) };
+    // Compare the actual tile edges, skipping the configured gap.
+    if !(start..end).any(|t| pixel(a1 - 1, t)[3] != 0 && pixel(b0, t)[3] != 0) { return false; }
+    // One-third-width strips include the interior behind a narrow outline.
+    let width = (a1 - a0).min(b1 - b0).div_ceil(3);
+    let average = |left: std::ops::Range<u32>, right: u32| {
+        let count = u64::from(left.end - left.start) * u64::from(end - start);
+        let mut sum = 0;
+        for t in start..end { for x in left.clone() {
+            sum += difference(pixel(x, t), pixel(right + x - left.start, t));
+        } }
+        sum / count.max(1)
+    };
+    let across = average(a1 - width..a1, b0);
+    // Use the same pixel distance throughout both tiles. The more varied tile
+    // sets the baseline, so a detailed part can continue into a plain part.
+    let inside = average(a0..a1 - width, a0 + width).max(average(b0..b1 - width, b0 + width));
+    // Allow two levels per RGBA channel for weak changes and integer rounding.
+    // Prefer a merged group over cutting a coherent object into pieces.
+    across <= 2 * inside + 8
 }
 
 #[cfg(test)]
@@ -100,6 +144,91 @@ mod tests {
         detect(img, img.width() / tile[0], img.height() / tile[1], |x, y| {
             (x * tile[0], y * tile[1], (x + 1) * tile[0], (y + 1) * tile[1])
         })
+    }
+
+    #[test]
+    fn matching_borders_can_join_different_interiors() {
+        let mut img = RgbaImage::new(32, 16);
+        for (x, _, p) in img.enumerate_pixels_mut() {
+            *p = if (14..18).contains(&x) { Rgba([40, 40, 40, 255]) }
+                else if x < 16 { Rgba([160, 180, 80, 255]) } else { Rgba([160, 100, 180, 255]) };
+        }
+        let found = grid(&img, [8, 8]);
+        assert_eq!(found.islands.len(), 1);
+        assert_eq!(found.islands[0].cells.len(), 8);
+        assert_eq!(found, grid(&img, [8, 8]));
+        let larger = image::imageops::resize(&img, 64, 32, image::imageops::FilterType::Nearest);
+        assert_eq!(found, grid(&larger, [16, 16]));
+        assert_eq!(grid(&image::imageops::rotate90(&img), [8, 8]).islands.len(), 1);
+    }
+
+    #[test]
+    fn hidden_colors_and_clipped_cells_do_not_change_continuity() {
+        let mut img = RgbaImage::new(7, 3);
+        for x in 0..7 { img.put_pixel(x, 1, Rgba([100, 120, 140, 255])); }
+        let geometry = ([3, 2], [0, 0], [-1, 0]);
+        let expected = regions(&img, geometry);
+        assert_eq!(expected.len(), 1);
+        for p in img.pixels_mut().filter(|p| p[3] == 0) { *p = Rgba([255, 30, 200, 0]); }
+        assert_eq!(regions(&img, geometry), expected);
+        assert_eq!(regions(&RgbaImage::from_pixel(2, 1, Rgba([80, 90, 100, 255])), ([1, 1], [0, 0], [0, 0])).len(), 1);
+    }
+
+    #[test]
+    fn furniture_example_keeps_doorway_tables_and_beds_whole() {
+        let path = std::path::Path::new("assets/armm1998_zelda-like/gfx/Inner.png");
+        if !path.exists() { return; }
+        let img = image::open(path).unwrap().into_rgba8();
+        let found = grid(&img, [16, 16]);
+        let owner = |x, y| found.islands.iter().position(|i| i.cells.contains(&(x, y))).unwrap();
+        let table = owner(13, 1);
+        let green = owner(17, 1);
+        let purple = owner(20, 1);
+        // Neighboring objects may merge. Splitting these objects is the worse error.
+        for y in 1..4 {
+            for x in 13..16 { assert_eq!(owner(x, y), table); }
+            for x in 17..19 { assert_eq!(owner(x, y), green); }
+            for x in 20..22 { assert_eq!(owner(x, y), purple); }
+        }
+        for (left, top, right, bottom) in [(8, 6, 10, 8), (10, 7, 13, 10), (6, 9, 9, 12), (14, 7, 17, 9), (14, 9, 17, 10)] {
+            let island = owner(left, top);
+            for y in top..bottom { for x in left..right { assert_eq!(owner(x, y), island, "split cell ({x}, {y})"); } }
+        }
+    }
+
+    #[test]
+    fn ambiguous_touching_outlines_and_thin_sprites_stay_whole() {
+        let mut img = RgbaImage::new(16, 8);
+        for y in 1..7 { for x in 0..16 { img.put_pixel(x, y, Rgba([30, 30, 30, 255])); } }
+        assert_eq!(grid(&img, [8, 8]).islands.len(), 1);
+        for y in 2..6 { for x in [4, 5, 10, 11] { img.put_pixel(x, y, Rgba([180, 100, 80, 255])); } }
+        assert_eq!(grid(&img, [8, 8]).islands.len(), 1);
+        let rotated = image::imageops::rotate90(&img);
+        assert_eq!(grid(&rotated, [8, 8]).islands.len(), 1);
+    }
+
+    #[test]
+    fn configured_gaps_never_change_edge_decisions() {
+        let tile = [4, 3];
+        let offset = [2, 1];
+        let mut expected = None;
+        for gap in [[0, 0], [1, 1], [4, 2]] {
+            for background in [Rgba([0, 0, 0, 0]), Rgba([255, 0, 255, 255])] {
+                let geometry = (tile, gap, offset);
+                let mut img = RgbaImage::from_pixel(2 + 2 * tile[0] + gap[0], 1 + 2 * tile[1] + gap[1], background);
+                for y in 0..2 { for x in 0..2 {
+                    let (left, top, right, bottom) = pixel_rect(&img, geometry, x, y);
+                    let color = if (x, y) == (1, 1) { Rgba([0, 0, 255, 255]) } else { Rgba([255, 0, 0, 255]) };
+                    for py in top..bottom { for px in left..right { img.put_pixel(px, py, color); } }
+                } }
+                let found = detect(&img, 2, 2, |x, y| pixel_rect(&img, geometry, x, y));
+                assert_eq!(found.islands.iter().map(|i| i.cells.len()).sum::<usize>(), 4);
+                if let Some(expected) = &expected { assert_eq!(&found, expected); } else { expected = Some(found); }
+                let regions = regions(&img, geometry);
+                assert_eq!(regions.len(), expected.as_ref().unwrap().islands.len());
+                assert_eq!(regions.iter().flat_map(|r| &r.rects).map(|r| r[2] * r[3]).sum::<u32>(), 4 * tile[0] * tile[1]);
+            }
+        }
     }
 
     #[test]

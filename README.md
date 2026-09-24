@@ -18,8 +18,8 @@ Two folders: the packs you collected, and the tilesheets you make. Tilepicky
 reads each one with all its subfolders.
 
 It never changes anything in your **library**. It only writes a
-`tilepicky.json` there, which remembers the grid and the animations you set
-on each sheet, so it can show them the same way next time. Your **project**
+`tilepicky.json` there, which remembers grids, animations, and AI labels
+for each sheet, so it can show them the same way next time. Your **project**
 is where it writes tilesheets, with a `tilepicky.json` of its own beside
 them.
 
@@ -37,14 +37,21 @@ wgpu out, because it is half the compile time. Add it with
 
 ## Install
 
-    cargo install --path .
+[Download a release](https://github.com/spookysys/tilepicky/releases/latest)
+for Linux, Windows, or macOS. Extract the archive first.
+On Windows, open `tilepicky.exe`. On Linux or macOS, run `./tilepicky`
+from the extracted folder. The Mac download supports Intel and Apple Silicon.
+
+For Linux desktop integration, install the extracted files:
+
+    install -Dm755 tilepicky ~/.local/bin/tilepicky
     install -Dm644 tilepicky.desktop ~/.local/share/applications/tilepicky.desktop
     install -Dm644 icon.png ~/.local/share/icons/hicolor/128x128/apps/tilepicky.png
 
-The desktop entry gives the window its name and icon in the dock. It runs
-`tilepicky` from your PATH, where `cargo install` puts it, in
-`~/.cargo/bin`. If your desktop session does not look there, write the whole
-path in the `Exec=` line.
+The desktop entry runs `tilepicky` from your PATH. If your desktop cannot find
+it, set `Exec=` in that entry to the binary's full path.
+
+To build from a source checkout, use `cargo install --locked --path .`.
 
 ## Layout
 
@@ -66,12 +73,17 @@ selects or edits while the eye is on, and it starts off.
 Right-click a library file or its open sheet and choose **Detect islands** to build
 islands using the current grid. Opening a sheet detects its grid if none is
 saved. The library eye (`E`) highlights the island under the pointer.
-Transparent edges and sharp color changes separate islands; smooth edges
-join them. Seamless terrain can form one large island. Gaps and empty cells do not light up.
+Detection groups cells into rectangles. It compares shared boundaries, then
+splits or joins regions. A join can undo an earlier cut, including part of a
+neighboring region. A final pass joins regions with net continuity across their
+shared boundary, allowing irregular islands. Keeping objects whole takes priority over separating every
+neighbor. Rectangles may include transparent cells; entirely empty regions are
+excluded. Configured grid gaps stay out of the crops and highlights.
+Some touching objects still merge, and some irregular objects can split.
 
-Analysis stays with the open sheet in memory. Changing its image
-clears the result. Choose **Detect islands** again after a correction or reopening
-the sheet. Sheets with saved labels restore their pixel regions on open.
+Detect islands saves pixel regions in `tilepicky.json`, even without AI labels.
+Reopening restores them. Grid changes leave them alone. Changing the image
+makes them stale; choose **Detect islands** again to rebuild them.
 Switching the eye on or off does not run analysis.
 
 ## Label one library sheet
@@ -80,16 +92,22 @@ Open a library sheet, then open **AI assist** with its header button or `I`.
 In settings, choose an instant model with image input and structured JSON
 output. Use an OpenAI-compatible provider URL, such as
 `https://openrouter.ai/api/v1`, and enter its key or set its key environment
-variable. The Google and batch settings remain available for future work;
-this action uses only the instant OpenAI-compatible endpoint.
+variable. This action uses the instant OpenAI-compatible endpoint.
+Library batches use the separate batch model in Settings.
 
 Choose **Label with AI** in the AI panel, the sheet's right-click menu, or
 its library file's right-click menu. All three start the same operation.
 Opening a panel or menu sends nothing.
+**Detect islands** is also available above **Label with AI** in the panel.
+It runs locally and reports the number of islands. Configured grid gaps are
+skipped when comparing tile edges; gap pixels cannot join or separate islands.
+
 The model first describes the sheet's asset type, setting, style, palette,
 and contents. It then labels groups of island crops with that description
 as context. Crops contain only the island's cells. Progress appears in the
-AI panel, and you can keep browsing while requests run. One sheet can be
+AI panel, with the current request, elapsed wait, and received results.
+Failures remain visible in the panel after the operation ends, even if you change sheets.
+You can keep browsing while requests run. One sheet can be
 labeled at a time; each request has a 60-second timeout.
 
 The library eye shows an island's caption and tags under the pointer. Hover
@@ -110,16 +128,46 @@ Results stay in memory while requests run. When the operation ends, the
 book receives the results, including valid partial results if a later
 request failed. **Label with AI** starts again from the whole sheet.
 Old companion files are deleted on open and removal, without importing them.
-Labels are not searched yet.
+Search can match saved captions and tags.
 
 Choose **Remove saved AI labels...** in the panel or either context menu,
 then confirm the named sheet. This clears its saved label data from the book.
 The image, grid, and island highlight stay. Removal is unavailable while
 labeling runs, so an arriving response cannot restore deleted labels.
 
-This first version labels still images. Images larger than 2048 pixels on
+GIFs use their first frame for labels and island detection. The library eye
+shows that frame; normal browsing still plays the animation.
+Images larger than 2048 pixels on
 an edge are reduced for the model; the original image is not changed.
 Check the labels: models can misidentify pixel art or miss small details.
+
+## Label an entire library
+
+Open the library folder, open **AI assist** (`I`), and choose
+**Label entire library with AI...**. No sheet needs to be opened first.
+Choose the batch model and provider key in Settings. Library batches support
+Google Gemini and OpenRouter; the selected model must accept images and
+structured JSON output.
+
+Preparation scans all supported files, including subfolders. It reads missing
+grids and detects islands locally. The confirmation shows sheets to label,
+current sheets skipped, excluded files, islands, image inputs, request count,
+and approximate request size. It also shows the maximum requested output tokens.
+These numbers describe the job size; they are not a price quote. Pricing is
+not stored in Settings, so the dialog does not show a currency estimate.
+Nothing is sent until you choose **Start batch**, which authorizes both stages.
+
+The batch labels whole sheets first, then groups of islands with each sheet's
+caption and tags as context. It splits large libraries into provider batches.
+Progress and errors appear in AI assist. Valid results go into `tilepicky.json`.
+The app keeps batch IDs and image snapshots under its configuration folder,
+so reopening the library resumes the existing jobs. Keys stay in key storage.
+
+Run the action again to retry incomplete work. Current, successful sheets and
+island labels are reused. Changed images need new labels. GIFs use their first
+frame, including the image fingerprint. A submission interrupted before its ID arrives is not repeated:
+check the provider's batch list and attach its ID in AI assist. Single-sheet
+labeling and label removal are unavailable while a library batch is active.
 
 ## From the keyboard
 
@@ -284,40 +332,34 @@ survives its own file moving.
 
 ## Search
 
-Type words in the box, and the trees show only the files whose path holds
-every one of them. A word matches from the start: `gra` finds `grass`. The
-☰ button beside the box chooses whether to match folder names, file names,
-or both. It searches your own tilesheets by the same rules.
+Type words in the box. Each word matches a prefix: `gra` finds `grass`.
+Open the menu beside the box to choose file names, folder names, captions,
+and tags. All words must match. Sheet context and one island's label can
+supply different words. Labels from changed images do not match.
+Project sheets still match file and folder names only.
+
+The menu also selects the library result view:
+
+- **Filter files** shows matching files in the tree. Open a file to see
+  matching islands at full brightness, with other areas dimmed.
+- **Virtual tilesheet** packs matching islands into one temporary sheet.
+  Select and copy tiles into your project as usual. Copies retain their
+  source names. Eye mode shows each island's label.
+
+Search runs locally, with no model requests or embeddings. Sheets without
+current labels can match their paths; their islands are detected locally.
+GIFs use their first frame. A virtual sheet keeps original pixels and uses
+one common grid. Large results require a narrower query.
+Right-click an island to select it. In a virtual sheet, **Show source sheet**
+opens its original file. **Back to search** returns to the latest result,
+with its selection and zoom intact. A new search replaces that result.
+Virtual sheets are temporary and are not saved.
 
 ## tilepicky.json
 
-The library and the project each keep one `tilepicky.json` in their top
-folder. It is the book of that tree: for every sheet, the grid it is read
-through, where its pixels came from, and its animations. Sheets are keyed by
-their path from the top folder, and `tile` at the head of the file is the
-size that tree used last.
-
-    {
-      "tile": 16,
-      "sheets": {
-        "kenney_tiny-town/Tilemap/tilemap_packed.png": {
-          "animations": [
-            { "px": [1280, 64], "frame": [64, 64], "frames": 6, "ms": 100 }
-          ]
-        },
-        "village.png": {
-          "tile": [32, 48],
-          "provenance": [
-            { "source": "kenney_tiny-town/Tilemap/tilemap_packed.png", "rects": [[96, 48, 96, 96]] }
-          ],
-          "animations": [
-            { "px": [256, 32], "frame": [64, 64], "frames": [4, 2], "ms": 100 }
-          ]
-        }
-      }
-    }
-
-One number stands for both axes. For `frames`, one number means one row.
+Each folder's book remembers grids, animations, pixel origins, and AI labels.
+The images stay ordinary image files. See the [file format](docs/tilepicky-json.md)
+if you want to read or change the metadata yourself.
 
 ## Tile sizes
 

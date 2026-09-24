@@ -7,7 +7,7 @@ the person who uses the tool; this file is for an agent that works on it.
 ## Build, run, test
 
 - `cargo run --release -- [<library dir> [<project dir>]]` starts the tool.
-  `--glow` draws with OpenGL instead of wgpu.
+  OpenGL is the default. Builds with the `wgpu` feature also accept `--wgpu`.
 - `cargo test` runs the unit tests. Most write their own files under the
   temp dir. One reads the real packs: `the_real_packs_read_as_they_did`
   checks `src/detect.rs` against `tools/grid-cases.json`, and skips every
@@ -33,25 +33,40 @@ the person who uses the tool; this file is for an agent that works on it.
   popups, and the drag of a block between the panels.
 - `src/sheet.rs`: one sheet on screen: the grid, the selection, the copy
   and paste, the provenance map, the eye mode, and the animations.
+- `src/files.rs`: project file operations, separate from the UI.
+- `src/storage.rs`: strict JSON reads and complete-file replacement.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
   grid, pixel origins, animations, labels, and saved island geometry.
   The image fingerprint covers dimensions and pixel bytes only.
+  GIF detection, labeling, and fingerprints use the first frame.
   Island regions use pixel rectangles, as project provenance does.
   Grid changes leave them alone; Detect islands or Label with AI rebuilds them.
-- `src/index.rs`: the scan of a folder, and the search.
+- `src/index.rs`: the scan of a folder, and path search.
+- `src/search.rs`: local caption and tag search, image validation, and
+  temporary packed island sheets. One worker keeps decoding off the UI.
+  File results dim unmatched regions. Virtual results preserve source names.
+  Search has no network requests or saved results.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
-  and their settings page. Google and batch settings are retained; sheet
-  labeling uses the instant model on an OpenAI-compatible endpoint.
+  and their settings page. Single-sheet labeling uses the instant model.
+  Library batches use the configured Google or OpenRouter batch model.
 - `src/islands.rs`: local island detection for the library eye.
+  `src/islands/partition.rs` partitions grid cells into rectangles with reversible
+  cuts and joins, then merges continuous neighbors into irregular islands. Its tests include a local parameter search; see
+  `docs/island-detection.md` for the examples, score, and reproduction commands.
 - `src/labels.rs`: structured labeling requests, validation, image identity,
-  and pixel-region lookup. Requests run only from the explicit Label with AI
-  action. One worker thread sends results to the UI; there is no task queue.
-  Label completion, removal, and existing sheet saves write the book.
-  Analysis stays in memory. Opening a sheet deletes obsolete
+  and pixel-region lookup. Single-sheet requests run from Label with AI.
+  One worker thread sends results to the UI; there is no single-sheet task queue.
+  Explicit island detection, label completion, removal, and existing sheet saves write the book.
+  Detection needs no AI label; the saved sheet label is optional. Opening a sheet deletes obsolete
   companion files without importing them. Tests use synthetic images and fake responses.
+- `src/batch.rs`: local library preparation, job-size confirmation, and two
+  provider batch stages. Start batch authorizes sheet and island requests.
+  The configuration folder holds snapshots and an atomic journal with batch
+  IDs, never keys. Interrupted submissions require their provider ID before
+  resuming. Tests use fake transports and temporary libraries.
 
 ## Folders that stay local
 

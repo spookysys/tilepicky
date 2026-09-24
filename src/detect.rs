@@ -27,12 +27,10 @@
 //! two is near one when a pitch explains nothing, whatever its size, and it
 //! climbs only when a pitch is real.
 //!
-//! Only the pitch is read. A gap and an offset can be read off the same
-//! fold, and an earlier version did, but they were guessed from the same
-//! evidence that had already been spent on the pitch, and they were wrong
-//! often enough to move every tile on the screen. A sheet is read as
-//! starting at its corner with its tiles touching until they can be found
-//! as surely as the pitch.
+//! Read the pitch first. A narrow, fully transparent separator can then
+//! split it into tile size and gap when the tile size is a power of two.
+//! Other gaps and offsets stay at zero; transparent sprite margins alone
+//! must not shrink an ordinary tile grid.
 //!
 //! The two axes then help each other. A sheet is one picture, and a pitch
 //! that runs across it usually runs down it as well, so a pitch both axes
@@ -133,7 +131,24 @@ pub fn grid(img: &RgbaImage) -> (Axis, Axis) {
         .max_by(|&a, &b| fx[a].min(fy[a]).total_cmp(&fx[b].min(fy[b])))
         .filter(|&i| fx[i].min(fy[i]) >= AGREE)
         .map(|i| i as u32 + MIN_TILE);
-    (axis(&fx, w, both), axis(&fy, h, both))
+    (separate_gap(img, axis(&fx, w, both), true), separate_gap(img, axis(&fy, h, both), false))
+}
+
+/// Only a repeated empty strip after a conventional tile size establishes a gap.
+fn separate_gap(img: &RgbaImage, mut axis: Axis, horizontal: bool) -> Axis {
+    let pitch = axis.tile;
+    let (len, across) = if horizontal { img.dimensions() } else { (img.height(), img.width()) };
+    if pitch.is_power_of_two() || len / pitch < 3 { return axis; }
+    let Some(gap) = (1..=4).find(|&gap| pitch > gap + MIN_TILE - 1 && (pitch - gap).is_power_of_two()) else { return axis };
+    let tile = pitch - gap;
+    for start in (tile..len).step_by(pitch as usize) {
+        if (start..(start + gap).min(len)).any(|n| (0..across).any(|t| {
+            img.get_pixel(if horizontal { n } else { t }, if horizontal { t } else { n })[3] != 0
+        })) { return axis; }
+    }
+    axis.tile = tile;
+    axis.gap = gap;
+    axis
 }
 
 /// How much the pixels at two places in the buffer differ, as two whole
@@ -213,10 +228,7 @@ fn axis(f: &[f32], len: u32, both: Option<u32>) -> Axis {
         }
     };
 
-    // The gap and the offset are not read yet. A pitch is hard enough to
-    // find on its own, and a wrong offset moves every tile on the screen,
-    // so until they are as sure as the pitch is, a sheet starts at its
-    // corner with its tiles touching.
+    // A separate pixel check can identify transparent spacing after this pitch is chosen.
     Axis { tile: pitch, gap: 0, offset: 0 }
 }
 
@@ -245,14 +257,36 @@ mod tests {
     }
 
     #[test]
+    fn transparent_separators_are_gaps_not_part_of_tiles() {
+        for gap in [1, 2, 4] {
+            let img = flat(16, gap, 0, 8);
+            let expected = Axis { tile: 16, gap, offset: 0 };
+            assert_eq!(grid(&img), (expected, expected));
+        }
+        let path = "assets/kenney_tiny-dungeon/Tilemap/tilemap.png";
+        if let Ok(img) = image::open(path) {
+            let expected = Axis { tile: 16, gap: 1, offset: 0 };
+            assert_eq!(grid(&img.to_rgba8()), (expected, expected));
+        }
+    }
+
+    #[test]
+    fn transparent_sprite_margins_do_not_shrink_power_of_two_tiles() {
+        let img = flat(15, 1, 0, 8);
+        assert_eq!(grid(&img).0, Axis { tile: 16, gap: 0, offset: 0 });
+        let mut not_a_gap = flat(16, 1, 0, 8);
+        not_a_gap.put_pixel(16, 3, Rgba([255; 4]));
+        assert_eq!(grid(&not_a_gap).0, Axis { tile: 17, gap: 0, offset: 0 });
+    }
+
+    #[test]
     fn it_reads_a_plain_grid() {
         let (x, y) = grid(&flat(16, 0, 0, 8));
         assert_eq!(x, Axis { tile: 16, gap: 0, offset: 0 });
         assert_eq!(y, Axis { tile: 16, gap: 0, offset: 0 });
     }
 
-    /// A gap is part of the pitch, and the pitch is all we read for now,
-    /// so a sheet of 16 with a gap of 2 reads as 18.
+    /// Offset inference stays conservative, even when the pitch includes spacing.
     #[test]
     fn a_gap_counts_into_the_pitch() {
         let (x, y) = grid(&flat(16, 2, 3, 8));
@@ -364,7 +398,7 @@ mod tests {
                 }
                 let pass = image::open(case["file"].as_str().unwrap()).is_ok_and(|img| {
                     let (x, y) = grid(&img.to_rgba8());
-                    [x.tile as i64, y.tile as i64] == [t[0] + g[0], t[1] + g[1]]
+                    [(x.tile + x.gap) as i64, (y.tile + y.gap) as i64] == [t[0] + g[0], t[1] + g[1]]
                 });
                 case["expect"] = serde_json::json!(if pass { "pass" } else { "fail" });
                 cases.push(case);
@@ -399,7 +433,7 @@ mod tests {
             let (tile, gap) = (two("tile"), two("gap"));
             let want = [tile[0] + gap[0], tile[1] + gap[1]];
             let (x, y) = grid(&img.to_rgba8());
-            let got = [x.tile, y.tile];
+            let got = [x.tile + x.gap, y.tile + y.gap];
             match (case["expect"].as_str() == Some("pass"), got == want) {
                 (true, false) => broke.push(format!("{file}: wanted pitch {want:?}, read {got:?}")),
                 (false, true) => println!("now right, mark it pass: {file}"),

@@ -19,16 +19,27 @@ pub struct Side {
     pub tile: Option<Pair>,
 }
 
-/// What the search matches on. More comes with the AI features.
+/// Which text fields the search matches.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchIn {
     pub folders: bool,
     pub files: bool,
+    #[serde(default = "enabled")]
+    pub captions: bool,
+    #[serde(default = "enabled")]
+    pub tags: bool,
+    #[serde(default)]
+    pub view: SearchView,
 }
+
+fn enabled() -> bool { true }
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchView { #[default] Files, Virtual }
 
 impl Default for SearchIn {
     fn default() -> Self {
-        SearchIn { folders: true, files: true }
+        SearchIn { folders: true, files: true, captions: true, tags: true, view: SearchView::Files }
     }
 }
 
@@ -63,17 +74,10 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Writes the file, making its directory when it is not there yet. A
-    /// failure is silent: the tool works without remembering.
-    pub fn save(&self) {
-        let Some(path) = file() else { return };
-        let Ok(json) = serde_json::to_string_pretty(self) else {
-            return;
-        };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, json);
+    pub fn save(&self) -> Result<(), String> {
+        let path = file().ok_or("No configuration directory available.")?;
+        crate::storage::read::<Self>(&path)?;
+        crate::storage::write(&path, self)
     }
 }
 

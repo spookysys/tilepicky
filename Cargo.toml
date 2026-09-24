@@ -7,7 +7,7 @@ repository = "https://github.com/spookysys/tilepicky"
 license = "GPL-3.0-only"
 keywords = ["tiles", "sprites", "tilesheet", "pixel-art", "egui"]
 categories = ["game-development", "multimedia::images"]
-include = ["src/**", "icon.png", "README.md", "LICENSE"]
+include = ["src/**", "icon.png", "README.md", "docs/**", "LICENSE"]
 
 [features]
 # wgpu is the other half of the compile time. OpenGL draws this tool just
