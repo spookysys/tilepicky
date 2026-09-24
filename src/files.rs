@@ -26,15 +26,17 @@ pub fn relocate(root: &Path, old: &str, new: &str, copy: bool) -> Result<(), Str
     if directory { sidecar::move_prefix(root, old, new) } else { sidecar::move_entry(root, old, new, copy) }
 }
 
+/// Deletes files and folders. The book forgets what went, even when a later
+/// one of them fails.
 pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
     let mut book = sidecar::load_book(root)?;
-    for rel in rels {
+    let result = rels.iter().try_for_each(|rel| {
         let path = root.join(rel);
-        if path.is_dir() { std::fs::remove_dir_all(path).map_err(|e| e.to_string())?; }
-        else { std::fs::remove_file(path).map_err(|e| e.to_string())?; }
+        if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }.map_err(|e| format!("{rel}: {e}"))?;
         book.sheets.retain(|key, _| key != rel && !key.starts_with(&format!("{rel}/")));
-    }
-    sidecar::write_book(root, &book)
+        Ok(())
+    });
+    sidecar::write_book(root, &book).and(result)
 }
 
 #[cfg(test)]
@@ -57,6 +59,16 @@ mod tests {
         relocate(&dir.0, "plants/tree.png", "plants/oak.png", false).unwrap();
         assert_eq!(sidecar::load_book(&dir.0).unwrap().sheets["plants/oak.png"], side);
         remove(&dir.0, &["plants".into()]).unwrap();
+        assert!(sidecar::load_book(&dir.0).unwrap().sheets.is_empty());
+    }
+
+    #[test]
+    fn a_failed_delete_keeps_the_book_in_step() {
+        let dir = Folder::new();
+        std::fs::write(dir.0.join("tree.png"), b"fixture").unwrap();
+        sidecar::store_entry(&dir.0, "tree.png", &Sidecar { tile: Some(Pair::of([8, 8])), ..Default::default() }).unwrap();
+        assert!(remove(&dir.0, &["tree.png".into(), "gone.png".into()]).is_err());
+        assert!(!dir.0.join("tree.png").exists());
         assert!(sidecar::load_book(&dir.0).unwrap().sheets.is_empty());
     }
 

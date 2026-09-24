@@ -235,12 +235,12 @@ pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
     write_book(dir, &book)
 }
 
-/// Writes one entry. The book is read again first, so that entries changed
-/// by hand in the meantime survive. An empty entry is removed.
 fn not(b: &bool) -> bool {
     !*b
 }
 
+/// Writes one entry. The book is read again first, so that entries changed
+/// by hand in the meantime survive. An empty entry is removed.
 pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> {
     let mut book = load_book(dir)?;
     if side.is_empty() {

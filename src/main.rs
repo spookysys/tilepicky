@@ -454,7 +454,7 @@ impl App {
             Ok(answer) => {
                 self.picking = None;
                 if let Some(dir) = answer {
-                    self.set_folder(ctx, panel, dir);
+                    self.set_folder(panel, dir);
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
@@ -464,8 +464,7 @@ impl App {
 
     /// Points one side at a folder: reads it, drops what was open there, and
     /// remembers it for the next run.
-    fn set_folder(&mut self, ctx: &egui::Context, panel: Panel, dir: PathBuf) {
-        let _ = ctx;
+    fn set_folder(&mut self, panel: Panel, dir: PathBuf) {
         match panel {
             Panel::Library => {
                 self.settings.library.path = Some(dir.clone());
@@ -513,7 +512,7 @@ impl App {
     }
 
     fn refresh_query(&mut self) {
-        self.qwords = index::query_words(&self.query);
+        self.qwords = index::words(&self.query);
         self.open_trees = true;
         self.refresh_visible();
     }
@@ -601,13 +600,13 @@ impl App {
         }
         let dir = step + grow;
         let Some(row) = walk_rows(rows, at.as_ref(), dir) else { return };
-        self.stand_on(ctx, if library { Panel::Library } else { Panel::Project }, row);
+        self.stand_on(if library { Panel::Library } else { Panel::Project }, row);
     }
 
     /// Puts the arrow keys on a row of a tree. Standing on a file does not
     /// open it: the cursor and the sheet on show are two different things,
     /// and Enter is what joins them.
-    fn stand_on(&mut self, _ctx: &egui::Context, panel: Panel, row: tree::Row) {
+    fn stand_on(&mut self, panel: Panel, row: tree::Row) {
         if panel == Panel::Library {
             self.library_at = Some(row);
             self.library_scroll = self.library_at.clone();
@@ -697,22 +696,32 @@ impl App {
     /// block dropped on the panel starts one, and so does a Ctrl+Tab that
     /// crosses to it. Both name it at the first save.
     fn start_canvas(&mut self, ctx: &egui::Context, tile: [u32; 2]) {
-        let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
-        let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
-        self.project_sheet = Some(Sheet::new_empty(ctx, &self.project.root, "", tile, cols, rows));
+        self.project_sheet = Some(self.new_canvas(ctx, "", tile));
         self.project_sel = None;
     }
 
-    fn create_project(&mut self, ctx: &egui::Context) {
-        let name = self.new_name.trim().trim_end_matches(".png").to_string();
-        if name.is_empty() {
-            return;
-        }
-        let rel = format!("{name}.png");
-        let tile = self.inherited_tile(Panel::Project);
+    /// An empty tilesheet of about `NEW_PX` pixels a side.
+    fn new_canvas(&self, ctx: &egui::Context, rel: &str, tile: [u32; 2]) -> Sheet {
         let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
         let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
-        let mut sheet = Sheet::new_empty(ctx, &self.project.root, &rel, tile, cols, rows);
+        Sheet::new_empty(ctx, &self.project.root, rel, tile, cols, rows)
+    }
+
+    fn create_project(&mut self, ctx: &egui::Context) {
+        if self.new_name.trim().is_empty() {
+            return;
+        }
+        // The name stays inside the project, and a new sheet never takes
+        // the place of one that is there.
+        let Some(rel) = files::normalize_name(&self.new_name, Some(".png")) else {
+            self.status = "that is not a usable name".into();
+            return;
+        };
+        if self.project.root.join(&rel).exists() {
+            self.status = format!("{rel} exists");
+            return;
+        }
+        let mut sheet = self.new_canvas(ctx, &rel, self.inherited_tile(Panel::Project));
         if let Err(e) = sheet.save() {
             self.status = e;
             return;
@@ -887,16 +896,21 @@ impl App {
         let files = self.file_drag.take().unwrap();
         let Some(dir) = hover_dir else { return };
         let copy = ctx.input(|i| i.modifiers.command);
+        let mut errors = Vec::new();
         for rel in &files {
             let name = rel.rsplit_once('/').map_or(rel.as_str(), |(_, n)| n);
             let new = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
             if let Err(e) = self.relocate(rel, &new, copy) {
-                self.status = e;
+                errors.push(e);
             }
         }
         let what = if copy { "copied" } else { "moved" };
         let where_to = if dir.is_empty() { "the top".to_string() } else { dir.clone() };
-        self.status = format!("{} {what} to {where_to}", files.len());
+        self.status = format!("{} {what} to {where_to}", files.len() - errors.len());
+        // A file that stayed says why.
+        if !errors.is_empty() {
+            self.status = format!("{}; {}", self.status, errors.join("; "));
+        }
         self.marked.clear();
         self.rescan_project();
     }
@@ -944,8 +958,11 @@ impl App {
                 if let Some(parent) = root.join(&rel).parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                sheet.rel = rel.clone();
-                sheet.save()?;
+                let old = std::mem::replace(&mut sheet.rel, rel.clone());
+                if let Err(e) = sheet.save() {
+                    sheet.rel = old;
+                    return Err(e);
+                }
                 self.status = format!("saved as {rel}");
                 self.rescan_project();
             }
@@ -960,8 +977,9 @@ impl App {
                 let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
                 self.relocate(old, &rel, true)?;
                 self.rescan_project();
+                // The copy opens as any file does: unsaved changes ask first.
                 if let Some(i) = self.project.position(&rel) {
-                    self.open_project(ctx, i);
+                    self.request(ctx, Pending::Open(i));
                 }
             }
         }
@@ -1065,13 +1083,17 @@ impl App {
                 self.save();
                 return;
             }
+            self.pending = None;
             if save {
                 self.save();
+                // A save that failed keeps the changes, and the action waits.
+                if self.has_unsaved() {
+                    return;
+                }
             }
             if let Some(sheet) = &mut self.project_sheet {
                 sheet.dirty = false;
             }
-            self.pending = None;
             self.run(ctx, action);
         }
     }
@@ -1206,7 +1228,7 @@ impl App {
         // A frame in which nothing holds the keys, such as the frame in
         // which a text field lets go of them, fires no command.
         let focus = ctx.memory(|m| m.focused());
-        if !focus.is_some_and(|id| self.pane_of(id).is_some()) {
+        if focus.is_none_or(|id| self.pane_of(id).is_none()) {
             return;
         }
         // The status bar lies in neither half. A command that asks which
@@ -1240,7 +1262,7 @@ impl App {
                 self.clip = Some(b);
                 // A cut clears the cells; only your tilesheet is editable.
                 if cut && self.active == Panel::Project && let Some(sheet) = &mut self.project_sheet {
-                    sheet.clear_selection(ctx);
+                    sheet.clear_selection();
                     self.after_edit();
                 }
             }
@@ -1275,7 +1297,7 @@ impl App {
         if in_half && self.active == Panel::Project && !project_eye
             && (key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace))
             && let Some(sheet) = &mut self.project_sheet {
-            sheet.clear_selection(ctx);
+            sheet.clear_selection();
             self.after_edit();
         }
         if in_half && !eye && key(cmd, Key::A) && let Some(s) = self.sheet_mut(self.active) {
@@ -1827,7 +1849,7 @@ impl App {
         }
         // A tree with no row under the keys, or a grid with nothing
         // selected, shows nothing at all. Arriving puts that right at once.
-        self.enter_tree(ctx, id);
+        self.enter_tree(id);
         if let Some(panel) = [(library_id(), Panel::Library), (project_id(), Panel::Project)].iter().find(|(k, _)| *k == id).map(|(_, p)| *p)
             && let Some(sheet) = self.sheet_mut(panel)
         {
@@ -1837,7 +1859,7 @@ impl App {
 
     /// Puts the keys on a row when they arrive in a tree with none: the file
     /// on show, else the first row.
-    fn enter_tree(&mut self, ctx: &egui::Context, id: Id) {
+    fn enter_tree(&mut self, id: Id) {
         let library = if id == library_tree_id() {
             true
         } else if id == project_tree_id() {
@@ -1855,7 +1877,7 @@ impl App {
         let open = if library { self.library_sel } else { self.project_sel };
         let row = open.map(tree::Row::File).filter(|r| rows.contains(r)).or_else(|| rows.first().cloned());
         if let Some(row) = row {
-            self.stand_on(ctx, panel, row);
+            self.stand_on(panel, row);
         }
     }
 
@@ -2354,7 +2376,7 @@ impl eframe::App for App {
             Some(TreeAction::Open(i)) => self.open_library(ctx, i),
             Some(TreeAction::Labels(i, action)) => {
                 let rel = self.library.entries[i].rel.clone();
-                if !self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) { self.open_library(ctx, i); }
+                if self.library_sheet.as_ref().is_none_or(|s| s.rel != rel) { self.open_library(ctx, i); }
                 if self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) { self.label_action(ctx, action); }
             }
             Some(TreeAction::Refresh) => self.rescan_library(),
@@ -2597,7 +2619,7 @@ impl eframe::App for App {
                     drag_from = Some((Panel::Project, grab));
                 }
                 if ev.delete {
-                    s.clear_selection(ctx);
+                    s.clear_selection();
                     delete_in_mine = true;
                 }
             } else {

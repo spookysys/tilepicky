@@ -58,15 +58,12 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// An unreadable file gives the defaults; `save` then refuses to
+    /// overwrite it.
     pub fn load() -> Self {
-        file()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .map(|mut s: Settings| {
-                s.ai.heal();
-                s
-            })
-            .unwrap_or_default()
+        let mut s: Settings = file().and_then(|p| crate::storage::read(&p).ok()).unwrap_or_default();
+        s.ai.heal();
+        s
     }
 
     pub fn save(&self) -> Result<(), String> {

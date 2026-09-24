@@ -1690,11 +1690,10 @@ impl Sheet {
         self.sel = there;
     }
 
-    pub fn clear_selection(&mut self, ctx: &egui::Context) {
+    pub fn clear_selection(&mut self) {
         if self.sel.is_empty() {
             return;
         }
-        let _ = ctx;
         self.snapshot();
         let s = self.sel.clone();
         self.clear_cells(&s);
@@ -1722,8 +1721,6 @@ impl Sheet {
         }
     }
 
-    /// Marks the selected area as an animation strip, or unmarks it. A new
-    /// strip starts with one frame per column; set the frame count afterwards.
     /// The draft for the current selection. It follows the selection and
     /// keeps its numbers, so that the user can resize the selection until
     /// the frames divide it.
@@ -2017,7 +2014,16 @@ impl Sheet {
     /// its grid, so it is never lost between runs.
     pub fn save(&mut self) -> Result<(), String> {
         sidecar::load_book(&self.dir)?;
-        self.img.save(self.dir.join(&self.rel)).map_err(|e| e.to_string())?;
+        // The image is written whole or not at all: a crash halfway must
+        // not leave half a tilesheet.
+        let path = self.dir.join(&self.rel);
+        let format = image::ImageFormat::from_path(&path).map_err(|e| e.to_string())?;
+        crate::storage::replace(&path, false, |file| {
+            let mut out = std::io::BufWriter::new(file);
+            self.img.write_to(&mut out, format).map_err(std::io::Error::other)?;
+            std::io::Write::flush(&mut out)
+        })
+        .map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
         self.side.tile = Some(Pair::of(self.tile));
         self.side.provenance = self.prov.extract();
         self.save_entry()

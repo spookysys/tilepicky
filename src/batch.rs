@@ -69,11 +69,7 @@ impl Job {
         crate::storage::write(&dir.join("state.json"), self)
     }
     fn load(dir: &Path) -> Result<Option<Self>, String> {
-        match std::fs::read(dir.join("state.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|_| "The saved batch state is unreadable.".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.to_string()),
-        }
+        crate::storage::read(&dir.join("state.json"))
     }
 }
 
@@ -170,9 +166,7 @@ impl Failure {
 pub struct Transport { client: ureq::Agent, base: String, key: String, kind: Kind }
 impl Transport {
     pub fn new(provider: &Provider, key: String) -> Result<Self, String> {
-        let client = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(60)))
-            .max_redirects(0).http_status_as_error(false).build().new_agent();
-        Ok(Self { client, base: endpoint(provider)?, key, kind: provider.kind })
+        Ok(Self { client: labels::agent(), base: endpoint(provider)?, key, kind: provider.kind })
     }
     pub fn send(&self, path: &str, body: Option<&Value>) -> Result<Value, Failure> {
         use ureq::{Error, Timeout};
