@@ -23,6 +23,22 @@ pub fn menu(ui: &mut eframe::egui::Ui) -> Option<Action> {
     action
 }
 
+/// The most a label holds: characters of the caption, tags, and characters
+/// of one tag. The request asks for no more, and a reply is cut to them.
+const CAPTION: usize = 320;
+const TAGS: usize = 12;
+const TAG: usize = 40;
+
+/// The text up to `max` characters, cut after the last whole word that fits.
+fn cut(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.into();
+    }
+    let head: String = text.chars().take(max).collect();
+    let end = head.rfind(' ').unwrap_or(head.len());
+    head[..end].trim_end_matches([',', ';', ':', '-', ' ']).into()
+}
+
 /// What the model returns, before the tool checks it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,16 +59,21 @@ impl Reply {
             .iter().any(|prefix| caption.starts_with(prefix)) {
             return Err("The model returned refusal text instead of a label.".into());
         }
-        if self.caption.is_empty() || self.caption.chars().count() > 320 || self.tags.len() > 12 {
-            return Err("Caption or tags exceed the response limits, or the caption is empty.".into());
+        if self.caption.is_empty() {
+            return Err("The model returned an empty caption.".into());
         }
+        // A model that says too much still said something useful: the
+        // caption is cut at a word, and the tags it named first are kept.
+        self.caption = cut(&self.caption, CAPTION);
         let mut tags = Vec::new();
         for tag in &self.tags {
             let tag: String = tag.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
             let tag = tag.split_whitespace().collect::<Vec<_>>().join(" ");
-            if tag.is_empty() || tag.chars().count() > 40 { return Err("An unusable tag was returned.".into()); }
-            tags.push(tag);
+            if !tag.is_empty() && tag.chars().count() <= TAG && !tags.contains(&tag) {
+                tags.push(tag);
+            }
         }
+        tags.truncate(TAGS);
         tags.sort();
         tags.dedup();
         self.tags = tags;
@@ -253,6 +274,20 @@ pub mod tests {
         for url in ["http://example.test", "https://user:key@example.test", "https://example.test?key=secret", "https://example.test/#fragment", "bad"] {
             assert!(checked_url(url).is_err());
         }
+    }
+
+    /// GLM once answered five sheets of 32 with more than twelve tags. The
+    /// label keeps the first twelve and a caption cut at a word; a tag that
+    /// is too long goes on its own.
+    #[test]
+    fn a_reply_that_says_too_much_is_cut_to_the_limits() {
+        let tags: Vec<String> = (0..15).map(|i| format!("tag{}", (b'a' + i) as char)).chain(["x".repeat(41)]).collect();
+        let caption = "word ".repeat(80);
+        let reply = response(&completion(json!({"status":"labeled", "caption":caption, "tags":tags}))).unwrap();
+        assert_eq!(reply.tags.len(), 12);
+        assert_eq!(reply.tags.last().unwrap(), "tagl", "the first twelve stay, in order of the alphabet");
+        assert!(reply.caption.chars().count() <= 320 && reply.caption.ends_with("word"));
+        assert_eq!(cut("short enough", 320), "short enough");
     }
 
     #[test]
