@@ -80,11 +80,15 @@ Search runs locally and synchronously on your machine. It makes no network reque
 
 Tilepicky can generate searchable captions and tags for library sheets using multimodal vision models.
 
+![I opens AI assist, Label with AI describes the open sheet, Label entire library with AI describes the rest, and a search for snow finds the ski pack through its captions and tags](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/ai-labels.gif)
+
+In the recording, `I` opens the AI assist panel, and **Label with AI** describes the open sheet in a few seconds. **Label entire library with AI...** then labels the other 31 sheets, one request each, in about four minutes. The waits play sped up. A search for "snow" finds the Tiny Ski pack, although no file or folder carries that word: the captions and tags do. Unticking captions and tags in the ☰ menu empties the results.
+
 ### Label a single sheet
 
 1. Open a library sheet.
 2. Open the **AI assist** panel with `I` or the header toolbar button.
-3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output.
+3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output. Tilepicky ships with OpenRouter and `z-ai/glm-5.3-flash`; set `OPENROUTER_API_KEY` or type the key in Settings.
 4. Select **Label with AI** in the panel or from the sheet context menu.
 
 The model returns one caption and up to 12 tags. Tilepicky writes this label to `tilepicky.json`. You can continue working while the request runs in the background. Requests abort after 60 seconds, or when you click **Cancel**.
@@ -99,10 +103,10 @@ To label multiple library sheets in bulk:
 
 1. Open the library folder.
 2. Open **AI assist** (`I`) and select **Label entire library with AI...**.
-3. Choose a Google Gemini or OpenRouter batch model and provider key in Settings.
+3. Choose a batch model and provider key in Settings. The default is `z-ai/glm-5.3-flash:batch` on OpenRouter.
 4. Review the unlabeled sheet count and token limits, then click **Start batch**.
 
-Tilepicky submits requests in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`.
 
 Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
 
@@ -112,7 +116,9 @@ API keys are stored separately in `~/.config/tilepicky/keys.json` with restricte
 
 Tilepicky supports complete operation using the keyboard.
 
-![Picking a whole house, and then a column of trees, out of a pack and into a tilesheet of your own, without touching the mouse](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+![A house and two trees go from the Tiny Town pack into a new tilesheet without the mouse: the arrows open the pack, Ctrl+Tab moves between panes, Shift and the arrows select, Ctrl+C and Ctrl+V copy, Ctrl+T trims, and Ctrl+S saves](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+
+In the recording, the arrows walk the library tree and open the Tiny Town pack. `Ctrl+Tab` moves to the source sheet, and `Shift` with the arrows selects a house. `Ctrl+C` copies it, and `Ctrl+Tab` into the empty canvas starts a new tilesheet, where `Ctrl+V` pastes it. Two trees follow the same way. `Ctrl+T` trims the canvas to what it holds, and `Ctrl+S` names and saves it.
 
 ### Pane and widget navigation
 

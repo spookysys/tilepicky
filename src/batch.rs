@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! One library batch: the sheets without a label, sent through the provider's batch API.
-//! Each sheet is one request, the same one that Label with AI sends.
+//! One library job: the sheets without a label, each sent as the request that
+//! Label with AI sends. Google's Gemini API takes them as a batch. An
+//! OpenAI-style endpoint takes them one at a time: OpenRouter's batch API
+//! reads only images at public URLs, and a library lies on this machine.
 //!
 //! The journal in the configuration folder holds the state, so that a batch
 //! continues after a restart. It never holds a key. The state of a sheet:
@@ -26,7 +28,15 @@ pub struct Sheet {
     pub error: String,
     /// The label is in the book.
     pub imported: bool,
+    /// Requests for this sheet that may have arrived but gave no answer the
+    /// tool could read. See `one`.
+    #[serde(default)]
+    pub unknown: u32,
 }
+
+/// How many requests of one sheet may end without a readable answer. Each
+/// may have been billed, so the sheet fails after this many.
+const UNKNOWN_TRIES: u32 = 3;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub enum Remote {
@@ -59,7 +69,11 @@ pub struct Job {
 impl Job {
     fn untaken(&self) -> bool { self.sheets.iter().any(|s| !s.taken) }
     pub fn done(&self) -> bool { !self.untaken() && self.groups.iter().all(|g| g.remote == Remote::Done) }
-    pub fn uncertain(&self) -> bool { self.groups.iter().any(|g| g.remote == Remote::Submitting) }
+    /// A Gemini batch went out and no reply confirmed it. An OpenAI-style job
+    /// is never so: its groups are released; see `release_groups`.
+    pub fn uncertain(&self) -> bool {
+        self.provider.kind == Kind::Gemini && self.groups.iter().any(|g| g.remote == Remote::Submitting)
+    }
     fn progress(&self) -> String {
         let labeled = self.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
         let failed = self.sheets.iter().filter(|s| !s.error.is_empty()).count();
@@ -81,10 +95,9 @@ fn directory(root: &Path) -> Result<PathBuf, String> {
     Ok(crate::settings::dir().ok_or("No configuration directory is available.")?.join("batches").join(format!("{hash:x}")))
 }
 
-/// The request body for one sheet, in the format of the provider.
+/// The request body for one sheet in a Gemini batch.
 fn body(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
-    let body = labels::request(&job.model, img)?;
-    Ok(if job.provider.kind == Kind::Gemini { gemini_request(&body) } else { body })
+    Ok(gemini_request(&labels::request(&job.model, img)?))
 }
 
 /// Lists the sheets without a label. It reads no image and sends nothing.
@@ -94,7 +107,8 @@ pub fn prepare(index: &Index, provider: Provider, model: String) -> Result<Job, 
     let (labeled, open): (Vec<_>, Vec<_>) = index.entries.iter().partition(|e| e.side.label.is_some());
     Ok(Job {
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: labeled.len(),
-        sheets: open.iter().map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false }).collect(),
+        sheets: open.iter().map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
+            .collect(),
     })
 }
 
@@ -110,33 +124,30 @@ fn gemini_request(chat: &Value) -> Value {
             "responseMimeType":"application/json", "responseJsonSchema":chat["response_format"]["json_schema"]["schema"]}})
 }
 
+/// The URL the requests of a job go under. An OpenAI-style one loses a
+/// `/chat/completions` it ends in, since that is the path of each request.
 pub fn endpoint(provider: &Provider) -> Result<String, String> {
     let url = labels::checked_url(&provider.url)?;
-    let uri: ureq::http::Uri = url.parse().map_err(|_| "Invalid batch endpoint URL.")?;
-    match provider.kind {
-        Kind::Gemini => Ok(url),
-        Kind::OpenAi if uri.host() == Some("openrouter.ai") => Ok("https://openrouter.ai/api/beta".into()),
-        _ => Err("Library batches support Google Gemini and OpenRouter. Select one in Settings.".into()),
-    }
+    Ok(match provider.kind {
+        Kind::Gemini => url,
+        Kind::OpenAi => url.trim_end_matches("/chat/completions").into(),
+    })
 }
 
-fn submit_body(job: &Job, requests: &[(String, Value)]) -> Value {
-    match job.provider.kind {
-        Kind::Gemini => json!({"batch":{"displayName":"Tilepicky library labels", "inputConfig":{"requests":{"requests":
-            requests.iter().map(|(key, body)| json!({"metadata":{"key":key}, "request":body})).collect::<Vec<_>>()}}}}),
-        Kind::OpenAi => json!({"endpoint":"/v1/chat/completions", "model":job.model,
-            "requests":requests.iter().map(|(key, body)| json!({"custom_id":key, "body":body})).collect::<Vec<_>>()}),
-    }
+fn submit_body(requests: &[(String, Value)]) -> Value {
+    json!({"batch":{"displayName":"Tilepicky library labels", "inputConfig":{"requests":{"requests":
+        requests.iter().map(|(key, body)| json!({"metadata":{"key":key}, "request":body})).collect::<Vec<_>>()}}}})
 }
 
-fn remote_id(kind: Kind, response: &Value) -> Result<String, String> {
-    let id = response[if kind == Kind::Gemini { "name" } else { "id" }].as_str().ok_or("The batch ID is missing.")?;
-    validate_id(kind, id)?;
+fn remote_id(response: &Value) -> Result<String, String> {
+    let id = response["name"].as_str().ok_or("The batch ID is missing.")?;
+    validate_id(id)?;
     Ok(id.into())
 }
 
-pub fn validate_id(kind: Kind, id: &str) -> Result<(), String> {
-    let tail = if kind == Kind::Gemini { id.strip_prefix("batches/").ok_or("Expected a batches/... ID.")? } else { id };
+/// A Gemini batch ID: `batches/` and letters, digits, `_` and `-`.
+pub fn validate_id(id: &str) -> Result<(), String> {
+    let tail = id.strip_prefix("batches/").ok_or("Expected a batches/... ID.")?;
     if tail.is_empty() || !tail.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)) {
         return Err("Invalid batch ID.".into());
     }
@@ -188,66 +199,63 @@ impl Transport {
     }
 }
 
-fn outputs(kind: Kind, value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
-    let values = if kind == Kind::Gemini {
-        if value["done"] != true { return Ok(None); }
-        if !value["error"].is_null() { return Err("The provider batch failed, expired, or was cancelled.".into()); }
-        value.pointer("/response/inlinedResponses/inlinedResponses").and_then(Value::as_array)
-    } else {
-        match value["status"].as_str() {
-            Some("failed" | "cancelled" | "expired") => return Err("The provider batch failed, expired, or was cancelled.".into()),
-            Some("completed") => {},
-            Some("validating" | "in_progress" | "finalizing" | "queued") => return Ok(None),
-            _ => return Err("The provider returned an unknown batch status.".into()),
-        }
-        value["results"].as_array()
-    }.ok_or("The completed batch has no inline results.")?;
+/// The results of a finished Gemini batch, each as the chat completion that
+/// `labels::response` reads. None while the batch still runs.
+fn outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
+    if value["done"] != true { return Ok(None); }
+    if !value["error"].is_null() { return Err("The provider batch failed, expired, or was cancelled.".into()); }
+    let values = value.pointer("/response/inlinedResponses/inlinedResponses").and_then(Value::as_array)
+        .ok_or("The completed batch has no inline results.")?;
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for item in values {
-        let key = if kind == Kind::Gemini { &item["metadata"]["key"] } else { &item["custom_id"] };
-        let key = key.as_str().ok_or("A batch result has no request ID.")?;
+        let key = item["metadata"]["key"].as_str().ok_or("A batch result has no request ID.")?;
         if !seen.insert(key.to_string()) { return Err("Duplicate batch request ID.".into()); }
-        let response = if !item["error"].is_null() { Value::Null } else if kind == Kind::Gemini {
-            if item["response"]["candidates"].as_array().is_none_or(|a| a.len() != 1)
-                || !item["response"]["promptFeedback"]["blockReason"].is_null() {
-                out.push((key.into(), Value::Null));
-                continue;
-            }
-            let candidate = &item["response"]["candidates"][0];
-            let parts = candidate["content"]["parts"].as_array();
-            let text = parts.map(|p| p.iter().filter(|p| p["thought"] != true).filter_map(|p| p["text"].as_str()).collect::<String>());
-            json!({"choices":[{"finish_reason": if candidate["finishReason"] == "STOP" {"stop"} else {"invalid"},
-                "message":{"content":text}}]})
-        } else if item["response"]["status_code"].as_u64().is_some_and(|s| s != 200) { Value::Null }
-        else { item["response"]["body"].clone() };
-        out.push((key.into(), response));
+        if !item["error"].is_null() || item["response"]["candidates"].as_array().is_none_or(|a| a.len() != 1)
+            || !item["response"]["promptFeedback"]["blockReason"].is_null() {
+            out.push((key.into(), Value::Null));
+            continue;
+        }
+        let candidate = &item["response"]["candidates"][0];
+        let parts = candidate["content"]["parts"].as_array();
+        let text = parts.map(|p| p.iter().filter(|p| p["thought"] != true).filter_map(|p| p["text"].as_str()).collect::<String>());
+        out.push((key.into(), json!({"choices":[{"finish_reason": if candidate["finishReason"] == "STOP" {"stop"} else {"invalid"},
+            "message":{"content":text}}]})));
     }
     Ok(Some(out))
 }
 
+/// Writes what a request gave back into the sheet: a label, or the reason
+/// there is none.
+fn record(sheet: &mut Sheet, provider: &str, model: &str, reply: Result<labels::Reply, String>) {
+    match reply {
+        Ok(reply) => {
+            let label = reply.into_label(provider, model);
+            if label.status == Status::Unlabelable { sheet.error = "The model could not label the sheet.".into(); }
+            sheet.label = Some(label);
+        }
+        Err(error) => sheet.error = error,
+    }
+}
+
 fn accept(job: &mut Job, group: usize, values: Vec<(String, Value)>) {
     let mut values: std::collections::BTreeMap<_, _> = values.into_iter().collect();
-    let (provider, model) = (job.provider.name.clone(), job.model.clone());
     for &i in &job.groups[group].sheets {
-        let sheet = &mut job.sheets[i];
-        match values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v| labels::response(&v)) {
-            Ok(reply) => {
-                let label = reply.into_label(&provider, &model);
-                if label.status == Status::Unlabelable { sheet.error = "The model could not label the sheet.".into(); }
-                sheet.label = Some(label);
-            }
-            Err(error) => sheet.error = error,
-        }
+        let reply = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v| labels::response(&v));
+        record(&mut job.sheets[i], &job.provider.name, &job.model, reply);
     }
 }
 
 type Send<'a> = &'a mut dyn FnMut(&str, Option<&Value>) -> Result<Value, Failure>;
 
-/// Does one network operation: submit the next group of sheets, or ask about
-/// a submitted one. The job is saved before it returns, with or without error.
+/// Does one network operation: label the next sheet, submit the next group
+/// of sheets, or ask about a submitted one. The job is saved before it
+/// returns, with or without error.
 pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
-    let result = if job.uncertain() {
+    let result = if job.provider.kind == Kind::OpenAi {
+        job.release_groups();
+        one(&mut job, root, dir, &mut send)
+    } else if job.uncertain() {
         Err("The provider did not confirm the last submission.".into())
     } else if job.untaken() {
         submit(&mut job, root, dir, &mut send)
@@ -257,7 +265,35 @@ pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str,
     (job, result)
 }
 
-/// Reads the next sheets, and submits them as one group. The group is saved
+/// Labels the next sheet with one ordinary request. A request that did not
+/// arrive, or that the provider could not take now, goes out again for the
+/// same sheet. One whose answer was lost or could not be read may have been
+/// billed: it goes out again, up to `UNKNOWN_TRIES` times in all.
+fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
+    let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
+    let request = image::open(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))
+        .and_then(|img| labels::request(&job.model, &img.to_rgba8()));
+    let reply = match request {
+        Err(error) => Err(error),
+        Ok(request) => match send("chat/completions", Some(&request)) {
+            Ok(value) => labels::response(&value),
+            Err(Failure::Unknown(message)) if job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
+                job.sheets[i].unknown += 1;
+                return job.save(dir).and(Err(message));
+            }
+            Err(Failure::Unknown(message)) => Err(format!("{message} No readable answer after {UNKNOWN_TRIES} tries.")),
+            Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 500..=599))) => {
+                return job.save(dir).and(Err(failure.message()));
+            }
+            Err(Failure::Status(code)) => Err(format!("The provider refused the request (HTTP {code}).")),
+        },
+    };
+    record(&mut job.sheets[i], &job.provider.name, &job.model, reply);
+    job.sheets[i].taken = true;
+    job.save(dir)
+}
+
+/// Reads the next sheets, and submits them as one Gemini batch. The group is saved
 /// as `Submitting` before the request goes out, so that a crash cannot send
 /// it twice.
 fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
@@ -281,14 +317,11 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     for &i in &sheets { job.sheets[i].taken = true; }
     job.groups.push(Group { sheets, remote: Remote::Submitting });
     job.save(dir)?;
-    let path = match job.provider.kind {
-        Kind::Gemini => format!("models/{}:batchGenerateContent", job.model),
-        Kind::OpenAi => "batches".into(),
-    };
+    let path = format!("models/{}:batchGenerateContent", job.model);
     let requests: Vec<_> = requests.into_iter().map(|(i, body)| (key(i), body)).collect();
     let g = job.groups.len() - 1;
-    let result = match send(&path, Some(&submit_body(job, &requests))) {
-        Ok(response) => remote_id(job.provider.kind, &response).map(|id| job.groups[g].remote = Remote::Waiting(id)),
+    let result = match send(&path, Some(&submit_body(&requests))) {
+        Ok(response) => remote_id(&response).map(|id| job.groups[g].remote = Remote::Waiting(id)),
         // The provider made no batch: the sheets wait for the next try.
         Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 503))) => {
             job.send_again();
@@ -307,11 +340,9 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
 fn poll(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     let Some(i) = job.groups.iter().position(|g| matches!(g.remote, Remote::Waiting(_))) else { return Ok(()) };
     let Remote::Waiting(id) = job.groups[i].remote.clone() else { unreachable!() };
-    let kind = job.provider.kind;
-    validate_id(kind, &id)?;
-    let path = if kind == Kind::Gemini { id } else { format!("batches/{id}") };
-    let response = send(&path, None).map_err(|f| f.message())?;
-    match outputs(kind, &response) {
+    validate_id(&id)?;
+    let response = send(&id, None).map_err(|f| f.message())?;
+    match outputs(&response) {
         // Ask about the other groups first, next time.
         Ok(None) => { job.groups.rotate_left(i + 1); return job.save(dir); }
         Ok(Some(values)) => accept(job, i, values),
@@ -328,6 +359,20 @@ impl Job {
             for &i in &group.sheets { self.sheets[i].taken = false; }
         }
         self.groups.retain(|g| g.remote != Remote::Submitting);
+    }
+
+    /// Lets the sheets of an unfinished group go out one at a time. An
+    /// OpenAI-style job of 0.2 went through OpenRouter's batch API, which
+    /// read no local image: its groups never finish, and nothing asks about
+    /// them any more.
+    fn release_groups(&mut self) {
+        for group in self.groups.iter().filter(|g| g.remote != Remote::Done) {
+            for &i in &group.sheets {
+                let sheet = &mut self.sheets[i];
+                (sheet.taken, sheet.error) = (false, String::new());
+            }
+        }
+        self.groups.retain(|g| g.remote == Remote::Done);
     }
 }
 
@@ -455,7 +500,7 @@ impl Panel {
         let ids: Vec<_> = job.groups.iter().filter_map(|g| if let Remote::Waiting(id) = &g.remote { Some(id.clone()) } else { None }).collect();
         if let Some(Ok(transport)) = job.provider.key(keys).map(|key| Transport::new(&job.provider, key)) {
             std::thread::spawn(move || for id in ids {
-                let path = if transport.kind == Kind::Gemini { format!("{id}:cancel") } else { format!("batches/{id}/cancel") };
+                let path = format!("{id}:cancel");
                 let _ = transport.send(&path, Some(&json!({})));
             });
         }
@@ -467,7 +512,8 @@ impl Panel {
         if job.uncertain() {
             "The provider did not confirm the last submission.".into()
         } else if self.task.is_some() {
-            if job.untaken() { "Sending sheets to the provider...".into() } else { "Asking the provider...".into() }
+            if job.provider.kind == Kind::OpenAi { "Labeling the sheets one by one...".into() }
+            else if job.untaken() { "Sending sheets to the provider...".into() } else { "Asking the provider...".into() }
         } else if !self.error.is_empty() {
             format!("{} Next try in {wait} s.", self.error)
         } else if job.done() {
@@ -498,9 +544,8 @@ impl Panel {
             ui.weak("Find the batch in the provider's batch list and attach its ID. If there is none, send the sheets again.");
             crate::stopped(ui.text_edit_singleline(&mut self.attach_id));
             ui.horizontal(|ui| {
-                let kind = self.job.as_ref().unwrap().provider.kind;
                 if crate::stopped(ui.button("Attach batch ID")).clicked() {
-                    match validate_id(kind, self.attach_id.trim()) {
+                    match validate_id(self.attach_id.trim()) {
                         Ok(()) => {
                             let job = self.job.as_mut().unwrap();
                             for g in job.groups.iter_mut().filter(|g| g.remote == Remote::Submitting) {
@@ -529,7 +574,7 @@ impl Panel {
             self.retry = true;
         }
         if self.retry { self.next_check = None; }
-        if !ready { ui.weak("Set a Google or OpenRouter batch model and key in Settings."); }
+        if !ready { ui.weak("Set a batch model and its key in Settings."); }
         let button = ui.add_enabled(ready && !self.running() && self.task.is_none() && !index.root.as_os_str().is_empty(),
             egui::Button::new("Label entire library with AI..."));
         crate::stop(&button);
@@ -596,8 +641,8 @@ mod tests {
             RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255])).save(root.join("folder/sheet.png")).unwrap();
             Self { base, root, spool }
         }
-        fn prepare(&self) -> Job {
-            prepare(&Index::scan(&self.root, [16, 16]), provider(Kind::OpenAi), "test:batch".into()).unwrap()
+        fn prepare(&self, kind: Kind) -> Job {
+            prepare(&Index::scan(&self.root, [16, 16]), provider(kind), "test:batch".into()).unwrap()
         }
         fn advance(&self, job: Job, send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
             advance(job, &self.root, &self.spool, send)
@@ -611,15 +656,16 @@ mod tests {
             Kind::OpenAi => "https://openrouter.ai/api/v1".into(),
         } }
     }
-    /// The provider's answer for a finished group, in reverse order.
+    /// Gemini's answer for a finished group, in reverse order.
     fn completed(job: &Job, group: usize, caption: &str) -> Value {
-        json!({"status":"completed", "results":job.groups[group].sheets.iter().rev().map(|&i| {
-            json!({"custom_id":key(i), "response":{"status_code":200, "body":completion(labeled(caption))}})
-        }).collect::<Vec<_>>()})
+        let text = completion(labeled(caption))["choices"][0]["message"]["content"].clone();
+        json!({"done":true, "response":{"inlinedResponses":{"inlinedResponses":job.groups[group].sheets.iter().rev().map(|&i| {
+            json!({"metadata":{"key":key(i)}, "response":{"candidates":[{"finishReason":"STOP", "content":{"parts":[{"text":text}]}}]}})
+        }).collect::<Vec<_>>()}}})
     }
     fn id(value: &str) -> impl FnMut(&str, Option<&Value>) -> Result<Value, Failure> {
         let value = value.to_string();
-        move |_, _| Ok(json!({"id":value}))
+        move |_, _| Ok(json!({"name":value}))
     }
 
     #[test]
@@ -630,32 +676,118 @@ mod tests {
         let label = labels::tests::completion(labeled("Done"));
         let label = labels::response(&label).unwrap().into_label("test", "test");
         crate::sidecar::store_labels(&files.root, [("done.png", Some(label))]).unwrap();
-        let job = files.prepare();
+        let job = files.prepare(Kind::Gemini);
         assert_eq!(job.sheets.iter().map(|s| s.rel.as_str()).collect::<Vec<_>>(), ["broken.png", "folder/sheet.png"]);
         assert_eq!(job.skipped, 1);
         assert_eq!(job.model, "test");
         assert!(!files.spool.exists());
     }
 
+    /// An OpenAI-style endpoint gets one request per sheet, as Label with AI
+    /// sends it, and the job is done when every sheet had its turn.
+    #[test]
+    fn an_openai_endpoint_labels_one_sheet_at_a_time() {
+        let files = Files::new();
+        std::fs::write(files.root.join("broken.png"), b"not an image").unwrap();
+        RgbaImage::new(4, 4).save(files.root.join("more.png")).unwrap();
+        let mut job = files.prepare(Kind::OpenAi);
+        let mut sent = 0;
+        while !job.done() {
+            let result;
+            (job, result) = files.advance(job, |path, request| {
+                assert_eq!(path, "chat/completions");
+                assert_eq!(request.unwrap()["model"], "test");
+                sent += 1;
+                Ok(completion(labeled("Forest")))
+            });
+            result.unwrap();
+        }
+        assert_eq!(sent, 2, "the sheet that cannot be read sends nothing");
+        assert!(job.sheets[0].error.contains("Could not read"));
+        assert_eq!(job.sheets[1].label.as_ref().unwrap().caption, "Forest");
+        assert!(job.groups.is_empty());
+        assert!(files.journal().done());
+    }
+
+    /// A request that did not arrive, or that the provider could not take
+    /// now, goes out again for the same sheet. A refusal ends that sheet.
+    #[test]
+    fn an_openai_request_that_failed_goes_out_again() {
+        let files = Files::new();
+        for failure in [Failure::NotSent("offline".into()), Failure::Status(429), Failure::Status(503), Failure::Unknown("timeout".into())] {
+            let mut failure = Some(failure);
+            let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(failure.take().unwrap()));
+            assert!(result.is_err());
+            assert!(!job.sheets[0].taken && job.sheets[0].error.is_empty());
+            let (job, result) = files.advance(job, |_, _| Ok(completion(labeled("Tree"))));
+            result.unwrap();
+            assert!(job.done() && job.sheets[0].label.is_some());
+        }
+        let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(Failure::Status(401)));
+        result.unwrap();
+        assert!(job.done() && job.sheets[0].error.contains("401"));
+    }
+
+    /// A request whose answer was lost or unreadable may have been billed,
+    /// so one sheet goes out at most three times that way. Offline tries
+    /// do not count.
+    #[test]
+    fn an_unreadable_answer_is_not_paid_for_forever() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::OpenAi);
+        let mut sent = 0;
+        for _ in 0..10 {
+            let result;
+            (job, result) = files.advance(job, |_, _| Err(Failure::NotSent("offline".into())));
+            assert!(result.is_err());
+        }
+        while !job.done() {
+            let result;
+            (job, result) = files.advance(job, |_, _| { sent += 1; Err(Failure::Unknown("Invalid or oversized batch response.".into())) });
+            assert_eq!(result.is_err(), sent < 3);
+        }
+        assert_eq!(sent, 3);
+        assert!(job.sheets[0].taken && job.sheets[0].error.contains("3 tries"));
+        assert_eq!(files.journal().sheets[0].unknown, 2);
+    }
+
+    /// A journal of 0.2 holds OpenRouter batch groups that never finish.
+    /// Their sheets go out one at a time instead, and the job ends.
+    #[test]
+    fn an_openai_journal_of_0_2_finishes() {
+        let files = Files::new();
+        RgbaImage::new(4, 4).save(files.root.join("more.png")).unwrap();
+        let mut job = files.prepare(Kind::OpenAi);
+        for s in &mut job.sheets { s.taken = true; }
+        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batch-1".into()) },
+            Group { sheets: vec![1], remote: Remote::Submitting }];
+        assert!(!job.uncertain() && !job.done());
+        while !job.done() {
+            let result;
+            (job, result) = files.advance(job, |path, _| { assert_eq!(path, "chat/completions"); Ok(completion(labeled("Tree"))) });
+            result.unwrap();
+        }
+        assert!(job.groups.is_empty());
+        assert!(job.sheets.iter().all(|s| s.label.is_some()));
+    }
+
     #[test]
     fn a_batch_submits_waits_and_saves_its_labels() {
         let files = Files::new();
         std::fs::write(files.root.join("broken.png"), b"not an image").unwrap();
-        let (job, result) = files.advance(files.prepare(), |path, request| {
-            assert_eq!(path, "batches");
+        let (job, result) = files.advance(files.prepare(Kind::Gemini), |path, request| {
+            assert_eq!(path, "models/test:batchGenerateContent");
             assert!(files.journal().uncertain(), "the journal says Submitting before the request goes out");
-            let request = request.unwrap();
-            assert_eq!(request["model"], "test");
-            assert_eq!(request["requests"].as_array().unwrap().len(), 1);
-            Ok(json!({"id":"batch-1"}))
+            assert_eq!(request.unwrap()["batch"]["inputConfig"]["requests"]["requests"].as_array().unwrap().len(), 1);
+            Ok(json!({"name":"batches/batch-1"}))
         });
         result.unwrap();
         assert!(job.sheets[0].error.contains("Could not read"));
-        assert!(matches!(&files.journal().groups[0].remote, Remote::Waiting(id) if id == "batch-1"));
+        assert!(matches!(&files.journal().groups[0].remote, Remote::Waiting(id) if id == "batches/batch-1"));
         let (job, result) = files.advance(job, |path, request| {
             assert_eq!(path, "batches/batch-1");
             assert!(request.is_none());
-            Ok(json!({"status":"in_progress"}))
+            Ok(json!({"done":false}))
         });
         result.unwrap();
         assert!(!job.done());
@@ -677,11 +809,11 @@ mod tests {
             encoder.encode_frame(image::Frame::new(first.clone())).unwrap();
             encoder.encode_frame(image::Frame::new(RgbaImage::from_pixel(8, 4, Rgba([200, 10, 20, 255])))).unwrap();
         }
-        let (_, result) = files.advance(files.prepare(), |_, request| {
-            let url = request.unwrap()["requests"][0]["body"]["messages"][1]["content"][1]["image_url"]["url"].as_str().unwrap().to_string();
+        let (_, result) = files.advance(files.prepare(Kind::OpenAi), |_, request| {
+            let url = request.unwrap()["messages"][1]["content"][1]["image_url"]["url"].as_str().unwrap().to_string();
             let png = STANDARD.decode(url.strip_prefix("data:image/png;base64,").unwrap()).unwrap();
             assert_eq!(image::load_from_memory(&png).unwrap().to_rgba8(), first);
-            Ok(json!({"id":"batch-1"}))
+            Ok(completion(labeled("Waterfall")))
         });
         result.unwrap();
     }
@@ -691,11 +823,11 @@ mod tests {
         let files = Files::new();
         for failure in [Failure::NotSent("offline".into()), Failure::Status(429)] {
             let mut failure = Some(failure);
-            let (job, result) = files.advance(files.prepare(), |_, _| Err(failure.take().unwrap()));
+            let (job, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(failure.take().unwrap()));
             assert!(result.is_err());
             assert!(job.groups.is_empty() && !job.sheets[0].taken);
             assert!(!files.journal().uncertain());
-            let (job, result) = files.advance(job, id("batch-2"));
+            let (job, result) = files.advance(job, id("batches/batch-2"));
             result.unwrap();
             assert!(matches!(&job.groups[0].remote, Remote::Waiting(_)));
         }
@@ -704,14 +836,14 @@ mod tests {
     #[test]
     fn an_unconfirmed_submission_is_not_sent_twice() {
         let files = Files::new();
-        let (_, result) = files.advance(files.prepare(), |_, _| Err(Failure::Unknown("timeout".into())));
+        let (_, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Unknown("timeout".into())));
         assert!(result.is_err());
         let mut job = files.journal();
         assert!(job.uncertain());
         let (_, result) = files.advance(job.clone(), |_, _| panic!("a paid submission must not go out twice"));
         assert!(result.is_err());
         job.send_again();
-        let (job, result) = files.advance(job, id("batch-3"));
+        let (job, result) = files.advance(job, id("batches/batch-3"));
         result.unwrap();
         assert!(!job.uncertain());
     }
@@ -719,7 +851,7 @@ mod tests {
     #[test]
     fn a_refused_submission_fails_its_sheets() {
         let files = Files::new();
-        let (job, result) = files.advance(files.prepare(), |_, _| Err(Failure::Status(401)));
+        let (job, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Status(401)));
         result.unwrap();
         assert!(job.sheets[0].error.contains("401"));
         assert!(job.done());
@@ -728,9 +860,9 @@ mod tests {
     #[test]
     fn results_follow_their_ids_and_missing_results_fail() {
         let files = Files::new();
-        let mut job = files.prepare();
+        let mut job = files.prepare(Kind::Gemini);
         job.sheets.push(job.sheets[0].clone());
-        job.groups.push(Group { sheets: vec![0, 1], remote: Remote::Waiting("x".into()) });
+        job.groups.push(Group { sheets: vec![0, 1], remote: Remote::Waiting("batches/x".into()) });
         accept(&mut job, 0, vec![(key(1), completion(labeled("Second"))), ("unknown".into(), Value::Null)]);
         assert!(job.sheets[0].label.is_none());
         assert!(!job.sheets[0].error.is_empty());
@@ -740,12 +872,12 @@ mod tests {
     #[test]
     fn polls_take_turns() {
         let files = Files::new();
-        let mut job = files.prepare();
+        let mut job = files.prepare(Kind::Gemini);
         job.sheets[0].taken = true;
-        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("first".into()) },
-            Group { sheets: vec![0], remote: Remote::Waiting("second".into()) }];
-        let (job, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/first"); Ok(json!({"status":"in_progress"})) });
-        let (_, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/second"); Ok(json!({"status":"in_progress"})) });
+        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batches/first".into()) },
+            Group { sheets: vec![0], remote: Remote::Waiting("batches/second".into()) }];
+        let (job, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/first"); Ok(json!({"done":false})) });
+        let (_, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/second"); Ok(json!({"done":false})) });
     }
 
     #[test]
@@ -771,22 +903,30 @@ mod tests {
                 "text":completion(labeled("Tree"))["choices"][0]["message"]["content"]
             }]}}]}
         }]}}});
-        let out = outputs(Kind::Gemini, &response).unwrap().unwrap();
+        let out = outputs(&response).unwrap().unwrap();
         assert_eq!(out[0].0, "sheet-0");
         assert_eq!(labels::response(&out[0].1).unwrap().into_label("", "").caption, "Tree");
         let mut bad = response.clone();
         bad["response"]["inlinedResponses"]["inlinedResponses"][0]["response"]["candidates"][0]["finishReason"] = json!("SAFETY");
-        let out = outputs(Kind::Gemini, &bad).unwrap().unwrap();
+        let out = outputs(&bad).unwrap().unwrap();
         assert!(labels::response(&out[0].1).is_err());
-        assert!(outputs(Kind::Gemini, &json!({"done":false})).unwrap().is_none());
-        assert!(outputs(Kind::OpenAi, &json!({"status":"completed", "results":[{"custom_id":"a"},{"custom_id":"a"}]})).is_err());
+        assert!(outputs(&json!({"done":false})).unwrap().is_none());
+        let mut twice = response.clone();
+        let item = twice["response"]["inlinedResponses"]["inlinedResponses"][0].clone();
+        twice["response"]["inlinedResponses"]["inlinedResponses"] = json!([item.clone(), item]);
+        assert!(outputs(&twice).is_err());
     }
 
     #[test]
     fn provider_and_resource_paths_do_not_redirect_keys() {
-        assert_eq!(endpoint(&provider(Kind::OpenAi)).unwrap(), "https://openrouter.ai/api/beta");
-        assert!(validate_id(Kind::Gemini, "batches/test_1").is_ok());
-        for id in ["", "../files", "abc?key=other", "https://other.test", "abc/def"] { assert!(validate_id(Kind::OpenAi, id).is_err()); }
+        assert_eq!(endpoint(&provider(Kind::OpenAi)).unwrap(), "https://openrouter.ai/api/v1");
+        let mut p = provider(Kind::OpenAi);
+        p.url = "https://example.test/v1/chat/completions".into();
+        assert_eq!(endpoint(&p).unwrap(), "https://example.test/v1");
+        assert!(validate_id("batches/test_1").is_ok());
+        for id in ["", "batches/", "../files", "batches/abc?key=other", "https://other.test", "batches/abc/def", "abc"] {
+            assert!(validate_id(id).is_err(), "{id}");
+        }
         let mut p = provider(Kind::Gemini);
         p.url = "https://user:password@example.test".into();
         assert!(endpoint(&p).is_err());

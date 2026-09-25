@@ -121,6 +121,8 @@ struct App {
     /// The settings popup was open at the last frame; both files are
     /// written when it closes.
     config_open: bool,
+    /// The settings popup is open. See `settings_popup`.
+    settings_open: bool,
     /// The legend asks whether to hide itself.
     legend_prompt: bool,
     /// The eye of the project panel: tooltips and islands, no editing. Off
@@ -363,6 +365,7 @@ impl App {
             library_batch: batch::Panel::default(),
             remove_label: None,
             config_open: false,
+            settings_open: false,
             legend_prompt: false,
             project_eye: false,
             picking: None,
@@ -915,8 +918,23 @@ impl App {
     /// are written when the popup closes.
     fn settings_popup(&mut self, gear: &egui::Response, ui: &egui::Ui) {
         let id = Id::new("settings popup");
-        egui::Popup::new(id, ui.ctx().clone(), gear, ui.layer_id())
-            .open_memory(gear.clicked().then_some(egui::SetOpenCommand::Toggle))
+        // egui holds one open popup at a time, and a combo box in the
+        // settings takes it. So the settings keep their own open state, and
+        // close here: on Escape, or on a click outside them. A click that
+        // closes a combo box leaves them open.
+        let ctx = ui.ctx().clone();
+        let combo = egui::Popup::is_any_open(&ctx);
+        let last = ctx.read_response(id).map(|r| r.rect);
+        let (click, escape) = ctx.input(|i| (i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten(),
+            i.key_pressed(Key::Escape)));
+        let outside = click.is_some_and(|p| !gear.rect.contains(p) && last.is_none_or(|r| !r.contains(p)));
+        if gear.clicked() {
+            self.settings_open = !self.settings_open;
+        } else if self.settings_open && !combo && (escape || outside) {
+            self.settings_open = false;
+        }
+        egui::Popup::new(id, ctx.clone(), gear, ui.layer_id())
+            .open(self.settings_open)
             .align(egui::RectAlign::TOP_END)
             .show(|ui| {
                 // A maximum, not a fixed width: the popup shrinks to its
@@ -937,7 +955,7 @@ impl App {
                     });
                 }
             });
-        let open = egui::Popup::is_id_open(ui.ctx(), id);
+        let open = self.settings_open;
         if self.config_open && !open {
             if let Err(e) = self.settings.save() { self.status = e; }
             if let Err(e) = self.keys.save() { self.status = e; }
@@ -986,7 +1004,7 @@ impl App {
             self.go(ctx, search_id());
         }
         if key(cmd, Key::Comma) {
-            egui::Popup::toggle_id(ctx, Id::new("settings popup"));
+            self.settings_open = !self.settings_open;
         }
         // Tab walks the stops, and Ctrl+Tab walks the panes. They work from
         // a text field too. The most modifiers go first: `consume_key` lets
@@ -2154,7 +2172,9 @@ impl eframe::App for App {
                 // What the search matches on, in a popup under the button.
                 let r = ui.small_button("☰").on_hover_text("search in…");
                 stop(&r);
-                egui::Popup::from_toggle_button_response(&r).show(|ui| {
+                // A click on a box ticks it and leaves the popup open, so
+                // that several can change at once.
+                egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                     ui.set_min_width(220.0);
                     ui.strong("Search in");
                     let first = ui.checkbox(&mut self.settings.search.folders, "folder names");

@@ -55,8 +55,9 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/labels.rs`: one labeling request per sheet, and the checks on the
   reply. GIFs send their first frame. Label with AI sends it from a worker
   thread; to cancel, drop the `Run`. Tests use fake responses.
-- `src/batch.rs`: library batches through the provider batch API, one
-  request per sheet. A worker thread does one network operation at a time,
+- `src/batch.rs`: library batches, one request per sheet: through the
+  Gemini batch API, or one at a time to an OpenAI-style endpoint, whose
+  batch API (OpenRouter's) takes no local images. A worker thread does one network operation at a time,
   and a journal in the configuration folder holds the state, never keys.
   Single labeling and a batch run independently: both write the book from
   the UI thread. Tests use fake transports.
