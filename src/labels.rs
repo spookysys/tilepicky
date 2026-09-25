@@ -179,6 +179,12 @@ pub fn checked_url(url: &str) -> Result<String, String> {
     Ok(url.into())
 }
 
+/// The HTTP client that carries a key. It follows no redirect, so the key
+/// goes to the checked URL and nowhere else.
+pub fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(60))).max_redirects(0).http_status_as_error(false).build().new_agent()
+}
+
 pub struct Endpoint {
     client: ureq::Agent,
     url: String,
@@ -189,9 +195,7 @@ impl Endpoint {
     pub fn new(url: &str, key: String) -> Result<Self, String> {
         let url = checked_url(url)?;
         let url = if url.ends_with("/chat/completions") { url } else { format!("{url}/chat/completions") };
-        let client = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(60)))
-            .max_redirects(0).http_status_as_error(false).build().new_agent();
-        Ok(Self { client, url, key })
+        Ok(Self { client: agent(), url, key })
     }
 
     pub fn send(&self, body: &Value) -> Result<Value, String> {

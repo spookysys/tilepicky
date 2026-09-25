@@ -11,11 +11,13 @@
 
 mod ai;
 mod detect;
+mod dialogs;
 mod index;
 mod labels;
 mod batch;
 mod storage;
 mod files;
+mod half;
 mod settings;
 mod sheet;
 mod sidecar;
@@ -34,7 +36,9 @@ use sidecar::{Animation, Pair};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tree::{Node, TreeAction};
+use dialogs::{Damaged, NameFor, NamePrompt, Pending};
+use half::Half;
+use tree::TreeAction;
 
 /// A new tilesheet starts with this many cells.
 /// The sizes the tile field steps through when dragged. Typing allows any
@@ -52,6 +56,29 @@ enum Panel {
     Project,
 }
 
+/// What a sheet panel asked for while it drew. The app does it once both
+/// panels are drawn.
+struct PanelOut {
+    /// A new grid from the header fields.
+    grid: Option<Grid>,
+    /// A stored animation changed, or the reason a change was refused.
+    anim: Result<bool, String>,
+    /// A hold on this cell lifted a block.
+    drag: Option<(u32, u32)>,
+    /// A click on the empty panel asks for the folder.
+    ask: bool,
+    /// A canvas edge drag ended.
+    resized: bool,
+    /// A right click deleted the content of the selection.
+    deleted: bool,
+}
+
+impl Default for PanelOut {
+    fn default() -> Self {
+        Self { grid: None, anim: Ok(false), drag: None, ask: false, resized: false, deleted: false }
+    }
+}
+
 /// A block on its way from one place to another, under the pointer.
 struct Drag {
     block: Block,
@@ -66,32 +93,10 @@ struct Drag {
     ghost: TextureHandle,
 }
 
-/// What to do once the user has decided about unsaved changes.
-#[derive(Clone, Copy, PartialEq)]
-enum Pending {
-    Open(usize),
-    Create,
-    Close,
-}
-
-/// What the name prompt is for.
-#[derive(Clone, PartialEq)]
-enum NameFor {
-    SaveAs,
-    RenameFile(String),
-    DuplicateFile(String),
-    NewFolder(String),
-    RenameFolder(String),
-}
-
-struct NamePrompt {
-    title: String,
-    value: String,
-    what: NameFor,
-    focus: bool,
-}
-
 struct App {
+    /// Configuration files that could not be read, waiting for the user
+    /// to agree that they are written over.
+    damaged: Vec<Damaged>,
     drag: Option<Drag>,
     prompt: Option<NamePrompt>,
     /// Files marked with Ctrl+click in the PROJECT tree.
@@ -127,36 +132,18 @@ struct App {
     sweep: Option<usize>,
     /// Files held in the air, waiting for a folder to land in.
     file_drag: Option<Vec<String>>,
-    /// A file the arrow keys moved to, to bring into view next frame.
-    library_scroll: Option<tree::Row>,
-    project_scroll: Option<tree::Row>,
-    /// The row the arrow keys stand on in each tree, folders included.
-    library_at: Option<tree::Row>,
-    project_at: Option<tree::Row>,
-    /// The rows each tree showed when it last drew, in reading order.
-    library_rows: Vec<tree::Row>,
-    project_rows: Vec<tree::Row>,
-    /// A folder the arrow keys opened or closed, applied on the next draw.
-    library_open_dir: Option<(String, bool)>,
-    project_open_dir: Option<(String, bool)>,
     /// Where the project pane sat last frame, for drops onto the empty pane.
     project_rect: Rect,
     /// A pending deletion, waiting for the user's yes.
     confirm: Option<(String, Vec<String>)>,
     /// An action that waits for the save dialog.
     pending: Option<Pending>,
-    library: Index,
-    project: Index,
-    library_tree: Node,
-    project_tree: Node,
+    /// An action that waits for the Save As the save dialog asked for.
+    after_save: Option<Pending>,
+    library: Half,
+    project: Half,
     query: String,
     qwords: Vec<String>,
-    library_visible: Option<Vec<bool>>,
-    project_visible: Option<Vec<bool>>,
-    library_sheet: Option<Sheet>,
-    project_sheet: Option<Sheet>,
-    library_sel: Option<usize>,
-    project_sel: Option<usize>,
     active: Panel,
     clip: Option<Block>,
     new_name: String,
@@ -297,6 +284,9 @@ fn library_id() -> Id {
 fn project_id() -> Id {
     Id::new("project sheet")
 }
+fn sheet_id(panel: Panel) -> Id {
+    if panel == Panel::Library { library_id() } else { project_id() }
+}
 
 /// The keys of a popup that hangs from a button. While the popup is open,
 /// the keys stay in it: when they are anywhere else, they go to `first`,
@@ -345,16 +335,28 @@ fn library_tree_id() -> Id {
 fn project_tree_id() -> Id {
     Id::new("project free space")
 }
+fn tree_id(panel: Panel) -> Id {
+    if panel == Panel::Library { library_tree_id() } else { project_tree_id() }
+}
+/// The half whose tree has this name.
+fn tree_panel(id: Id) -> Option<Panel> {
+    [Panel::Library, Panel::Project].into_iter().find(|p| tree_id(*p) == id)
+}
 
 impl App {
-    fn new(settings: settings::Settings) -> Self {
+    /// `damaged` is why the settings file could not be read, if it could not.
+    fn new(settings: settings::Settings, damaged: Option<String>) -> Self {
         let root = |s: &Option<PathBuf>| s.clone().unwrap_or_default();
+        let cleaned = drop_own_sources(&root(&settings.project.path), &root(&settings.library.path));
         let library = Index::scan(&root(&settings.library.path), settings.library.tile.map_or(TILE, Pair::xy));
         let mut project = Index::scan(&root(&settings.project.path), settings.project.tile.map_or(TILE, Pair::xy));
         migrate_sidecars(&mut project);
+        let (keys, damaged_keys) = ai::Keys::load();
+        let damaged = damaged.map(Damaged::Settings).into_iter().chain(damaged_keys.map(Damaged::Keys)).collect();
         Self {
+            damaged,
             settings,
-            keys: ai::Keys::load(),
+            keys,
             ai_panel: false,
             label_run: None,
             label_outcome: None,
@@ -371,30 +373,15 @@ impl App {
             tree_cursor: None,
             sweep: None,
             file_drag: None,
-            library_scroll: None,
-            project_scroll: None,
-            library_at: None,
-            project_at: None,
-            library_rows: Vec::new(),
-            project_rows: Vec::new(),
-            library_open_dir: None,
-            project_open_dir: None,
             project_rect: Rect::NOTHING,
             confirm: None,
             pending: None,
-            library_tree: Node::build(&library.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &library.dirs),
-            project_tree: Node::build(&project.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &project.dirs),
-            status: library.error.clone().or_else(|| project.error.clone()).unwrap_or_default(),
-            library,
-            project,
+            after_save: None,
+            status: library.error.clone().or_else(|| project.error.clone()).or(cleaned).unwrap_or_default(),
+            library: Half::new(library, true),
+            project: Half::new(project, false),
             query: String::new(),
             qwords: Vec::new(),
-            library_visible: None,
-            project_visible: None,
-            library_sheet: None,
-            project_sheet: None,
-            library_sel: None,
-            project_sel: None,
             active: Panel::Library,
             pane: (Panel::Library, Spot::Tree),
             stops: Vec::new(),
@@ -408,15 +395,25 @@ impl App {
         }
     }
 
-    /// Whether a side has a folder to work in.
-    fn is_set(&self, panel: Panel) -> bool {
-        !self.index(panel).root.as_os_str().is_empty()
-    }
-
-    fn index(&self, panel: Panel) -> &Index {
+    fn half(&self, panel: Panel) -> &Half {
         match panel {
             Panel::Library => &self.library,
             Panel::Project => &self.project,
+        }
+    }
+
+    fn half_mut(&mut self, panel: Panel) -> &mut Half {
+        match panel {
+            Panel::Library => &mut self.library,
+            Panel::Project => &mut self.project,
+        }
+    }
+
+    /// What the settings remember about one side.
+    fn remembered(&mut self, panel: Panel) -> &mut settings::Side {
+        match panel {
+            Panel::Library => &mut self.settings.library,
+            Panel::Project => &mut self.settings.project,
         }
     }
 
@@ -454,7 +451,7 @@ impl App {
             Ok(answer) => {
                 self.picking = None;
                 if let Some(dir) = answer {
-                    self.set_folder(ctx, panel, dir);
+                    self.set_folder(panel, dir);
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
@@ -464,56 +461,38 @@ impl App {
 
     /// Points one side at a folder: reads it, drops what was open there, and
     /// remembers it for the next run.
-    fn set_folder(&mut self, ctx: &egui::Context, panel: Panel, dir: PathBuf) {
-        let _ = ctx;
-        match panel {
-            Panel::Library => {
-                self.settings.library.path = Some(dir.clone());
-                self.library.root = dir;
-                self.library_sheet = None;
-                self.library_sel = None;
-                self.rescan_library();
-            }
-            Panel::Project => {
-                self.settings.project.path = Some(dir.clone());
-                self.project.root = dir;
-                self.project_sheet = None;
-                self.project_sel = None;
-                self.marked.clear();
-                self.rescan_project();
-            }
-        }
+    fn set_folder(&mut self, panel: Panel, dir: PathBuf) {
         let name = match panel {
             Panel::Library => "library",
-            Panel::Project => "project",
+            Panel::Project => {
+                self.marked.clear();
+                "project"
+            }
         };
-        self.status = self.index(panel).error.clone().unwrap_or_else(|| format!("{name}: {}", self.index(panel).root.display()));
+        self.remembered(panel).path = Some(dir.clone());
+        let cleaned = if panel == Panel::Project { drop_own_sources(&dir, &self.library.index.root) } else { None };
+        let (query, search) = (self.qwords.clone(), self.settings.search);
+        self.half_mut(panel).set_root(&dir, &query, search);
+        let index = &self.half(panel).index;
+        self.status = index.error.clone().or(cleaned).unwrap_or_else(|| format!("{name}: {}", index.root.display()));
         if let Err(e) = self.settings.save() { self.status = e; }
     }
 
     /// Remembers the tile size a side used last, in the folder's own book and
     /// in the settings, so that a new sheet there starts with it.
     fn remember_tile(&mut self, panel: Panel, tile: [u32; 2]) {
-        if !self.is_set(panel) {
+        if !self.half(panel).is_set() {
             return;
         }
-        let root = self.index(panel).root.clone();
+        let root = self.half(panel).index.root.clone();
         if let Err(e) = sidecar::store_tile(&root, tile) { self.status = e; return; }
-        match panel {
-            Panel::Library => {
-                self.library.tile = tile;
-                self.settings.library.tile = Some(Pair::of(tile));
-            }
-            Panel::Project => {
-                self.project.tile = tile;
-                self.settings.project.tile = Some(Pair::of(tile));
-            }
-        }
+        self.half_mut(panel).index.tile = tile;
+        self.remembered(panel).tile = Some(Pair::of(tile));
         if let Err(e) = self.settings.save() { self.status = e; }
     }
 
     fn refresh_query(&mut self) {
-        self.qwords = index::query_words(&self.query);
+        self.qwords = index::words(&self.query);
         self.open_trees = true;
         self.refresh_visible();
     }
@@ -521,18 +500,8 @@ impl App {
     /// Filters the trees again after the entries changed. The folders stay
     /// open or closed as they are.
     fn refresh_visible(&mut self) {
-        self.library_visible = self.library.visible(&self.qwords, self.settings.search);
-        self.project_visible = self.project.visible(&self.qwords, self.settings.search);
-    }
-
-    /// The tile size to assume for a sheet whose entry names none: the sheet
-    /// now open in the same panel, else the folder's default.
-    fn inherited_tile(&self, panel: Panel) -> [u32; 2] {
-        let (sheet, default) = match panel {
-            Panel::Library => (&self.library_sheet, self.library.tile),
-            Panel::Project => (&self.project_sheet, self.project.tile),
-        };
-        sheet.as_ref().map_or(default, |s| s.tile)
+        self.library.refresh_visible(&self.qwords, self.settings.search);
+        self.project.refresh_visible(&self.qwords, self.settings.search);
     }
 
     /// The arrow keys move a cursor over the folders and files of the tree
@@ -543,11 +512,8 @@ impl App {
     ///
     /// The keys go to a tree only while its body holds the focus.
     fn tree_keys(&mut self, ctx: &egui::Context, library_rows: &[tree::Row], project_rows: &[tree::Row], project_order: &[usize]) {
-        let library = match ctx.memory(|m| m.focused()) {
-            Some(id) if id == library_tree_id() => true,
-            Some(id) if id == project_tree_id() => false,
-            _ => return,
-        };
+        let Some(panel) = ctx.memory(|m| m.focused()).and_then(tree_panel) else { return };
+        let library = panel == Panel::Library;
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k)) as i32;
         // Shift first: `consume_key` ignores an extra Shift, so the plain
         // arrows would eat the shifted ones.
@@ -563,62 +529,49 @@ impl App {
         // screen shows the cursor one key late.
         ctx.request_repaint();
         let rows = if library { library_rows } else { project_rows };
-        let at = if library {
-            self.library_at.clone().or(self.library_sel.map(tree::Row::File))
-        } else {
-            self.project_at.clone().or(self.tree_cursor.or(self.project_sel).map(tree::Row::File))
-        };
+        let half = self.half(panel);
+        let open = if library { half.sel } else { self.tree_cursor.or(half.sel) };
+        let at = half.at.clone().or(open.map(tree::Row::File));
         // Right and Left open and close the folder the keys stand on.
         if fold != 0 {
             if let Some(tree::Row::Dir(d)) = &at {
-                let open = (d.clone(), fold > 0);
-                if library {
-                    self.library_open_dir = Some(open);
-                } else {
-                    self.project_open_dir = Some(open);
-                }
+                self.half_mut(panel).open_dir = Some((d.clone(), fold > 0));
             }
             return;
         }
         // Shift walks the files only: a folder has nothing to mark.
         if grow != 0 && !library {
-            let from = self.tree_cursor.or(self.project_sel);
+            let from = self.tree_cursor.or(self.project.sel);
             let Some(i) = walk(project_order, from, grow) else { return };
             let a = self.tree_anchor.or(from).unwrap_or(i);
             self.mark_range(project_order, a, i, false);
             self.tree_anchor = Some(a);
             self.tree_cursor = Some(i);
-            self.project_at = Some(tree::Row::File(i));
-            self.project_scroll = Some(tree::Row::File(i));
+            self.project.at = Some(tree::Row::File(i));
+            self.project.scroll = Some(tree::Row::File(i));
             return;
         }
         if enter && step == 0 && grow == 0 {
             if let Some(row) = &at {
-                let panel = if library { Panel::Library } else { Panel::Project };
-                self.open_row(ctx, panel, &row.clone());
+                self.open_row(ctx, panel, row);
             }
             return;
         }
         let dir = step + grow;
         let Some(row) = walk_rows(rows, at.as_ref(), dir) else { return };
-        self.stand_on(ctx, if library { Panel::Library } else { Panel::Project }, row);
+        self.stand_on(panel, row);
     }
 
     /// Puts the arrow keys on a row of a tree. Standing on a file does not
     /// open it: the cursor and the sheet on show are two different things,
     /// and Enter is what joins them.
-    fn stand_on(&mut self, _ctx: &egui::Context, panel: Panel, row: tree::Row) {
-        if panel == Panel::Library {
-            self.library_at = Some(row);
-            self.library_scroll = self.library_at.clone();
-            self.active = Panel::Library;
-            return;
-        }
-        self.active = Panel::Project;
-        self.project_at = Some(row.clone());
-        self.project_scroll = self.project_at.clone();
+    fn stand_on(&mut self, panel: Panel, row: tree::Row) {
+        self.active = panel;
+        let half = self.half_mut(panel);
+        half.at = Some(row.clone());
+        half.scroll = Some(row.clone());
         // A group grows from wherever the cursor stands, so the two agree.
-        if let tree::Row::File(i) = row {
+        if panel == Panel::Project && let tree::Row::File(i) = row {
             self.tree_anchor = Some(i);
             self.tree_cursor = Some(i);
         }
@@ -627,18 +580,10 @@ impl App {
     /// Enter, or Space, in a tree: it opens the file the cursor stands on,
     /// or unfolds the folder it stands on.
     fn open_row(&mut self, ctx: &egui::Context, panel: Panel, row: &tree::Row) {
-        let library = panel == Panel::Library;
         match row {
-            tree::Row::Dir(d) => {
-                let open = Some((d.clone(), true));
-                if library {
-                    self.library_open_dir = open;
-                } else {
-                    self.project_open_dir = open;
-                }
-            }
-            tree::Row::File(i) if library => self.open_library(ctx, *i),
-            tree::Row::File(i) => self.request(ctx, Pending::Open(*i)),
+            tree::Row::Dir(d) => self.half_mut(panel).open_dir = Some((d.clone(), true)),
+            tree::Row::File(i) if panel == Panel::Library => self.open_library(ctx, *i),
+            tree::Row::File(i) => self.request(ctx, Pending::Open(self.project.index.entries[*i].rel.clone())),
         }
     }
 
@@ -658,34 +603,18 @@ impl App {
     }
 
     fn open_library(&mut self, ctx: &egui::Context, i: usize) {
-        let e = &self.library.entries[i];
-        match Sheet::open(ctx, &self.library.root, &e.rel, self.inherited_tile(Panel::Library), e.side.clone()) {
-            Ok(mut s) => {
-                if let Some(prev) = &self.library_sheet {
-                    s.zoom = prev.zoom;
-                }
-                self.library_sheet = Some(s);
-                self.library_sel = Some(i);
-                // The keys follow the file, however it was opened. A click
-                // that left the cursor behind means the next arrow starts
-                // somewhere the eye is not.
-                self.library_at = Some(tree::Row::File(i));
-                self.active = Panel::Library;
-            }
+        // The keys follow the file, however it was opened. A click that
+        // left the cursor behind means the next arrow starts somewhere the
+        // eye is not.
+        match self.library.open(ctx, i) {
+            Ok(()) => self.active = Panel::Library,
             Err(err) => self.status = err,
         }
     }
 
     fn open_project(&mut self, ctx: &egui::Context, i: usize) {
-        let e = &self.project.entries[i];
-        match Sheet::open(ctx, &self.project.root, &e.rel, self.inherited_tile(Panel::Project), e.side.clone()) {
-            Ok(mut s) => {
-                if let Some(prev) = &self.project_sheet {
-                    s.zoom = prev.zoom;
-                }
-                self.project_sheet = Some(s);
-                self.project_sel = Some(i);
-                self.project_at = Some(tree::Row::File(i));
+        match self.project.open(ctx, i) {
+            Ok(()) => {
                 self.tree_cursor = Some(i);
                 self.active = Panel::Project;
             }
@@ -697,158 +626,64 @@ impl App {
     /// block dropped on the panel starts one, and so does a Ctrl+Tab that
     /// crosses to it. Both name it at the first save.
     fn start_canvas(&mut self, ctx: &egui::Context, tile: [u32; 2]) {
+        self.project.sheet = Some(self.new_canvas(ctx, "", tile));
+        self.project.sel = None;
+    }
+
+    /// An empty tilesheet of about `NEW_PX` pixels a side.
+    fn new_canvas(&self, ctx: &egui::Context, rel: &str, tile: [u32; 2]) -> Sheet {
         let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
         let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
-        self.project_sheet = Some(Sheet::new_empty(ctx, &self.project.root, "", tile, cols, rows));
-        self.project_sel = None;
+        Sheet::new_empty(ctx, &self.project.index.root, rel, tile, cols, rows)
     }
 
     fn create_project(&mut self, ctx: &egui::Context) {
-        let name = self.new_name.trim().trim_end_matches(".png").to_string();
-        if name.is_empty() {
+        if self.new_name.trim().is_empty() {
             return;
         }
-        let rel = format!("{name}.png");
-        let tile = self.inherited_tile(Panel::Project);
-        let cols = ((NEW_PX + tile[0] / 2) / tile[0]).max(1);
-        let rows = ((NEW_PX + tile[1] / 2) / tile[1]).max(1);
-        let mut sheet = Sheet::new_empty(ctx, &self.project.root, &rel, tile, cols, rows);
+        // The name stays inside the project, and a new sheet never takes
+        // the place of one that is there.
+        let Some(rel) = files::normalize_name(&self.new_name, Some(".png")) else {
+            self.status = "that is not a usable name".into();
+            return;
+        };
+        if self.project.index.root.join(&rel).exists() {
+            self.status = format!("{rel} exists");
+            return;
+        }
+        let mut sheet = self.new_canvas(ctx, &rel, self.project.inherited_tile());
         if let Err(e) = sheet.save() {
             self.status = e;
             return;
         }
         self.new_name.clear();
         self.rescan_project();
-        if let Some(i) = self.project.position(&rel) {
+        if let Some(i) = self.project.index.position(&rel) {
             self.open_project(ctx, i);
         }
     }
 
     fn rescan_library(&mut self) {
-        self.library = Index::scan(&self.library.root, self.library.tile);
-        self.library_tree = Node::build(&self.library.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.library.dirs);
-        self.library_visible = self.library.visible(&self.qwords, self.settings.search);
-        self.library_sel = self.library_sheet.as_ref().and_then(|s| self.library.position(&s.rel));
-        self.status = self.library.error.clone().unwrap_or_else(|| format!("{} files in the library", self.library.entries.len()));
+        self.library.rescan(&self.qwords, self.settings.search);
+        let index = &self.library.index;
+        self.status = index.error.clone().unwrap_or_else(|| format!("{} files in the library", index.entries.len()));
     }
 
     fn rescan_project(&mut self) {
         self.marked.clear();
-        self.project = Index::scan(&self.project.root, self.project.tile);
-        if let Some(e) = &self.project.error { self.status = e.clone(); }
-        self.project_tree = Node::build(&self.project.entries.iter().map(|e| e.rel.clone()).collect::<Vec<_>>(), &self.project.dirs);
-        self.project_visible = self.project.visible(&self.qwords, self.settings.search);
-        if let Some(rel) = self.project_sheet.as_ref().map(|s| s.rel.clone()) {
-            self.project_sel = self.project.position(&rel);
-        }
-    }
-
-    /// A click on the legend asks before it goes; the settings bring it back.
-    fn legend_dialog(&mut self, ctx: &egui::Context) {
-        if !self.legend_prompt {
-            return;
-        }
-        let mut done = false;
-        let modal = egui::Modal::new(Id::new("legend dialog")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Hide the legend?");
-            ui.label("You can show it again in the settings: the gear at the right end of the status line.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Hide").clicked() {
-                    self.settings.hide_legend = true;
-                    if let Err(e) = self.settings.save() { self.status = e; }
-                    done = true;
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    done = true;
-                }
-            });
-        });
-        if done || modal.should_close() {
-            self.legend_prompt = false;
-        }
-    }
-
-    /// The name prompt for Save As, renames, duplicates, and new folders.
-    fn name_dialog(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = &mut self.prompt else {
-            return;
-        };
-        let mut apply = false;
-        let mut cancel = false;
-        egui::Modal::new(Id::new("name dialog")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading(&prompt.title);
-            let r = ui.add(egui::TextEdit::singleline(&mut prompt.value).desired_width(f32::INFINITY));
-            if prompt.focus {
-                r.request_focus();
-                prompt.focus = false;
-            }
-            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                apply = true;
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Ok").clicked() {
-                    apply = true;
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    cancel = true;
-                }
-            });
-        });
-        if cancel {
-            self.prompt = None;
-        } else if apply {
-            let p = self.prompt.take().unwrap();
-            if let Err(e) = self.apply_name(ctx, &p.what, &p.value) {
-                self.status = e;
-            }
-        }
+        self.project.rescan(&self.qwords, self.settings.search);
+        if let Some(e) = &self.project.index.error { self.status = e.clone(); }
     }
 
     /// Deletes files (and, through their paths, whole folders), with their
     /// book entries. Runs only after the confirm dialog.
     fn delete_paths(&mut self, rels: &[String]) -> Result<(), String> {
-        let root = self.project.root.clone();
+        let root = self.project.index.root.clone();
         files::remove(&root, rels)?;
-        if self.project_sheet.as_ref().is_some_and(|sheet| !root.join(&sheet.rel).exists()) { self.project_sheet = None; }
+        if self.project.sheet.as_ref().is_some_and(|sheet| !root.join(&sheet.rel).exists()) { self.project.sheet = None; }
         self.status = format!("deleted {}", rels.join(", "));
         self.rescan_project();
         Ok(())
-    }
-
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some((message, _)) = &self.confirm else {
-            return;
-        };
-        let message = message.clone();
-        let mut choice = None;
-        egui::Modal::new(Id::new("confirm dialog")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Delete");
-            ui.label(&message);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Delete").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    choice = Some(false);
-                }
-            });
-        });
-        match choice {
-            Some(true) => {
-                let (_, rels) = self.confirm.take().unwrap();
-                if let Err(e) = self.delete_paths(&rels) {
-                    self.status = e;
-                }
-            }
-            Some(false) => self.confirm = None,
-            None => {}
-        }
     }
 
     /// Puts a file's path on the clipboard: the whole path, or the short
@@ -887,16 +722,21 @@ impl App {
         let files = self.file_drag.take().unwrap();
         let Some(dir) = hover_dir else { return };
         let copy = ctx.input(|i| i.modifiers.command);
+        let mut errors = Vec::new();
         for rel in &files {
             let name = rel.rsplit_once('/').map_or(rel.as_str(), |(_, n)| n);
             let new = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
             if let Err(e) = self.relocate(rel, &new, copy) {
-                self.status = e;
+                errors.push(e);
             }
         }
         let what = if copy { "copied" } else { "moved" };
         let where_to = if dir.is_empty() { "the top".to_string() } else { dir.clone() };
-        self.status = format!("{} {what} to {where_to}", files.len());
+        self.status = format!("{} {what} to {where_to}", files.len() - errors.len());
+        // A file that stayed says why.
+        if !errors.is_empty() {
+            self.status = format!("{}; {}", self.status, errors.join("; "));
+        }
         self.marked.clear();
         self.rescan_project();
     }
@@ -904,13 +744,13 @@ impl App {
     /// Moves or copies one file of the PROJECT tree, with its book entry. The
     /// open sheet follows its own file.
     fn relocate(&mut self, old: &str, new: &str, copy: bool) -> Result<(), String> {
-        files::relocate(&self.project.root, old, new, copy)?;
-        if !copy && let Some(sheet) = &mut self.project_sheet && sheet.rel == old { sheet.rel = new.to_string(); }
+        files::relocate(&self.project.index.root, old, new, copy)?;
+        if !copy && let Some(sheet) = &mut self.project.sheet && sheet.rel == old { sheet.rel = new.to_string(); }
         Ok(())
     }
 
     fn apply_name(&mut self, ctx: &egui::Context, what: &NameFor, name: &str) -> Result<(), String> {
-        let root = self.project.root.clone();
+        let root = self.project.index.root.clone();
         match what {
             NameFor::NewFolder(parent) => {
                 let rel = files::normalize_name(name, None).ok_or("that is not a usable name")?;
@@ -926,7 +766,7 @@ impl App {
                 };
                 if new != *old {
                     files::relocate(&root, old, &new, false)?;
-                    if let Some(sheet) = &mut self.project_sheet
+                    if let Some(sheet) = &mut self.project.sheet
                         && let Some(rest) = sheet.rel.strip_prefix(&format!("{old}/")) {
                         sheet.rel = format!("{new}/{rest}");
                     }
@@ -938,16 +778,22 @@ impl App {
                 if root.join(&rel).exists() {
                     return Err(format!("{rel} exists"));
                 }
-                let Some(sheet) = &mut self.project_sheet else {
+                let Some(sheet) = &mut self.project.sheet else {
                     return Ok(());
                 };
                 if let Some(parent) = root.join(&rel).parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                sheet.rel = rel.clone();
-                sheet.save()?;
+                let old = std::mem::replace(&mut sheet.rel, rel.clone());
+                if let Err(e) = sheet.save() {
+                    sheet.rel = old;
+                    return Err(e);
+                }
                 self.status = format!("saved as {rel}");
                 self.rescan_project();
+                if let Some(action) = self.after_save.take() {
+                    self.run(ctx, action);
+                }
             }
             NameFor::RenameFile(old) => {
                 let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
@@ -960,9 +806,8 @@ impl App {
                 let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
                 self.relocate(old, &rel, true)?;
                 self.rescan_project();
-                if let Some(i) = self.project.position(&rel) {
-                    self.open_project(ctx, i);
-                }
+                // The copy opens as any file does: unsaved changes ask first.
+                self.request(ctx, Pending::Open(rel));
             }
         }
         Ok(())
@@ -970,23 +815,21 @@ impl App {
 
     /// Keeps search in step with an edit. Saving is explicit: Ctrl+S.
     fn after_edit(&mut self) {
-        let Some(sheet) = &mut self.project_sheet else {
-            return;
-        };
-        if let Some(i) = self.project_sel {
-            self.project.entries[i].side = sheet.side.clone();
-        }
-        self.project_visible = self.project.visible(&self.qwords, self.settings.search);
+        self.project.sync_entry();
+        self.project.refresh_visible(&self.qwords, self.settings.search);
     }
 
     fn save(&mut self) {
-        let Some(sheet) = &mut self.project_sheet else {
+        let Some(sheet) = &mut self.project.sheet else {
             return;
         };
-        if sheet.rel.is_empty() {
+        // A sheet with no name asks for one. A sheet from a GIF or a JPEG
+        // asks for a PNG name: those formats would lose frames or alpha.
+        if sheet.rel.is_empty() || !sheet::is_png(&sheet.rel) {
+            let value = if sheet.rel.is_empty() { String::new() } else { Path::new(&sheet.rel).with_extension("png").to_string_lossy().into() };
             self.prompt = Some(NamePrompt {
                 title: "Save as".into(),
-                value: String::new(),
+                value,
                 what: NameFor::SaveAs,
                 focus: true,
             });
@@ -999,7 +842,7 @@ impl App {
     }
 
     fn trim(&mut self, ctx: &egui::Context) {
-        let Some(sheet) = &mut self.project_sheet else {
+        let Some(sheet) = &mut self.project.sheet else {
             return;
         };
         let before = (sheet.cols(), sheet.rows());
@@ -1013,7 +856,7 @@ impl App {
     }
 
     fn has_unsaved(&self) -> bool {
-        self.project_sheet.as_ref().is_some_and(|s| s.dirty)
+        self.project.sheet.as_ref().is_some_and(|s| s.dirty)
     }
 
     /// Runs the action, or asks about unsaved changes first.
@@ -1027,52 +870,16 @@ impl App {
 
     fn run(&mut self, ctx: &egui::Context, action: Pending) {
         match action {
-            Pending::Open(i) => self.open_project(ctx, i),
+            Pending::Open(rel) => {
+                if let Some(i) = self.project.index.position(&rel) {
+                    self.open_project(ctx, i);
+                }
+            }
             Pending::Create => self.create_project(ctx),
             Pending::Close => {
-                self.project_sheet = None;
+                self.project.sheet = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-        }
-    }
-
-    /// The dialog for unsaved changes: save, discard, or cancel.
-    fn save_dialog(&mut self, ctx: &egui::Context) {
-        let Some(action) = self.pending else { return };
-        let name = self.project_sheet.as_ref().map(|s| s.rel.clone()).unwrap_or_default();
-        let mut choice = None;
-        egui::Modal::new(Id::new("save dialog")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Unsaved changes");
-            ui.label(format!("{name} has changes that are not saved."));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Discard").clicked() {
-                    choice = Some(false);
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    self.pending = None;
-                }
-            });
-        });
-        if let Some(save) = choice {
-            if save && self.project_sheet.as_ref().is_some_and(|s| s.rel.is_empty()) {
-                // No name yet: ask for one; the interrupted action is dropped.
-                self.pending = None;
-                self.save();
-                return;
-            }
-            if save {
-                self.save();
-            }
-            if let Some(sheet) = &mut self.project_sheet {
-                sheet.dirty = false;
-            }
-            self.pending = None;
-            self.run(ctx, action);
         }
     }
 
@@ -1138,12 +945,6 @@ impl App {
         self.config_open = open;
     }
 
-    /// A dialog or a popup is up: the keys belong to it, Escape first of all.
-    fn dialog_open(&self, ctx: &egui::Context) -> bool {
-        self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.library_batch.open()
-            || self.pending.is_some() || self.legend_prompt || egui::Popup::is_any_open(ctx)
-    }
-
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // A dialog or a popup takes the keys as egui gives them, and no
         // command of the window behind it fires.
@@ -1163,12 +964,12 @@ impl App {
         // A run of Shift and the arrows keeps the corner that walks. It ends
         // when Shift comes up, so nothing invisible outlasts the gesture.
         if !ctx.input(|i| i.modifiers.shift) {
-            for s in [self.library_sheet.as_mut(), self.project_sheet.as_mut()].into_iter().flatten() {
+            for s in [self.library.sheet.as_mut(), self.project.sheet.as_mut()].into_iter().flatten() {
                 s.end_run();
             }
         }
         // Saving works no matter what has focus; a swallowed Ctrl+S loses work.
-        if key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) && let Some(sheet) = &self.project_sheet {
+        if key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) && let Some(sheet) = &self.project.sheet {
             self.prompt = Some(NamePrompt {
                 title: "Save as".into(),
                 value: sheet.rel.clone(),
@@ -1206,7 +1007,7 @@ impl App {
         // A frame in which nothing holds the keys, such as the frame in
         // which a text field lets go of them, fires no command.
         let focus = ctx.memory(|m| m.focused());
-        if !focus.is_some_and(|id| self.pane_of(id).is_some()) {
+        if focus.is_none_or(|id| self.pane_of(id).is_none()) {
             return;
         }
         // The status bar lies in neither half. A command that asks which
@@ -1229,23 +1030,20 @@ impl App {
         let cut = !project_eye && (cut || key(cmd, Key::X));
 
         if in_half && (copy || cut || key(cmd, Key::C)) {
-            let from = match self.active {
-                Panel::Library => &self.library_sheet,
-                Panel::Project => &self.project_sheet,
-            };
+            let from = &self.half(self.active).sheet;
             if let Some(b) = from.as_ref().and_then(Sheet::copy) {
                 self.status = format!("copied {}x{} tiles", b.cols, b.rows);
                 // A note in the system clipboard, so that Ctrl+V reaches us as a Paste event.
                 ctx.copy_text(b.note());
                 self.clip = Some(b);
                 // A cut clears the cells; only your tilesheet is editable.
-                if cut && self.active == Panel::Project && let Some(sheet) = &mut self.project_sheet {
-                    sheet.clear_selection(ctx);
+                if cut && self.active == Panel::Project && let Some(sheet) = &mut self.project.sheet {
+                    sheet.clear_selection();
                     self.after_edit();
                 }
             }
         }
-        if in_half && !project_eye && (paste || key(cmd, Key::V)) && let (Some(block), Some(sheet)) = (&self.clip, &mut self.project_sheet) {
+        if in_half && !project_eye && (paste || key(cmd, Key::V)) && let (Some(block), Some(sheet)) = (&self.clip, &mut self.project.sheet) {
             let at = sheet.sel.origin().unwrap_or((0, 0));
             sheet.paste(ctx, at, block);
             self.active = Panel::Project;
@@ -1274,8 +1072,8 @@ impl App {
         }
         if in_half && self.active == Panel::Project && !project_eye
             && (key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace))
-            && let Some(sheet) = &mut self.project_sheet {
-            sheet.clear_selection(ctx);
+            && let Some(sheet) = &mut self.project.sheet {
+            sheet.clear_selection();
             self.after_edit();
         }
         if in_half && !eye && key(cmd, Key::A) && let Some(s) = self.sheet_mut(self.active) {
@@ -1345,10 +1143,7 @@ impl App {
     }
 
     fn start_drag(&mut self, ctx: &egui::Context, from: Panel, cell: (u32, u32)) {
-        let sheet = match from {
-            Panel::Library => self.library_sheet.as_ref(),
-            Panel::Project => self.project_sheet.as_ref(),
-        };
+        let sheet = self.half(from).sheet.as_ref();
         let Some(sheet_ref) = sheet else { return };
         let from_selection = sheet_ref.sel.contains(cell);
         let origin = if from_selection { sheet_ref.sel.clone() } else { Sel::rect(cell, cell) };
@@ -1378,7 +1173,7 @@ impl App {
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
 
         // Over the tilesheet the ghost snaps to the grid; elsewhere it floats at the pointer.
-        let mut target = self.project_sheet.as_ref().and_then(|d| {
+        let mut target = self.project.sheet.as_ref().and_then(|d| {
             let c = d.cell_at(p)?;
             Some((c.0.saturating_sub(drag.grab.0), c.1.saturating_sub(drag.grab.1)))
         });
@@ -1386,16 +1181,13 @@ impl App {
         // of the block, since the tile sizes may differ.
         let block_px = Vec2::new(drag.block.img.width() as f32, drag.block.img.height() as f32);
         let library_cell = Vec2::new(drag.block.tile[0] as f32, drag.block.tile[1] as f32);
-        let (min, zoom) = match (target, &self.project_sheet) {
+        let (min, zoom) = match (target, &self.project.sheet) {
             (Some(t), Some(d)) => {
                 let c = d.cell_px();
                 (d.screen.min + Vec2::new(t.0 as f32 * c.x, t.1 as f32 * c.y), d.zoom_px())
             }
             _ => {
-                let z = match drag.from {
-                    Panel::Library => self.library_sheet.as_ref().map_or(2.0, |s| s.zoom_px()),
-                    Panel::Project => self.project_sheet.as_ref().map_or(2.0, |s| s.zoom_px()),
-                };
+                let z = self.half(drag.from).sheet.as_ref().map_or(2.0, |s| s.zoom_px());
                 (
                     p - Vec2::new((drag.grab.0 as f32 + 0.5) * library_cell.x, (drag.grab.1 as f32 + 0.5) * library_cell.y) * z,
                     z,
@@ -1437,12 +1229,12 @@ impl App {
         }
         // A drop on the empty pane starts a fresh, unnamed tilesheet; its name
         // is asked for at the first save.
-        if target.is_none() && self.project_sheet.is_none() && self.project_rect.contains(p) {
+        if target.is_none() && self.project.sheet.is_none() && self.project_rect.contains(p) {
             // The new tilesheet takes the grid of the block that lands on it.
             self.start_canvas(ctx, drag.block.tile);
             target = Some((0, 0));
         }
-        let (Some(at), Some(sheet)) = (target, &mut self.project_sheet) else {
+        let (Some(at), Some(sheet)) = (target, &mut self.project.sheet) else {
             return;
         };
         let copy = drag.from == Panel::Library || ctx.input(|i| i.modifiers.command);
@@ -1553,7 +1345,8 @@ impl App {
             }
             here.push(r);
             if let Some(eye) = eye {
-                let r = ui.add_enabled(open, egui::Button::new("👁").small().selected(*eye)).on_hover_text("view information about the sheet, no editing (E)");
+                let r = ui.add_enabled(open, egui::Button::new("👁").small().selected(*eye))
+                    .on_hover_text("view information about the sheet, no editing (E)");
                 if r.clicked() {
                     *eye = !*eye;
                     clicked = true;
@@ -1623,7 +1416,7 @@ impl App {
             self.status = "Wait for the current label, or cancel it.".into();
             return;
         }
-        let Some(sheet) = &self.library_sheet else { return };
+        let Some(sheet) = &self.library.sheet else { return };
         if action == labels::Action::Remove {
             self.remove_label = Some((sheet.dir.clone(), sheet.rel.clone()));
             ctx.request_repaint();
@@ -1671,43 +1464,9 @@ impl App {
     /// Puts labels that the book now holds into the open sheets and the search.
     fn apply_labels(&mut self, dir: &Path, labels: &[(String, Option<sidecar::Label>)]) {
         if labels.is_empty() { return; }
-        for index in [&mut self.library, &mut self.project].into_iter().filter(|i| i.root == dir) {
-            for (rel, label) in labels {
-                if let Some(i) = index.position(rel) { index.entries[i].side.label = label.clone(); }
-            }
-        }
-        for sheet in [&mut self.library_sheet, &mut self.project_sheet].into_iter().flatten().filter(|s| s.dir == dir) {
-            if let Some((_, label)) = labels.iter().find(|(rel, _)| *rel == sheet.rel) { sheet.side.label = label.clone(); }
-        }
+        self.library.apply_labels(dir, labels);
+        self.project.apply_labels(dir, labels);
         self.refresh_visible();
-    }
-
-    fn remove_label_dialog(&mut self, ctx: &egui::Context) {
-        let Some((dir, rel)) = self.remove_label.clone() else { return };
-        let path = dir.join(&rel);
-        let mut choice = None;
-        egui::Modal::new(Id::new("remove AI label")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Remove the AI label?");
-            ui.label(path.display().to_string());
-            ui.label("This removes the caption and the tags. The image and the grid stay.");
-            ui.horizontal(|ui| {
-                if ui.button("Remove label").clicked() { choice = Some(true); }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) { choice = Some(false); }
-            });
-        });
-        if let Some(remove) = choice {
-            self.remove_label = None;
-            if remove {
-                match sidecar::store_labels(&dir, [(rel.as_str(), None)]) {
-                    Ok(()) => {
-                        self.apply_labels(&dir, &[(rel, None)]);
-                        self.status = "AI label removed.".into();
-                    }
-                    Err(error) => self.status = error,
-                }
-            }
-        }
     }
 
     /// `A` opens or closes the animation panel of the active panel. Storing
@@ -1745,9 +1504,9 @@ impl App {
     fn zoom_under_pointer(&mut self) -> Option<&mut sheet::Zoom> {
         let active = self.active;
         let hovered = |s: &Sheet| s.preview_hovered || s.hover.is_some();
-        let panel = if self.library_sheet.as_ref().is_some_and(hovered) {
+        let panel = if self.library.sheet.as_ref().is_some_and(hovered) {
             Panel::Library
-        } else if self.project_sheet.as_ref().is_some_and(hovered) {
+        } else if self.project.sheet.as_ref().is_some_and(hovered) {
             Panel::Project
         } else {
             active
@@ -1772,11 +1531,8 @@ impl App {
         match panel {
             Panel::Project => self.after_edit(),
             Panel::Library => {
-                if let Some(sheet) = &mut self.library_sheet && let Err(e) = sheet.save_entry() {
+                if let Err(e) = self.store_library_entry() {
                     self.status = e;
-                }
-                if let (Some(i), Some(sheet)) = (self.library_sel, &self.library_sheet) {
-                    self.library.entries[i].side = sheet.side.clone();
                 }
             }
         }
@@ -1801,11 +1557,9 @@ impl App {
     /// Where the keys land in a pane: the rows of a tree, the grid of a
     /// sheet, else the first stop of the pane.
     fn body(&self, pane: (Panel, Spot)) -> Option<Id> {
-        let library = pane.0 == Panel::Library;
         match pane.1 {
-            Spot::Tree => return Some(if library { library_tree_id() } else { project_tree_id() }),
-            Spot::Sheet if library && self.library_sheet.is_some() => return Some(library_id()),
-            Spot::Sheet if !library && self.project_sheet.is_some() => return Some(project_id()),
+            Spot::Tree => return Some(tree_id(pane.0)),
+            Spot::Sheet if self.half(pane.0).sheet.is_some() => return Some(sheet_id(pane.0)),
             _ => {}
         }
         self.stops.iter().find(|(p, _)| *p == pane).map(|(_, id)| *id)
@@ -1827,8 +1581,8 @@ impl App {
         }
         // A tree with no row under the keys, or a grid with nothing
         // selected, shows nothing at all. Arriving puts that right at once.
-        self.enter_tree(ctx, id);
-        if let Some(panel) = [(library_id(), Panel::Library), (project_id(), Panel::Project)].iter().find(|(k, _)| *k == id).map(|(_, p)| *p)
+        self.enter_tree(id);
+        if let Some(panel) = [Panel::Library, Panel::Project].into_iter().find(|p| sheet_id(*p) == id)
             && let Some(sheet) = self.sheet_mut(panel)
         {
             sheet.start();
@@ -1837,25 +1591,17 @@ impl App {
 
     /// Puts the keys on a row when they arrive in a tree with none: the file
     /// on show, else the first row.
-    fn enter_tree(&mut self, ctx: &egui::Context, id: Id) {
-        let library = if id == library_tree_id() {
-            true
-        } else if id == project_tree_id() {
-            false
-        } else {
-            return;
-        };
-        let panel = if library { Panel::Library } else { Panel::Project };
-        let rows = if library { &self.library_rows } else { &self.project_rows };
-        let here = if library { &self.library_at } else { &self.project_at };
+    fn enter_tree(&mut self, id: Id) {
+        let Some(panel) = tree_panel(id) else { return };
+        let half = self.half(panel);
         // A cursor that is still on a row of this tree stays where it is.
-        if here.as_ref().is_some_and(|r| rows.contains(r)) {
+        if half.at.as_ref().is_some_and(|r| half.rows.contains(r)) {
             return;
         }
-        let open = if library { self.library_sel } else { self.project_sel };
-        let row = open.map(tree::Row::File).filter(|r| rows.contains(r)).or_else(|| rows.first().cloned());
+        let rows = &half.rows;
+        let row = half.sel.map(tree::Row::File).filter(|r| rows.contains(r)).or_else(|| rows.first().cloned());
         if let Some(row) = row {
-            self.stand_on(ctx, panel, row);
+            self.stand_on(panel, row);
         }
     }
 
@@ -1876,8 +1622,8 @@ impl App {
         // The canvas is the one pane you can make on the way. A step down
         // from the source sheet starts a tilesheet there, as a dropped block
         // does, at the tile size of the sheet you come from.
-        if step > 0 && self.pane == (Panel::Library, Spot::Sheet) && self.project_sheet.is_none() && self.is_set(Panel::Project) {
-            let tile = self.inherited_tile(Panel::Library);
+        if step > 0 && self.pane == (Panel::Library, Spot::Sheet) && self.project.sheet.is_none() && self.project.is_set() {
+            let tile = self.library.inherited_tile();
             self.start_canvas(ctx, tile);
         }
         let n = PANES.len() as i32;
@@ -1894,10 +1640,7 @@ impl App {
     }
 
     fn sheet_mut(&mut self, panel: Panel) -> Option<&mut Sheet> {
-        match panel {
-            Panel::Library => self.library_sheet.as_mut(),
-            Panel::Project => self.project_sheet.as_mut(),
-        }
+        self.half_mut(panel).sheet.as_mut()
     }
 
     /// A tilesheet keeps the change until Ctrl+S. A library sheet has no pixel
@@ -1905,19 +1648,19 @@ impl App {
     fn after_animation_edit(&mut self, panel: Panel) {
         match panel {
             Panel::Project => self.after_edit(),
-            Panel::Library => {
-                let Some(sheet) = &mut self.library_sheet else {
-                    return;
-                };
-                match sheet.save_entry() {
-                    Ok(()) => self.status = format!("stored in {}", self.library.root.join(sidecar::BOOK).display()),
-                    Err(e) => self.status = e,
-                }
-                if let Some(i) = self.library_sel {
-                    self.library.entries[i].side = sheet.side.clone();
-                }
-            }
+            Panel::Library => match self.store_library_entry() {
+                Ok(()) => self.status = format!("stored in {}", self.library.index.root.join(sidecar::BOOK).display()),
+                Err(e) => self.status = e,
+            },
         }
+    }
+
+    /// Writes the book entry of the library sheet, and gives search the
+    /// same entry.
+    fn store_library_entry(&mut self) -> Result<(), String> {
+        let result = self.library.sheet.as_mut().map_or(Ok(()), Sheet::save_entry);
+        self.library.sync_entry();
+        result
     }
 
     /// The side panel of a sheet: the selection played as an animation, with
@@ -2060,6 +1803,270 @@ impl App {
         ui.weak(format!("{}x - frame {}/{}", sheet.preview_zoom.level, frame + 1, n));
         ui.ctx().request_repaint_after(Duration::from_millis(a.ms.max(16) as u64));
     }
+
+    /// The upper sheet panel: the library sheet, its header, and its side
+    /// panels. What it asks for is done in `after_panel`.
+    fn library_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, keys: (Panel, Spot), dragging: bool) -> PanelOut {
+        let mut out = PanelOut::default();
+        set_pane(ui, (Panel::Library, Spot::Sheet));
+        ui.horizontal(|ui| {
+            let live = keys == (Panel::Library, Spot::Sheet);
+            let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
+            let clicked;
+            (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), ai, None);
+            // A header button does not keep the keys: they go to the grid.
+            if clicked {
+                self.active = Panel::Library;
+                if self.library.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(library_id())); }
+            }
+        });
+        if self.ai_panel {
+            let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
+                set_pane(ui, (Panel::Library, Spot::Side));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let out = Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library.sheet.as_ref(),
+                        self.label_run.as_ref(), self.label_outcome.as_deref());
+                    self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys);
+                    out
+                }).inner
+            });
+            if let Some(action) = label.inner { self.label_action(ctx, action); }
+        }
+        if let Some(s) = &mut self.library.sheet {
+            if s.anim_panel {
+                egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                    set_pane(ui, (Panel::Library, Spot::Side));
+                    out.anim = Self::animation_panel(ui, s, true, keys == (Panel::Library, Spot::Side));
+                });
+            }
+            set_pane(ui, (Panel::Library, Spot::Sheet));
+            stop_id(ui.ctx(), library_id());
+            let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false, false, keys == (Panel::Library, Spot::Sheet))).inner;
+            if let Some(action) = ev.labels { self.label_action(ctx, action); }
+            if ev.interacted {
+                self.active = Panel::Library;
+            }
+            out.drag = ev.drag_block;
+        } else {
+            // Fill the panel, so that it keeps its height and can be dragged.
+            egui::CentralPanel::default().show(ui, |ui| {
+                let hint = if self.library.is_set() {
+                    "Open a sheet on the left, or press Ctrl+F to search."
+                } else {
+                    "Click to open your asset library."
+                };
+                let r = ui.interact(ui.max_rect(), Id::new("library empty"), egui::Sense::click());
+                ui.weak(hint);
+                if !self.library.is_set() && r.clicked() {
+                    out.ask = true;
+                }
+            });
+        }
+        out
+    }
+
+    /// The lower sheet panel: your tilesheet, its header, and its animation
+    /// panel. What it asks for is done in `after_panel`.
+    fn project_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, keys: (Panel, Spot), dragging: bool) -> PanelOut {
+        let mut out = PanelOut::default();
+        self.project_rect = ui.max_rect();
+        set_pane(ui, (Panel::Project, Spot::Sheet));
+        let live = keys == (Panel::Project, Spot::Sheet);
+        let clicked;
+        (out.grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye));
+        if clicked {
+            self.active = Panel::Project;
+            if self.project.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(project_id())); }
+        }
+        let eye = self.project_eye;
+        if let Some(s) = &mut self.project.sheet {
+            if s.anim_panel {
+                egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
+                    set_pane(ui, (Panel::Project, Spot::Side));
+                    out.anim = Self::animation_panel(ui, s, false, keys == (Panel::Project, Spot::Side));
+                });
+            }
+            set_pane(ui, (Panel::Project, Spot::Sheet));
+            stop_id(ui.ctx(), project_id());
+            let ev = egui::CentralPanel::default().show(ui, |ui| s.view(ui, project_id(), dragging, true, eye, keys == (Panel::Project, Spot::Sheet))).inner;
+            if ev.interacted {
+                self.active = Panel::Project;
+            }
+            out.resized = ev.resized;
+            out.drag = ev.drag_block;
+            if ev.delete {
+                s.clear_selection();
+                out.deleted = true;
+            }
+        } else {
+            // The same frame as the library pane, so both hints sit alike.
+            egui::CentralPanel::default().show(ui, |ui| {
+                let hint = if self.project.is_set() {
+                    "Create or open a tilesheet on the left. Then select tiles in the library, Ctrl+C, click a tile here, Ctrl+V."
+                } else {
+                    "Click to open your project folder."
+                };
+                let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
+                ui.weak(hint);
+                if !self.project.is_set() && r.clicked() {
+                    out.ask = true;
+                }
+            });
+        }
+        out
+    }
+
+    /// Does what a sheet panel asked for while it drew.
+    fn after_panel(&mut self, ctx: &egui::Context, panel: Panel, out: PanelOut) {
+        if let Some(g) = out.grid {
+            self.change_grid(ctx, panel, g);
+        }
+        if out.deleted {
+            self.after_edit();
+        }
+        if out.resized {
+            if let Some(s) = &self.project.sheet {
+                self.status = format!("resized to {}x{} tiles", s.cols(), s.rows());
+            }
+            self.after_edit();
+        }
+        match out.anim {
+            Ok(true) => self.after_animation_edit(panel),
+            Ok(false) => {}
+            Err(e) => self.status = e,
+        }
+        if let Some(grab) = out.drag {
+            self.start_drag(ctx, panel, grab);
+        }
+    }
+
+    /// What a click or a menu in the LIBRARY tree asks for.
+    fn library_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
+        match action {
+            TreeAction::Open(i) => self.open_library(ctx, i),
+            TreeAction::Labels(i, action) => {
+                let rel = self.library.index.entries[i].rel.clone();
+                if self.library.sheet.as_ref().is_none_or(|s| s.rel != rel) { self.open_library(ctx, i); }
+                if self.library.sheet.as_ref().is_some_and(|s| s.rel == rel) { self.label_action(ctx, action); }
+            }
+            TreeAction::Refresh => self.rescan_library(),
+            TreeAction::Reveal(i) => reveal(&file_path(&self.library.index.root, &self.library.index.entries[i].rel)),
+            TreeAction::RevealDir(dir) => reveal(&file_path(&self.library.index.root, &dir)),
+            TreeAction::CopyPath(i, whole) => {
+                let rel = self.library.index.entries[i].rel.clone();
+                self.copy_path(ctx, &self.library.index.root.clone(), &rel, whole);
+            }
+            TreeAction::CopyDirPath(dir, whole) => self.copy_path(ctx, &self.library.index.root.clone(), &dir, whole),
+            _ => {}
+        }
+    }
+
+    /// What a click, a drag, or a menu in the PROJECT tree asks for.
+    /// `project_order` is the files in the order the tree shows them.
+    fn project_tree_action(&mut self, ctx: &egui::Context, action: TreeAction, project_order: &[usize]) {
+        match action {
+            TreeAction::Open(i) => {
+                // The plainly clicked file is the start of any group.
+                self.marked.clear();
+                self.marked.insert(i);
+                self.tree_anchor = Some(i);
+                self.tree_cursor = Some(i);
+                self.request(ctx, Pending::Open(self.project.index.entries[i].rel.clone()));
+            }
+            TreeAction::Toggle(i) => {
+                if !self.marked.remove(&i) {
+                    self.marked.insert(i);
+                }
+                self.tree_anchor = Some(i);
+                self.tree_cursor = Some(i);
+            }
+            TreeAction::Range(i, additive) => {
+                self.tree_cursor = Some(i);
+                let a = self.tree_anchor.unwrap_or(i);
+                self.mark_range(project_order, a, i, additive);
+            }
+            TreeAction::LiftFile(i) => {
+                let group = self.marked.len() > 1 && self.marked.contains(&i);
+                self.file_drag = Some(if group {
+                    let mut rels: Vec<String> = self.marked.iter().map(|&k| self.project.index.entries[k].rel.clone()).collect();
+                    rels.sort();
+                    rels
+                } else {
+                    self.marked.clear();
+                    self.marked.insert(i);
+                    vec![self.project.index.entries[i].rel.clone()]
+                });
+            }
+            TreeAction::SweepStart(i) => {
+                self.sweep = Some(i);
+                self.tree_anchor = Some(i);
+                self.tree_cursor = Some(i);
+                self.marked.clear();
+                self.marked.insert(i);
+            }
+            TreeAction::Sweep(i) => {
+                let a = self.sweep.unwrap_or(i);
+                self.tree_cursor = Some(i);
+                self.mark_range(project_order, a, i, false);
+            }
+            TreeAction::DeleteFile(i) => {
+                let rel = self.project.index.entries[i].rel.clone();
+                self.confirm = Some((format!("Delete {rel}? There is no undo."), vec![rel]));
+            }
+            TreeAction::DeleteMarked => {
+                let rels: Vec<String> = self.marked.iter().map(|&i| self.project.index.entries[i].rel.clone()).collect();
+                self.confirm = Some((format!("Delete {} files? There is no undo.", rels.len()), rels));
+            }
+            TreeAction::Refresh => self.rescan_project(),
+            TreeAction::Reveal(i) => reveal(&file_path(&self.project.index.root, &self.project.index.entries[i].rel)),
+            TreeAction::RevealDir(dir) => reveal(&file_path(&self.project.index.root, &dir)),
+            TreeAction::CopyPath(i, whole) => {
+                let rel = self.project.index.entries[i].rel.clone();
+                self.copy_path(ctx, &self.project.index.root.clone(), &rel, whole);
+            }
+            TreeAction::CopyDirPath(dir, whole) => self.copy_path(ctx, &self.project.index.root.clone(), &dir, whole),
+            TreeAction::DeleteFolder(dir) => {
+                self.confirm = Some((format!("Delete the folder {dir} and everything in it? There is no undo."), vec![dir]));
+            }
+            TreeAction::RenameFile(i) => {
+                let rel = self.project.index.entries[i].rel.clone();
+                self.prompt = Some(NamePrompt {
+                    title: "Rename".into(),
+                    value: rel.clone(),
+                    what: NameFor::RenameFile(rel),
+                    focus: true,
+                });
+            }
+            TreeAction::DuplicateFile(i) => {
+                let rel = self.project.index.entries[i].rel.clone();
+                let suggestion = format!("{} copy", rel.trim_end_matches(".png"));
+                self.prompt = Some(NamePrompt {
+                    title: "Duplicate".into(),
+                    value: suggestion,
+                    what: NameFor::DuplicateFile(rel),
+                    focus: true,
+                });
+            }
+            TreeAction::NewFolder(dir) => {
+                self.prompt = Some(NamePrompt {
+                    title: "New folder".into(),
+                    value: String::new(),
+                    what: NameFor::NewFolder(dir),
+                    focus: true,
+                });
+            }
+            TreeAction::RenameFolder(dir) => {
+                let name = dir.rsplit_once('/').map(|(_, n)| n).unwrap_or(&dir).to_string();
+                self.prompt = Some(NamePrompt {
+                    title: "Rename folder".into(),
+                    value: name,
+                    what: NameFor::RenameFolder(dir),
+                    focus: true,
+                });
+            }
+            TreeAction::Labels(_, _) => {}
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -2091,7 +2098,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         self.receive_label();
-        if self.library_batch.tick(ctx, &self.library.root, &self.keys) {
+        if self.library_batch.tick(ctx, &self.library.index.root, &self.keys) {
             let root = self.library_batch.root.clone();
             let labels = self.library_batch.import();
             self.apply_labels(&root, &labels);
@@ -2112,7 +2119,7 @@ impl eframe::App for App {
         self.handle_keys(ctx);
         // The preview sets this flag while drawing; clear it first, so that
         // a closed preview does not keep it.
-        for s in [&mut self.library_sheet, &mut self.project_sheet].into_iter().flatten() {
+        for s in [&mut self.library.sheet, &mut self.project.sheet].into_iter().flatten() {
             s.preview_hovered = false;
         }
 
@@ -2130,12 +2137,11 @@ impl eframe::App for App {
         let mut library_action = None;
         let mut project_action = None;
         // A click in an empty pane asks for that side's folder.
-        let (library_set, project_set) = (self.is_set(Panel::Library), self.is_set(Panel::Project));
+        let (library_set, project_set) = (self.library.is_set(), self.project.is_set());
         let mut ask: Option<Panel> = None;
         let mut hover_dir: Option<String> = None;
         let mut library_rows: Vec<tree::Row> = Vec::new();
         let mut project_rows: Vec<tree::Row> = Vec::new();
-        let mut delete_in_mine = false;
         let mut create = false;
         if self.settings.hide_legend {
             self.status_bar(ctx, ui);
@@ -2186,7 +2192,8 @@ impl eframe::App for App {
                     let legend = format!(
                         "click and drag: select tiles | click and hold: lift and move (ctrl: copy) | \
                          ctrl+c, ctrl+v: copy/paste | drag an edge of the selection: resize it | right click: clear it, or delete inside it | \
-                         ctrl+tab: next panel | tab: next field | arrows: move the selection, shift: extend | {ai_key}ctrl+f: search | ctrl+wheel: zoom | ctrl+z, ctrl+y: undo, redo | ctrl+s: save"
+                         ctrl+tab: next panel | tab: next field | arrows: move the selection, shift: extend | \
+                         {ai_key}ctrl+f: search | ctrl+wheel: zoom | ctrl+z, ctrl+y: undo, redo | ctrl+s: save"
                     );
                     let text = egui::RichText::new(legend).weak();
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("click: hide the legend").clicked() {
@@ -2209,7 +2216,10 @@ impl eframe::App for App {
                         if !library_set {
                             ui.weak("No library folder yet.");
                             ui.add_space(4.0);
-                            ui.weak("This is your library of tilesheets and packs. I'll help you browse and search them, and to transfer what you need into your own tilesheets. I'll track details about your assets in a tilepicky.json.");
+                            ui.weak(
+                                "This is your library of tilesheets and packs. I'll help you browse and search them, and to transfer what you \
+                                 need into your own tilesheets. I'll track details about your assets in a tilepicky.json.",
+                            );
                             ui.add_space(6.0);
                             ui.weak("Click here to choose it.");
                             if bg.clicked() {
@@ -2217,20 +2227,20 @@ impl eframe::App for App {
                             }
                         }
                         let view = tree::View {
-                            visible: self.library_visible.as_deref(),
-                            selected: self.library_sel,
+                            visible: self.library.visible.as_deref(),
+                            selected: self.library.sel,
                             marked: None,
                             query: &self.qwords,
                             apply_query: self.open_trees,
                             menus: false,
-                            scroll_to: self.library_scroll.as_ref(),
-                            cursor: on_rows.0.then_some(self.library_at.as_ref()).flatten(),
-                            open_dir: self.library_open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
+                            scroll_to: self.library.scroll.as_ref(),
+                            cursor: on_rows.0.then_some(self.library.at.as_ref()).flatten(),
+                            open_dir: self.library.open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                             sweeping: false,
                             lifting: false,
-                            entries: &self.library.entries,
+                            entries: &self.library.index.entries,
                         };
-                        library_action = self.library_tree.show(ui, &view, "", &mut Vec::new(), &mut library_rows, &mut None);
+                        library_action = self.library.tree.show(ui, &view, "", &mut Vec::new(), &mut library_rows, &mut None);
                         claim_on_press(ui, library_tree_id());
                         bg.context_menu(|ui| {
                             let label = if library_set { "Change library folder…" } else { "Set library folder…" };
@@ -2298,25 +2308,25 @@ impl eframe::App for App {
                         }
                     }
                     let view = tree::View {
-                        visible: self.project_visible.as_deref(),
-                        selected: self.project_sel,
+                        visible: self.project.visible.as_deref(),
+                        selected: self.project.sel,
                         marked: Some(&self.marked),
                         query: &self.qwords,
                         apply_query: self.open_trees,
                         menus: true,
-                        scroll_to: self.project_scroll.as_ref(),
-                        cursor: on_rows.1.then_some(self.project_at.as_ref()).flatten(),
-                        open_dir: self.project_open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
+                        scroll_to: self.project.scroll.as_ref(),
+                        cursor: on_rows.1.then_some(self.project.at.as_ref()).flatten(),
+                        open_dir: self.project.open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                         sweeping: self.sweep.is_some(),
                         lifting: self.file_drag.is_some(),
-                        entries: &self.project.entries,
+                        entries: &self.project.index.entries,
                     };
                     // The tree area itself is the root folder; the tree names
                     // a folder inside it when the pointer is over one.
                     if self.file_drag.is_some() && bg.contains_pointer() {
                         hover_dir = Some(String::new());
                     }
-                    project_action = self.project_tree.show(ui, &view, "", &mut Vec::new(), &mut project_rows, &mut hover_dir);
+                    project_action = self.project.tree.show(ui, &view, "", &mut Vec::new(), &mut project_rows, &mut hover_dir);
                     claim_on_press(ui, project_tree_id());
                     bg.context_menu(|ui| {
                         let label = if project_set { "Change project folder…" } else { "Set project folder…" };
@@ -2326,7 +2336,8 @@ impl eframe::App for App {
                         }
                         if project_set {
                             if ui.button("New folder…").clicked() {
-                                self.prompt = Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(String::new()), focus: true });
+                                self.prompt =
+                                    Some(NamePrompt { title: "New folder".into(), value: String::new(), what: NameFor::NewFolder(String::new()), focus: true });
                                 ui.close();
                             }
                             if ui.button("Refresh").clicked() {
@@ -2342,132 +2353,19 @@ impl eframe::App for App {
             self.status_bar(ctx, ui);
         }
         self.open_trees = false;
-        self.library_scroll = None;
-        self.project_scroll = None;
-        self.library_open_dir = None;
-        self.project_open_dir = None;
+        self.library.scroll = None;
+        self.project.scroll = None;
+        self.library.open_dir = None;
+        self.project.open_dir = None;
         // The files of the PROJECT tree, in the order it shows them: what a
         // marked group runs over.
         let project_order: Vec<usize> = project_rows.iter().filter_map(|r| if let tree::Row::File(i) = r { Some(*i) } else { None }).collect();
         self.tree_keys(ctx, &library_rows, &project_rows, &project_order);
-        match library_action {
-            Some(TreeAction::Open(i)) => self.open_library(ctx, i),
-            Some(TreeAction::Labels(i, action)) => {
-                let rel = self.library.entries[i].rel.clone();
-                if !self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) { self.open_library(ctx, i); }
-                if self.library_sheet.as_ref().is_some_and(|s| s.rel == rel) { self.label_action(ctx, action); }
-            }
-            Some(TreeAction::Refresh) => self.rescan_library(),
-            Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.library.root, &self.library.entries[i].rel)),
-            Some(TreeAction::RevealDir(dir)) => reveal(&file_path(&self.library.root, &dir)),
-            Some(TreeAction::CopyPath(i, whole)) => {
-                let rel = self.library.entries[i].rel.clone();
-                self.copy_path(ctx, &self.library.root.clone(), &rel, whole);
-            }
-            Some(TreeAction::CopyDirPath(dir, whole)) => self.copy_path(ctx, &self.library.root.clone(), &dir, whole),
-            _ => {}
+        if let Some(action) = library_action {
+            self.library_tree_action(ctx, action);
         }
-        match project_action {
-            Some(TreeAction::Open(i)) => {
-                // The plainly clicked file is the start of any group.
-                self.marked.clear();
-                self.marked.insert(i);
-                self.tree_anchor = Some(i);
-                self.tree_cursor = Some(i);
-                self.request(ctx, Pending::Open(i));
-            }
-            Some(TreeAction::Toggle(i)) => {
-                if !self.marked.remove(&i) {
-                    self.marked.insert(i);
-                }
-                self.tree_anchor = Some(i);
-                self.tree_cursor = Some(i);
-            }
-            Some(TreeAction::Range(i, additive)) => {
-                self.tree_cursor = Some(i);
-                let a = self.tree_anchor.unwrap_or(i);
-                self.mark_range(&project_order, a, i, additive);
-            }
-            Some(TreeAction::LiftFile(i)) => {
-                let group = self.marked.len() > 1 && self.marked.contains(&i);
-                self.file_drag = Some(if group {
-                    let mut rels: Vec<String> = self.marked.iter().map(|&k| self.project.entries[k].rel.clone()).collect();
-                    rels.sort();
-                    rels
-                } else {
-                    self.marked.clear();
-                    self.marked.insert(i);
-                    vec![self.project.entries[i].rel.clone()]
-                });
-            }
-            Some(TreeAction::SweepStart(i)) => {
-                self.sweep = Some(i);
-                self.tree_anchor = Some(i);
-                self.tree_cursor = Some(i);
-                self.marked.clear();
-                self.marked.insert(i);
-            }
-            Some(TreeAction::Sweep(i)) => {
-                let a = self.sweep.unwrap_or(i);
-                self.tree_cursor = Some(i);
-                self.mark_range(&project_order, a, i, false);
-            }
-            Some(TreeAction::DeleteFile(i)) => {
-                let rel = self.project.entries[i].rel.clone();
-                self.confirm = Some((format!("Delete {rel}? There is no undo."), vec![rel]));
-            }
-            Some(TreeAction::DeleteMarked) => {
-                let rels: Vec<String> = self.marked.iter().map(|&i| self.project.entries[i].rel.clone()).collect();
-                self.confirm = Some((format!("Delete {} files? There is no undo.", rels.len()), rels));
-            }
-            Some(TreeAction::Refresh) => self.rescan_project(),
-            Some(TreeAction::Reveal(i)) => reveal(&file_path(&self.project.root, &self.project.entries[i].rel)),
-            Some(TreeAction::RevealDir(dir)) => reveal(&file_path(&self.project.root, &dir)),
-            Some(TreeAction::CopyPath(i, whole)) => {
-                let rel = self.project.entries[i].rel.clone();
-                self.copy_path(ctx, &self.project.root.clone(), &rel, whole);
-            }
-            Some(TreeAction::CopyDirPath(dir, whole)) => self.copy_path(ctx, &self.project.root.clone(), &dir, whole),
-            Some(TreeAction::DeleteFolder(dir)) => {
-                self.confirm = Some((format!("Delete the folder {dir} and everything in it? There is no undo."), vec![dir]));
-            }
-            Some(TreeAction::RenameFile(i)) => {
-                let rel = self.project.entries[i].rel.clone();
-                self.prompt = Some(NamePrompt {
-                    title: "Rename".into(),
-                    value: rel.clone(),
-                    what: NameFor::RenameFile(rel),
-                    focus: true,
-                });
-            }
-            Some(TreeAction::DuplicateFile(i)) => {
-                let rel = self.project.entries[i].rel.clone();
-                let suggestion = format!("{} copy", rel.trim_end_matches(".png"));
-                self.prompt = Some(NamePrompt {
-                    title: "Duplicate".into(),
-                    value: suggestion,
-                    what: NameFor::DuplicateFile(rel),
-                    focus: true,
-                });
-            }
-            Some(TreeAction::NewFolder(dir)) => {
-                self.prompt = Some(NamePrompt {
-                    title: "New folder".into(),
-                    value: String::new(),
-                    what: NameFor::NewFolder(dir),
-                    focus: true,
-                });
-            }
-            Some(TreeAction::RenameFolder(dir)) => {
-                let name = dir.rsplit_once('/').map(|(_, n)| n).unwrap_or(&dir).to_string();
-                self.prompt = Some(NamePrompt {
-                    title: "Rename folder".into(),
-                    value: name,
-                    what: NameFor::RenameFolder(dir),
-                    focus: true,
-                });
-            }
-            Some(TreeAction::Labels(_, _)) | None => {}
+        if let Some(action) = project_action {
+            self.project_tree_action(ctx, action, &project_order);
         }
         // The sweep ends with the button, after this frame's marks are in;
         // clearing it earlier would let the last step mark one file only.
@@ -2475,27 +2373,12 @@ impl eframe::App for App {
             self.sweep = None;
         }
         self.drop_files(ctx, hover_dir);
-        self.name_dialog(ctx);
-        self.confirm_dialog(ctx);
-        self.remove_label_dialog(ctx);
-        self.library_batch.confirmation(ctx);
         if create {
             self.request(ctx, Pending::Create);
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.has_unsaved() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(Pending::Close);
-        }
-        self.save_dialog(ctx);
-        self.legend_dialog(ctx);
+        self.dialogs(ctx);
 
         let dragging = self.drag.is_some();
-        let mut drag_from = None;
-        let mut anim_changed = Ok(false);
-        let mut library_anim = Ok(false);
-        let mut library_tile = None;
-        let mut project_tile = None;
-        let mut resized = false;
         // The split is kept as a fraction of the height, so that it stays in
         // place when the window changes size. The panel state is written from
         // it each frame and read back after the user drags the divider.
@@ -2503,151 +2386,22 @@ impl eframe::App for App {
         let panel_id = Id::new("library panel");
         let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
         ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
-        egui::Panel::top("library panel").resizable(true).show(ui, |ui| {
-            set_pane(ui, (Panel::Library, Spot::Sheet));
-            ui.horizontal(|ui| {
-                let live = keys == (Panel::Library, Spot::Sheet);
-                let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
-                let clicked;
-                (library_tile, clicked) = Self::sheet_header(ui, "Source", live, true, self.library_sheet.as_mut(), ai, None);
-                // A header button does not keep the keys: they go to the grid.
-                if clicked {
-                    self.active = Panel::Library;
-                    if self.library_sheet.is_some() { ctx.memory_mut(|m| m.request_focus(library_id())); }
-                }
-            });
-            if self.ai_panel {
-                let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
-                    set_pane(ui, (Panel::Library, Spot::Side));
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let out = Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library_sheet.as_ref(),
-                            self.label_run.as_ref(), self.label_outcome.as_deref());
-                        self.library_batch.ui(ui, &self.library, &self.settings.ai, &self.keys);
-                        out
-                    }).inner
-                });
-                if let Some(action) = label.inner { self.label_action(ctx, action); }
-            }
-            if let Some(s) = &mut self.library_sheet {
-                if s.anim_panel {
-                    egui::Panel::right("library animation").resizable(true).default_size(220.0).show(ui, |ui| {
-                        set_pane(ui, (Panel::Library, Spot::Side));
-                        library_anim = Self::animation_panel(ui, s, true, keys == (Panel::Library, Spot::Side));
-                    });
-                }
-                set_pane(ui, (Panel::Library, Spot::Sheet));
-                stop_id(ui.ctx(), library_id());
-                let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, library_id(), dragging, false, false, keys == (Panel::Library, Spot::Sheet)));
-                let ev = out.inner;
-                if let Some(action) = ev.labels { self.label_action(ctx, action); }
-                if ev.interacted {
-                    self.active = Panel::Library;
-                }
-                if let Some(grab) = ev.drag_block {
-                    drag_from = Some((Panel::Library, grab));
-                }
-            } else {
-                // Fill the panel, so that it keeps its height and can be dragged.
-                egui::CentralPanel::default().show(ui, |ui| {
-                    let hint = if library_set {
-                        "Open a sheet on the left, or press Ctrl+F to search."
-                    } else {
-                        "Click to open your asset library."
-                    };
-                    let r = ui.interact(ui.max_rect(), Id::new("library empty"), egui::Sense::click());
-                    ui.weak(hint);
-                    if !library_set && r.clicked() {
-                        ask = Some(Panel::Library);
-                    }
-                });
-            }
-        });
+        let library_out = egui::Panel::top("library panel").resizable(true).show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner;
         if let Some(state) = egui::PanelState::load(ctx, panel_id) && total > 0.0 {
             self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
         }
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.project_rect = ui.max_rect();
-            set_pane(ui, (Panel::Project, Spot::Sheet));
-            let live = keys == (Panel::Project, Spot::Sheet);
-            let clicked;
-            (project_tile, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project_sheet.as_mut(), None, Some(&mut self.project_eye));
-            if clicked {
-                self.active = Panel::Project;
-                if self.project_sheet.is_some() { ctx.memory_mut(|m| m.request_focus(project_id())); }
+        let project_out = egui::CentralPanel::default().show(ui, |ui| self.project_panel(ctx, ui, keys, dragging)).inner;
+        for (panel, out) in [(Panel::Library, &library_out), (Panel::Project, &project_out)] {
+            if out.ask {
+                ask = Some(panel);
             }
-            let eye = self.project_eye;
-            if let Some(s) = &mut self.project_sheet {
-                if s.anim_panel {
-                    egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
-                        set_pane(ui, (Panel::Project, Spot::Side));
-                        anim_changed = Self::animation_panel(ui, s, false, keys == (Panel::Project, Spot::Side));
-                    });
-                }
-                set_pane(ui, (Panel::Project, Spot::Sheet));
-                stop_id(ui.ctx(), project_id());
-                let out = egui::CentralPanel::default().show(ui, |ui| s.view(ui, project_id(), dragging, true, eye, keys == (Panel::Project, Spot::Sheet)));
-                let ev = out.inner;
-                if ev.interacted {
-                    self.active = Panel::Project;
-                }
-                if ev.resized {
-                    resized = true;
-                }
-                if let Some(grab) = ev.drag_block {
-                    drag_from = Some((Panel::Project, grab));
-                }
-                if ev.delete {
-                    s.clear_selection(ctx);
-                    delete_in_mine = true;
-                }
-            } else {
-                // The same frame as the library pane, so both hints sit alike.
-                egui::CentralPanel::default().show(ui, |ui| {
-                    let hint = if project_set {
-                        "Create or open a tilesheet on the left. Then select tiles in the library, Ctrl+C, click a tile here, Ctrl+V."
-                    } else {
-                        "Click to open your project folder."
-                    };
-                    let r = ui.interact(ui.max_rect(), Id::new("project empty"), egui::Sense::click());
-                    ui.weak(hint);
-                    if !project_set && r.clicked() {
-                        ask = Some(Panel::Project);
-                    }
-                });
-            }
-        });
-        match anim_changed {
-            Ok(true) => self.after_animation_edit(Panel::Project),
-            Ok(false) => {}
-            Err(e) => self.status = e,
         }
         if let Some(panel) = ask {
             self.ask_folder(panel);
         }
         self.poll_folder(ctx);
-        if let Some(g) = library_tile {
-            self.change_grid(ctx, Panel::Library, g);
-        }
-        if let Some(g) = project_tile {
-            self.change_grid(ctx, Panel::Project, g);
-        }
-        if delete_in_mine {
-            self.after_edit();
-        }
-        if resized {
-            if let Some(s) = &self.project_sheet {
-                self.status = format!("resized to {}x{} tiles", s.cols(), s.rows());
-            }
-            self.after_edit();
-        }
-        match library_anim {
-            Ok(true) => self.after_animation_edit(Panel::Library),
-            Ok(false) => {}
-            Err(e) => self.status = e,
-        }
-        if let Some((from, grab)) = drag_from {
-            self.start_drag(ctx, from, grab);
-        }
+        self.after_panel(ctx, Panel::Library, library_out);
+        self.after_panel(ctx, Panel::Project, project_out);
         // The stops of this frame, in reading order: pane by pane, and in
         // each pane in the order they drew. The next frame's Tab walks them.
         let mut stops = ctx.data_mut(|d| d.remove_temp::<Vec<((Panel, Spot), Id)>>(Id::new("stops"))).unwrap_or_default();
@@ -2655,8 +2409,8 @@ impl eframe::App for App {
         let mut seen = HashSet::new();
         stops.retain(|(_, id)| seen.insert(*id));
         self.stops = stops;
-        self.library_rows = library_rows;
-        self.project_rows = project_rows;
+        self.library.rows = library_rows;
+        self.project.rows = project_rows;
         // When nothing holds the keys, they go back to the body of the pane
         // in use: after Escape or Enter in a text field, and after a click
         // on something that does not take the keys itself. This waits for
@@ -2666,6 +2420,19 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.update_drag(ctx);
+    }
+}
+
+/// Drops the sources that older versions wrote for cells drawn in the
+/// project; see `files::drop_own_sources`. It runs before the project is
+/// read, and says what it did. A broken book is left to the scan to report.
+fn drop_own_sources(project: &Path, library: &Path) -> Option<String> {
+    if project.as_os_str().is_empty() {
+        return None;
+    }
+    match files::drop_own_sources(project, library) {
+        Ok(0) | Err(_) => None,
+        Ok(n) => sidecar::count_text(n, "sheet").map(|n| format!("removed sources that named the project itself from {n}")),
     }
 }
 
@@ -3188,7 +2955,7 @@ fn main() -> eframe::Result {
         eprintln!("usage: tilepicky [--glow{}] [<library dir> [<project dir>]]", if WGPU { " | --wgpu" } else { "" });
         std::process::exit(2);
     }
-    let mut settings = settings::Settings::load();
+    let (mut settings, damaged) = settings::Settings::load();
     // A folder named on the command line wins for this run, and is what the
     // tool offers next time.
     if let Some(d) = dirs.first() {
@@ -3225,7 +2992,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(App::new(settings)))
+            Ok(Box::new(App::new(settings, damaged)))
         }),
     )
 }
@@ -3246,6 +3013,222 @@ mod tests {
         unsafe { std::env::set_var("HOME", "/home/x") };
         assert_eq!(home_path(Path::new("/home/x/work/a.png")), "~/work/a.png");
         assert_eq!(home_path(Path::new("/opt/a.png")), "/opt/a.png");
+    }
+
+    use crate::storage::tests::Folder;
+    use image::{Rgba, RgbaImage};
+
+    /// A library and a project on disk, and the app that shows them. No
+    /// test here writes the settings, which live in the user's own folder.
+    struct Bench {
+        ctx: egui::Context,
+        app: App,
+        library: Folder,
+        project: Folder,
+    }
+
+    fn sheet_file(dir: &Path, rel: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        RgbaImage::from_pixel(16, 16, Rgba([90, 120, 30, 255])).save(path).unwrap();
+    }
+
+    fn bench(library: &[&str], project: &[&str]) -> Bench {
+        let (lib, proj) = (Folder::new(), Folder::new());
+        library.iter().for_each(|rel| sheet_file(&lib.0, rel));
+        project.iter().for_each(|rel| sheet_file(&proj.0, rel));
+        let mut settings = settings::Settings::default();
+        settings.library.path = Some(lib.0.clone());
+        settings.project.path = Some(proj.0.clone());
+        Bench { ctx: egui::Context::default(), app: App::new(settings, None), library: lib, project: proj }
+    }
+
+    impl Bench {
+        fn project_rel(&self) -> Option<&str> {
+            self.app.project.sheet.as_ref().map(|s| s.rel.as_str())
+        }
+        /// The index entry the project side says is open.
+        fn project_sel_rel(&self) -> Option<&str> {
+            self.app.project.sel.map(|i| self.app.project.index.entries[i].rel.as_str())
+        }
+        fn open_project(&mut self, rel: &str) {
+            let i = self.app.project.index.position(rel).unwrap();
+            self.app.open_project(&self.ctx, i);
+        }
+    }
+
+    #[test]
+    fn a_damaged_settings_file_waits_for_the_user() {
+        let app = App::new(settings::Settings::default(), Some("Cannot read settings.json".into()));
+        assert!(matches!(app.damaged.first(), Some(Damaged::Settings(e)) if e == "Cannot read settings.json"));
+        assert!(app.dialog_open(&egui::Context::default()));
+    }
+
+    #[test]
+    fn the_project_forgets_sources_that_name_itself_at_start() {
+        let (lib, proj) = (Folder::new(), Folder::new());
+        sheet_file(&proj.0, "mine.png");
+        let side = sidecar::Sidecar { provenance: vec![sidecar::Provenance { source: "mine.png".into(), rects: vec![[0, 0, 8, 8]] }],
+            tile: Some(Pair::of([8, 8])), ..Default::default() };
+        sidecar::store_entry(&proj.0, "mine.png", &side).unwrap();
+        let mut settings = settings::Settings::default();
+        settings.library.path = Some(lib.0.clone());
+        settings.project.path = Some(proj.0.clone());
+        let app = App::new(settings, None);
+        assert!(app.project.index.entries[0].side.provenance.is_empty());
+        assert!(app.status.ends_with("from 1 sheet"));
+    }
+
+    #[test]
+    fn the_open_sheet_keeps_its_place_through_a_rescan() {
+        let mut b = bench(&["a.png", "c.png"], &[]);
+        let i = b.app.library.index.position("c.png").unwrap();
+        b.app.open_library(&b.ctx, i);
+        assert_eq!(b.app.library.sel, Some(1));
+        assert!(b.app.library.sheet.as_ref().unwrap().library, "a library sheet is a source");
+        assert_eq!(b.app.library.at, Some(tree::Row::File(1)));
+        assert!(b.app.active == Panel::Library);
+        sheet_file(&b.library.0, "b.png");
+        b.app.rescan_library();
+        assert_eq!(b.app.library.sel, Some(2));
+        assert_eq!(b.app.library.sheet.as_ref().unwrap().rel, "c.png");
+    }
+
+    #[test]
+    fn opening_a_project_file_moves_the_cursor_to_it() {
+        let mut b = bench(&[], &["a.png", "b.png"]);
+        b.open_project("b.png");
+        assert_eq!(b.project_rel(), Some("b.png"));
+        assert!(!b.app.project.sheet.as_ref().unwrap().library, "a tilesheet is no source");
+        assert_eq!((b.app.project.sel, b.app.tree_cursor), (Some(1), Some(1)));
+        assert_eq!(b.app.project.at, Some(tree::Row::File(1)));
+        assert!(b.app.active == Panel::Project);
+    }
+
+    #[test]
+    fn renames_take_the_open_sheet_along() {
+        let mut b = bench(&[], &["pack/tree.png", "rock.png"]);
+        b.open_project("pack/tree.png");
+        b.app.apply_name(&b.ctx, &NameFor::RenameFolder("pack".into()), "plants").unwrap();
+        assert_eq!(b.project_rel(), Some("plants/tree.png"));
+        assert_eq!(b.project_sel_rel(), Some("plants/tree.png"));
+        b.app.apply_name(&b.ctx, &NameFor::RenameFile("plants/tree.png".into()), "plants/oak").unwrap();
+        assert_eq!(b.project_rel(), Some("plants/oak.png"));
+        assert_eq!(b.project_sel_rel(), Some("plants/oak.png"));
+        assert!(b.project.0.join("plants/oak.png").is_file());
+    }
+
+    #[test]
+    fn deleting_the_open_file_closes_it() {
+        let mut b = bench(&[], &["a.png", "b.png"]);
+        b.open_project("b.png");
+        b.app.delete_paths(&["a.png".into()]).unwrap();
+        assert_eq!(b.project_sel_rel(), Some("b.png"));
+        b.app.delete_paths(&["b.png".into()]).unwrap();
+        assert!(b.app.project.sheet.is_none());
+        assert!(b.app.project.index.entries.is_empty());
+    }
+
+    #[test]
+    fn a_new_sheet_never_replaces_one_or_leaves_the_project() {
+        let mut b = bench(&[], &["tree.png"]);
+        let before = std::fs::read(b.project.0.join("tree.png")).unwrap();
+        for name in ["tree", "tree.png", "../outside"] {
+            b.app.new_name = name.into();
+            b.app.create_project(&b.ctx);
+            assert!(b.app.project.sheet.is_none(), "{name}");
+        }
+        assert_eq!(std::fs::read(b.project.0.join("tree.png")).unwrap(), before);
+        assert!(!b.project.0.parent().unwrap().join("outside.png").exists());
+        b.app.new_name = "pack/fresh".into();
+        b.app.create_project(&b.ctx);
+        assert_eq!(b.project_rel(), Some("pack/fresh.png"));
+        assert_eq!(b.project_sel_rel(), Some("pack/fresh.png"));
+        assert!(b.app.new_name.is_empty());
+    }
+
+    #[test]
+    fn unsaved_changes_hold_an_open_until_asked() {
+        let mut b = bench(&[], &["a.png", "b.png", "c.png"]);
+        b.open_project("a.png");
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        b.app.request(&b.ctx, Pending::Open("b.png".into()));
+        assert!(b.app.pending == Some(Pending::Open("b.png".into())));
+        assert_eq!(b.project_rel(), Some("a.png"));
+        // A duplicate opens as any file does: it waits too.
+        b.app.pending = None;
+        b.app.apply_name(&b.ctx, &NameFor::DuplicateFile("c.png".into()), "d").unwrap();
+        assert!(b.project.0.join("d.png").is_file());
+        assert_eq!(b.project_rel(), Some("a.png"));
+        assert!(b.app.pending.is_some());
+        // Without changes, it opens at once.
+        b.app.project.sheet.as_mut().unwrap().dirty = false;
+        b.app.pending = None;
+        b.app.apply_name(&b.ctx, &NameFor::DuplicateFile("c.png".into()), "e").unwrap();
+        assert_eq!(b.project_rel(), Some("e.png"));
+    }
+
+    /// Save in the unsaved changes dialog may have to ask for a name first.
+    /// The action it interrupted runs once that save is done, on the file
+    /// it named, whatever the new file did to the order of the tree.
+    #[test]
+    fn an_action_waits_through_save_as() {
+        let mut b = bench(&[], &["a.png", "c.png"]);
+        b.app.start_canvas(&b.ctx, [8, 8]);
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        b.app.answer_save(&b.ctx, Pending::Open("c.png".into()), true);
+        let prompt = b.app.prompt.take().unwrap();
+        assert!(prompt.what == NameFor::SaveAs);
+        assert_eq!(b.project_rel(), Some(""));
+        b.app.apply_name(&b.ctx, &prompt.what, "b").unwrap();
+        assert!(b.project.0.join("b.png").is_file());
+        assert_eq!(b.project_rel(), Some("c.png"));
+        assert!(b.app.after_save.is_none());
+        // A Save As that is cancelled drops the action with it.
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        b.app.project.sheet.as_mut().unwrap().rel = "d.gif".into();
+        b.app.answer_save(&b.ctx, Pending::Open("a.png".into()), true);
+        assert!(b.app.prompt.is_some() && b.app.after_save.is_some());
+        b.app.cancel_name();
+        assert!(b.app.after_save.is_none());
+        assert_eq!(b.project_rel(), Some("d.gif"));
+    }
+
+    /// A GIF would keep one frame and a JPEG no alpha, so a sheet from
+    /// another format saves as a PNG beside it.
+    #[test]
+    fn a_sheet_that_is_no_png_saves_as_one() {
+        let mut b = bench(&[], &["walk.gif"]);
+        let before = std::fs::read(b.project.0.join("walk.gif")).unwrap();
+        b.open_project("walk.gif");
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        b.app.save();
+        let prompt = b.app.prompt.take().unwrap();
+        assert!(prompt.what == NameFor::SaveAs);
+        assert_eq!(prompt.value, "walk.png");
+        assert_eq!(std::fs::read(b.project.0.join("walk.gif")).unwrap(), before);
+        assert!(b.app.project.sheet.as_mut().unwrap().save().is_err());
+        b.app.apply_name(&b.ctx, &prompt.what, &prompt.value).unwrap();
+        assert_eq!(b.project_rel(), Some("walk.png"));
+        assert!(b.project.0.join("walk.png").is_file());
+        assert_eq!(std::fs::read(b.project.0.join("walk.gif")).unwrap(), before);
+    }
+
+    #[test]
+    fn labels_reach_the_index_the_open_sheet_and_the_search() {
+        let mut b = bench(&["a.png", "b.png"], &[]);
+        let i = b.app.library.index.position("b.png").unwrap();
+        b.app.open_library(&b.ctx, i);
+        b.app.query = "mossy".into();
+        b.app.refresh_query();
+        assert_eq!(b.app.library.visible, Some(vec![false, false]));
+        let label = sidecar::Label { provider: "p".into(), model: "m".into(), status: sidecar::Status::Labeled,
+            caption: "Mossy stones".into(), tags: vec![] };
+        let root = b.library.0.clone();
+        b.app.apply_labels(&root, &[("b.png".into(), Some(label.clone()))]);
+        assert_eq!(b.app.library.index.entries[1].side.label.as_ref(), Some(&label));
+        assert_eq!(b.app.library.sheet.as_ref().unwrap().side.label.as_ref(), Some(&label));
+        assert_eq!(b.app.library.visible, Some(vec![false, true]));
     }
 
     #[test]

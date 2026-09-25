@@ -161,6 +161,8 @@ Tilepicky reads PNG, GIF, JPEG, WebP, BMP, and TGA image formats.
 
 Tilepicky exports sheets exclusively as 32-bit RGBA PNG files with straight alpha transparency.
 
+Saving an edited project sheet from another format prompts for a PNG name and leaves the original file untouched.
+
 ## Grid configuration
 
 Each sheet maintains independent grid parameters:

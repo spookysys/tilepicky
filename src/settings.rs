@@ -58,21 +58,37 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn load() -> Self {
-        file()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .map(|mut s: Settings| {
-                s.ai.heal();
-                s
-            })
-            .unwrap_or_default()
+    /// The settings, and the error when the file could not be read. The
+    /// tool then runs on the defaults, and `save` refuses to overwrite the
+    /// file until the user says yes; see `rewrite`.
+    pub fn load() -> (Self, Option<String>) {
+        file().map_or_else(|| (Self::default(), None), |p| Self::load_from(&p))
+    }
+
+    fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
+        let (mut s, notice) = match crate::storage::read::<Settings>(path) {
+            Ok(s) => (s, None),
+            Err(e) => (Self::default(), Some(e)),
+        };
+        s.ai.heal();
+        (s, notice)
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = file().ok_or("No configuration directory available.")?;
-        crate::storage::read::<Self>(&path)?;
-        crate::storage::write(&path, self)
+        self.save_to(&file().ok_or("No configuration directory available.")?, false)
+    }
+
+    /// Writes the settings over a file that could not be read. The user
+    /// agreed to lose what it held.
+    pub fn rewrite(&self) -> Result<(), String> {
+        self.save_to(&file().ok_or("No configuration directory available.")?, true)
+    }
+
+    fn save_to(&self, path: &std::path::Path, overwrite: bool) -> Result<(), String> {
+        if !overwrite {
+            crate::storage::read::<Self>(path)?;
+        }
+        crate::storage::write_private(path, self)
     }
 }
 
@@ -101,5 +117,20 @@ mod tests {
         assert_eq!(s.ai, crate::ai::Ai::default());
         let s: Settings = serde_json::from_str(r#"{"ai": {"providers": []}}"#).unwrap();
         assert!(s.ai.providers.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_file_is_kept_until_the_user_says_yes() {
+        let dir = crate::storage::tests::Folder::new();
+        let path = dir.0.join("settings.json");
+        assert!(Settings::load_from(&path).1.is_none());
+        std::fs::write(&path, b"{broken").unwrap();
+        let (s, error) = Settings::load_from(&path);
+        assert!(error.unwrap().contains("settings.json"));
+        assert_eq!(s.ai, crate::ai::Ai::default());
+        assert!(s.save_to(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
+        s.save_to(&path, true).unwrap();
+        assert!(Settings::load_from(&path).1.is_none());
     }
 }

@@ -85,22 +85,26 @@ impl Provider {
         Provider { name: name.into(), kind, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
     }
 
-    /// Resolve the key only when the user starts a request.
+    /// Resolve the key only when the user starts a request. It comes from
+    /// where `key_source` says it does.
     pub fn key(&self, keys: &Keys) -> Option<String> {
-        keys.get(&self.name).map(str::to_string)
-            .or_else(|| self.key_env.iter().find_map(|name| std::env::var(name).ok().filter(|s| !s.trim().is_empty())))
+        match self.key_source(keys) {
+            KeySource::Typed => keys.get(&self.name).map(str::to_string),
+            KeySource::Env(name) => std::env::var(name).ok(),
+            KeySource::None => None,
+        }
     }
 
     pub fn key_source(&self, keys: &Keys) -> KeySource {
         self.key_source_in(keys, |name| std::env::var(name).ok())
     }
 
-    /// A typed key wins over the environment.
+    /// A typed key wins over the environment. Blanks are no key.
     fn key_source_in(&self, keys: &Keys, env: impl Fn(&str) -> Option<String>) -> KeySource {
         if keys.get(&self.name).is_some() {
             return KeySource::Typed;
         }
-        match self.key_env.iter().find(|name| env(name).is_some_and(|v| !v.is_empty())) {
+        match self.key_env.iter().find(|name| env(name).is_some_and(|v| !v.trim().is_empty())) {
             Some(name) => KeySource::Env(name.clone()),
             None => KeySource::None,
         }
@@ -229,23 +233,40 @@ impl Keys {
         crate::settings::dir().map(|d| d.join("keys.json"))
     }
 
-    pub fn load() -> Self {
-        Self::file()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .map(Keys)
-            .unwrap_or_default()
+    /// The typed keys, and the error when the file could not be read. The
+    /// tool then has no typed keys, and `save` refuses to overwrite the file
+    /// until the user says yes; see `rewrite`.
+    pub fn load() -> (Self, Option<String>) {
+        Self::file().map_or_else(|| (Self::default(), None), |p| Self::load_from(&p))
+    }
+
+    fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
+        match crate::storage::read(path) {
+            Ok(keys) => (Keys(keys), None),
+            Err(e) => (Self::default(), Some(e)),
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::file().ok_or("No configuration directory available.")?;
-        crate::storage::read::<BTreeMap<String, String>>(&path)?;
-        let kept: BTreeMap<&String, &String> = self.0.iter().filter(|(_, v)| !v.is_empty()).collect();
-        crate::storage::write(&path, &kept)
+        self.save_to(&Self::file().ok_or("No configuration directory available.")?, false)
+    }
+
+    /// Writes the keys over a file that could not be read. The user agreed
+    /// to lose what it held.
+    pub fn rewrite(&self) -> Result<(), String> {
+        self.save_to(&Self::file().ok_or("No configuration directory available.")?, true)
+    }
+
+    fn save_to(&self, path: &std::path::Path, overwrite: bool) -> Result<(), String> {
+        if !overwrite {
+            crate::storage::read::<BTreeMap<String, String>>(path)?;
+        }
+        let kept: BTreeMap<&String, &String> = self.0.iter().filter(|(_, v)| !v.trim().is_empty()).collect();
+        crate::storage::write_private(path, &kept)
     }
 
     pub fn get(&self, provider: &str) -> Option<&str> {
-        self.0.get(provider).map(String::as_str).filter(|k| !k.is_empty())
+        self.0.get(provider).map(String::as_str).filter(|k| !k.trim().is_empty())
     }
 
     /// The typed key of a provider, to edit; empty when there is none.
@@ -334,13 +355,21 @@ fn providers_ui(
     batch: &mut Option<ModelRef>,
     keys: &mut Keys,
 ) {
-    let names = providers.iter().map(|p| p.name.clone()).collect();
-    let (sel, remove) = selector(ui, "provider", names, &mut || providers.push(Provider::new("New provider", Kind::OpenAi)));
+    // The name is what the models, the defaults, and the key hold on to, so
+    // no two providers share one.
+    let names: Vec<String> = providers.iter().map(|p| p.name.clone()).collect();
+    let fresh = (1..).map(|n| if n == 1 { "New provider".to_string() } else { format!("New provider {n}") })
+        .find(|name| !names.contains(name)).unwrap();
+    let (sel, remove) = selector(ui, "provider", names.clone(), &mut || providers.push(Provider::new(&fresh, Kind::OpenAi)));
     if let Some(p) = providers.get_mut(sel) {
         egui::Grid::new("provider fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("name");
             let old = p.name.clone();
-            if ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(f32::INFINITY)).changed() {
+            let field = ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(f32::INFINITY));
+            let taken = names.iter().enumerate().any(|(i, n)| i != sel && *n == p.name);
+            if field.changed() && taken {
+                p.name = old;
+            } else if field.changed() {
                 // The models, the defaults, and the key follow the name.
                 for m in models.iter_mut().filter(|m| m.provider == old) {
                     m.provider = p.name.clone();
@@ -478,12 +507,30 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_key_file_is_kept_until_the_user_says_yes() {
+        let dir = crate::storage::tests::Folder::new();
+        let path = dir.0.join("keys.json");
+        std::fs::write(&path, b"[]").unwrap();
+        let (keys, error) = Keys::load_from(&path);
+        assert!(error.unwrap().contains("keys.json"));
+        assert!(keys.0.is_empty());
+        assert!(keys.save_to(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+        keys.save_to(&path, true).unwrap();
+        assert!(Keys::load_from(&path).1.is_none());
+        std::fs::write(&path, br#"{"X": "k"}"#).unwrap();
+        let (keys, notice) = Keys::load_from(&path);
+        assert_eq!((keys.get("X"), notice), (Some("k"), None));
+    }
+
+    #[test]
     fn a_typed_key_wins_over_the_environment() {
         let p = Provider::new("X", Kind::Gemini);
         let mut keys = Keys::default();
         let env = |name: &str| (name == "GEMINI_API_KEY").then(|| "k".to_string());
         assert_eq!(p.key_source_in(&keys, env), KeySource::Env("GEMINI_API_KEY".into()));
         assert_eq!(p.key_source_in(&keys, |_| None), KeySource::None);
+        assert_eq!(p.key_source_in(&keys, |_| Some(" ".into())), KeySource::None);
         *keys.entry("X") = "typed".into();
         assert_eq!(p.key_source_in(&keys, env), KeySource::Typed);
     }

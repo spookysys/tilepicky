@@ -530,6 +530,9 @@ struct CanvasDrag {
 
 pub struct Sheet {
     pub rel: String,
+    /// A sheet of the library: a copy names it as the source of its cells.
+    /// A tilesheet of the project only passes on the sources it carries.
+    pub library: bool,
     /// The directory whose book describes this sheet.
     pub dir: PathBuf,
     /// The file format and color type as the loader saw them, such as
@@ -669,14 +672,19 @@ impl Sheet {
     pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], side: Sidecar) -> Result<Self, String> {
         let path = dir.join(rel);
         let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
-        let fail = |e: image::ImageError| format!("{rel}: {e}");
-        let reader = image::ImageReader::open(&path).and_then(image::ImageReader::with_guessed_format).map_err(|e| format!("{rel}: {e}"))?;
-        let format = reader.format();
-        let decoder = reader.into_decoder().map_err(fail)?;
-        let kind = file_kind(&path, format, decoder.original_color_type());
-        let img = match frames.first() {
-            Some(f) => f.clone(),
-            None => image::DynamicImage::from_decoder(decoder).map_err(fail)?.to_rgba8(),
+        // A GIF that decoded has its frames already. Anything else, a GIF
+        // that did not decode included, goes through the loader, which
+        // says what is wrong with it.
+        let (img, kind) = match frames.first() {
+            Some(f) => (f.clone(), file_kind(&path, Some(image::ImageFormat::Gif), image::ExtendedColorType::Rgba8)),
+            None => {
+                let fail = |e: image::ImageError| format!("{rel}: {e}");
+                let reader = image::ImageReader::open(&path).and_then(image::ImageReader::with_guessed_format).map_err(|e| format!("{rel}: {e}"))?;
+                let format = reader.format();
+                let decoder = reader.into_decoder().map_err(fail)?;
+                let kind = file_kind(&path, format, decoder.original_color_type());
+                (image::DynamicImage::from_decoder(decoder).map_err(fail)?.to_rgba8(), kind)
+            }
         };
         let read = side.tile.is_none();
         let mut sheet = Self::from_image(ctx, dir, rel, tile, img, side);
@@ -714,6 +722,7 @@ impl Sheet {
         let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
             rel: rel.to_string(),
+            library: false,
             dir: dir.to_path_buf(),
             kind: String::new(),
             tile,
@@ -1383,7 +1392,6 @@ impl Sheet {
         let [tw, th] = self.tile;
         let mut img = RgbaImage::new(b.cols() * tw, b.rows() * th);
         let mut prov = ProvMap::new(b.cols() * tw, b.rows() * th);
-        let own = self.rel.clone();
         let mut mask = Vec::new();
         for y in b.y0..=b.y1 {
             for x in b.x0..=b.x1 {
@@ -1409,9 +1417,11 @@ impl Sheet {
                         }
                     }
                 }
-                // A cell of this sheet itself, unless it is empty or traced.
-                if !empty {
-                    let v = prov.intern(&own);
+                // A cell of a library sheet comes from that sheet, unless
+                // it is empty or traced. A tilesheet of the project is no
+                // source: what it carries no trace for stays untraced.
+                if self.library && !empty {
+                    let v = prov.intern(&self.rel);
                     for py in 0..th {
                         for px in 0..tw {
                             let (bx, by) = ((x - b.x0) * tw + px, (y - b.y0) * th + py);
@@ -1463,8 +1473,10 @@ impl Sheet {
         let (fw, fh) = (b.cols() * tw, b.rows() * th);
         let mut img = RgbaImage::new(fw * n, fh);
         let mut prov = ProvMap::new(fw * n, fh);
-        let v = prov.intern(&self.rel);
-        prov.fill(0, 0, fw * n, fh, v);
+        if self.library {
+            let v = prov.intern(&self.rel);
+            prov.fill(0, 0, fw * n, fh, v);
+        }
         for (f, frame) in self.frames.iter().enumerate() {
             for y in b.y0..=b.y1 {
                 for x in b.x0..=b.x1 {
@@ -1690,11 +1702,10 @@ impl Sheet {
         self.sel = there;
     }
 
-    pub fn clear_selection(&mut self, ctx: &egui::Context) {
+    pub fn clear_selection(&mut self) {
         if self.sel.is_empty() {
             return;
         }
-        let _ = ctx;
         self.snapshot();
         let s = self.sel.clone();
         self.clear_cells(&s);
@@ -1722,8 +1733,6 @@ impl Sheet {
         }
     }
 
-    /// Marks the selected area as an animation strip, or unmarks it. A new
-    /// strip starts with one frame per column; set the frame count afterwards.
     /// The draft for the current selection. It follows the selection and
     /// keeps its numbers, so that the user can resize the selection until
     /// the frames divide it.
@@ -2016,8 +2025,20 @@ impl Sheet {
     /// Writes the image and the book entry. A tilesheet's entry always names
     /// its grid, so it is never lost between runs.
     pub fn save(&mut self) -> Result<(), String> {
+        if !is_png(&self.rel) {
+            return Err(format!("{}: a tilesheet saves as a PNG, which keeps every pixel and the alpha", self.rel));
+        }
         sidecar::load_book(&self.dir)?;
-        self.img.save(self.dir.join(&self.rel)).map_err(|e| e.to_string())?;
+        // The image is written whole or not at all: a crash halfway must
+        // not leave half a tilesheet.
+        let path = self.dir.join(&self.rel);
+        let format = image::ImageFormat::from_path(&path).map_err(|e| e.to_string())?;
+        crate::storage::replace(&path, false, |file| {
+            let mut out = std::io::BufWriter::new(file);
+            self.img.write_to(&mut out, format).map_err(std::io::Error::other)?;
+            std::io::Write::flush(&mut out)
+        })
+        .map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
         self.side.tile = Some(Pair::of(self.tile));
         self.side.provenance = self.prov.extract();
         self.save_entry()
@@ -2037,6 +2058,11 @@ impl Sheet {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// Whether a file name ends in `.png`, in any case.
+pub fn is_png(rel: &str) -> bool {
+    rel.to_ascii_lowercase().ends_with(".png")
 }
 
 /// Light and lighter squares behind transparent pixels, drawn only where visible.
@@ -2325,6 +2351,31 @@ mod prov_tests {
         // Grouped by file, and the hole split rects for a.
         assert_eq!(side.len(), 2);
         assert!(side.iter().any(|p| p.source == "packs/b.png" && p.rects == vec![[32, 0, 64, 64]]));
+    }
+
+    /// Only the library is a source. A copy inside the project keeps the
+    /// sources its cells carry, and a cell that carries none stays without.
+    #[test]
+    fn only_the_library_names_itself_as_a_source() {
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "mine.png", [8, 8], 4, 4);
+        sheet.img.put_pixel(0, 0, Rgba([200, 0, 0, 255]));
+        sheet.img.put_pixel(8, 0, Rgba([0, 200, 0, 255]));
+        let v = sheet.prov.intern("pack/tree.png");
+        sheet.prov.fill(8, 0, 8, 8, v);
+        let untraced = sheet.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
+        assert!(untraced.prov.sources.is_empty());
+        let traced = sheet.copy_sel(&Sel::rect((1, 0), (1, 0))).unwrap();
+        assert_eq!(traced.prov.get(0, 0), Some("pack/tree.png"));
+        sheet.paste(&ctx, (2, 2), &untraced);
+        sheet.save().unwrap();
+        let book = sidecar::load_book(&dir.0).unwrap();
+        let sources: Vec<_> = book.sheets["mine.png"].provenance.iter().map(|p| p.source.as_str()).collect();
+        assert_eq!(sources, ["pack/tree.png"]);
+        sheet.library = true;
+        let from_library = sheet.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
+        assert_eq!(from_library.prov.get(0, 0), Some("mine.png"));
     }
 }
 

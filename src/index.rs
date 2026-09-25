@@ -29,7 +29,7 @@ pub struct Index {
 }
 
 impl Index {
-    /// Lists every PNG and GIF under `root`, sorted by path.
+    /// Lists every image under `root` that the tool reads, sorted by path.
     pub fn scan(root: &Path, default_tile: [u32; 2]) -> Self {
         // No folder chosen for this side yet: nothing to list.
         if root.as_os_str().is_empty() {
@@ -127,10 +127,6 @@ pub fn words(s: &str) -> Vec<String> {
 pub fn path_words(rel: &str) -> Vec<String> {
     let stem = Path::new(rel).with_extension("");
     words(&stem.to_string_lossy())
-}
-
-pub fn query_words(q: &str) -> Vec<String> {
-    words(q)
 }
 
 pub fn matches(query: &[String], has: impl Fn(&str) -> bool) -> bool {
