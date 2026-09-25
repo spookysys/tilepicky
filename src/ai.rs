@@ -179,26 +179,39 @@ impl Default for Ai {
         let google = Provider::new("Google", Kind::Gemini);
         let on = |provider: &str, id: &str| Model { provider: provider.into(), id: id.into() };
         let models = vec![
-            on("OpenRouter", "xiaomi/mimo-v2.5"),
-            on("OpenRouter", "openrouter/free"),
-            on("OpenRouter", "xiaomi/mimo-v2.5:batch"),
+            on("OpenRouter", "z-ai/glm-5.3-flash"),
+            on("OpenRouter", "z-ai/glm-5.3-flash:batch"),
             on("Google", "gemini-3.7-flash:batch"),
         ];
-        let (instant, batch) = (Some(models[1].reference()), Some(models[2].reference()));
+        let (instant, batch) = (Some(models[0].reference()), Some(models[1].reference()));
         Ai { providers: vec![openrouter, google], models, instant, batch }
     }
 }
 
+/// Models an older tool shipped and this one does not: `openrouter/free`
+/// sent each request to whichever free model was up, and MiMo has no batch
+/// endpoint on OpenRouter.
+const RETIRED: [(&str, &str); 3] =
+    [("OpenRouter", "openrouter/free"), ("OpenRouter", "xiaomi/mimo-v2.5"), ("OpenRouter", "xiaomi/mimo-v2.5:batch")];
+
 impl Ai {
     /// Fills in what a settings file from an older tool lacks. A model
-    /// without an id is dropped; without any model left, the shipped
-    /// models come in, on the providers that exist; a choice that names no
-    /// model falls back to the shipped one, when that exists.
+    /// without an id is dropped, and so is a model the tool once shipped
+    /// and retired; the shipped models take its place. Without any model
+    /// left, the shipped models come in, on the providers that exist; a
+    /// choice that names no model falls back to the shipped one, when that
+    /// exists.
     pub fn heal(&mut self) {
-        self.models.retain(|m| !m.id.is_empty());
+        let before = self.models.len();
+        self.models.retain(|m| !m.id.is_empty() && !RETIRED.contains(&(m.provider.as_str(), m.id.as_str())));
+        let retired = self.models.len() < before;
         let shipped = Ai::default();
-        if self.models.is_empty() {
-            self.models = shipped.models.into_iter().filter(|m| self.providers.iter().any(|p| p.name == m.provider)).collect();
+        if self.models.is_empty() || retired {
+            for m in shipped.models {
+                if self.providers.iter().any(|p| p.name == m.provider) && !self.models.contains(&m) {
+                    self.models.push(m);
+                }
+            }
         }
         for (mode, fallback) in [(Mode::Instant, shipped.instant), (Mode::Batch, shipped.batch)] {
             if self.chosen(mode).is_none() {
@@ -479,8 +492,26 @@ mod tests {
     fn the_defaults_name_a_model_for_each_mode() {
         let ai = Ai::default();
         let name = |c: Option<(&Provider, &Model)>| c.map(|(p, m)| (p.name.clone(), m.id.clone()));
-        assert_eq!(name(ai.chosen(Mode::Instant)), Some(("OpenRouter".into(), "openrouter/free".into())));
-        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "xiaomi/mimo-v2.5:batch".into())));
+        assert_eq!(name(ai.chosen(Mode::Instant)), Some(("OpenRouter".into(), "z-ai/glm-5.3-flash".into())));
+        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "z-ai/glm-5.3-flash:batch".into())));
+    }
+
+    /// A file from 0.2 names the models it shipped. They go, the new ones
+    /// come in, and the choices follow; a model the user added stays.
+    #[test]
+    fn retired_models_give_way_to_the_shipped_ones() {
+        let on = |id: &str| Model { provider: "OpenRouter".into(), id: id.into() };
+        let mut ai = Ai {
+            models: vec![on("xiaomi/mimo-v2.5"), on("openrouter/free"), on("xiaomi/mimo-v2.5:batch"), on("mine/vision")],
+            instant: Some(on("openrouter/free").reference()),
+            batch: Some(on("xiaomi/mimo-v2.5:batch").reference()),
+            ..Ai::default()
+        };
+        ai.heal();
+        let ids: Vec<_> = ai.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["mine/vision", "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-3.7-flash:batch"]);
+        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash"));
+        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash:batch"));
     }
 
     /// A file from the tool that kept models inside the providers: no
@@ -491,8 +522,8 @@ mod tests {
         ai.batch = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash".into() });
         ai.heal();
         assert_eq!(ai.models, Ai::default().models);
-        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("openrouter/free"));
-        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("xiaomi/mimo-v2.5:batch"));
+        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash"));
+        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash:batch"));
     }
 
     #[test]

@@ -84,7 +84,7 @@ Tilepicky can generate searchable captions and tags for library sheets using mul
 
 1. Open a library sheet.
 2. Open the **AI assist** panel with `I` or the header toolbar button.
-3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output.
+3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output. Tilepicky ships with OpenRouter and `z-ai/glm-5.3-flash`; set `OPENROUTER_API_KEY` or type the key in Settings.
 4. Select **Label with AI** in the panel or from the sheet context menu.
 
 The model returns one caption and up to 12 tags. Tilepicky writes this label to `tilepicky.json`. You can continue working while the request runs in the background. Requests abort after 60 seconds, or when you click **Cancel**.
@@ -99,10 +99,10 @@ To label multiple library sheets in bulk:
 
 1. Open the library folder.
 2. Open **AI assist** (`I`) and select **Label entire library with AI...**.
-3. Choose a Google Gemini or OpenRouter batch model and provider key in Settings.
+3. Choose a batch model and provider key in Settings. The default is `z-ai/glm-5.3-flash:batch` on OpenRouter.
 4. Review the unlabeled sheet count and token limits, then click **Start batch**.
 
-Tilepicky submits requests in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`.
 
 Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
 
