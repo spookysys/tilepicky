@@ -80,6 +80,10 @@ Search runs locally and synchronously on your machine. It makes no network reque
 
 Tilepicky can generate searchable captions and tags for library sheets using multimodal vision models.
 
+![I opens AI assist, Label with AI describes the open sheet, Label entire library with AI describes the rest, and a search for snow finds the ski pack through its captions and tags](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/ai-labels.gif)
+
+In the recording, `I` opens the AI assist panel, and **Label with AI** describes the open sheet in a few seconds. **Label entire library with AI...** then labels the other 31 sheets, one request each, in about four minutes. The waits play sped up. A search for "snow" finds the Tiny Ski pack, although no file or folder carries that word: the captions and tags do. Unticking captions and tags in the ☰ menu empties the results.
+
 ### Label a single sheet
 
 1. Open a library sheet.
