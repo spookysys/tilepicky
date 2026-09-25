@@ -28,7 +28,15 @@ pub struct Sheet {
     pub error: String,
     /// The label is in the book.
     pub imported: bool,
+    /// Requests for this sheet that may have arrived but gave no answer the
+    /// tool could read. See `one`.
+    #[serde(default)]
+    pub unknown: u32,
 }
+
+/// How many requests of one sheet may end without a readable answer. Each
+/// may have been billed, so the sheet fails after this many.
+const UNKNOWN_TRIES: u32 = 3;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub enum Remote {
@@ -61,7 +69,11 @@ pub struct Job {
 impl Job {
     fn untaken(&self) -> bool { self.sheets.iter().any(|s| !s.taken) }
     pub fn done(&self) -> bool { !self.untaken() && self.groups.iter().all(|g| g.remote == Remote::Done) }
-    pub fn uncertain(&self) -> bool { self.groups.iter().any(|g| g.remote == Remote::Submitting) }
+    /// A Gemini batch went out and no reply confirmed it. An OpenAI-style job
+    /// is never so: its groups are released; see `release_groups`.
+    pub fn uncertain(&self) -> bool {
+        self.provider.kind == Kind::Gemini && self.groups.iter().any(|g| g.remote == Remote::Submitting)
+    }
     fn progress(&self) -> String {
         let labeled = self.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
         let failed = self.sheets.iter().filter(|s| !s.error.is_empty()).count();
@@ -95,7 +107,8 @@ pub fn prepare(index: &Index, provider: Provider, model: String) -> Result<Job, 
     let (labeled, open): (Vec<_>, Vec<_>) = index.entries.iter().partition(|e| e.side.label.is_some());
     Ok(Job {
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: labeled.len(),
-        sheets: open.iter().map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false }).collect(),
+        sheets: open.iter().map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
+            .collect(),
     })
 }
 
@@ -240,6 +253,7 @@ type Send<'a> = &'a mut dyn FnMut(&str, Option<&Value>) -> Result<Value, Failure
 /// returns, with or without error.
 pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
     let result = if job.provider.kind == Kind::OpenAi {
+        job.release_groups();
         one(&mut job, root, dir, &mut send)
     } else if job.uncertain() {
         Err("The provider did not confirm the last submission.".into())
@@ -252,8 +266,9 @@ pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str,
 }
 
 /// Labels the next sheet with one ordinary request. A request that did not
-/// arrive, that the provider could not take now, or whose answer was lost
-/// goes out again for the same sheet; at worst a sheet is billed twice.
+/// arrive, or that the provider could not take now, goes out again for the
+/// same sheet. One whose answer was lost or could not be read may have been
+/// billed: it goes out again, up to `UNKNOWN_TRIES` times in all.
 fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
     let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
     let request = image::open(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))
@@ -262,7 +277,12 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
         Err(error) => Err(error),
         Ok(request) => match send("chat/completions", Some(&request)) {
             Ok(value) => labels::response(&value),
-            Err(failure @ (Failure::NotSent(_) | Failure::Unknown(_) | Failure::Status(429 | 500..=599))) => {
+            Err(Failure::Unknown(message)) if job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
+                job.sheets[i].unknown += 1;
+                return job.save(dir).and(Err(message));
+            }
+            Err(Failure::Unknown(message)) => Err(format!("{message} No readable answer after {UNKNOWN_TRIES} tries.")),
+            Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 500..=599))) => {
                 return job.save(dir).and(Err(failure.message()));
             }
             Err(Failure::Status(code)) => Err(format!("The provider refused the request (HTTP {code}).")),
@@ -339,6 +359,20 @@ impl Job {
             for &i in &group.sheets { self.sheets[i].taken = false; }
         }
         self.groups.retain(|g| g.remote != Remote::Submitting);
+    }
+
+    /// Lets the sheets of an unfinished group go out one at a time. An
+    /// OpenAI-style job of 0.2 went through OpenRouter's batch API, which
+    /// read no local image: its groups never finish, and nothing asks about
+    /// them any more.
+    fn release_groups(&mut self) {
+        for group in self.groups.iter().filter(|g| g.remote != Remote::Done) {
+            for &i in &group.sheets {
+                let sheet = &mut self.sheets[i];
+                (sheet.taken, sheet.error) = (false, String::new());
+            }
+        }
+        self.groups.retain(|g| g.remote == Remote::Done);
     }
 }
 
@@ -692,6 +726,49 @@ mod tests {
         let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(Failure::Status(401)));
         result.unwrap();
         assert!(job.done() && job.sheets[0].error.contains("401"));
+    }
+
+    /// A request whose answer was lost or unreadable may have been billed,
+    /// so one sheet goes out at most three times that way. Offline tries
+    /// do not count.
+    #[test]
+    fn an_unreadable_answer_is_not_paid_for_forever() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::OpenAi);
+        let mut sent = 0;
+        for _ in 0..10 {
+            let result;
+            (job, result) = files.advance(job, |_, _| Err(Failure::NotSent("offline".into())));
+            assert!(result.is_err());
+        }
+        while !job.done() {
+            let result;
+            (job, result) = files.advance(job, |_, _| { sent += 1; Err(Failure::Unknown("Invalid or oversized batch response.".into())) });
+            assert_eq!(result.is_err(), sent < 3);
+        }
+        assert_eq!(sent, 3);
+        assert!(job.sheets[0].taken && job.sheets[0].error.contains("3 tries"));
+        assert_eq!(files.journal().sheets[0].unknown, 2);
+    }
+
+    /// A journal of 0.2 holds OpenRouter batch groups that never finish.
+    /// Their sheets go out one at a time instead, and the job ends.
+    #[test]
+    fn an_openai_journal_of_0_2_finishes() {
+        let files = Files::new();
+        RgbaImage::new(4, 4).save(files.root.join("more.png")).unwrap();
+        let mut job = files.prepare(Kind::OpenAi);
+        for s in &mut job.sheets { s.taken = true; }
+        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batch-1".into()) },
+            Group { sheets: vec![1], remote: Remote::Submitting }];
+        assert!(!job.uncertain() && !job.done());
+        while !job.done() {
+            let result;
+            (job, result) = files.advance(job, |path, _| { assert_eq!(path, "chat/completions"); Ok(completion(labeled("Tree"))) });
+            result.unwrap();
+        }
+        assert!(job.groups.is_empty());
+        assert!(job.sheets.iter().all(|s| s.label.is_some()));
     }
 
     #[test]
