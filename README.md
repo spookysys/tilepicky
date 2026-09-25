@@ -112,7 +112,9 @@ API keys are stored separately in `~/.config/tilepicky/keys.json` with restricte
 
 Tilepicky supports complete operation using the keyboard.
 
-![Picking a whole house, and then a column of trees, out of a pack and into a tilesheet of your own, without touching the mouse](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+![A house and two trees go from the Tiny Town pack into a new tilesheet without the mouse: the arrows open the pack, Ctrl+Tab moves between panes, Shift and the arrows select, Ctrl+C and Ctrl+V copy, Ctrl+T trims, and Ctrl+S saves](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+
+In the recording, the arrows walk the library tree and open the Tiny Town pack. `Ctrl+Tab` moves to the source sheet, and `Shift` with the arrows selects a house. `Ctrl+C` copies it, and `Ctrl+Tab` into the empty canvas starts a new tilesheet, where `Ctrl+V` pastes it. Two trees follow the same way. `Ctrl+T` trims the canvas to what it holds, and `Ctrl+S` names and saves it.
 
 ### Pane and widget navigation
 
