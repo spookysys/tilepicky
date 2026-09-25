@@ -260,7 +260,8 @@ impl App {
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
         self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.library_batch.open()
-            || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || egui::Popup::is_any_open(ctx)
+            || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
+            || egui::Popup::is_any_open(ctx)
     }
 
     fn remove_label_dialog(&mut self, ctx: &egui::Context) {
