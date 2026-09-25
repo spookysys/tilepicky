@@ -138,6 +138,8 @@ struct App {
     confirm: Option<(String, Vec<String>)>,
     /// An action that waits for the save dialog.
     pending: Option<Pending>,
+    /// An action that waits for the Save As the save dialog asked for.
+    after_save: Option<Pending>,
     library: Half,
     project: Half,
     query: String,
@@ -374,6 +376,7 @@ impl App {
             project_rect: Rect::NOTHING,
             confirm: None,
             pending: None,
+            after_save: None,
             status: library.error.clone().or_else(|| project.error.clone()).or(cleaned).unwrap_or_default(),
             library: Half::new(library, true),
             project: Half::new(project, false),
@@ -580,7 +583,7 @@ impl App {
         match row {
             tree::Row::Dir(d) => self.half_mut(panel).open_dir = Some((d.clone(), true)),
             tree::Row::File(i) if panel == Panel::Library => self.open_library(ctx, *i),
-            tree::Row::File(i) => self.request(ctx, Pending::Open(*i)),
+            tree::Row::File(i) => self.request(ctx, Pending::Open(self.project.index.entries[*i].rel.clone())),
         }
     }
 
@@ -788,6 +791,9 @@ impl App {
                 }
                 self.status = format!("saved as {rel}");
                 self.rescan_project();
+                if let Some(action) = self.after_save.take() {
+                    self.run(ctx, action);
+                }
             }
             NameFor::RenameFile(old) => {
                 let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
@@ -801,9 +807,7 @@ impl App {
                 self.relocate(old, &rel, true)?;
                 self.rescan_project();
                 // The copy opens as any file does: unsaved changes ask first.
-                if let Some(i) = self.project.index.position(&rel) {
-                    self.request(ctx, Pending::Open(i));
-                }
+                self.request(ctx, Pending::Open(rel));
             }
         }
         Ok(())
@@ -866,7 +870,11 @@ impl App {
 
     fn run(&mut self, ctx: &egui::Context, action: Pending) {
         match action {
-            Pending::Open(i) => self.open_project(ctx, i),
+            Pending::Open(rel) => {
+                if let Some(i) = self.project.index.position(&rel) {
+                    self.open_project(ctx, i);
+                }
+            }
             Pending::Create => self.create_project(ctx),
             Pending::Close => {
                 self.project.sheet = None;
@@ -1963,7 +1971,7 @@ impl App {
                 self.marked.insert(i);
                 self.tree_anchor = Some(i);
                 self.tree_cursor = Some(i);
-                self.request(ctx, Pending::Open(i));
+                self.request(ctx, Pending::Open(self.project.index.entries[i].rel.clone()));
             }
             TreeAction::Toggle(i) => {
                 if !self.marked.remove(&i) {
@@ -3144,8 +3152,8 @@ mod tests {
         let mut b = bench(&[], &["a.png", "b.png", "c.png"]);
         b.open_project("a.png");
         b.app.project.sheet.as_mut().unwrap().dirty = true;
-        b.app.request(&b.ctx, Pending::Open(1));
-        assert!(b.app.pending == Some(Pending::Open(1)));
+        b.app.request(&b.ctx, Pending::Open("b.png".into()));
+        assert!(b.app.pending == Some(Pending::Open("b.png".into())));
         assert_eq!(b.project_rel(), Some("a.png"));
         // A duplicate opens as any file does: it waits too.
         b.app.pending = None;
@@ -3158,6 +3166,32 @@ mod tests {
         b.app.pending = None;
         b.app.apply_name(&b.ctx, &NameFor::DuplicateFile("c.png".into()), "e").unwrap();
         assert_eq!(b.project_rel(), Some("e.png"));
+    }
+
+    /// Save in the unsaved changes dialog may have to ask for a name first.
+    /// The action it interrupted runs once that save is done, on the file
+    /// it named, whatever the new file did to the order of the tree.
+    #[test]
+    fn an_action_waits_through_save_as() {
+        let mut b = bench(&[], &["a.png", "c.png"]);
+        b.app.start_canvas(&b.ctx, [8, 8]);
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        b.app.answer_save(&b.ctx, Pending::Open("c.png".into()), true);
+        let prompt = b.app.prompt.take().unwrap();
+        assert!(prompt.what == NameFor::SaveAs);
+        assert_eq!(b.project_rel(), Some(""));
+        b.app.apply_name(&b.ctx, &prompt.what, "b").unwrap();
+        assert!(b.project.0.join("b.png").is_file());
+        assert_eq!(b.project_rel(), Some("c.png"));
+        assert!(b.app.after_save.is_none());
+        // A Save As that is cancelled drops the action with it.
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        b.app.project.sheet.as_mut().unwrap().rel = "d.gif".into();
+        b.app.answer_save(&b.ctx, Pending::Open("a.png".into()), true);
+        assert!(b.app.prompt.is_some() && b.app.after_save.is_some());
+        b.app.cancel_name();
+        assert!(b.app.after_save.is_none());
+        assert_eq!(b.project_rel(), Some("d.gif"));
     }
 
     /// A GIF would keep one frame and a JPEG no alpha, so a sheet from

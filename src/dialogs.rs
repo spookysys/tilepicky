@@ -6,10 +6,11 @@
 use crate::{App, sidecar};
 use eframe::egui::{self, Id, Key};
 
-/// What to do once the user has decided about unsaved changes.
-#[derive(Clone, Copy, PartialEq)]
+/// What to do once the user has decided about unsaved changes. A file is
+/// named by its path, since a save can add a file and so move the others.
+#[derive(Clone, PartialEq)]
 pub enum Pending {
-    Open(usize),
+    Open(String),
     Create,
     Close,
 }
@@ -157,12 +158,15 @@ impl App {
             });
         });
         if cancel {
-            self.prompt = None;
+            self.cancel_name();
         } else if apply {
             let p = self.prompt.take().unwrap();
             if let Err(e) = self.apply_name(ctx, &p.what, &p.value) {
                 self.status = e;
             }
+            // A Save As that succeeded ran the action that waited for it;
+            // one that failed drops it.
+            self.after_save = None;
         }
     }
 
@@ -200,7 +204,7 @@ impl App {
 
     /// The dialog for unsaved changes: save, discard, or cancel.
     fn save_dialog(&mut self, ctx: &egui::Context) {
-        let Some(action) = self.pending else { return };
+        let Some(action) = self.pending.clone() else { return };
         let name = self.project.sheet.as_ref().map(|s| s.rel.clone()).unwrap_or_default();
         let mut choice = None;
         egui::Modal::new(Id::new("save dialog")).show(ctx, |ui| {
@@ -221,25 +225,36 @@ impl App {
             });
         });
         if let Some(save) = choice {
-            if save && self.project.sheet.as_ref().is_some_and(|s| s.rel.is_empty()) {
-                // No name yet: ask for one; the interrupted action is dropped.
-                self.pending = None;
-                self.save();
+            self.answer_save(ctx, action, save);
+        }
+    }
+
+    /// Save or Discard in the unsaved changes dialog. A sheet with no name,
+    /// or one that is no PNG, asks for a name first, and the action waits
+    /// for that save. A save that fails keeps the changes, and the action
+    /// is dropped.
+    pub fn answer_save(&mut self, ctx: &egui::Context, action: Pending, save: bool) {
+        self.pending = None;
+        if save {
+            self.save();
+            if self.prompt.is_some() {
+                self.after_save = Some(action);
                 return;
             }
-            self.pending = None;
-            if save {
-                self.save();
-                // A save that failed keeps the changes, and the action waits.
-                if self.has_unsaved() {
-                    return;
-                }
+            if self.has_unsaved() {
+                return;
             }
-            if let Some(sheet) = &mut self.project.sheet {
-                sheet.dirty = false;
-            }
-            self.run(ctx, action);
         }
+        if let Some(sheet) = &mut self.project.sheet {
+            sheet.dirty = false;
+        }
+        self.run(ctx, action);
+    }
+
+    /// Closes the name prompt, and drops an action that waited for it.
+    pub fn cancel_name(&mut self) {
+        self.prompt = None;
+        self.after_save = None;
     }
 
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.

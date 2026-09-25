@@ -43,13 +43,14 @@ pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
 /// Older versions wrote one for every cell drawn in the project: the name
 /// of the project sheet, or an empty name for a sheet without one. Only the
 /// library is a source, so a name that the project holds and the library
-/// does not is one of those. Without a library, only the empty name goes.
+/// does not is one of those. Without a library, or with one out of reach,
+/// such as a drive that is not mounted, only the empty name goes.
 /// Returns how many entries changed.
 pub fn drop_own_sources(project: &Path, library: &Path) -> Result<usize, String> {
     let mut book = sidecar::load_book(project)?;
     let own = |source: &str| {
         source.is_empty()
-            || (!library.as_os_str().is_empty() && project.join(source).is_file() && !library.join(source).exists())
+            || (library.is_dir() && project.join(source).is_file() && !library.join(source).exists())
     };
     let mut changed = 0;
     for side in book.sheets.values_mut() {
@@ -129,10 +130,14 @@ mod tests {
         assert_eq!(sources, ["pack/tree.png", "both.png"]);
         assert!(!book.sheets.contains_key("both.png"), "an entry with nothing left goes");
         assert_eq!(drop_own_sources(&project.0, &library.0), Ok(0));
-        // Without a library, only the empty name is sure to be wrong.
-        sidecar::store_entry(&project.0, "mine.png", &side).unwrap();
-        assert_eq!(drop_own_sources(&project.0, Path::new("")), Ok(1));
-        assert_eq!(sidecar::load_book(&project.0).unwrap().sheets["mine.png"].provenance.len(), 3);
+        // Without a library, only the empty name is sure to be wrong. A
+        // library that is set but out of reach, such as a drive that is not
+        // mounted, counts as none.
+        for gone in [Path::new(""), &library.0.join("unmounted")] {
+            sidecar::store_entry(&project.0, "mine.png", &side).unwrap();
+            assert_eq!(drop_own_sources(&project.0, gone), Ok(1));
+            assert_eq!(sidecar::load_book(&project.0).unwrap().sheets["mine.png"].provenance.len(), 3);
+        }
     }
 
     #[test]
