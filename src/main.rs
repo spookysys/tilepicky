@@ -917,6 +917,8 @@ impl App {
         let id = Id::new("settings popup");
         egui::Popup::new(id, ui.ctx().clone(), gear, ui.layer_id())
             .open_memory(gear.clicked().then_some(egui::SetOpenCommand::Toggle))
+            // A click in a field or a box edits it; only a click elsewhere closes.
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .align(egui::RectAlign::TOP_END)
             .show(|ui| {
                 // A maximum, not a fixed width: the popup shrinks to its
@@ -2154,7 +2156,9 @@ impl eframe::App for App {
                 // What the search matches on, in a popup under the button.
                 let r = ui.small_button("☰").on_hover_text("search in…");
                 stop(&r);
-                egui::Popup::from_toggle_button_response(&r).show(|ui| {
+                // A click on a box ticks it and leaves the popup open, so
+                // that several can change at once.
+                egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                     ui.set_min_width(220.0);
                     ui.strong("Search in");
                     let first = ui.checkbox(&mut self.settings.search.folders, "folder names");
