@@ -115,6 +115,12 @@ struct App {
     /// The Label with AI request in flight, and what the last one ended with.
     label_run: Option<labels::Run>,
     label_outcome: Option<String>,
+    /// The tag list of the library as the user types it, and whether the
+    /// list changed since the book last got it.
+    tag_text: String,
+    tag_dirty: bool,
+    /// A prompt to show: a title, and its two texts.
+    prompt_view: Option<(String, [String; 2])>,
     library_batch: batch::Panel,
     /// The sheet whose label waits for the user's yes to be removed.
     remove_label: Option<(PathBuf, String)>,
@@ -123,6 +129,8 @@ struct App {
     config_open: bool,
     /// The settings popup is open. See `settings_popup`.
     settings_open: bool,
+    /// Something outside the gear asked for the settings.
+    settings_request: bool,
     /// The legend asks whether to hide itself.
     legend_prompt: bool,
     /// The eye of the project panel: tooltips and islands, no editing. Off
@@ -362,10 +370,14 @@ impl App {
             ai_panel: false,
             label_run: None,
             label_outcome: None,
+            tag_text: String::new(),
+            tag_dirty: false,
+            prompt_view: None,
             library_batch: batch::Panel::default(),
             remove_label: None,
             config_open: false,
             settings_open: false,
+            settings_request: false,
             legend_prompt: false,
             project_eye: false,
             picking: None,
@@ -928,7 +940,9 @@ impl App {
         let (click, escape) = ctx.input(|i| (i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten(),
             i.key_pressed(Key::Escape)));
         let outside = click.is_some_and(|p| !gear.rect.contains(p) && last.is_none_or(|r| !r.contains(p)));
-        if gear.clicked() {
+        if std::mem::take(&mut self.settings_request) {
+            self.settings_open = true;
+        } else if gear.clicked() {
             self.settings_open = !self.settings_open;
         } else if self.settings_open && !combo && (escape || outside) {
             self.settings_open = false;
@@ -1384,42 +1398,120 @@ impl App {
         clicked
     }
 
-    /// Configuration belongs in Settings; this panel shows the label of the open sheet.
-    fn assist_panel(
-        ui: &mut egui::Ui, ai: &ai::Ai, keys: &ai::Keys, sheet: Option<&Sheet>, run: Option<&labels::Run>, outcome: Option<&str>,
-    ) -> Option<labels::Action> {
-        ui.strong("AI label");
-        let ready = match ai.chosen(ai::Mode::Instant) {
-            Some((p, m)) if p.kind == ai::Kind::OpenAi && p.key_source(keys) != ai::KeySource::None => {
-                ui.weak(format!("Ready: {}", m.id));
-                true
+    /// The AI panel of the library, in the order of the work: the models,
+    /// the open sheet, the whole library, and the tags every request looks
+    /// for. The models themselves are chosen in Settings.
+    fn assist_panel(&mut self, ui: &mut egui::Ui) -> Option<labels::Action> {
+        ui.heading("AI labels");
+        let instant = self.settings.ai.chosen(ai::Mode::Instant)
+            .filter(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
+        let ready = instant.is_some();
+        ui.horizontal_wrapped(|ui| {
+            match instant {
+                Some((_, m)) => { ui.weak(format!("Model: {}", m.id)); }
+                None => { ui.colored_label(ui.visuals().warn_fg_color, "No model with a key yet."); }
             }
-            _ => { ui.weak("Set an instant image model and key in Settings."); false }
-        };
-        let mut cancel = None;
-        if let Some(run) = run {
+            if stopped(ui.small_button("Settings...")).on_hover_text("Choose the models and keys (Ctrl+,).").clicked() {
+                self.settings_request = true;
+            }
+        });
+
+        ui.separator();
+        ui.strong("This sheet");
+        let sheet = self.library.sheet.as_ref();
+        let mut action = None;
+        match sheet {
+            None => { ui.weak("Open a sheet of the library to label it."); }
+            Some(sheet) => {
+                match &sheet.side.label {
+                    Some(label) => {
+                        label.show(ui);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak(format!("{} / {}", label.provider, label.model));
+                            if stopped(ui.small_button("Prompt...")).on_hover_text("The prompt that made this label.").clicked() {
+                                let title = match &label.tag_list {
+                                    Some(_) => "The prompt of this label".to_string(),
+                                    None => "The prompt of this label, as far as known".to_string(),
+                                };
+                                self.prompt_view = Some((title, labels::prompt(label.tag_list.as_deref().unwrap_or_default())));
+                            }
+                        });
+                    }
+                    None => { ui.weak("No label yet."); }
+                }
+            }
+        }
+        if let Some(run) = &self.label_run {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(format!("Waiting for the model: {}s of 60s.", run.started.elapsed().as_secs()));
+                ui.label(format!("Labeling {}: {} s", run.path.file_name().unwrap_or_default().to_string_lossy(), run.started.elapsed().as_secs()))
+                    .on_hover_text(run.path.display().to_string());
             });
-            ui.weak(run.path.file_name().unwrap_or_default().to_string_lossy()).on_hover_text(run.path.display().to_string());
-            cancel = Some(stopped(ui.button("Cancel").on_hover_text("Stops waiting. The provider may still bill the request.")));
+            if stopped(ui.button("Cancel").on_hover_text("Stops waiting. The provider may still bill the request.")).clicked() {
+                action = Some(labels::Action::Cancel);
+            }
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-        } else if let Some(outcome) = outcome {
+        } else if let Some(outcome) = &self.label_outcome {
             ui.label(outcome);
         }
-        match sheet.map(|s| &s.side.label) {
-            Some(Some(label)) => label.show(ui),
-            Some(None) => { ui.weak("No AI label yet."); }
-            None => { ui.weak("Select a library sheet."); }
+        let labeled = sheet.is_some_and(|s| s.side.label.is_some());
+        ui.horizontal_wrapped(|ui| {
+            let text = if labeled { "Label again" } else { "Label with AI" };
+            let label = ui.add_enabled(ready && sheet.is_some() && self.label_run.is_none(), egui::Button::new(text))
+                .on_hover_text("Sends this sheet to the model. A new label replaces the old one.");
+            let remove = ui.add_enabled(labeled && self.label_run.is_none(), egui::Button::new("Remove label..."));
+            stop(&label);
+            stop(&remove);
+            if label.clicked() { action = Some(labels::Action::Label); }
+            if remove.clicked() { action = Some(labels::Action::Remove); }
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.strong("Whole library");
+        let entries = &self.library.index.entries;
+        if self.library.is_set() {
+            let done = entries.iter().filter(|e| e.side.label.is_some()).count();
+            ui.label(format!("{done} of {} sheets have a label.", entries.len()));
         }
-        let label = ui.add_enabled(ready && sheet.is_some() && run.is_none(), egui::Button::new("Label with AI"))
-            .on_hover_text("Sends this sheet to the configured instant model.");
-        let remove = ui.add_enabled(sheet.is_some_and(|s| s.side.label.is_some()) && run.is_none(), egui::Button::new("Remove AI label..."));
-        stop(&label);
-        stop(&remove);
-        if label.clicked() { Some(labels::Action::Label) } else if remove.clicked() { Some(labels::Action::Remove) }
-            else if cancel.as_ref().is_some_and(egui::Response::clicked) { Some(labels::Action::Cancel) } else { None }
+        self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys);
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.strong("Tags to look for");
+        ui.weak("The model checks every sheet for each of these, and adds tags of its own. Commas separate them. \
+            The list is saved with the library.");
+        let edit = stopped(ui.add_enabled(self.library.is_set(),
+            egui::TextEdit::multiline(&mut self.tag_text).desired_rows(3).desired_width(f32::INFINITY)));
+        if edit.changed() {
+            self.library.index.tag_list = labels::parse_list(&self.tag_text);
+            self.tag_dirty = true;
+        } else if !edit.has_focus() && labels::parse_list(&self.tag_text) != self.library.index.tag_list {
+            // The library changed, or read its book again.
+            self.tag_text = self.library.index.tag_list.join(", ");
+        }
+        if edit.lost_focus() { self.store_tag_list(); }
+        ui.horizontal_wrapped(|ui| {
+            let default: Vec<String> = sidecar::TAG_LIST.map(String::from).to_vec();
+            if stopped(ui.add_enabled(self.library.is_set() && self.library.index.tag_list != default, egui::Button::new("Reset")))
+                .on_hover_text(sidecar::TAG_LIST.join(", ")).clicked() {
+                self.library.index.tag_list = default;
+                self.tag_dirty = true;
+                self.store_tag_list();
+            }
+            if stopped(ui.button("Prompt...")).on_hover_text("The prompt that the next request sends.").clicked() {
+                self.prompt_view = Some(("The prompt of the next request".into(), labels::prompt(&self.library.index.tag_list)));
+            }
+        });
+        action
+    }
+
+    /// Writes the tag list of the library into its book, if it changed.
+    fn store_tag_list(&mut self) {
+        if !std::mem::take(&mut self.tag_dirty) || !self.library.is_set() { return; }
+        if let Err(e) = sidecar::store_tag_list(&self.library.index.root, &self.library.index.tag_list) {
+            self.status = format!("Could not save the tag list: {e}");
+        }
     }
 
     /// Every UI entry point reaches this operation after it opens the target sheet.
@@ -1434,6 +1526,7 @@ impl App {
             self.status = "Wait for the current label, or cancel it.".into();
             return;
         }
+        self.store_tag_list();
         let Some(sheet) = &self.library.sheet else { return };
         if action == labels::Action::Remove {
             self.remove_label = Some((sheet.dir.clone(), sheet.rel.clone()));
@@ -1446,7 +1539,9 @@ impl App {
             let key = provider.key(&self.keys).ok_or("Set the provider key in Settings.")?;
             let endpoint = labels::Endpoint::new(&provider.url, key)?;
             let ctx = ctx.clone();
-            labels::Run::start(sheet.label_input(), provider.name.clone(), model.id.clone(), move |body| endpoint.send(body), move || ctx.request_repaint())
+            let list = self.library.index.tag_list.clone();
+            let (name, id) = (provider.name.clone(), model.id.clone());
+            labels::Run::start(sheet.label_input(), name, id, list, move |body| endpoint.send(body), move || ctx.request_repaint())
         })();
         self.label_outcome = None;
         match result {
@@ -1841,12 +1936,7 @@ impl App {
         if self.ai_panel {
             let label = egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
                 set_pane(ui, (Panel::Library, Spot::Side));
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let out = Self::assist_panel(ui, &self.settings.ai, &self.keys, self.library.sheet.as_ref(),
-                        self.label_run.as_ref(), self.label_outcome.as_deref());
-                    self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys);
-                    out
-                }).inner
+                egui::ScrollArea::vertical().show(ui, |ui| self.assist_panel(ui)).inner
             });
             if let Some(action) = label.inner { self.label_action(ctx, action); }
         }
@@ -3243,7 +3333,7 @@ mod tests {
         b.app.refresh_query();
         assert_eq!(b.app.library.visible, Some(vec![false, false]));
         let label = sidecar::Label { provider: "p".into(), model: "m".into(), status: sidecar::Status::Labeled,
-            caption: "Mossy stones".into(), tags: vec![] };
+            caption: "Mossy stones".into(), tags: vec![], tag_list: None };
         let root = b.library.0.clone();
         b.app.apply_labels(&root, &[("b.png".into(), Some(label.clone()))]);
         assert_eq!(b.app.library.index.entries[1].side.label.as_ref(), Some(&label));

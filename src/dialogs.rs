@@ -45,6 +45,7 @@ impl App {
         self.name_dialog(ctx);
         self.confirm_dialog(ctx);
         self.remove_label_dialog(ctx);
+        self.prompt_dialog(ctx);
         self.library_batch.confirmation(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.has_unsaved() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -259,9 +260,27 @@ impl App {
 
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
-        self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.library_batch.open()
+        self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.prompt_view.is_some() || self.library_batch.open()
             || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
             || egui::Popup::is_any_open(ctx)
+    }
+
+    /// Shows a prompt as it goes to the model. The text can be selected and copied.
+    fn prompt_dialog(&mut self, ctx: &egui::Context) {
+        let Some((title, texts)) = &self.prompt_view else { return };
+        let mut close = false;
+        egui::Modal::new(Id::new("labeling prompt")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading(title.as_str());
+            for (name, text) in ["System", "User, with the image"].iter().zip(texts) {
+                ui.add_space(4.0);
+                ui.strong(*name);
+                ui.add(egui::TextEdit::multiline(&mut text.as_str()).desired_width(f32::INFINITY));
+            }
+            ui.add_space(4.0);
+            close = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+        });
+        if close { self.prompt_view = None; }
     }
 
     fn remove_label_dialog(&mut self, ctx: &egui::Context) {

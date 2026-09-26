@@ -89,11 +89,12 @@ In the recording, `I` opens the AI assist panel, and **Label with AI** describes
 1. Open a library sheet.
 2. Open the **AI assist** panel with `I` or the header toolbar button.
 3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output. Tilepicky ships with OpenRouter and `z-ai/glm-5.3-flash`; set `OPENROUTER_API_KEY` or type the key in Settings.
-4. Select **Label with AI** in the panel or from the sheet context menu.
+4. Select **Label with AI** in the panel or from the sheet context menu. On a sheet that has a label, the panel button reads **Label again**.
 
-The model returns one caption and up to 12 tags. Tilepicky writes this label to `tilepicky.json`. You can continue working while the request runs in the background. Requests abort after 60 seconds, or when you click **Cancel**.
+The model returns one caption and up to 12 tags of its own, plus the tags from your list that fit; see below. Tilepicky writes this label to `tilepicky.json`. You can continue working while the request runs in the background. Requests abort after 60 seconds, or when you click **Cancel**.
 
-To delete existing labels, select **Remove AI label...** from the context menu and confirm.
+To delete a label, select **Remove label...** in the panel, or **Remove AI label...** in the context menu, and confirm.
+**Prompt...** beside the label shows the prompt that made it.
 
 GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixels are scaled down before submission.
 
@@ -102,13 +103,23 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 To label multiple library sheets in bulk:
 
 1. Open the library folder.
-2. Open **AI assist** (`I`) and select **Label entire library with AI...**.
+2. Open **AI assist** (`I`), and under **Whole library** select **Label the unlabeled sheets...**.
 3. Choose a batch model and provider key in Settings. The default is `z-ai/glm-5.3-flash:batch` on OpenRouter.
-4. Review the unlabeled sheet count and token limits, then click **Start batch**.
+4. Review the unlabeled sheet count, the token limit, and the tags to look for, then click **Start batch**.
+
+A batch keeps the tag list it started with, even if you change the list while it runs.
 
 With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`.
 
 Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
+
+### Tags to look for
+
+The bottom of the AI assist panel holds a list of tags, separated by commas. Every request asks the model to check the sheet for each of them, and to add each one that fits, spelled as in your list. If characters matter to you, keep `character` in the list, and every sheet that shows one gets that tag. These tags do not count toward the 12 the model adds of its own.
+
+A new library starts with `character, NPC, hero, landscape, building, indoor, UI, font, animation, props, background`. **Reset** brings that list back. The list belongs to the library: Tilepicky writes it at the top of the library's `tilepicky.json`.
+
+Each label records the list its request used. **Prompt...** beside a label shows the prompt with that list, and **Prompt...** under the list shows the prompt of the next request. Changing the list does not relabel anything. To label a sheet with the new list, select **Label again**, or remove its label and label the library again.
 
 API keys are stored separately in `~/.config/tilepicky/keys.json` with restricted file permissions (`0600`).
 

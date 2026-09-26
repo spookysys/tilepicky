@@ -64,6 +64,10 @@ pub struct Job {
     pub groups: Vec<Group>,
     /// The sheets that had a label already.
     pub skipped: usize,
+    /// The library's tag list when the job started. Every request of the job
+    /// asks for it, and every label records it.
+    #[serde(default)]
+    pub tag_list: Vec<String>,
 }
 
 impl Job {
@@ -97,7 +101,7 @@ fn directory(root: &Path) -> Result<PathBuf, String> {
 
 /// The request body for one sheet in a Gemini batch.
 fn body(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
-    Ok(gemini_request(&labels::request(&job.model, img)?))
+    Ok(gemini_request(&labels::request(&job.model, img, &job.tag_list)?))
 }
 
 /// Lists the sheets without a label. It reads no image and sends nothing.
@@ -106,7 +110,7 @@ pub fn prepare(index: &Index, provider: Provider, model: String) -> Result<Job, 
     if let Some(error) = &index.error { return Err(error.clone()); }
     let (labeled, open): (Vec<_>, Vec<_>) = index.entries.iter().partition(|e| e.side.label.is_some());
     Ok(Job {
-        provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: labeled.len(),
+        provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: labeled.len(), tag_list: index.tag_list.clone(),
         sheets: open.iter().map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
             .collect(),
     })
@@ -227,10 +231,10 @@ fn outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
 
 /// Writes what a request gave back into the sheet: a label, or the reason
 /// there is none.
-fn record(sheet: &mut Sheet, provider: &str, model: &str, reply: Result<labels::Reply, String>) {
+fn record(sheet: &mut Sheet, job: (&str, &str, &[String]), reply: Result<labels::Reply, String>) {
     match reply {
         Ok(reply) => {
-            let label = reply.into_label(provider, model);
+            let label = reply.into_label(job.0, job.1, job.2);
             if label.status == Status::Unlabelable { sheet.error = "The model could not label the sheet.".into(); }
             sheet.label = Some(label);
         }
@@ -241,8 +245,8 @@ fn record(sheet: &mut Sheet, provider: &str, model: &str, reply: Result<labels::
 fn accept(job: &mut Job, group: usize, values: Vec<(String, Value)>) {
     let mut values: std::collections::BTreeMap<_, _> = values.into_iter().collect();
     for &i in &job.groups[group].sheets {
-        let reply = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v| labels::response(&v));
-        record(&mut job.sheets[i], &job.provider.name, &job.model, reply);
+        let reply = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v| labels::response(&v, &job.tag_list));
+        record(&mut job.sheets[i], (&job.provider.name, &job.model, &job.tag_list), reply);
     }
 }
 
@@ -272,11 +276,11 @@ pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str,
 fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
     let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
     let request = image::open(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))
-        .and_then(|img| labels::request(&job.model, &img.to_rgba8()));
+        .and_then(|img| labels::request(&job.model, &img.to_rgba8(), &job.tag_list));
     let reply = match request {
         Err(error) => Err(error),
         Ok(request) => match send("chat/completions", Some(&request)) {
-            Ok(value) => labels::response(&value),
+            Ok(value) => labels::response(&value, &job.tag_list),
             Err(Failure::Unknown(message)) if job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
                 job.sheets[i].unknown += 1;
                 return job.save(dir).and(Err(message));
@@ -288,7 +292,7 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
             Err(Failure::Status(code)) => Err(format!("The provider refused the request (HTTP {code}).")),
         },
     };
-    record(&mut job.sheets[i], &job.provider.name, &job.model, reply);
+    record(&mut job.sheets[i], (&job.provider.name, &job.model, &job.tag_list), reply);
     job.sheets[i].taken = true;
     job.save(dir)
 }
@@ -525,8 +529,6 @@ impl Panel {
 
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, index: &Index, ai: &crate::ai::Ai, keys: &crate::ai::Keys) {
         use eframe::egui;
-        ui.separator();
-        ui.strong("Library batch");
         let configured = ai.chosen(crate::ai::Mode::Batch);
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
         if self.running() && self.root != index.root { ui.weak(format!("For {}", self.root.display())); }
@@ -576,7 +578,7 @@ impl Panel {
         if self.retry { self.next_check = None; }
         if !ready { ui.weak("Set a batch model and its key in Settings."); }
         let button = ui.add_enabled(ready && !self.running() && self.task.is_none() && !index.root.as_os_str().is_empty(),
-            egui::Button::new("Label entire library with AI..."));
+            egui::Button::new("Label the unlabeled sheets..."));
         crate::stop(&button);
         if button.clicked() {
             let (provider, model) = configured.unwrap();
@@ -604,6 +606,10 @@ impl Panel {
                 ui.label(format!("Sheets to label: {}, one request each.", job.sheets.len()));
                 ui.label(format!("Skipped because they have a label: {}.", job.skipped));
                 ui.label(format!("At most {} output tokens.", job.sheets.len() * 4096));
+                match job.tag_list.is_empty() {
+                    true => ui.label("Tags to look for: none."),
+                    false => ui.label(format!("Tags to look for: {}.", job.tag_list.join(", "))),
+                };
                 ui.weak("Price estimate unavailable. Image token charges and model output vary.");
                 ui.weak("You can close the app while the batch runs; it continues when you open the library again.");
             }
@@ -674,7 +680,7 @@ mod tests {
         std::fs::write(files.root.join("broken.png"), b"not an image").unwrap();
         RgbaImage::new(4, 4).save(files.root.join("done.png")).unwrap();
         let label = labels::tests::completion(labeled("Done"));
-        let label = labels::response(&label).unwrap().into_label("test", "test");
+        let label = labels::response(&label, &[]).unwrap().into_label("test", "test", &[]);
         crate::sidecar::store_labels(&files.root, [("done.png", Some(label))]).unwrap();
         let job = files.prepare(Kind::Gemini);
         assert_eq!(job.sheets.iter().map(|s| s.rel.as_str()).collect::<Vec<_>>(), ["broken.png", "folder/sheet.png"]);
@@ -707,6 +713,26 @@ mod tests {
         assert_eq!(job.sheets[1].label.as_ref().unwrap().caption, "Forest");
         assert!(job.groups.is_empty());
         assert!(files.journal().done());
+    }
+
+    /// A job asks for the tag list the library had when it started, and
+    /// every label records it, though the list changes while the job runs.
+    #[test]
+    fn a_job_keeps_the_tag_list_it_started_with() {
+        let files = Files::new();
+        crate::sidecar::store_tag_list(&files.root, &["tree".into()]).unwrap();
+        let mut job = files.prepare(Kind::OpenAi);
+        crate::sidecar::store_tag_list(&files.root, &["house".into()]).unwrap();
+        let result;
+        (job, result) = files.advance(job, |_, request| {
+            assert!(request.unwrap()["messages"][0]["content"].as_str().unwrap().contains("exactly as given: tree."));
+            Ok(completion(json!({"status":"labeled", "caption":"Forest", "tags":["trees"]})))
+        });
+        result.unwrap();
+        let label = job.sheets[0].label.as_ref().unwrap();
+        assert_eq!(label.tags, ["tree"]);
+        assert_eq!(label.tag_list, Some(vec!["tree".to_string()]));
+        assert_eq!(files.journal().tag_list, ["tree"]);
     }
 
     /// A request that did not arrive, or that the provider could not take
@@ -893,7 +919,7 @@ mod tests {
 
     #[test]
     fn gemini_request_and_response_use_the_same_structured_label() {
-        let request = labels::request("test", &RgbaImage::new(2, 2)).unwrap();
+        let request = labels::request("test", &RgbaImage::new(2, 2), &[]).unwrap();
         let gemini = gemini_request(&request);
         assert_eq!(gemini["generationConfig"]["responseMimeType"], "application/json");
         assert!(gemini["generationConfig"]["responseJsonSchema"].is_object());
@@ -905,11 +931,11 @@ mod tests {
         }]}}});
         let out = outputs(&response).unwrap().unwrap();
         assert_eq!(out[0].0, "sheet-0");
-        assert_eq!(labels::response(&out[0].1).unwrap().into_label("", "").caption, "Tree");
+        assert_eq!(labels::response(&out[0].1, &[]).unwrap().into_label("", "", &[]).caption, "Tree");
         let mut bad = response.clone();
         bad["response"]["inlinedResponses"]["inlinedResponses"][0]["response"]["candidates"][0]["finishReason"] = json!("SAFETY");
         let out = outputs(&bad).unwrap().unwrap();
-        assert!(labels::response(&out[0].1).is_err());
+        assert!(labels::response(&out[0].1, &[]).is_err());
         assert!(outputs(&json!({"done":false})).unwrap().is_none());
         let mut twice = response.clone();
         let item = twice["response"]["inlinedResponses"]["inlinedResponses"][0].clone();

@@ -52,8 +52,8 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
   and their settings page. Single-sheet labeling uses the instant model.
   Library batches use the configured Google or OpenRouter batch model.
-- `src/labels.rs`: one labeling request per sheet, and the checks on the
-  reply. GIFs send their first frame. Label with AI sends it from a worker
+- `src/labels.rs`: one labeling request per sheet, the library's tag list
+  in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
   thread; to cancel, drop the `Run`. Tests use fake responses.
 - `src/batch.rs`: library batches, one request per sheet: through the
   Gemini batch API, or one at a time to an OpenAI-style endpoint, whose

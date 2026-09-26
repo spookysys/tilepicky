@@ -26,6 +26,8 @@ pub struct Index {
     pub dirs: Vec<String>,
     /// The run's default tile size, for entries that name none.
     pub tile: [u32; 2],
+    /// The tags a labeling request asks for; see `sidecar::Book::tag_list`.
+    pub tag_list: Vec<String>,
 }
 
 impl Index {
@@ -39,6 +41,7 @@ impl Index {
                 entries: Vec::new(),
                 dirs: Vec::new(),
                 tile: default_tile,
+                tag_list: Vec::new(),
             };
         }
         let mut rels: Vec<String> = Vec::new();
@@ -74,12 +77,14 @@ impl Index {
             })
             .collect();
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
+        let tag_list = sidecar::tag_list(&book);
         Self {
             root: root.to_path_buf(),
             error,
             entries,
             dirs,
             tile,
+            tag_list,
         }
     }
 

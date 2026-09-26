@@ -121,6 +121,10 @@ pub struct Label {
     pub status: Status,
     pub caption: String,
     pub tags: Vec<String>,
+    /// The tags the request asked the model to look for; see `Book::tag_list`.
+    /// Absent on a label made before the tool asked for any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_list: Option<Vec<String>>,
 }
 
 /// What the book says about one sheet.
@@ -167,8 +171,32 @@ pub struct Book {
     /// own. It follows the directory, so a project keeps its own size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile: Option<Pair>,
+    /// The tags each labeling request asks the model to look for. Absent:
+    /// `TAG_LIST`. It lives in the book of the library root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_list: Option<Vec<String>>,
     #[serde(default)]
     pub sheets: BTreeMap<String, Sidecar>,
+}
+
+/// The tags a library looks for until someone changes its list.
+pub const TAG_LIST: [&str; 11] = ["character", "NPC", "hero", "landscape", "building", "indoor", "UI", "font", "animation", "props", "background"];
+
+/// The list of a book: its own, else `TAG_LIST`.
+pub fn tag_list(book: &Book) -> Vec<String> {
+    book.tag_list.clone().unwrap_or_else(|| TAG_LIST.map(String::from).to_vec())
+}
+
+/// Writes the tag list of a library. The default list is written as absent,
+/// so that a library that never changed it follows a new default.
+pub fn store_tag_list(dir: &Path, list: &[String]) -> Result<(), String> {
+    let mut book = load_book(dir)?;
+    let want = (list != TAG_LIST).then(|| list.to_vec());
+    if book.tag_list == want {
+        return Ok(());
+    }
+    book.tag_list = want;
+    write_book(dir, &book)
 }
 
 /// A missing book is empty. Unreadable books must not be overwritten.
@@ -285,7 +313,7 @@ mod tests {
         let folder = crate::storage::tests::Folder::new();
         let dir = &folder.0;
         let label = Label { provider: "test".into(), model: "instant".into(), status: Status::Labeled,
-            caption: "Tree".into(), tags: vec!["forest".into()] };
+            caption: "Tree".into(), tags: vec!["forest".into()], tag_list: Some(vec!["tree".into()]) };
         let grid = Sidecar { tile: Some(Pair::Two([10, 20])), ..Sidecar::default() };
         store_entry(dir, "folder/sheet.png", &grid).unwrap();
         store_labels(dir, [("folder/sheet.png", Some(label.clone()))]).unwrap();
@@ -369,5 +397,24 @@ mod tests {
         let neg: Sidecar = serde_json::from_str(r#"{"offset": [-3, 0]}"#).unwrap();
         assert_eq!(neg.offset.map(Pair::xy), Some([-3, 0]));
         assert_eq!(serde_json::to_string(&neg).unwrap(), r#"{"offset":[-3,0]}"#);
+    }
+
+    /// A library starts with the default tag list, and keeps one of its own
+    /// at the root of its book. The default list is written as absent.
+    #[test]
+    fn the_tag_list_lives_at_the_root_of_the_book() {
+        let folder = crate::storage::tests::Folder::new();
+        let dir = &folder.0;
+        assert_eq!(tag_list(&load_book(dir).unwrap()), TAG_LIST);
+        let own = vec!["character".to_string(), "boss".into()];
+        store_tag_list(dir, &own).unwrap();
+        store_entry(dir, "a.png", &Sidecar { tile: Some(Pair::One(8)), ..Sidecar::default() }).unwrap();
+        let text = std::fs::read_to_string(dir.join(BOOK)).unwrap();
+        assert!(text.contains(r#""tag_list": ["#) || text.contains(r#""tag_list":["#), "{text}");
+        assert_eq!(tag_list(&load_book(dir).unwrap()), own);
+        store_tag_list(dir, &[]).unwrap();
+        assert!(tag_list(&load_book(dir).unwrap()).is_empty(), "an empty list stays empty");
+        store_tag_list(dir, &TAG_LIST.map(String::from)).unwrap();
+        assert_eq!(load_book(dir).unwrap().tag_list, None);
     }
 }

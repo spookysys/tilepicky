@@ -2124,7 +2124,7 @@ mod tests {
         sheet.save().unwrap();
         let before = sheet.step(false);
         sheet.side.label = Some(sidecar::Label { provider: "test".into(), model: "test".into(), status: sidecar::Status::Labeled,
-            caption: "Village".into(), tags: vec![] });
+            caption: "Village".into(), tags: vec![], tag_list: None });
         let label = sheet.side.label.clone();
         sheet.set_grid(&ctx, [2, 4], [0, 0], [0, 0]);
         assert_eq!(sheet.side.label, label);
