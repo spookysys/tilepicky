@@ -280,7 +280,15 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
     let reply = match request {
         Err(error) => Err(error),
         Ok(request) => match send("chat/completions", Some(&request)) {
-            Ok(value) => labels::response(&value, &job.tag_list),
+            // One provider of a model on OpenRouter may answer in prose. The
+            // next request may reach another.
+            Ok(value) => match labels::response(&value, &job.tag_list) {
+                Err(error) if error == labels::INVALID && job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
+                    job.sheets[i].unknown += 1;
+                    return job.save(dir);
+                }
+                reply => reply,
+            },
             Err(Failure::Unknown(message)) if job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
                 job.sheets[i].unknown += 1;
                 return job.save(dir).and(Err(message));
@@ -725,12 +733,12 @@ mod tests {
         crate::sidecar::store_tag_list(&files.root, &["house".into()]).unwrap();
         let result;
         (job, result) = files.advance(job, |_, request| {
-            assert!(request.unwrap()["messages"][0]["content"].as_str().unwrap().contains("exactly as given: tree."));
-            Ok(completion(json!({"status":"labeled", "caption":"Forest", "tags":["trees"]})))
+            assert!(request.unwrap()["messages"][0]["content"].as_str().unwrap().contains("true or false: tree."));
+            Ok(completion(json!({"status":"labeled", "caption":"Forest", "tags":["pines"], "listed":{"tree":true}})))
         });
         result.unwrap();
         let label = job.sheets[0].label.as_ref().unwrap();
-        assert_eq!(label.tags, ["tree"]);
+        assert_eq!(label.tags, ["pines", "tree"]);
         assert_eq!(label.tag_list, Some(vec!["tree".to_string()]));
         assert_eq!(files.journal().tag_list, ["tree"]);
     }
@@ -775,6 +783,30 @@ mod tests {
         assert_eq!(sent, 3);
         assert!(job.sheets[0].taken && job.sheets[0].error.contains("3 tries"));
         assert_eq!(files.journal().sheets[0].unknown, 2);
+    }
+
+    /// An answer in prose instead of the label goes out again, as a lost
+    /// one does, and the third ends the sheet. The next may reach a provider
+    /// that keeps to the schema.
+    #[test]
+    fn an_answer_in_prose_goes_out_again() {
+        let files = Files::new();
+        RgbaImage::new(4, 4).save(files.root.join("more.png")).unwrap();
+        let mut job = files.prepare(Kind::OpenAi);
+        let prose = json!({"choices":[{"finish_reason":"stop", "message":{"content":"**Caption:** Trees"}}]});
+        for answer in [prose.clone(), completion(labeled("Forest"))] {
+            let result;
+            (job, result) = files.advance(job, |_, _| Ok(answer.clone()));
+            result.unwrap();
+        }
+        assert_eq!(job.sheets[0].label.as_ref().unwrap().caption, "Forest");
+        assert_eq!(job.sheets[0].unknown, 1);
+        while !job.done() {
+            let result;
+            (job, result) = files.advance(job, |_, _| Ok(prose.clone()));
+            result.unwrap();
+        }
+        assert!(job.sheets[1].error == labels::INVALID && job.sheets[1].unknown == 2);
     }
 
     /// A journal of 0.2 holds OpenRouter batch groups that never finish.

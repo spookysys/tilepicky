@@ -46,6 +46,11 @@ pub struct Reply {
     status: Status,
     caption: String,
     tags: Vec<String>,
+    /// Whether the sheet shows each tag of the list. The request asks for
+    /// them apart from `tags`, and one by one: asked for a list of those
+    /// that fit, GLM names every one, and its own tags go.
+    #[serde(default)]
+    listed: std::collections::BTreeMap<String, bool>,
 }
 
 /// The tags of a list as the user types it: separated by commas or lines,
@@ -71,7 +76,10 @@ impl Reply {
     fn validate(mut self, list: &[String]) -> Result<Self, String> {
         self.caption = self.caption.split_whitespace().collect::<Vec<_>>().join(" ");
         if self.status == Status::Unlabelable {
-            return if self.caption.is_empty() && self.tags.is_empty() { Ok(self) } else { Err("Unusable unlabelable result.".into()) };
+            // A model that gave up and still wrote a caption said something:
+            // the caption counts, if it passes the checks below.
+            if self.caption.is_empty() { return Ok(Self { tags: vec![], listed: Default::default(), ..self }); }
+            self.status = Status::Labeled;
         }
         let caption = self.caption.to_ascii_lowercase();
         if ["i cannot", "i can't", "i am unable", "i'm unable", "i'm sorry", "i am sorry", "sorry,", "as an ai", "i must decline"]
@@ -85,7 +93,8 @@ impl Reply {
         // caption is cut at a word, and the tags it named first are kept.
         self.caption = cut(&self.caption, CAPTION);
         let (mut listed, mut free) = (Vec::new(), Vec::new());
-        for tag in &self.tags {
+        let shown = self.listed.iter().filter(|(_, yes)| **yes).map(|(tag, _)| tag);
+        for tag in shown.chain(&self.tags) {
             let tag = tidy(tag);
             let known = list.iter().find(|l| {
                 let l = tidy(l);
@@ -104,6 +113,11 @@ impl Reply {
         tags.dedup();
         self.tags = tags;
         Ok(self)
+    }
+
+    /// The tags of `list` that the request can name.
+    fn usable(list: &[String]) -> Vec<&str> {
+        list.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect()
     }
 
     pub fn into_label(self, provider: &str, model: &str, list: &[String]) -> Label {
@@ -155,15 +169,16 @@ pub struct Run {
 impl Run {
     pub fn start(
         input: Input, provider: String, model: String, list: Vec<String>,
-        send: impl FnOnce(&Value) -> Result<Value, String> + Send + 'static,
+        send: impl Fn(&Value) -> Result<Value, String> + Send + 'static,
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
         let (tx, result) = std::sync::mpsc::channel();
         let run = Self { path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(), started: std::time::Instant::now(), result };
         std::thread::Builder::new().name("label sheet".into()).spawn(move || {
+            // An answer in prose goes out once more; see `batch::one`.
+            let ask = |body: &Value| send(body).and_then(|reply| response(&reply, &list));
             let label = request(&model, &input.img, &list)
-                .and_then(|body| send(&body))
-                .and_then(|reply| response(&reply, &list))
+                .and_then(|body| match ask(&body) { Err(e) if e == INVALID => ask(&body), reply => reply })
                 .map(|reply| reply.into_label(&provider, &model, &list));
             let _ = tx.send(label);
             wake();
@@ -195,10 +210,10 @@ pub fn prompt(list: &[String]) -> [String; 2] {
         "If you cannot identify the content, return status unlabelable, an empty caption and empty tags. ",
         "Never put refusal prose in a caption. Do not invent details."
     ).to_string();
-    let list: Vec<&str> = list.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    let list = Reply::usable(list);
     if !list.is_empty() {
-        system += &format!(" Consider each of these tags, and add each one that fits the sheet, spelled exactly as given: {}. \
-            They do not count toward the 12.", list.join(", "));
+        system += &format!(" Put your own tags in tags. In listed, answer for each of these tags whether the sheet clearly shows it, \
+            true or false: {}. Most sheets show only a few of them.", list.join(", "));
     }
     [system, "Describe the whole sprite sheet: asset type, setting, visual style, palette and overall content.".into()]
 }
@@ -206,6 +221,17 @@ pub fn prompt(list: &[String]) -> [String; 2] {
 /// A chat completion request with one image and a strict JSON schema for the reply.
 pub fn request(model: &str, img: &RgbaImage, list: &[String]) -> Result<Value, String> {
     let [system, user] = prompt(list);
+    let mut properties = json!({
+        "status":{"type":"string", "enum":["labeled", "unlabelable"]},
+        "caption":{"type":"string"}, "tags":{"type":"array", "items":{"type":"string"}}
+    });
+    let mut required = vec!["status", "caption", "tags"];
+    let list = Reply::usable(list);
+    if !list.is_empty() {
+        let each: serde_json::Map<String, Value> = list.iter().map(|t| (t.to_string(), json!({"type":"boolean"}))).collect();
+        properties["listed"] = json!({"type":"object", "additionalProperties":false, "required":list, "properties":each});
+        required.push("listed");
+    }
     Ok(json!({"model":model, "stream":false, "max_tokens":4096,
         "messages":[
             {"role":"system", "content":system},
@@ -215,13 +241,13 @@ pub fn request(model: &str, img: &RgbaImage, list: &[String]) -> Result<Value, S
             ]}
         ],
         "response_format":{"type":"json_schema", "json_schema":{"name":"sheet_label", "strict":true, "schema":{
-            "type":"object", "additionalProperties":false, "required":["status", "caption", "tags"], "properties":{
-                "status":{"type":"string", "enum":["labeled", "unlabelable"]},
-                "caption":{"type":"string"}, "tags":{"type":"array", "items":{"type":"string"}}
-            }
+            "type":"object", "additionalProperties":false, "required":required, "properties":properties
         }}}
     }))
 }
+
+/// The error of an answer that is not the label the schema asks for.
+pub const INVALID: &str = "The model returned an invalid structured label.";
 
 /// Reject refusals, truncation, and malformed content.
 pub fn response(value: &Value, list: &[String]) -> Result<Reply, String> {
@@ -234,7 +260,7 @@ pub fn response(value: &Value, list: &[String]) -> Result<Reply, String> {
     let message = &choice["message"];
     if !message["refusal"].is_null() { return Err("The model refused the request.".into()); }
     let text = message["content"].as_str().ok_or("The response contains no JSON text.")?;
-    let reply: Reply = serde_json::from_str(text).map_err(|_| "The model returned an invalid structured label.")?;
+    let reply: Reply = serde_json::from_str(text).map_err(|_| INVALID)?;
     reply.validate(list)
 }
 
@@ -316,6 +342,20 @@ pub mod tests {
         assert_eq!(label.tags, ["pixel art", "tree"]);
     }
 
+    /// One answer in prose goes out again; a second one fails the label.
+    #[test]
+    fn a_label_in_prose_is_asked_for_once_more() {
+        let run = |answers: Vec<Value>| {
+            let input = Input { path: "s.png".into(), dir: "".into(), rel: "s.png".into(), img: RgbaImage::new(2, 2) };
+            let answers = std::sync::Mutex::new(answers);
+            let run = Run::start(input, "p".into(), "m".into(), vec![], move |_| Ok(answers.lock().unwrap().remove(0)), || {}).unwrap();
+            run.result.recv_timeout(Duration::from_secs(5)).unwrap()
+        };
+        let prose = json!({"choices":[{"finish_reason":"stop", "message":{"content":"**Caption:** Trees"}}]});
+        assert_eq!(run(vec![prose.clone(), completion(labeled("Trees"))]).unwrap().caption, "Trees");
+        assert_eq!(run(vec![prose.clone(), prose, completion(labeled("Trees"))]).unwrap_err(), INVALID);
+    }
+
     #[test]
     fn endpoint_urls_keep_the_configured_provider_and_reject_credentials() {
         assert_eq!(Endpoint::new(" https://example.test/api/v1/ ", String::new()).unwrap().url, "https://example.test/api/v1/chat/completions");
@@ -354,7 +394,6 @@ pub mod tests {
             refused, truncated, prose, fenced, json!({"error":{"message":"failed"}}),
             completion(labeled(" ")),
             completion(labeled("I cannot help with this image.")),
-            completion(json!({"status":"unlabelable", "caption":"refusal", "tags":[]})),
             completion(json!({"status":"maybe", "caption":"Tree", "tags":[]})),
             completion(json!({"status":"labeled", "caption":"Tree"})),
             completion(json!({"status":"labeled", "caption":"Tree", "tags":[], "extra":1})),
@@ -383,13 +422,25 @@ pub mod tests {
     #[test]
     fn listed_tags_keep_their_spelling_and_do_not_count() {
         let list = vec!["NPC".to_string(), "character".into(), "UI".into()];
-        let tags: Vec<String> = ["characters", "npc", "ui"].into_iter().map(String::from)
+        let tags: Vec<String> = ["characters", "npc"].into_iter().map(String::from)
             .chain((0..14).map(|i| format!("tag{}", (b'a' + i) as char))).collect();
-        let reply = response(&completion(json!({"status":"labeled", "caption":"Villagers", "tags":tags})), &list).unwrap();
+        let reply = json!({"status":"labeled", "caption":"Villagers", "tags":tags, "listed":{"UI":true, "NPC":true, "character":false}});
+        let reply = response(&completion(reply), &list).unwrap();
         for tag in ["NPC", "character", "UI", "tagl"] { assert!(reply.tags.contains(&tag.to_string()), "{tag}: {:?}", reply.tags); }
-        assert_eq!(reply.tags.len(), 15);
+        assert_eq!(reply.tags.len(), 15, "character came in tags as characters");
         let label = reply.into_label("p", "m", &list);
         assert_eq!(label.tag_list, Some(list));
+    }
+
+    /// GLM said unlabelable about two sheets of 32, and described them all
+    /// the same. The description counts.
+    #[test]
+    fn an_unlabelable_reply_with_a_caption_is_a_label() {
+        let reply = json!({"status":"unlabelable", "caption":"Snowy hills", "tags":["snow"]});
+        let reply = response(&completion(reply), &[]).unwrap();
+        assert_eq!((reply.status, reply.caption.as_str(), reply.tags.as_slice()), (Status::Labeled, "Snowy hills", &["snow".to_string()][..]));
+        let reply = response(&completion(json!({"status":"unlabelable", "caption":"", "tags":["x"]})), &[]).unwrap();
+        assert!(reply.status == Status::Unlabelable && reply.tags.is_empty());
     }
 
     #[test]
@@ -397,7 +448,13 @@ pub mod tests {
         let list = parse_list("character, NPC\n hero ,, npc\n\n");
         assert_eq!(list, ["character", "NPC", "hero"]);
         let body = request("m", &RgbaImage::new(1, 1), &list).unwrap();
-        assert!(body["messages"][0]["content"].as_str().unwrap().contains("exactly as given: character, NPC, hero."));
-        assert!(!prompt(&[])[0].contains("exactly as given"), "no list, no sentence about it");
+        assert!(body["messages"][0]["content"].as_str().unwrap().contains("true or false: character, NPC, hero."));
+        let schema = &body["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["properties"]["listed"]["required"], json!(["character", "NPC", "hero"]));
+        assert_eq!(schema["properties"]["listed"]["properties"]["NPC"], json!({"type":"boolean"}));
+        assert_eq!(schema["required"], json!(["status", "caption", "tags", "listed"]));
+        let bare = request("m", &RgbaImage::new(1, 1), &[]).unwrap();
+        assert!(bare["response_format"]["json_schema"]["schema"]["properties"].get("listed").is_none());
+        assert!(!prompt(&[])[0].contains("listed"), "no list, no sentence about it");
     }
 }

@@ -80,9 +80,9 @@ Search runs locally and synchronously on your machine. It makes no network reque
 
 Tilepicky can generate searchable captions and tags for library sheets using multimodal vision models.
 
-![I opens AI assist, Label with AI describes the open sheet, Label entire library with AI describes the rest, and a search for snow finds the ski pack through its captions and tags](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/ai-labels.gif)
+![I opens AI assist, weapon joins the tags to look for, Label with AI describes the open sheet and tags it weapon, Label the unlabeled sheets describes the rest, and a search for weapon finds the dungeon pack through its tags](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/ai-labels.gif)
 
-In the recording, `I` opens the AI assist panel, and **Label with AI** describes the open sheet in a few seconds. **Label entire library with AI...** then labels the other 31 sheets, one request each, in about four minutes. The waits play sped up. A search for "snow" finds the Tiny Ski pack, although no file or folder carries that word: the captions and tags do. Unticking captions and tags in the ☰ menu empties the results.
+In the recording, `I` opens the AI assist panel, and "weapon" joins the tags to look for. **Label with AI** describes the open sheet in a few seconds. The tags from the list show in bold, weapon among them. **Label the unlabeled sheets...** then labels the other 31 sheets, one request each, in about three minutes. The waits play sped up. A search for "weapon" finds three sheets of the Tiny Dungeon pack, although no file or folder carries that word: the tags do.
 
 ### Label a single sheet
 
@@ -109,7 +109,7 @@ To label multiple library sheets in bulk:
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
 
 Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
 
