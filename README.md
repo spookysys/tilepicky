@@ -286,8 +286,9 @@ Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
 Settings configure:
 
 - AI provider endpoints, API keys, and model selections for instant labeling and batch jobs.
-- Visibility of the keyboard shortcut legend in the status bar.
-- Target fields for search matching (folders, files, captions, tags).
+- Visibility of the keyboard shortcut legend below the file trees.
+
+Use the menu beside the search field to choose folders, files, captions, and tags for search matching.
 
 Settings are stored in `~/.config/tilepicky/settings.json`.
 

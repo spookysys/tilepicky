@@ -2181,6 +2181,12 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = &ui.ctx().clone();
         self.receive_label();
         if self.library_batch.tick(ctx, &self.library.index.root, &self.keys) {
@@ -2271,16 +2277,17 @@ impl eframe::App for App {
             if !self.settings.hide_legend {
                 egui::Panel::bottom("legend").show(ui, |ui| {
                     ui.set_max_width(ui.available_width());
-                    let ai_key = if AI_VISIBLE { "i: AI assist panel | " } else { "" };
-                    // The only manual anyone reads, and read once. It holds
-                    // what a person cannot guess and needs at once, in the
-                    // order they need it. Everything a tooltip already says
-                    // stays out of it, and so does every key that can wait.
+                    let ai_key = if AI_VISIBLE { " | I: AI labels" } else { "" };
                     let legend = format!(
-                        "click and drag: select tiles | click and hold: lift and move (ctrl: copy) | \
-                         ctrl+c, ctrl+v: copy/paste | drag an edge of the selection: resize it | right click: clear it, or delete inside it | \
-                         ctrl+tab: next panel | tab: next field | arrows: move the selection, shift: extend | \
-                         {ai_key}ctrl+f: search | ctrl+wheel: zoom | ctrl+z, ctrl+y: undo, redo | ctrl+s: save"
+                        "Drag: select | hold and drag: move | Ctrl+drag: copy\n\
+                         Ctrl+C/X/V: copy/cut/paste | Delete: clear tiles\n\
+                         Arrows: move | Shift+arrows: extend\n\
+                         Ctrl+Tab: next pane | Tab: next control\n\
+                         Ctrl+F: search | +/- or Ctrl+wheel: zoom\n\
+                         Ctrl+Z/Y: undo/redo | Ctrl+S: save | Ctrl+T: trim\n\
+                         A: animation | M: store/remove | E: inspect{ai_key}\n\
+                         Right-click: library menu; project clear/delete\n\
+                         Ctrl+,: settings"
                     );
                     let text = egui::RichText::new(legend).weak();
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("click: hide the legend").clicked() {
@@ -3019,9 +3026,11 @@ fn short_version() -> String {
 /// tool, and a person installing with `cargo install` waits for it.
 const WGPU: bool = cfg!(feature = "wgpu");
 
+fn default_renderer() -> eframe::Renderer { eframe::Renderer::default() }
+
 fn main() -> eframe::Result {
     let mut dirs: Vec<String> = Vec::new();
-    let mut renderer = eframe::Renderer::default();
+    let mut renderer = default_renderer();
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--help" | "-h" => {
@@ -3089,6 +3098,12 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "Known bug: WGPU replaces the documented default; see docs/test-drive.md"]
+    fn the_default_renderer_is_opengl_with_wgpu_available() {
+        assert!(matches!(default_renderer(), eframe::Renderer::Glow));
+    }
+
+    #[test]
     fn a_uri_escapes_what_a_name_may_hold() {
         let p = Path::new("/home/x/my tiles/yo+/a.png");
         assert_eq!(file_uri(p), "file:///home/x/my%20tiles/yo%2B/a.png");
@@ -3142,6 +3157,34 @@ mod tests {
             let i = self.app.project.index.position(rel).unwrap();
             self.app.open_project(&self.ctx, i);
         }
+    }
+
+    #[test]
+    #[ignore = "Known bug: Settings toggles the legend twice; see docs/test-drive.md"]
+    fn settings_can_restore_the_hidden_shortcut_legend() {
+        let mut b = bench(&["sheet.png"], &["canvas.png"]);
+        b.app.settings.hide_legend = true;
+        b.app.settings_open = true;
+        for _ in 0..3 {
+            let mut out = b.ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                ..Default::default()
+            }, |ui| b.app.draw(ui));
+            out.textures_delta.clear();
+        }
+        let checkbox = b.ctx.memory(|m| m.focused()).and_then(|id| b.ctx.read_response(id)).unwrap();
+        let at = checkbox.rect.center();
+        for pressed in [true, false] {
+            let mut out = b.ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                events: vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {
+                    pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            }, |ui| b.app.draw(ui));
+            out.textures_delta.clear();
+        }
+        assert!(!b.app.settings.hide_legend, "The Settings checkbox must restore the legend.");
     }
 
     #[test]

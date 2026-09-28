@@ -1031,6 +1031,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Known bug: HTTP errors discard provider details; see docs/test-drive.md"]
+    fn batch_errors_keep_the_provider_explanation() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                        std::thread::sleep(Duration::from_millis(10)),
+                    Err(e) => panic!("Test server did not receive a connection: {e}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            let body = r#"{"error":{"code":400,"message":"The selected model does not support batch requests."}}"#;
+            write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()).unwrap();
+        });
+        // Only this test uses HTTP and a local server. No real key or provider is used.
+        let transport = Transport { client: labels::agent(), base, key: "test-key".into(), kind: Kind::Gemini };
+        let failure = transport.send("batches/test", None).unwrap_err();
+        server.join().unwrap();
+        assert!(failure.message().contains("The selected model does not support batch requests."), "{}", failure.message());
+    }
+
+    #[test]
     fn gemini_request_and_response_use_the_same_structured_label() {
         let request = labels::request("test", &RgbaImage::new(2, 2), &[]).unwrap();
         let gemini = gemini_request(&request);
