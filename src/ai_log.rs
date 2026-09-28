@@ -62,7 +62,7 @@ fn scrub(value: Value, secrets: &[String], depth: usize) -> Value {
     match value {
         Value::Object(map) => Value::Object(map.into_iter().map(|(mut key, value)| {
             let hidden = matches!(key.to_ascii_lowercase().as_str(), "authorization" | "x-goog-api-key" | "api_key" | "apikey"
-                | "key" | "inline_data" | "inlinedata" | "image_url" | "thoughtsignature");
+                | "inline_data" | "inlinedata" | "image_url" | "thoughtsignature");
             for secret in secrets { key = key.replace(secret, "[redacted]"); }
             (key, if hidden { json!("[omitted]") } else { scrub(value, secrets, depth + 1) })
         }).collect()),
@@ -136,10 +136,11 @@ mod tests {
         let mut log = Log { dir: dir.0.clone(), secrets: vec!["test-secret".into()], error: None };
         log.append(json!({"api_key":"test-secret", "inlineData":{"data":"image-bytes"},
             "content":"{\"tags\":[\"crystal\"],\"listed\":{\"weapon\":false},\"message\":\"test-secret\"}",
-            "image_url":{"url":"data:image/png;base64,hidden"}}), LIMIT).unwrap();
+            "image_url":{"url":"data:image/png;base64,hidden"}, "listed":{"key":true}}), LIMIT).unwrap();
         let text = log.read().unwrap();
         for hidden in ["test-secret", "image-bytes", "base64,hidden"] { assert!(!text.contains(hidden)); }
         assert!(text.contains("crystal") && text.contains("weapon") && text.contains("false"));
+        assert!(text.contains("\"key\":true"), "A tag named key is not a credential.");
         #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(dir.0.join("current.jsonl")).unwrap().permissions().mode() & 0o777, 0o600);
