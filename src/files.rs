@@ -29,14 +29,15 @@ pub fn relocate(root: &Path, old: &str, new: &str, copy: bool) -> Result<(), Str
 /// Deletes files and folders. The book forgets what went, even when a later
 /// one of them fails.
 pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
-    let mut book = sidecar::load_book(root)?;
-    let result = rels.iter().try_for_each(|rel| {
-        let path = root.join(rel);
-        if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }.map_err(|e| format!("{rel}: {e}"))?;
-        book.sheets.retain(|key, _| key != rel && !key.starts_with(&format!("{rel}/")));
-        Ok(())
-    });
-    sidecar::write_book(root, &book).and(result)
+    sidecar::update_book(root, |book| {
+        // Keep completed deletions even when a later file cannot be removed.
+        Ok(rels.iter().try_for_each(|rel| {
+            let path = root.join(rel);
+            if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }.map_err(|e| format!("{rel}: {e}"))?;
+            book.sheets.retain(|key, _| key != rel && !key.starts_with(&format!("{rel}/")));
+            Ok(())
+        }))
+    })?
 }
 
 /// Drops the sources in the project's book that name the project itself.
@@ -47,22 +48,22 @@ pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
 /// such as a drive that is not mounted, only the empty name goes.
 /// Returns how many entries changed.
 pub fn drop_own_sources(project: &Path, library: &Path) -> Result<usize, String> {
-    let mut book = sidecar::load_book(project)?;
-    let own = |source: &str| {
-        source.is_empty()
-            || (library.is_dir() && project.join(source).is_file() && !library.join(source).exists())
-    };
-    let mut changed = 0;
-    for side in book.sheets.values_mut() {
-        let before = side.provenance.len();
-        side.provenance.retain(|p| !own(&p.source));
-        changed += usize::from(side.provenance.len() != before);
-    }
-    if changed > 0 {
-        book.sheets.retain(|_, side| !side.is_empty());
-        sidecar::write_book(project, &book)?;
-    }
-    Ok(changed)
+    sidecar::update_book(project, |book| {
+        let own = |source: &str| {
+            source.is_empty()
+                || (library.is_dir() && project.join(source).is_file() && !library.join(source).exists())
+        };
+        let mut changed = 0;
+        for side in book.sheets.values_mut() {
+            let before = side.provenance.len();
+            side.provenance.retain(|p| !own(&p.source));
+            changed += usize::from(side.provenance.len() != before);
+        }
+        if changed > 0 {
+            book.sheets.retain(|_, side| !side.is_empty());
+        }
+        Ok(changed)
+    })
 }
 
 #[cfg(test)]

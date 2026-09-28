@@ -60,10 +60,14 @@ the person who uses the tool; this file is for an agent that works on it.
   thread; to cancel, drop the `Run`. Tests use fake responses.
 - `src/batch.rs`: library batches, one request per sheet: through the
   Gemini batch API, or one at a time to an OpenAI-style endpoint, whose
-  batch API (OpenRouter's) takes no local images. A worker thread does one network operation at a time,
-  and a journal in the configuration folder holds the state, never keys.
-  Single labeling and a batch run independently: both write the book from
-  the UI thread. Tests use fake transports.
+  batch API (OpenRouter's) takes no local images. It also displays job snapshots and saves labels from the UI thread.
+- `src/batch/runner.rs`: one coordinator owns the job journal under a file lock.
+  It performs network operations and waits for the UI to acknowledge library writes.
+  User pause and cancel requests persist in the library book before the coordinator applies them.
+  Tests use fake transports and explicit times. The native UI fixture uses a loopback provider in a test build only.
+
+- `src/batch/store.rs`: one job and its commands in the root book, with migration from older configuration journals.
+  `sidecar::update_book` locks each read-modify-write operation for batch state, labels, and grid metadata.
 
 ## Folders that stay local
 

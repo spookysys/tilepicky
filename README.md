@@ -120,7 +120,7 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 To label multiple library sheets in bulk:
 
 1. Open the library folder.
-2. Open **AI assist** (`I`), and under **Library batch** select **Label unlabeled sheets...**.
+2. Open **AI assist** (`I`), and under **Library labeling** select **Label unlabeled sheets...**.
 3. Choose a batch model and provider key in Settings. The default is `z-ai/glm-5.3-flash:batch` on OpenRouter.
 4. Review the unlabeled sheet count, the token limit, and the tags to look for, then click **Start batch**.
 
@@ -143,20 +143,41 @@ Provider errors appear in the AI pane, including the provider's explanation when
 When no newer message is visible, the status bar shows the outstanding batch's progress and state.
 Click the batch status to open the AI pane and its controls.
 
-Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now** or **Cancel batch**.
-Tilepicky saves a unique reference before each Google submission. If its reply is lost, Tilepicky looks up that reference automatically.
-It checks accepted groups while submitting the remaining sheets. The progress counts separate queued sheets, provider work, and unconfirmed submissions.
-An unconfirmed submission does not block queued sheets. Tilepicky continues uploads and result checks while it looks for confirmation.
-It never automatically resends an unconfirmed submission. **Advanced recovery** contains manual controls for one unconfirmed group at a time.
-The pane separates **Single sheet** actions from **Library batch** progress. Each section shows its provider and model.
-A running batch keeps its original provider and model.
-The current operation shows image preparation, the actual upload count, result checks, or submission recovery, with elapsed seconds.
-Between requests, the pane shows the next check time. A progress bar counts processed sheets, including failures.
-Queue counts show where unfinished work waits. **Error details** and **Failed sheets** keep explanations available without filling the pane.
+The job view separates saved labels, provider work, unsent sheets, and uploads awaiting confirmation.
+The progress bar counts finished outcomes, including failures and cancellations. **Labels saved** counts usable labels written to the library.
+A stable message describes the job. The last provider response, next check, and current request appear below it.
+**Details** keeps provider errors, sheet errors, and the job's original tags available.
+
+**Pause uploads** stops new submissions after the current request finishes. Tilepicky still collects accepted results.
+For a provider that labels sheets one by one, the button is **Pause**. **Resume** continues the same job.
+**Cancel job** stops new submissions and asks Google to cancel accepted work.
+The job remains visible as **Cancellation pending** until Google confirms an outcome. Saved labels stay.
+
+Closing pauses local uploads and result collection. Google can continue work it has accepted.
+Reopen the same library to continue. Pause and cancellation requests survive restart.
+Each library has at most one outstanding job, stored under `ai_batch` in its root `tilepicky.json`.
+The record includes progress, provider batch IDs, and pause or cancellation requests. API keys stay in the app configuration.
+The job follows the library when you move the folder. Older configuration journals migrate automatically without another submission.
+Only one Tilepicky window can own a library job at a time.
+
+Tilepicky saves each submission's reference before sending it. A lost reply triggers an automatic lookup.
+An uncertain submission stays separate while other work can continue. Repeated uncertain uploads temporarily stop new submissions.
+Tilepicky never automatically resends uncertain sheets. **Retry unconfirmed sheets...** explains the possible duplicate charge before a resend.
+You do not need to find or attach a provider batch ID.
+
+Network operations retry independently, with a delay of up to eight minutes after repeated failures.
+A successful status check does not discard an upload or cancellation error. **Retry now** requests another attempt.
+**Retry failed sheets** becomes available after a job finishes with failures.
+A failed library write retries from stored results without another model request.
+New jobs record the image and existing label before submission, so delayed results cannot silently replace newer work.
+
+The pane separates **Single sheet** actions from **Library labeling**. Each section shows its provider and model.
+A running job keeps its original provider, model, prompt, and tags.
+**Copy log** includes the current job summary and recent diagnostics, without keys or image data.
 
 ### Tags to look for
 
-The bottom of the AI assist panel holds a list of tags, separated by commas.
+**Options for new labels** holds the tag list at the bottom of the AI pane. Separate tags with commas.
 The prompt asks the model to check each tag independently, including secondary content.
 It asks for every matching tag, with the spelling from your list, and no duplicate synonyms.
 The model can still miss visible content. These tags do not count toward the 12 the model adds of its own.

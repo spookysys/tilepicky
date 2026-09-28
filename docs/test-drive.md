@@ -117,8 +117,8 @@ It also documents Google's paid-project requirement and the `gemini-flash-latest
 
 ## Automated checks
 
-- `cargo test --locked`: 125 passed, with no ignored tests.
-- `cargo test --locked --features wgpu`: 125 passed, with no ignored tests.
+- `cargo test --locked`: 148 passed. The interactive native fixture is excluded from the automatic run.
+- `cargo test --locked --features wgpu`: 148 passed. The interactive native fixture is excluded from the automatic run.
 - `cargo clippy --locked --all-targets --features wgpu`: passed.
 - `cargo build --release --locked --features wgpu`: passed.
 
@@ -184,3 +184,46 @@ The AI pane keeps Copy log. Settings remains on the status bar.
 
 The private WGPU check showed a new upload beside an older unconfirmed group, with separate counts.
 Copy log remained visible at the top, and the duplicate Settings button was absent.
+
+## Durable library jobs
+
+The coordinator owns the job journal. The UI acknowledges successful library writes before the coordinator advances.
+Regressions first reproduced premature completion and cancellation deleting the job record.
+Tests now cover lost acceptance, restart, save failures, repeated saves, changed images, newer labels, and exclusive job ownership.
+Cancellation survives restart and remains pending until the provider confirms its outcome.
+Pause stops new uploads while result checks continue. Operation errors remain independent.
+
+The native WGPU fixture ran on a private display with an isolated configuration and a loopback provider.
+The test build alone supports the loopback override. The installed executable has no such override.
+The interactive pass covered:
+
+- Start and upload a two-sheet job.
+- Lose the submission reply, recover its ID, and verify exactly one submission.
+- Pause, close, reopen, and retain the pause and accepted ID.
+- Reject cancellation, retain the error and job, close, reopen, then retry successfully.
+- Start another job and show Finished only after both labels exist in the library book.
+- Open a saved label and copy diagnostics. The clipboard contained the job summary and errors without the test key or image data.
+
+The pane uses stable job descriptions and separate saved, waiting, queued, and uncertain counts.
+Options for new labels remain collapsed. The Settings button remains in the status bar.
+
+Run the interactive fixture with an isolated `XDG_CONFIG_HOME`, a private X11 display, and `TILEPICKY_TEST_TRANSPORT` set to a loopback server:
+
+```
+cargo test --features wgpu native_batch_fixture -- --ignored --nocapture
+```
+
+The library now stores one job and its commands under `ai_batch` in the root book.
+Migration tests preserve accepted IDs, refuse active legacy writers, and prevent old records from restoring cleared jobs.
+Concurrent-write tests check that commands, progress, and grid settings survive each other's writes.
+A moved library retains its outstanding job and refuses a second job.
+
+The live Google check accepted one copied sheet and retained the same provider ID across restart.
+Google completed it, but its reply omitted `status` and returned matching tag names as an array.
+A regression now accepts that unambiguous form while retaining the usual refusal and content checks.
+Unknown tag names and incomplete positional arrays still fail validation.
+
+After the storage change, the native fixture retained its paused job across restart with exactly one submission.
+It then replayed the captured Google response and saved both test labels before showing Finished.
+Both predefined tags and freeform tags appeared in the saved labels. No image was sent to Google during replay.
+Default and WGPU test suites passed. Clippy passed with all targets and WGPU enabled.

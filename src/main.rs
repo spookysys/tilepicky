@@ -1452,7 +1452,7 @@ impl App {
 
         ui.add_space(6.0);
         ui.separator();
-        ui.strong("Library batch");
+        ui.strong("Library labeling");
         if self.library.is_set() && self.library_batch.job.is_none() {
             let entries = &self.library.index.entries;
             let done = entries.iter().filter(|e| e.side.label.is_some()).count();
@@ -1467,36 +1467,38 @@ impl App {
 
         ui.add_space(6.0);
         ui.separator();
-        ui.strong("Tags to look for");
-        ui.weak("The model checks these tags and can add its own. Separate tags with commas.");
-        if self.library_batch.busy() { ui.weak("Changes apply to future requests. This batch keeps its original tags."); }
-        let edit = stopped(ui.add_enabled(self.library.is_set(),
-            egui::TextEdit::multiline(&mut self.tag_text).desired_rows(3).desired_width(f32::INFINITY)));
-        if edit.changed() {
-            self.library.index.tag_list = labels::parse_list(&self.tag_text);
-            self.tag_dirty = true;
-        } else if !edit.has_focus() && labels::parse_list(&self.tag_text) != self.library.index.tag_list {
-            // The library changed, or read its book again.
-            self.tag_text = self.library.index.tag_list.join(", ");
-        }
-        if edit.lost_focus() { self.store_tag_list(); }
-        ui.horizontal_wrapped(|ui| {
-            let default: Vec<String> = sidecar::TAG_LIST.map(String::from).to_vec();
-            if stopped(ui.add_enabled(self.library.is_set() && self.library.index.tag_list != default, egui::Button::new("Reset")))
-                .on_hover_text(sidecar::TAG_LIST.join(", ")).clicked() {
-                self.library.index.tag_list = default;
+        egui::CollapsingHeader::new("Options for new labels").show(ui, |ui| {
+            ui.strong("Tags to look for");
+            ui.weak("The model checks these tags and can add its own. Separate tags with commas.");
+            if self.library_batch.busy() { ui.weak("Changes apply to future requests. This batch keeps its original tags."); }
+            let edit = stopped(ui.add_enabled(self.library.is_set(),
+                egui::TextEdit::multiline(&mut self.tag_text).desired_rows(3).desired_width(f32::INFINITY)));
+            if edit.changed() {
+                self.library.index.tag_list = labels::parse_list(&self.tag_text);
                 self.tag_dirty = true;
-                self.store_tag_list();
+            } else if !edit.has_focus() && labels::parse_list(&self.tag_text) != self.library.index.tag_list {
+                // The library changed, or read its book again.
+                self.tag_text = self.library.index.tag_list.join(", ");
             }
-            if stopped(ui.button("Prompt...")).on_hover_text("The prompt that the next request sends.").clicked() {
-                self.prompt_view = Some(("The prompt of the next request".into(), labels::prompt(&self.library.index.tag_list)));
-            }
+            if edit.lost_focus() { self.store_tag_list(); }
+            ui.horizontal_wrapped(|ui| {
+                let default: Vec<String> = sidecar::TAG_LIST.map(String::from).to_vec();
+                if stopped(ui.add_enabled(self.library.is_set() && self.library.index.tag_list != default, egui::Button::new("Reset")))
+                    .on_hover_text(sidecar::TAG_LIST.join(", ")).clicked() {
+                    self.library.index.tag_list = default;
+                    self.tag_dirty = true;
+                    self.store_tag_list();
+                }
+                if stopped(ui.button("Prompt...")).on_hover_text("The prompt that the next request sends.").clicked() {
+                    self.prompt_view = Some(("The prompt of the next request".into(), labels::prompt(&self.library.index.tag_list)));
+                }
+            });
         });
     }
 
     fn copy_ai_log(&mut self, ctx: &egui::Context) {
         match ai_log::text() {
-            Ok(text) => { ctx.copy_text(text); self.status = "AI log copied to the clipboard.".into(); }
+            Ok(text) => { ctx.copy_text(self.library_batch.diagnostics() + &text); self.status = "AI log copied to the clipboard.".into(); }
             Err(error) => self.status = error,
         }
     }
@@ -1954,7 +1956,7 @@ impl App {
             }
         });
         if self.ai_panel {
-            egui::Panel::right("library assist").resizable(true).default_size(260.0).show(ui, |ui| {
+            egui::Panel::right("library assist").resizable(true).default_size(300.0).size_range(260.0..=480.0).show(ui, |ui| {
                 set_pane(ui, (Panel::Library, Spot::Side));
                 egui::ScrollArea::vertical().show(ui, |ui| self.assist_panel(ui)).inner
             });
@@ -3141,6 +3143,28 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Interactive fixture: run on a private X11 display with isolated settings and a loopback provider."]
+    fn native_batch_fixture() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        assert!(std::env::var("TILEPICKY_TEST_TRANSPORT").is_ok());
+        assert!(std::env::var("XDG_CONFIG_HOME").is_ok());
+        ai_log::init();
+        let (settings, damaged) = settings::Settings::load();
+        let options = eframe::NativeOptions {
+            renderer: default_renderer(),
+            event_loop_builder: Some(Box::new(|builder| { builder.with_any_thread(true); })),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1198.0, 900.0]).with_title("Tilepicky UI fixture"),
+            ..Default::default()
+        };
+        eframe::run_native("Tilepicky UI fixture", options, Box::new(move |cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
+            let mut app = App::new(settings, damaged); app.ai_panel = true;
+            Ok(Box::new(app))
+        })).unwrap();
+    }
 
     #[test]
     fn the_default_renderer_matches_the_documented_build() {

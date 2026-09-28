@@ -4,18 +4,23 @@
 //! OpenAI-style endpoint takes them one at a time: OpenRouter's batch API
 //! reads only images at public URLs, and a library lies on this machine.
 //!
-//! The journal in the configuration folder holds the state, so that a batch
+//! The library book holds the job state, so that a batch
 //! continues after a restart. It never holds a key. The state of a sheet:
 //! not taken yet, then in a group that is submitted, waiting, and done.
 
 use crate::{ai::{Kind, Provider}, index::Index, labels, sidecar::{Label, Status}};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::{Path, PathBuf}, sync::mpsc, time::{Duration, Instant}};
+mod runner;
+mod store;
+
+use std::{collections::{BTreeSet, BTreeMap}, path::{Path, PathBuf}, sync::mpsc, time::{Duration, Instant}};
 
 /// The limits of one provider batch.
 const MAX_BYTES: usize = 18_000_000;
 const MAX_REQUESTS: usize = 100;
+// Limit uncertain paid work while the connection is unreliable.
+const MAX_UNCONFIRMED: usize = 3;
 /// How often the tool asks the provider about a submitted batch.
 const POLL: Duration = Duration::from_secs(30);
 
@@ -32,6 +37,35 @@ pub struct Sheet {
     /// tool could read. See `one`.
     #[serde(default)]
     pub unknown: u32,
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    guard: Option<InputGuard>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct InputGuard { hash: String, label: Option<Label> }
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Tracking {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    error: String,
+    state: String,
+    checked_ms: u64,
+    cancel_sent: bool,
+    recoveries: u32,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+enum Mode { #[default] Running, Paused, Cancelling }
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Issue { message: String, attempts: u32, retry_ms: u64 }
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 /// How many requests of one sheet may end without a readable answer. Each
@@ -54,6 +88,8 @@ pub struct Group {
     pub remote: Remote,
     #[serde(default)]
     recovery: Option<Recovery>,
+    #[serde(default)]
+    tracking: Tracking,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -84,16 +120,30 @@ pub struct Job {
     /// asks for it, and every label records it.
     #[serde(default)]
     pub tag_list: Vec<String>,
+    #[serde(default)]
+    prompt: Option<[String; 2]>,
     /// Alternate submissions and polling so early results can arrive before the whole library is sent.
     #[serde(default)]
     poll_next: bool,
     /// Give queued sheets a turn after each recovery request.
     #[serde(default)]
     submit_next: bool,
+    #[serde(default)]
+    mode: Mode,
+    #[serde(default)]
+    control_revision: u64,
+    #[serde(default)]
+    issues: BTreeMap<String, Issue>,
+    #[serde(default)]
+    last_response_ms: u64,
+    #[serde(default)]
+    poll_ms: u64,
+    #[serde(default)]
+    recovery_ms: u64,
 }
 
-#[derive(Clone, Copy)]
-enum Operation { Label, Submit, Poll, Recover }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operation { Label, Submit, Poll, Recover, Cancel }
 
 impl Job {
     fn operation(&self) -> Operation {
@@ -106,7 +156,12 @@ impl Job {
     }
 
     fn untaken(&self) -> bool { self.sheets.iter().any(|s| !s.taken) }
-    pub fn done(&self) -> bool { !self.untaken() && self.groups.iter().all(|g| g.remote == Remote::Done) }
+    fn remote_done(&self) -> bool { !self.untaken() && self.groups.iter().all(|g| g.remote == Remote::Done) }
+    fn pending_save(&self) -> bool { self.sheets.iter().any(|s| s.label.is_some() && !s.imported) }
+    pub fn done(&self) -> bool { self.remote_done() && !self.pending_save() }
+    fn saved(&self) -> usize {
+        self.sheets.iter().filter(|s| s.imported && s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count()
+    }
     /// A Gemini batch went out and no reply confirmed it. An OpenAI-style job
     /// is never so: its groups are released; see `release_groups`.
     pub fn uncertain(&self) -> bool {
@@ -120,15 +175,15 @@ impl Job {
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), String> {
-        crate::storage::write_private(&dir.join("state.json"), self)
+        store::save(dir, self)
     }
     fn load(dir: &Path) -> Result<Option<Self>, String> {
-        crate::storage::read(&dir.join("state.json"))
+        store::load(dir)
     }
 }
 
 /// The folder of one library's batch journal, in the configuration folder.
-fn directory(root: &Path) -> Result<PathBuf, String> {
+fn legacy_directory(root: &Path) -> Result<PathBuf, String> {
     use sha2::{Digest, Sha256};
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let hash = Sha256::digest(root.as_os_str().as_encoded_bytes());
@@ -137,7 +192,61 @@ fn directory(root: &Path) -> Result<PathBuf, String> {
 
 /// The request body for one sheet in a Gemini batch.
 fn body(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
-    Ok(gemini_request(&labels::request(&job.model, img, &job.tag_list)?))
+    Ok(gemini_request(&chat_request(job, img)?))
+}
+
+fn chat_request(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
+    let mut request = labels::request(&job.model, img, &job.tag_list)?;
+    if let Some([system, user]) = &job.prompt {
+        request["messages"][0]["content"] = json!(system);
+        request["messages"][1]["content"][0]["text"] = json!(user);
+    }
+    Ok(request)
+}
+
+fn image_request(job: &mut Job, root: &Path, i: usize) -> Result<Value, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))?;
+    let image = image::load_from_memory(&bytes).map_err(|e| format!("Could not read the image: {e}"))?;
+    let book = crate::sidecar::load_book(root)?;
+    job.sheets[i].guard = Some(InputGuard { hash: format!("{:x}", Sha256::digest(&bytes)),
+        label: book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone()) });
+    if job.provider.kind == Kind::Gemini { body(job, &image.to_rgba8()) }
+    else { Ok(job.provider.route(chat_request(job, &image.to_rgba8())?)) }
+}
+
+fn save_labels(job: &Job, root: &Path) -> (runner::SaveReport, Vec<(String, Option<Label>)>) {
+    use sha2::{Digest, Sha256};
+    let mut report = runner::SaveReport { saved: vec![], rejected: vec![], error: None };
+    let mut labels = Vec::new();
+    let saved = crate::sidecar::update_book(root, |book| {
+    for (i, sheet) in job.sheets.iter().enumerate().filter(|(_, s)| !s.imported && s.label.is_some()) {
+        let current = book.sheets.get(&sheet.rel).and_then(|s| s.label.as_ref());
+        if current == sheet.label.as_ref() { report.saved.push(i); continue; }
+        let checked = std::fs::read(root.join(&sheet.rel)).map_err(|_| "The image moved or was removed.".to_string()).and_then(|bytes| {
+            if let Some(guard) = &sheet.guard {
+                if format!("{:x}", Sha256::digest(&bytes)) != guard.hash { return Err("The image changed after submission.".into()); }
+                if current != guard.label.as_ref() { return Err("The label changed after submission. The newer label was kept.".into()); }
+            } else if current.is_some() {
+                return Err("An existing label was kept because this older job has no saved label revision.".into());
+            }
+            Ok(())
+        });
+        match checked {
+            Ok(()) => {
+                book.sheets.entry(sheet.rel.clone()).or_default().label = sheet.label.clone();
+                labels.push((sheet.rel.clone(), sheet.label.clone())); report.saved.push(i);
+            }
+            Err(error) => report.rejected.push((i, error)),
+        }
+    }
+        Ok(())
+    });
+    if let Err(error) = saved {
+        report.saved.clear(); report.error = Some(format!("Could not save labels: {error}")); labels.clear();
+    }
+    if !labels.is_empty() { crate::ai_log::event("batch_saved", json!({"provider":job.provider.name, "labels":labels})); }
+    (report, labels)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -152,8 +261,11 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
     let open = index.entries.iter().filter(|e| all || e.side.label.is_none());
     Ok(Job {
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
-        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), poll_next: false, submit_next: false,
-        sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
+        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), prompt: Some(labels::prompt(&index.tag_list)),
+        poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
+        issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0,
+        sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(),
+            imported: false, unknown: 0, cancelled: false, guard: None })
             .collect(),
     })
 }
@@ -240,10 +352,22 @@ impl Transport {
     }
 
     fn send_inner(&self, path: &str, body: Option<&Value>, status: &mut Option<u16>) -> Result<Value, Failure> {
+        #[cfg(test)]
+        if let Ok(base) = std::env::var("TILEPICKY_TEST_TRANSPORT") {
+            let uri: ureq::http::Uri = base.parse().map_err(|_| Failure::NotSent("Invalid test endpoint.".into()))?;
+            if uri.scheme_str() != Some("http") || uri.host() != Some("127.0.0.1") {
+                return Err(Failure::NotSent("The UI fixture requires a loopback endpoint.".into()));
+            }
+            return self.send_at(&base, "test-key", path, body, status);
+        }
+        self.send_at(&self.base, &self.key, path, body, status)
+    }
+
+    fn send_at(&self, base: &str, credential: &str, path: &str, body: Option<&Value>, status: &mut Option<u16>) -> Result<Value, Failure> {
         use ureq::{Error, Timeout};
-        let (header, key) = if self.kind == Kind::Gemini { ("x-goog-api-key", self.key.clone()) }
-            else { ("Authorization", format!("Bearer {}", self.key)) };
-        let url = format!("{}/{path}", self.base);
+        let (header, key) = if self.kind == Kind::Gemini { ("x-goog-api-key", credential.to_string()) }
+            else { ("Authorization", format!("Bearer {credential}")) };
+        let url = format!("{base}/{path}");
         let response = match body {
             Some(body) => self.client.post(&url).header(header, &key).send_json(body),
             None => self.client.get(&url).header(header, &key).call(),
@@ -332,12 +456,19 @@ type Send<'a> = &'a mut dyn FnMut(&str, Option<&Value>) -> Result<Value, Failure
 /// Does one network operation: label the next sheet, submit the next group
 /// of sheets, or ask about a submitted one. The job is saved before it
 /// returns, with or without error.
-pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
-    let result = match job.operation() {
-        Operation::Label => { job.release_groups(); one(&mut job, root, dir, &mut send) }
-        Operation::Poll => { job.poll_next = false; poll(&mut job, dir, &mut send) }
-        Operation::Recover => { job.poll_next = true; job.submit_next = true; recover(&mut job, dir, &mut send) }
-        Operation::Submit => { job.poll_next = true; job.submit_next = false; submit(&mut job, root, dir, &mut send) }
+#[cfg(test)]
+pub fn advance(job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
+    let operation = job.operation();
+    advance_operation(job, root, dir, operation, &mut send)
+}
+
+fn advance_operation(mut job: Job, root: &Path, dir: &Path, operation: Operation, send: Send) -> (Job, Result<(), String>) {
+    let result = match operation {
+        Operation::Label => { job.release_groups(); one(&mut job, root, dir, send) }
+        Operation::Poll => { job.poll_next = false; poll(&mut job, dir, send) }
+        Operation::Recover => { job.poll_next = true; job.submit_next = true; recover(&mut job, dir, send) }
+        Operation::Submit => { job.poll_next = true; job.submit_next = false; submit(&mut job, root, dir, send) }
+        Operation::Cancel => cancel_remote(&mut job, dir, send),
     };
     (job, result)
 }
@@ -350,9 +481,8 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
     let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
     crate::ai_log::event("batch_sheet_start", json!({"sheet":job.sheets[i].rel, "provider":job.provider.name,
         "model":job.model, "attempt":job.sheets[i].unknown + 1, "tags_requested":job.tag_list}));
-    let request = image::open(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))
-        .and_then(|img| labels::request(&job.model, &img.to_rgba8(), &job.tag_list))
-        .map(|body| job.provider.route(body));
+    let request = image_request(job, root, i);
+    job.save(dir)?;
     let reply = match request {
         Err(error) => Err(error),
         Ok(request) => match send("chat/completions", Some(&request)) {
@@ -370,7 +500,7 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
                 return job.save(dir).and(Err(message));
             }
             Err(Failure::Unknown(message)) => Err(format!("{message} No readable answer after {UNKNOWN_TRIES} tries.")),
-            Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 500..=599, _))) => {
+            Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429 | 500..=599, _))) => {
                 return job.save(dir).and(Err(failure.message()));
             }
             Err(failure @ Failure::Status(..)) => Err(failure.message()),
@@ -389,8 +519,7 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     for i in 0..job.sheets.len() {
         if job.sheets[i].taken { continue; }
         if requests.len() == MAX_REQUESTS { break; }
-        let body = image::open(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))
-            .and_then(|img| body(job, &img.to_rgba8()));
+        let body = image_request(job, root, i);
         let size = body.as_ref().map_or(0, |b| serde_json::to_vec(b).unwrap().len() + 512);
         match body {
             Ok(_) if size > MAX_BYTES => job.sheets[i].error = "The image request is too large.".into(),
@@ -406,7 +535,7 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let reference = format!("Tilepicky-{}-{stamp}", std::process::id());
     job.groups.push(Group { sheets, remote: Remote::Submitting,
-        recovery: Some(Recovery { reference: reference.clone(), ..Recovery::default() }) });
+        recovery: Some(Recovery { reference: reference.clone(), ..Recovery::default() }), tracking: Tracking::default() });
     job.save(dir)?;
     crate::ai_log::event("batch_submit", json!({"provider":job.provider.name, "model":job.model, "tags_requested":job.tag_list,
         "sheets":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel})).collect::<Vec<_>>()}));
@@ -414,9 +543,11 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     let requests: Vec<_> = requests.into_iter().map(|(i, body)| (key(i), body)).collect();
     let g = job.groups.len() - 1;
     let result = match send(&path, Some(&submit_body(&requests, &reference))) {
-        Ok(response) => remote_id(&response).map(|id| job.groups[g].remote = Remote::Waiting(id)),
+        Ok(response) => remote_id(&response).map(|id| {
+            job.groups[g].tracking.id = id.clone(); job.groups[g].remote = Remote::Waiting(id);
+        }),
         // The provider made no batch: the sheets wait for the next try.
-        Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 503, _))) => {
+        Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429 | 503, _))) => {
             job.send_again(g);
             Err(failure.message())
         }
@@ -427,12 +558,13 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
         }
         Err(failure) => Err(failure.message()),
     };
-    job.save(dir).and(result)
+    job.save(dir).and(result.map(|_| ()))
 }
 
 /// Recover by the unique reference saved before submission. Never resend an uncertain request.
 fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
-    let i = job.groups.iter().position(|g| g.remote == Remote::Submitting).ok_or("No submission needs recovery.")?;
+    let i = job.groups.iter().position(|g| g.remote == Remote::Submitting && g.recovery.is_some())
+        .ok_or("No submission has a recovery reference.")?;
     let Some(recovery) = &mut job.groups[i].recovery else {
         return Err("This older submission has no recovery reference. Open Advanced recovery for help.".into());
     };
@@ -453,26 +585,36 @@ fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     if !recovery.page.is_empty() { return job.save(dir); }
     let matches = std::mem::take(&mut recovery.matches);
     recovery.not_found = matches.is_empty();
+
     crate::ai_log::event("batch_recovery_check", json!({"reference":recovery.reference, "matches":matches.len()}));
     let result = match matches.as_slice() {
         [id] => {
             crate::ai_log::event("batch_recovered", json!({"reference":recovery.reference, "id":id}));
+            job.groups[i].tracking.id = id.clone();
             job.groups[i].remote = Remote::Waiting(id.clone());
             Ok(())
         }
         [] => Ok(()),
         _ => Err("Google returned more than one matching batch. Open Advanced recovery; nothing was resent.".into()),
     };
+    job.groups[i].tracking.recoveries += 1;
     // Give each unconfirmed group a turn after a complete lookup.
     job.groups.rotate_left(i + 1);
-    job.save(dir).and(result)
+    job.save(dir).and(result.map(|_| ()))
 }
 
 fn poll(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
-    let Some(i) = job.groups.iter().position(|g| matches!(g.remote, Remote::Waiting(_))) else { return Ok(()) };
+    let Some(i) = job.groups.iter().enumerate().filter(|(_, g)| matches!(g.remote, Remote::Waiting(_)))
+        .min_by_key(|(_, g)| g.tracking.checked_ms).map(|(i, _)| i) else { return Ok(()) };
     let Remote::Waiting(id) = job.groups[i].remote.clone() else { unreachable!() };
     validate_id(&id)?;
     let response = send(&id, None).map_err(|f| f.message())?;
+    job.groups[i].tracking.state = response["metadata"]["state"].as_str().unwrap_or_default().into();
+    if job.groups[i].tracking.state.ends_with("CANCELLED") {
+        for &s in &job.groups[i].sheets { job.sheets[s].cancelled = true; }
+        job.groups[i].remote = Remote::Done;
+        return job.save(dir);
+    }
     match outputs(&response) {
         // Ask about the other groups first, next time.
         Ok(None) => { job.groups.rotate_left(i + 1); return job.save(dir); }
@@ -481,6 +623,17 @@ fn poll(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     }
     job.groups[i].remote = Remote::Done;
     job.save(dir)
+}
+
+fn cancel_remote(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
+    let Some(i) = job.groups.iter().position(|g| matches!(g.remote, Remote::Waiting(_)) && !g.tracking.cancel_sent) else { return Ok(()) };
+    let Remote::Waiting(id) = &job.groups[i].remote else { unreachable!() };
+    validate_id(id)?;
+    let result = send(&format!("{id}:cancel"), Some(&json!({}))).map_err(|f| f.message());
+    if result.is_ok() { job.groups[i].tracking.cancel_sent = true; }
+    job.groups.rotate_left(i + 1);
+    job.poll_ms = 0;
+    job.save(dir).and(result.map(|_| ()))
 }
 
 impl Job {
@@ -507,18 +660,19 @@ impl Job {
 }
 
 #[derive(Clone, Copy)]
-enum Activity { Preparing, Uploading(usize), Checking, Recovering, Labeling }
+enum Activity { Preparing, Uploading(usize), Checking, Recovering, Labeling, Cancelling }
 
 impl Activity {
     fn before(operation: Operation) -> Self {
         match operation {
             Operation::Label => Self::Labeling, Operation::Submit => Self::Preparing,
-            Operation::Poll => Self::Checking, Operation::Recover => Self::Recovering,
+            Operation::Poll => Self::Checking, Operation::Recover => Self::Recovering, Operation::Cancel => Self::Cancelling,
         }
     }
 
     fn request(path: &str, body: Option<&Value>) -> Self {
-        if path.ends_with(":batchGenerateContent") {
+        if path.ends_with(":cancel") { Self::Cancelling }
+        else if path.ends_with(":batchGenerateContent") {
             let count = body.and_then(|b| b.pointer("/batch/inputConfig/requests/requests"))
                 .and_then(Value::as_array).map_or(0, Vec::len);
             Self::Uploading(count)
@@ -534,345 +688,317 @@ impl Activity {
             Self::Checking => format!("Checking results from {provider}"),
             Self::Recovering => format!("Looking up the interrupted submission at {provider}"),
             Self::Labeling => format!("Labeling one sheet with {provider}"),
+            Self::Cancelling => format!("Requesting cancellation from {provider}"),
         };
         format!("{action} ({seconds} s)")
     }
 
-    fn summary(self, seconds: u64) -> String {
-        let action = match self {
-            Self::Preparing => "preparing upload".into(), Self::Uploading(n) => format!("uploading {n}"),
-            Self::Checking => "checking results".into(), Self::Recovering => "recovering submission".into(),
-            Self::Labeling => "labeling one sheet".into(),
-        };
-        format!("{action}; {seconds} s")
-    }
+
 }
 
-/// The part of the AI panel that runs library batches, and its state
-/// between frames. A worker thread does each network operation.
+/// The pane displays coordinator snapshots. It never changes a running job's journal.
 #[derive(Default)]
 pub struct Panel {
-    /// The library that the batch belongs to.
     pub root: PathBuf,
     dir: PathBuf,
-    /// The started batch, as the journal holds it.
     pub job: Option<Job>,
-    /// A batch that waits for the user's yes. It is not in the journal yet.
     proposal: Option<Job>,
-    task: Option<mpsc::Receiver<(Job, Result<(), String>)>>,
-    progress: Option<mpsc::Receiver<Activity>>,
+    runner: Option<runner::Runner>,
+    lock: Option<std::sync::Arc<std::fs::File>>,
+    pending_save: Option<mpsc::Sender<runner::SaveReport>>,
     activity: Option<(Activity, Instant)>,
     error: String,
-    /// Failures in a row, for the wait before the next try.
-    failures: u32,
-    next_check: Option<Instant>,
-    attach_id: String,
-    /// The user asked to try again now; the caller also imports again.
-    retry: bool,
+    storage_error: String,
+    key: String,
+    control: runner::Control,
+    resend_confirm: bool,
 }
 
 impl Panel {
     fn running(&self) -> bool { self.job.as_ref().is_some_and(|j| !j.done()) }
-
-    pub fn open(&self) -> bool { self.proposal.is_some() }
-
-    pub fn busy(&self) -> bool { self.running() || self.task.is_some() || self.open() }
+    pub fn open(&self) -> bool { self.proposal.is_some() || self.resend_confirm }
+    pub fn busy(&self) -> bool { self.running() || self.open() }
 
     fn submission_counts(&self, job: &Job) -> (usize, usize, usize) {
         let (queued, waiting, uncertain) = job.submission_counts();
-        if self.task.is_some() && let Some((Activity::Uploading(count), _)) = self.activity {
+        if let Some((Activity::Uploading(count), _)) = self.activity {
             (queued.saturating_sub(count), waiting, uncertain + count)
         } else { (queued, waiting, uncertain) }
     }
 
-    /// A compact status for the main window when no newer message takes its place.
     pub fn status(&self) -> Option<String> {
         let job = self.job.as_ref()?;
-        if job.done() && self.error.is_empty() { return None; }
-        let processed = job.sheets.iter().filter(|s| s.label.is_some() || !s.error.is_empty()).count();
-        let total = job.sheets.len();
-        let state = if self.task.is_some() {
-            let (activity, seconds) = self.current_activity(job);
-            activity.summary(seconds)
-        } else if job.uncertain() {
-            if job.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_none()) { "needs attention".into() }
-            else { "recovering".into() }
-        } else if !self.error.is_empty() { "retry pending".into() } else { "waiting".into() };
-        if job.provider.kind == Kind::Gemini {
-            let (_, waiting, _) = self.submission_counts(job);
-            Some(format!("AI batch: {state} | {waiting} at {} | {processed}/{total} processed", job.provider.name))
-        } else {
-            Some(format!("AI batch: {state} | {processed}/{total} processed"))
-        }
+        if job.done() && job.issues.is_empty() && self.error.is_empty() { return None; }
+        Some(format!("AI labels: {} saved / {} | {}", job.saved(), job.sheets.len(), self.state(job)))
     }
 
-    /// Prevents a completed journal from restoring labels after Clear all.
+    pub fn diagnostics(&self) -> String {
+        self.job.as_ref().map_or(String::new(), |job| format!("Library job summary\n{}\n\n", json!({
+            "provider":job.provider.name, "model":job.model, "sheets":job.sheets.len(), "saved":job.saved(),
+            "mode":job.mode, "groups":job.groups, "issues":job.issues, "last_response_ms":job.last_response_ms,
+            "tags":job.tag_list, "prompt":job.prompt
+        })))
+    }
+
     pub fn discard_completed(&mut self, root: &Path) -> Result<(), String> {
-        if self.busy() { return Err("Wait for the batch to finish or cancel it first.".into()); }
-        if self.root != root { return Err("The batch panel belongs to another library.".into()); }
-        if self.dir.as_os_str().is_empty() { return Err("The batch journal directory is unavailable.".into()); }
-        match std::fs::remove_file(self.dir.join("state.json")) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Could not remove the completed batch journal: {e}")),
-        }
+        if self.busy() { return Err("Wait for the job to finish or cancel it first.".into()); }
+        if self.root != root { return Err("This job belongs to another library.".into()); }
+        if self.lock.is_none() { return Err("This window does not own the library job.".into()); }
+        self.stop_runner();
+        store::clear(&self.dir)?;
         self.job = None;
-        (self.error, self.failures, self.next_check, self.retry) = (String::new(), 0, None, false);
+        self.error.clear();
         Ok(())
     }
 
-    /// Records a failure. The next try waits longer after each one, up to 8 minutes.
-    pub fn fail(&mut self, error: String) {
-        crate::ai_log::event("batch_error", json!({"error":error, "retry":self.failures + 1}));
-        self.error = error;
-        self.failures += 1;
-        self.next_check = Some(Instant::now() + POLL * 2u32.pow(self.failures.min(5) - 1));
+    fn stop_runner(&mut self) { if let Some(runner) = self.runner.take() { runner.finish(); } }
+    fn command(&self, command: runner::Command) { if let Some(runner) = &self.runner { runner.command(command); } }
+
+    fn set_mode(&mut self, mode: Mode) {
+        if self.lock.is_none() { self.error = "This window does not own the library job.".into(); return; }
+        let revision = now_ms().max(self.control.revision + 1);
+        let control = runner::Control { revision, mode };
+        match store::set_control(&self.dir, &control) {
+            Ok(()) => { self.control = control; self.command(runner::Command::Wake); }
+            Err(error) => self.error = error,
+        }
     }
 
-    /// Runs the batch forward. Returns true when the job changed, so that the
-    /// caller imports the new labels.
     pub fn tick(&mut self, ctx: &eframe::egui::Context, root: &Path, keys: &crate::ai::Keys) -> bool {
-        let mut changed = std::mem::take(&mut self.retry);
-        if self.task.is_none() && !self.running() && self.root != root && !root.as_os_str().is_empty() {
+        if !self.running() && self.root != root && !root.as_os_str().is_empty() {
+            self.stop_runner();
             *self = Panel { root: root.into(), ..Panel::default() };
-            match directory(root).and_then(|dir| Ok((Job::load(&dir)?, dir))) {
-                Ok((job, dir)) => { self.job = job; self.dir = dir; changed = true; }
-                Err(e) => self.error = e,
-            }
-        }
-        if let Some(progress) = &self.progress {
-            while let Ok(activity) = progress.try_recv() { self.activity = Some((activity, Instant::now())); }
-        }
-        if let Some(rx) = &self.task {
-            let result = match rx.try_recv() {
-                Ok((job, result)) => Some((Some(job), result)),
-                Err(mpsc::TryRecvError::Disconnected) => Some((None, Err("The batch worker stopped unexpectedly.".into()))),
-                Err(mpsc::TryRecvError::Empty) => None,
-            };
-            if let Some((job, result)) = result {
-                self.task = None;
-                self.progress = None;
-                self.activity = None;
-                let soon = job.as_ref().is_some_and(Job::untaken);
-                match job {
-                    Some(job) if self.job.is_some() => self.job = Some(job),
-                    // The user cancelled while the worker ran. The worker saved
-                    // the journal once more, and it may have made a batch.
-                    Some(job) => { self.forget(&job, keys); return true; }
-                    None => {}
-                }
-                match result {
-                    Ok(()) => {
-                        self.error.clear();
-                        self.failures = 0;
-                        self.next_check = Some(Instant::now() + if soon { Duration::ZERO } else { POLL });
+            let opened = (|| {
+                let lock = runner::lock(root)?;
+                store::migrate(root, &legacy_directory(root)?)?;
+                Ok::<_, String>((lock, root.to_path_buf()))
+            })();
+            match opened {
+                Ok((lock, dir)) => {
+                    self.lock = Some(lock); self.dir = dir;
+                    match Job::load(&self.dir) { Ok(job) => self.job = job, Err(error) => self.error = error }
+                    match store::control(&self.dir) {
+                        Ok(control) => self.control = control, Err(error) => self.error = error,
                     }
-                    Err(e) => self.fail(e),
                 }
-                changed = true;
+                Err(error) => self.error = error,
             }
         }
-        let due = self.next_check.is_none_or(|t| t <= Instant::now());
-        if self.task.is_none() && due && let Some(job) = &self.job && !job.done() {
-            match job.provider.key(keys).ok_or("The batch provider key is missing in Settings.".to_string())
-                .and_then(|key| Transport::new(&job.provider, key)) {
-                Ok(transport) => {
-                    let (job, root, dir) = (job.clone(), self.root.clone(), self.dir.clone());
-                    let (tx, rx) = mpsc::channel();
-                    let ctx = ctx.clone();
-                    self.task = Some(rx);
-                    self.activity = Some((Activity::before(job.operation()), Instant::now()));
-                    let (progress_tx, progress_rx) = mpsc::channel();
-                    self.progress = Some(progress_rx);
-                    std::thread::spawn(move || {
-                        let result = advance(job, &root, &dir, |path, body| {
-                            let _ = progress_tx.send(Activity::request(path, body));
-                            ctx.request_repaint();
-                            transport.send(path, body)
-                        });
-                        let _ = tx.send(result);
-                        ctx.request_repaint();
-                    });
-                }
-                Err(e) => self.fail(e),
+        if let Some(job) = &self.job {
+            let key = job.provider.key(keys).unwrap_or_default();
+            if self.runner.is_none() && self.storage_error.is_empty() && !job.done() && let Some(lock) = &self.lock {
+                self.key = key.clone();
+                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), self.dir.clone(), key, lock.clone(), ctx.clone()));
+            } else if key != self.key {
+                self.key = key.clone(); self.command(runner::Command::Key(key));
             }
         }
-        if let Some(t) = self.next_check { ctx.request_repaint_after(t.saturating_duration_since(Instant::now())); }
-        changed
+        let mut save = false;
+        let mut stopped = false;
+        if let Some(runner) = &self.runner {
+            loop {
+                let event = match runner.events.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => { stopped = true; break; }
+                };
+                match event {
+                    runner::Event::Snapshot(job) => { self.job = Some(job); self.storage_error.clear(); }
+                    runner::Event::Activity(activity) => self.activity = Some((activity, Instant::now())),
+                    runner::Event::Idle => self.activity = None,
+                    runner::Event::Import(job, reply) => {
+                        self.job = Some(job); self.pending_save = Some(reply); self.activity = None; save = true;
+                    }
+                    runner::Event::Error(error) => self.storage_error = error,
+                }
+            }
+        }
+        if stopped {
+            self.stop_runner(); self.activity = None;
+            if self.storage_error.is_empty() { self.storage_error = "The job worker stopped. Reload the saved job to continue.".into(); }
+        }
+        if self.running() { ctx.request_repaint_after(Duration::from_secs(1)); }
+        save
     }
 
-    /// Writes the labels that arrived into the book, in one write, and returns them.
     pub fn import(&mut self) -> Vec<(String, Option<Label>)> {
-        let Some(job) = &mut self.job else { return vec![] };
-        let mut labels = Vec::new();
-        for sheet in job.sheets.iter_mut().filter(|s| !s.imported && s.label.is_some()) {
-            if self.root.join(&sheet.rel).is_file() { labels.push((sheet.rel.clone(), sheet.label.clone())); }
-            else { (sheet.error, sheet.imported) = ("The file moved or was removed.".into(), true); }
-        }
-        if labels.is_empty() { return labels; }
-        if let Err(e) = crate::sidecar::store_labels(&self.root, labels.iter().map(|(rel, label)| (rel.as_str(), label.clone()))) {
-            self.fail(format!("Could not save the labels: {e}"));
-            return vec![];
-        }
-        crate::ai_log::event("batch_saved", json!({"provider":job.provider.name, "model":job.model, "labels":labels}));
-        for sheet in job.sheets.iter_mut().filter(|s| s.label.is_some()) { sheet.imported = true; }
-        if let Err(e) = job.save(&self.dir) { self.fail(e); }
+        let Some(reply) = self.pending_save.take() else { return vec![] };
+        let Some(job) = &self.job else { return vec![] };
+        let (report, labels) = save_labels(job, &self.root);
+        let _ = reply.send(report);
         labels
     }
 
-    /// Forgets the batch here, and asks the provider to cancel what it still runs.
-    /// Labels already in the book stay.
-    fn cancel(&mut self, keys: &crate::ai::Keys) {
-        let Some(job) = self.job.take() else { return };
-        crate::ai_log::event("batch_cancel", json!({"provider":job.provider.name, "model":job.model}));
-        // A running worker finishes first; `tick` forgets its result too.
-        if self.task.is_none() { self.forget(&job, keys); }
-        (self.error, self.failures, self.next_check) = (String::new(), 0, None);
-    }
+    fn cancel(&mut self, _keys: &crate::ai::Keys) { self.set_mode(Mode::Cancelling); }
 
-    fn forget(&self, job: &Job, keys: &crate::ai::Keys) {
-        let _ = std::fs::remove_file(self.dir.join("state.json"));
-        let ids: Vec<_> = job.groups.iter().filter_map(|g| if let Remote::Waiting(id) = &g.remote { Some(id.clone()) } else { None }).collect();
-        if let Some(Ok(transport)) = job.provider.key(keys).map(|key| Transport::new(&job.provider, key)) {
-            std::thread::spawn(move || for id in ids {
-                let path = format!("{id}:cancel");
-                let _ = transport.send(&path, Some(&json!({})));
-            });
-        }
+    fn mode(&self, job: &Job) -> Mode {
+        if self.control.revision > job.control_revision { self.control.mode } else { job.mode }
     }
-
-    fn current_activity(&self, job: &Job) -> (Activity, u64) {
-        self.activity.map(|(activity, started)| (activity, started.elapsed().as_secs()))
-            .unwrap_or((Activity::before(job.operation()), 0))
-    }
-
-    /// Separates network activity from time spent waiting for provider processing.
     fn state(&self, job: &Job) -> String {
-        let wait = self.next_check.map_or(0, |t| t.saturating_duration_since(Instant::now()).as_secs());
-        if self.task.is_some() {
-            let (activity, seconds) = self.current_activity(job);
-            activity.description(&job.provider.name, seconds)
-        } else if !self.error.is_empty() {
-            if job.done() { "Attention needed. See error details.".into() }
-            else { format!("Request failed. Retrying in {wait} s.") }
-        } else if job.uncertain() {
-            format!("Waiting to recover the interrupted submission. Next check in {wait} s.")
-        } else if job.done() {
-            "Done.".into()
-        } else if job.provider.kind == Kind::Gemini && !job.untaken() {
-            format!("{} is processing the submitted sheets. Next results check in {wait} s.", job.provider.name)
-        } else {
-            format!("Waiting for the next batch operation in {wait} s.")
+        if !self.storage_error.is_empty() { return "Job needs attention".into(); }
+        if job.done() {
+            if job.mode == Mode::Cancelling { return "Cancelled; saved labels kept".into(); }
+            let failed = job.sheets.iter().filter(|s| !s.error.is_empty() && s.label.is_none()).count();
+            return if failed == 0 { "Finished".into() } else { format!("Finished; {failed} sheets need attention") };
         }
+        if self.mode(job) == Mode::Cancelling { return "Cancellation pending".into(); }
+        if job.pending_save() {
+            return if job.issues.contains_key("save") { "Could not save labels; retry pending".into() } else { "Saving received labels".into() };
+        }
+        if self.mode(job) == Mode::Paused {
+            return if job.provider.kind == Kind::Gemini { "Uploads paused; submitted work can continue".into() } else { "Labeling paused".into() };
+        }
+        if job.issues.contains_key("upload") { return "Uploads interrupted; retry pending".into(); }
+        if job.issues.contains_key("check") { return format!("Waiting for {}; connection interrupted", job.provider.name); }
+        if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= MAX_UNCONFIRMED {
+            return "Waiting for upload confirmations".into();
+        }
+        if job.untaken() {
+            return if job.provider.kind == Kind::Gemini { "Uploading remaining sheets".into() } else { "Labeling sheets".into() };
+        }
+        if job.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_))) {
+            return format!("{} is processing your sheets", job.provider.name);
+        }
+        if job.uncertain() { return "Some sheets need confirmation".into(); }
+        "Waiting for the next operation".into()
     }
 
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, index: &Index, ai: &crate::ai::Ai, keys: &crate::ai::Keys, single_running: bool) {
         use eframe::egui;
         let configured = ai.chosen(crate::ai::Mode::Batch);
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
+        for error in [&self.error, &self.storage_error] {
+            if !error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, error); }
+        }
+        if (self.lock.is_none() || (!self.storage_error.is_empty() && self.runner.is_none()))
+            && crate::stopped(ui.button("Reload saved job")).clicked() {
+            self.stop_runner(); self.job = None; self.root = PathBuf::new();
+        }
         if self.running() && self.root != index.root { ui.weak(format!("For {}", self.root.display())); }
+        let mut pause = None;
+        let mut cancel = false;
+        let mut retry = false;
+        let mut retry_failed = false;
         if let Some(job) = &self.job {
             ui.weak(format!("{} / {}", job.provider.name, job.model));
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                if self.task.is_some() { ui.spinner(); }
-                ui.strong(self.state(job));
-            });
-            let processed = job.sheets.iter().filter(|s| s.label.is_some() || !s.error.is_empty()).count();
+            ui.add_space(5.0);
+            ui.strong(self.state(job));
+            let mode = self.mode(job);
             let total = job.sheets.len();
-            let fraction = if total == 0 { 1.0 } else { processed as f32 / total as f32 };
-            ui.add(egui::ProgressBar::new(fraction).text(format!("{processed} / {total} processed")));
-            if job.provider.kind == Kind::Gemini {
-                let (queued, waiting, uncertain) = self.submission_counts(job);
-                egui::Grid::new("batch counts").num_columns(2).show(ui, |ui| {
-                    ui.label("Queued on this PC"); ui.label(queued.to_string()); ui.end_row();
-                    ui.label(format!("At {}", job.provider.name)); ui.label(waiting.to_string()); ui.end_row();
-                    let uploading = if self.task.is_some() && let Some((Activity::Uploading(count), _)) = self.activity { count } else { 0 };
-                    if uploading > 0 { ui.label("Uploading now"); ui.label(uploading.to_string()); ui.end_row(); }
-                    if uncertain > uploading {
-                        ui.label("Awaiting confirmation"); ui.label((uncertain - uploading).to_string()); ui.end_row();
+            let saved = job.saved();
+            let failed = job.sheets.iter().filter(|s| !s.error.is_empty() && s.label.is_none()).count();
+            let unusable = job.sheets.iter().filter(|s| s.imported && s.label.as_ref().is_some_and(|l| l.status == Status::Unlabelable)).count();
+            let cancelled = job.sheets.iter().filter(|s| s.cancelled).count();
+            let finished = saved + failed + unusable + cancelled;
+            ui.add(egui::ProgressBar::new(if total == 0 { 1.0 } else { finished as f32 / total as f32 })
+                .text(format!("{finished} / {total} finished")));
+            let (queued, waiting, uncertain) = self.submission_counts(job);
+            let uploading = match self.activity { Some((Activity::Uploading(count), _)) => count, _ => 0 };
+            egui::Grid::new("batch counts").num_columns(2).show(ui, |ui| {
+                for (name, count) in [("Labels saved".to_string(), saved), (format!("Waiting at {}", job.provider.name), waiting),
+                    ("Not sent yet".into(), queued), ("Uploading now".into(), uploading),
+                    ("Needs confirmation".into(), uncertain.saturating_sub(uploading)), ("Failed sheets".into(), failed),
+                    ("No usable label".into(), unusable), ("Cancelled sheets".into(), cancelled)] {
+                    if count > 0 || name == "Labels saved" || name == "Not sent yet" {
+                        ui.label(name); ui.label(count.to_string()); ui.end_row();
                     }
-                });
-            }
-            if self.running() { ui.ctx().request_repaint_after(Duration::from_secs(1)); }
-            if !self.error.is_empty() {
-                egui::CollapsingHeader::new("Error details").show(ui, |ui| {
-                    ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
-                });
-            }
-            let failed = job.sheets.iter().filter(|s| !s.error.is_empty()).count();
-            if failed > 0 {
-                egui::CollapsingHeader::new(format!("Failed sheets ({failed})")).show(ui, |ui| {
-                    for s in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", s.rel, s.error)); }
-                });
-            }
-        } else {
-            if let Some((provider, model)) = configured {
-                ui.weak(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
-            }
-            if !self.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &self.error); }
-        }
-        if self.job.as_ref().is_some_and(Job::uncertain) {
-            if self.job.as_ref().unwrap().groups.iter().any(|g| g.recovery.as_ref().is_some_and(|r| r.not_found)) {
-                ui.weak("Google has not confirmed an interrupted upload. Other sheets continue; these sheets stay separate.");
-            } else { ui.weak("Tilepicky is checking an interrupted upload. Other sheets can continue."); }
-            egui::CollapsingHeader::new("Advanced recovery").show(ui, |ui| {
-                ui.add_enabled_ui(self.task.is_none(), |ui| {
-                    ui.weak("These controls apply to the first unconfirmed group. Attach its batch ID, or resend only if no batch exists.");
-                    crate::stopped(ui.text_edit_singleline(&mut self.attach_id));
-                    ui.horizontal(|ui| {
-                        if crate::stopped(ui.button("Attach batch ID")).clicked() {
-                            match validate_id(self.attach_id.trim()) {
-                                Ok(()) => {
-                                    let job = self.job.as_mut().unwrap();
-                                    if let Some(g) = job.groups.iter_mut().find(|g| g.remote == Remote::Submitting) {
-                                        g.remote = Remote::Waiting(self.attach_id.trim().into());
-                                    }
-                                    self.retry = true;
-                                }
-                                Err(e) => self.error = e,
-                            }
-                        }
-                        if crate::stopped(ui.button("Send again").on_hover_text("No batch was made. The provider may bill twice if one was.")).clicked() {
-                            let job = self.job.as_mut().unwrap();
-                            if let Some(i) = job.groups.iter().position(|g| g.remote == Remote::Submitting) { job.send_again(i); }
-                            self.retry = true;
-                        }
-                    });
-                    if self.retry && let Err(e) = self.job.as_ref().unwrap().save(&self.dir) { self.error = e; }
-                });
-            });
-        }
-        if self.running() {
-            ui.horizontal(|ui| {
-                if !self.error.is_empty() && crate::stopped(ui.button("Try again now")).clicked() { self.retry = true; }
-                if crate::stopped(ui.button("Cancel batch").on_hover_text("Asks the provider to cancel. Labels already saved stay.")).clicked() {
-                    self.cancel(keys);
                 }
             });
-        } else if self.job.is_some() && !self.error.is_empty() && crate::stopped(ui.button("Try again now")).clicked() {
-            self.retry = true;
-        }
-        if self.retry { self.next_check = None; }
-        if !ready && !self.running() { ui.weak("Set a batch model and its key in Settings."); }
-        let idle = !self.busy() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
+            let now = now_ms();
+            if job.last_response_ms > 0 { ui.weak(format!("Last provider response: {} s ago", now.saturating_sub(job.last_response_ms) / 1000)); }
+            if waiting > 0 && job.poll_ms > now { ui.weak(format!("Next results check in {} s", (job.poll_ms - now).div_ceil(1000))); }
+            if let Some((activity, started)) = self.activity {
+                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.weak(activity.description(&job.provider.name, started.elapsed().as_secs())); });
+            }
+            if job.uncertain() { ui.label("Some uploads need confirmation. Their sheets will not be sent twice automatically."); }
+            ui.horizontal_wrapped(|ui| {
+                if !job.done() && self.mode(job) != Mode::Cancelling {
+                    let paused = self.mode(job) == Mode::Paused;
+                    let text = if paused { "Resume" } else if job.provider.kind == Kind::Gemini { "Pause uploads" } else { "Pause" };
+                    if crate::stopped(ui.button(text)).clicked() { pause = Some(if paused { Mode::Running } else { Mode::Paused }); }
+                    if crate::stopped(ui.button("Cancel job")).clicked() { cancel = true; }
+                }
+                if !job.issues.is_empty() && crate::stopped(ui.button("Retry now")).clicked() { retry = true; }
+                if job.done() && failed > 0 && crate::stopped(ui.button("Retry failed sheets")).clicked() { retry_failed = true; }
+            });
+            if !job.done() {
+                ui.weak(if job.provider.kind == Kind::Gemini {
+                    "Closing pauses local work. Google can continue work it has accepted."
+                } else { "Closing pauses labeling. Reopen this library to continue." });
+            }
+            egui::CollapsingHeader::new("Details").show(ui, |ui| {
+                for (operation, issue) in &job.issues {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("{operation}: {}", issue.message));
+                    ui.weak(format!("Next retry in {} s", issue.retry_ms.saturating_sub(now).div_ceil(1000)));
+                }
+                if job.uncertain() {
+                    ui.label("Tilepicky checks the provider automatically. An upload can remain uncertain after an interrupted connection.");
+                    if mode != Mode::Cancelling && crate::stopped(ui.button("Retry unconfirmed sheets...")).clicked() { self.resend_confirm = true; }
+                }
+                for group in job.groups.iter().filter(|g| !g.tracking.error.is_empty()) {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("{} sheets: {}", group.sheets.len(), group.tracking.error));
+                }
+                let pending = job.sheets.iter().filter(|s| s.label.is_some() && !s.imported).count();
+                if pending > 0 { ui.label(format!("{pending} received results still need to be saved.")); }
+                ui.label(format!("Tags used for this job: {}", job.tag_list.join(", ")));
+                egui::CollapsingHeader::new("Sheet errors").show(ui, |ui| {
+                    for sheet in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", sheet.rel, sheet.error)); }
+                });
+                egui::CollapsingHeader::new("Provider batches").show(ui, |ui| {
+                    for group in &job.groups {
+                        if !group.tracking.id.is_empty() {
+                            ui.label(format!("{} sheets: {}", group.sheets.len(), group.tracking.state));
+                            ui.weak(&group.tracking.id);
+                        }
+                    }
+                });
+            });
+        } else if let Some((provider, model)) = configured { ui.weak(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch"))); }
+        if let Some(mode) = pause { self.set_mode(mode); }
+        if cancel { self.cancel(keys); }
+        if retry { self.command(runner::Command::Wake); }
+        if retry_failed { self.start_retry(runner::Command::RetryFailed, ui.ctx(), keys); }
         if self.busy() { return; }
+        let idle = self.lock.is_some() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
+        if !ready { ui.weak("Set a library model and its key in Settings."); }
         for (text, scope) in [("Label unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
             let button = ui.add_enabled(ready && idle && !index.entries.is_empty(), egui::Button::new(text));
             crate::stop(&button);
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
                 match prepare(index, provider.clone(), model.id.clone(), scope) {
-                    Ok(job) => self.proposal = Some(job),
-                    Err(e) => self.error = e,
+                    Ok(job) => self.proposal = Some(job), Err(e) => self.error = e,
                 }
             }
         }
     }
 
+    fn start_retry(&mut self, command: runner::Command, ctx: &eframe::egui::Context, keys: &crate::ai::Keys) {
+        if self.runner.is_none() && let (Some(job), Some(lock)) = (&self.job, &self.lock) {
+            self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), self.dir.clone(),
+                job.provider.key(keys).unwrap_or_default(), lock.clone(), ctx.clone()));
+        }
+        self.command(command);
+    }
+
     /// The dialog that asks before a batch starts.
     pub fn confirmation(&mut self, ctx: &eframe::egui::Context) {
         use eframe::egui;
+        if self.resend_confirm {
+            egui::Modal::new(egui::Id::new("retry unconfirmed")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.heading("Retry unconfirmed sheets?");
+                ui.label("Google may already have accepted these sheets. Sending them again can charge you twice.");
+                ui.label("Only the unconfirmed sheets will be retried. Accepted batches will keep their IDs.");
+                ui.horizontal(|ui| {
+                    if ui.button("Send these sheets again").clicked() {
+                        self.command(runner::Command::RetryUnconfirmed); self.resend_confirm = false;
+                    }
+                    if ui.button("Keep waiting").clicked() { self.resend_confirm = false; }
+                });
+            });
+            return;
+        }
         let Some(job) = &self.proposal else { return };
         let (mut start, mut close) = (false, false);
         egui::Modal::new(egui::Id::new("library batch confirmation")).show(ctx, |ui| {
@@ -897,7 +1023,9 @@ impl Panel {
                     false => ui.label(format!("Tags to look for: {}.", job.tag_list.join(", "))),
                 };
                 ui.weak("Price estimate unavailable. Image token charges and model output vary.");
-                ui.weak("You can close the app while the batch runs; it continues when you open the library again.");
+                ui.weak(if job.provider.kind == Kind::Gemini {
+                    "Closing pauses uploads and saves. Google continues accepted work. Reopen this library to collect results."
+                } else { "This provider labels sheets one by one. Closing pauses the job until you reopen this library." });
             }
             ui.horizontal(|ui| {
                 start = !job.sheets.is_empty() && ui.button("Start batch").clicked();
@@ -906,9 +1034,11 @@ impl Panel {
             });
         });
         if start {
-            let job = self.proposal.take().unwrap();
-            match job.save(&self.dir) {
-                Ok(()) => { self.job = Some(job); (self.error, self.failures, self.next_check) = (String::new(), 0, None); }
+            self.stop_runner();
+            let mut job = self.proposal.take().unwrap();
+            job.control_revision = self.control.revision;
+            match store::start(&self.dir, &job) {
+                Ok(()) => { self.job = Some(job); self.error.clear(); }
                 Err(e) => self.error = e,
             }
         }
@@ -928,7 +1058,8 @@ mod tests {
         fn new() -> Self {
             let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             let base = std::env::temp_dir().join(format!("tilepicky-batch-{}-{stamp}", std::process::id()));
-            let (root, spool) = (base.join("library"), base.join("spool"));
+            let root = base.join("library");
+            let spool = root.clone();
             std::fs::create_dir_all(root.join("folder")).unwrap();
             RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255])).save(root.join("folder/sheet.png")).unwrap();
             Self { base, root, spool }
@@ -942,7 +1073,7 @@ mod tests {
         fn journal(&self) -> Job { Job::load(&self.spool).unwrap().unwrap() }
     }
     impl Drop for Files { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.base); } }
-    fn provider(kind: Kind) -> Provider {
+    pub(super) fn provider(kind: Kind) -> Provider {
         Provider { name: "test".into(), kind, skip: None, key_env: vec![], url: match kind {
             Kind::Gemini => "https://generativelanguage.googleapis.com/v1beta".into(),
             Kind::OpenAi => "https://openrouter.ai/api/v1".into(),
@@ -961,14 +1092,32 @@ mod tests {
     }
 
     #[test]
-    fn the_status_names_a_result_check_instead_of_a_connection() {
+    fn completion_waits_for_labels_to_be_saved() {
         let files = Files::new();
-        let mut job = files.prepare(Kind::Gemini);
-        job.sheets[0].taken = true;
-        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/test".into()), recovery: None });
-        let (_tx, rx) = mpsc::channel();
-        let panel = Panel { job: Some(job), task: Some(rx), ..Panel::default() };
-        assert!(panel.state(panel.job.as_ref().unwrap()).starts_with("Checking results from test"));
+        let (job, _) = files.advance(files.prepare(Kind::Gemini), id("batches/test"));
+        let reply = completed(&job, 0, "Crystals");
+        let (job, result) = files.advance(job, |_, _| Ok(reply.clone()));
+        result.unwrap();
+        assert!(!job.done(), "Received results are not saved labels.");
+    }
+
+    #[test]
+    fn cancellation_keeps_the_job_until_the_provider_confirms() {
+        let files = Files::new();
+        let (job, _) = files.advance(files.prepare(Kind::Gemini), id("batches/test"));
+        let mut panel = Panel { root: files.root.clone(), dir: files.spool.clone(), lock: Some(runner::lock(&files.spool).unwrap()),
+            job: Some(job), ..Panel::default() };
+        panel.cancel(&crate::ai::Keys::default());
+        assert!(panel.job.is_some(), "Cancellation must remain visible.");
+        assert!(Job::load(&files.spool).unwrap().is_some(), "Cancellation must survive restart.");
+    }
+
+    #[test]
+    fn provider_processing_remains_visible_during_a_result_check() {
+        let files = Files::new();
+        let (job, _) = files.advance(files.prepare(Kind::Gemini), id("batches/test"));
+        let panel = Panel { activity: Some((Activity::Checking, Instant::now())), ..Panel::default() };
+        assert_eq!(panel.state(&job), "test is processing your sheets");
     }
 
     #[test]
@@ -976,7 +1125,6 @@ mod tests {
         let body = submit_body(&[("a".into(), json!({})), ("b".into(), json!({}))], "reference");
         let activity = Activity::request("models/test:batchGenerateContent", Some(&body));
         assert_eq!(activity.description("Google", 12), "Uploading 2 sheets to Google (12 s)");
-        assert_eq!(activity.summary(12), "uploading 2; 12 s");
         assert_eq!(Activity::request("batches/test", None).description("Google", 3), "Checking results from Google (3 s)");
     }
 
@@ -984,8 +1132,7 @@ mod tests {
     fn uploading_sheets_are_not_also_shown_as_queued() {
         let files = Files::new();
         let job = files.prepare(Kind::Gemini);
-        let (_tx, rx) = mpsc::channel();
-        let panel = Panel { task: Some(rx), activity: Some((Activity::Uploading(1), Instant::now())), ..Panel::default() };
+        let panel = Panel { activity: Some((Activity::Uploading(1), Instant::now())), ..Panel::default() };
         assert_eq!(panel.submission_counts(&job), (0, 0, 1));
         assert_eq!(Activity::Uploading(1).description("Google", 2), "Uploading 1 sheet to Google (2 s)");
     }
@@ -995,31 +1142,30 @@ mod tests {
         let files = Files::new();
         let mut job = files.prepare(Kind::Gemini);
         job.sheets[0].taken = true;
-        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/test".into()), recovery: None });
-        let panel = Panel { next_check: Some(Instant::now() + Duration::from_secs(30)), ..Panel::default() };
+        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/test".into()), recovery: None, tracking: Tracking::default() });
+        let panel = Panel::default();
         let state = panel.state(&job);
-        assert!(state.starts_with("test is processing the submitted sheets. Next results check in "));
+        assert_eq!(state, "test is processing your sheets");
         assert!(!state.contains("Contacting"));
     }
 
     #[test]
     fn outstanding_batches_have_status_without_the_ai_pane() {
         let files = Files::new();
+        let panel = Panel { job: Some(files.prepare(Kind::Gemini)), ..Panel::default() };
+        assert_eq!(panel.status().as_deref(), Some("AI labels: 0 saved / 1 | Uploading remaining sheets"));
+    }
+
+    #[test]
+    fn a_stopped_worker_is_visible_and_cannot_restart_from_a_stale_snapshot() {
+        let files = Files::new();
         let job = files.prepare(Kind::Gemini);
-        let mut panel = Panel { job: Some(job), ..Panel::default() };
-        assert_eq!(panel.status().as_deref(), Some("AI batch: waiting | 0 at test | 0/1 processed"));
-        panel.job.as_mut().unwrap().groups.push(Group { sheets: vec![0], remote: Remote::Submitting, recovery: None });
-        assert!(panel.status().unwrap().contains("needs attention"));
-        panel.job.as_mut().unwrap().groups.clear();
-        panel.error = "Temporary failure".into();
-        assert!(panel.status().unwrap().contains("retry pending"));
-        let (_tx, rx) = mpsc::channel();
-        panel.task = Some(rx);
-        assert!(panel.status().unwrap().contains("preparing upload"));
-        panel.task = None;
-        panel.error.clear();
-        panel.job.as_mut().unwrap().sheets[0].taken = true;
-        assert!(panel.status().is_none());
+        let mut panel = Panel { root: files.root.clone(), dir: files.spool.clone(), job: Some(job),
+            runner: Some(runner::Runner::disconnected()), activity: Some((Activity::Checking, Instant::now())), ..Panel::default() };
+        panel.tick(&eframe::egui::Context::default(), &files.root, &crate::ai::Keys::default());
+        assert!(panel.runner.is_none()); assert!(panel.activity.is_none());
+        assert!(panel.storage_error.contains("worker stopped"));
+        assert_eq!(panel.state(panel.job.as_ref().unwrap()), "Job needs attention");
     }
 
     #[test]
@@ -1034,7 +1180,7 @@ mod tests {
         assert_eq!(job.sheets.iter().map(|s| s.rel.as_str()).collect::<Vec<_>>(), ["broken.png", "folder/sheet.png"]);
         assert_eq!(job.skipped, 1);
         assert_eq!(job.model, "test");
-        assert!(!files.spool.exists());
+        assert!(Job::load(&files.root).unwrap().is_none());
     }
 
     #[test]
@@ -1046,14 +1192,16 @@ mod tests {
         let job = prepare(&index, provider(Kind::OpenAi), "test:batch".into(), Scope::All).unwrap();
         assert_eq!((job.sheets.len(), job.skipped, job.replacing), (1, 0, 1));
         assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label, Some(old.clone()));
-        let (failed, _) = files.advance(job.clone(), |_, _| Err(Failure::Status(401, String::new())));
+        let (failed, _) = files.advance(job.clone(), |_, _| Err(Failure::Status(400, String::new())));
         let mut panel = Panel { root: files.root.clone(), dir: files.spool.clone(), job: Some(failed), ..Panel::default() };
         assert!(panel.import().is_empty());
         assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label, Some(old));
         let (job, result) = files.advance(job, |_, _| Ok(completion(labeled("New"))));
         result.unwrap();
         panel.job = Some(job);
+        let (reply, received) = mpsc::channel(); panel.pending_save = Some(reply);
         assert_eq!(panel.import().len(), 1);
+        assert_eq!(received.recv().unwrap().saved, vec![0]);
         assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label.as_ref().unwrap().caption, "New");
     }
 
@@ -1065,7 +1213,12 @@ mod tests {
         assert!(panel.discard_completed(&files.root).is_err());
         let (job, result) = files.advance(job, |_, _| Ok(completion(labeled("New"))));
         result.unwrap();
+        let (report, _) = save_labels(&job, &files.root);
+        let mut job = job;
+        for i in report.saved { job.sheets[i].imported = true; }
+        job.save(&files.root).unwrap();
         panel.job = Some(job);
+        panel.lock = Some(runner::lock(&files.spool).unwrap());
         panel.discard_completed(&files.root).unwrap();
         assert!(panel.import().is_empty());
         assert!(Job::load(&files.spool).unwrap().is_none());
@@ -1081,7 +1234,7 @@ mod tests {
         RgbaImage::new(4, 4).save(files.root.join("more.png")).unwrap();
         let mut job = files.prepare(Kind::OpenAi);
         let mut sent = 0;
-        while !job.done() {
+        while !job.remote_done() {
             let result;
             (job, result) = files.advance(job, |path, request| {
                 assert_eq!(path, "chat/completions");
@@ -1095,7 +1248,7 @@ mod tests {
         assert!(job.sheets[0].error.contains("Could not read"));
         assert_eq!(job.sheets[1].label.as_ref().unwrap().caption, "Forest");
         assert!(job.groups.is_empty());
-        assert!(files.journal().done());
+        assert!(files.journal().remote_done());
     }
 
     /// A job asks for the tag list the library had when it started, and
@@ -1145,11 +1298,11 @@ mod tests {
             assert!(!job.sheets[0].taken && job.sheets[0].error.is_empty());
             let (job, result) = files.advance(job, |_, _| Ok(completion(labeled("Tree"))));
             result.unwrap();
-            assert!(job.done() && job.sheets[0].label.is_some());
+            assert!(job.remote_done() && job.sheets[0].label.is_some());
         }
-        let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(Failure::Status(401, String::new())));
+        let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(Failure::Status(400, String::new())));
         result.unwrap();
-        assert!(job.done() && job.sheets[0].error.contains("401"));
+        assert!(job.remote_done() && job.sheets[0].error.contains("400"));
     }
 
     /// A request whose answer was lost or unreadable may have been billed,
@@ -1165,7 +1318,7 @@ mod tests {
             (job, result) = files.advance(job, |_, _| Err(Failure::NotSent("offline".into())));
             assert!(result.is_err());
         }
-        while !job.done() {
+        while !job.remote_done() {
             let result;
             (job, result) = files.advance(job, |_, _| { sent += 1; Err(Failure::Unknown("Invalid or oversized batch response.".into())) });
             assert_eq!(result.is_err(), sent < 3);
@@ -1191,7 +1344,7 @@ mod tests {
         }
         assert_eq!(job.sheets[0].label.as_ref().unwrap().caption, "Forest");
         assert_eq!(job.sheets[0].unknown, 1);
-        while !job.done() {
+        while !job.remote_done() {
             let result;
             (job, result) = files.advance(job, |_, _| Ok(prose.clone()));
             result.unwrap();
@@ -1207,10 +1360,10 @@ mod tests {
         RgbaImage::new(4, 4).save(files.root.join("more.png")).unwrap();
         let mut job = files.prepare(Kind::OpenAi);
         for s in &mut job.sheets { s.taken = true; }
-        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batch-1".into()), recovery: None },
-            Group { sheets: vec![1], remote: Remote::Submitting, recovery: None }];
-        assert!(!job.uncertain() && !job.done());
-        while !job.done() {
+        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batch-1".into()), recovery: None, tracking: Tracking::default() },
+            Group { sheets: vec![1], remote: Remote::Submitting, recovery: None, tracking: Tracking::default() }];
+        assert!(!job.uncertain() && !job.remote_done());
+        while !job.remote_done() {
             let result;
             (job, result) = files.advance(job, |path, _| { assert_eq!(path, "chat/completions"); Ok(completion(labeled("Tree"))) });
             result.unwrap();
@@ -1238,13 +1391,13 @@ mod tests {
             Ok(json!({"done":false}))
         });
         result.unwrap();
-        assert!(!job.done());
+        assert!(!job.remote_done());
         let reply = completed(&job, 0, "Forest");
         let (job, result) = files.advance(job, |_, _| Ok(reply.clone()));
         result.unwrap();
-        assert!(job.done());
+        assert!(job.remote_done());
         assert_eq!(job.sheets[1].label.as_ref().unwrap().caption, "Forest");
-        assert!(files.journal().done());
+        assert!(files.journal().remote_done());
     }
 
     #[test]
@@ -1413,7 +1566,7 @@ mod tests {
         RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255])).save(files.root.join("another.png")).unwrap();
         let mut job = files.prepare(Kind::Gemini);
         job.sheets[0].taken = true;
-        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/accepted".into()), recovery: None });
+        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/accepted".into()), recovery: None, tracking: Tracking::default() });
         job.poll_next = true;
         let reply = completed(&job, 0, "Crystals");
         let (job, result) = files.advance(job, |path, body| {
@@ -1429,10 +1582,10 @@ mod tests {
     #[test]
     fn a_refused_submission_fails_its_sheets() {
         let files = Files::new();
-        let (job, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Status(401, String::new())));
+        let (job, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Status(400, String::new())));
         result.unwrap();
-        assert!(job.sheets[0].error.contains("401"));
-        assert!(job.done());
+        assert!(job.sheets[0].error.contains("400"));
+        assert!(job.remote_done());
     }
 
     #[test]
@@ -1442,7 +1595,7 @@ mod tests {
             let message = "The endpoint returned HTTP 400. This model does not support the requested schema.";
             let (job, result) = files.advance(files.prepare(kind), |_, _| Err(Failure::Status(400, message.into())));
             result.unwrap();
-            assert!(job.done());
+            assert!(job.remote_done());
             assert_eq!(files.journal().sheets[0].error, message);
         }
     }
@@ -1458,7 +1611,7 @@ mod tests {
             result.unwrap();
             let (job, result) = files.advance(job, |_, _| Ok(response.clone()));
             result.unwrap();
-            assert!(job.done());
+            assert!(job.remote_done());
             assert!(files.journal().sheets[0].error.contains("The requested image format is not supported."));
         }
     }
@@ -1468,7 +1621,7 @@ mod tests {
         let files = Files::new();
         let mut job = files.prepare(Kind::Gemini);
         job.sheets.push(job.sheets[0].clone());
-        job.groups.push(Group { sheets: vec![0, 1], remote: Remote::Waiting("batches/x".into()), recovery: None });
+        job.groups.push(Group { sheets: vec![0, 1], remote: Remote::Waiting("batches/x".into()), recovery: None, tracking: Tracking::default() });
         accept(&mut job, 0, vec![(key(1), completion(labeled("Second"))), ("unknown".into(), Value::Null)]);
         assert!(job.sheets[0].label.is_none());
         assert!(!job.sheets[0].error.is_empty());
@@ -1480,21 +1633,21 @@ mod tests {
         let files = Files::new();
         let mut job = files.prepare(Kind::Gemini);
         job.sheets[0].taken = true;
-        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batches/first".into()), recovery: None },
-            Group { sheets: vec![0], remote: Remote::Waiting("batches/second".into()), recovery: None }];
+        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batches/first".into()), recovery: None, tracking: Tracking::default() },
+            Group { sheets: vec![0], remote: Remote::Waiting("batches/second".into()), recovery: None, tracking: Tracking::default() }];
         let (job, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/first"); Ok(json!({"done":false})) });
         let (_, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/second"); Ok(json!({"done":false})) });
     }
 
     #[test]
-    fn failures_wait_longer_each_time() {
-        let mut panel = Panel::default();
+    fn repeated_failures_back_off_independently() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::Gemini);
         let mut waits = Vec::new();
-        for _ in 0..7 {
-            panel.fail("offline".into());
-            waits.push(panel.next_check.unwrap().saturating_duration_since(Instant::now()).as_secs() + 1);
-        }
-        assert_eq!(waits, [30, 60, 120, 240, 480, 480, 480]);
+        for _ in 0..7 { job.issue("upload", "offline".into(), 1_000); waits.push((job.issues["upload"].retry_ms - 1_000) / 1000); }
+        assert_eq!(waits, vec![30, 60, 120, 240, 480, 480, 480]);
+        job.issue("check", "offline".into(), 1_000);
+        assert_eq!(job.issues["check"].retry_ms, 31_000);
     }
 
     #[test]

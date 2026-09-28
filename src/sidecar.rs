@@ -175,6 +175,9 @@ pub struct Book {
     /// `TAG_LIST`. It lives in the book of the library root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_list: Option<Vec<String>>,
+    /// One library job and its durable commands. Credentials stay in the app configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_batch: Option<serde_json::Value>,
     #[serde(default)]
     pub sheets: BTreeMap<String, Sidecar>,
 }
@@ -190,13 +193,10 @@ pub fn tag_list(book: &Book) -> Vec<String> {
 /// Writes the tag list of a library. The default list is written as absent,
 /// so that a library that never changed it follows a new default.
 pub fn store_tag_list(dir: &Path, list: &[String]) -> Result<(), String> {
-    let mut book = load_book(dir)?;
-    let want = (list != TAG_LIST).then(|| list.to_vec());
-    if book.tag_list == want {
-        return Ok(());
-    }
-    book.tag_list = want;
-    write_book(dir, &book)
+    update_book(dir, |book| {
+        book.tag_list = (list != TAG_LIST).then(|| list.to_vec());
+        Ok(())
+    })
 }
 
 /// A missing book is empty. Unreadable books must not be overwritten.
@@ -220,47 +220,59 @@ fn normalize_windows_paths(mut book: Book) -> Result<Book, String> {
     Ok(book)
 }
 
-pub fn write_book(dir: &Path, book: &Book) -> Result<(), String> {
-    crate::storage::write(&dir.join(BOOK), book)
+/// Holds the lock across the read, change, and atomic replacement.
+/// Readers see either complete version. Writers cannot overwrite another writer's changes.
+pub fn update_book<T>(dir: &Path, change: impl FnOnce(&mut Book) -> Result<T, String>) -> Result<T, String> {
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(dir.join(".tilepicky-book.lock")).map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < std::time::Duration::from_secs(2) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("Cannot lock the library book: {error}")),
+        }
+    }
+    let mut book = load_book(dir)?;
+    let before = book.clone();
+    let result = change(&mut book)?;
+    if book != before { crate::storage::write(&dir.join(BOOK), &book)?; }
+    Ok(result)
 }
 
 /// Remembers the tile size of a directory, for the sheets that name none.
 pub fn store_tile(dir: &Path, tile: [u32; 2]) -> Result<(), String> {
-    let mut book = load_book(dir)?;
-    let want = Some(Pair::of(tile));
-    if book.tile == want {
-        return Ok(());
-    }
-    book.tile = want;
-    write_book(dir, &book)
+    update_book(dir, |book| { book.tile = Some(Pair::of(tile)); Ok(()) })
 }
 
 /// Moves or copies one entry to a new path, for a renamed or duplicated
 /// sheet.
 pub fn move_entry(dir: &Path, old: &str, new: &str, keep_old: bool) -> Result<(), String> {
-    let mut book = load_book(dir)?;
-    if let Some(e) = book.sheets.get(old).cloned() {
-        if !keep_old {
-            book.sheets.remove(old);
+    update_book(dir, |book| {
+        if let Some(e) = book.sheets.get(old).cloned() {
+            if !keep_old {
+                book.sheets.remove(old);
+            }
+            book.sheets.insert(new.to_string(), e);
         }
-        book.sheets.insert(new.to_string(), e);
-        write_book(dir, &book)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Re-keys every entry under a renamed folder.
 pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
-    let mut book = load_book(dir)?;
-    book.sheets = book
-        .sheets
-        .into_iter()
-        .map(|(k, v)| match k.strip_prefix(&format!("{old}/")) {
-            Some(rest) => (format!("{new}/{rest}"), v),
-            None => (k, v),
-        })
-        .collect();
-    write_book(dir, &book)
+    update_book(dir, |book| {
+        book.sheets = std::mem::take(&mut book.sheets)
+            .into_iter()
+            .map(|(k, v)| match k.strip_prefix(&format!("{old}/")) {
+                Some(rest) => (format!("{new}/{rest}"), v),
+                None => (k, v),
+            })
+            .collect();
+        Ok(())
+    })
 }
 
 fn not(b: &bool) -> bool {
@@ -270,37 +282,39 @@ fn not(b: &bool) -> bool {
 /// Writes one entry. The book is read again first, so that entries changed
 /// by hand in the meantime survive. An empty entry is removed.
 pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> {
-    let mut book = load_book(dir)?;
-    if side.is_empty() {
-        book.sheets.remove(rel);
-    } else {
-        book.sheets.insert(rel.to_string(), side.clone());
-    }
-    write_book(dir, &book)
+    update_book(dir, |book| {
+        if side.is_empty() {
+            book.sheets.remove(rel);
+        } else {
+            book.sheets.insert(rel.to_string(), side.clone());
+        }
+        Ok(())
+    })
 }
 
 /// Writes or removes the labels of some sheets, in one write of the book.
 /// The rest of each entry stays.
 pub fn store_labels<'a>(dir: &Path, labels: impl IntoIterator<Item = (&'a str, Option<Label>)>) -> Result<(), String> {
-    let mut book = load_book(dir)?;
-    for (rel, label) in labels {
-        let side = book.sheets.entry(rel.into()).or_default();
-        side.label = label;
-        if side.is_empty() { book.sheets.remove(rel); }
-    }
-    write_book(dir, &book)
+    update_book(dir, |book| {
+        for (rel, label) in labels {
+            let side = book.sheets.entry(rel.into()).or_default();
+            side.label = label;
+            if side.is_empty() { book.sheets.remove(rel); }
+        }
+        Ok(())
+    })
 }
 
 /// Clears all labels in the book, including entries for missing files.
 pub fn clear_labels(dir: &Path) -> Result<Vec<String>, String> {
-    let mut book = load_book(dir)?;
-    let mut cleared = Vec::new();
-    for (rel, side) in &mut book.sheets {
-        if side.label.take().is_some() { cleared.push(rel.clone()); }
-    }
-    book.sheets.retain(|_, side| !side.is_empty());
-    write_book(dir, &book)?;
-    Ok(cleared)
+    update_book(dir, |book| {
+        let mut cleared = Vec::new();
+        for (rel, side) in &mut book.sheets {
+            if side.label.take().is_some() { cleared.push(rel.clone()); }
+        }
+        book.sheets.retain(|_, side| !side.is_empty());
+        Ok(cleared)
+    })
 }
 
 #[cfg(test)]
@@ -377,7 +391,7 @@ mod tests {
         }}"#).unwrap();
         let book = load_book(&folder.0).unwrap();
         assert_eq!(book.sheets.keys().collect::<Vec<_>>(), ["a.png"]);
-        write_book(&folder.0, &book).unwrap();
+        crate::storage::write(&folder.0.join(BOOK), &book).unwrap();
         assert!(!std::fs::read_to_string(folder.0.join(BOOK)).unwrap().contains("islands"));
     }
 
