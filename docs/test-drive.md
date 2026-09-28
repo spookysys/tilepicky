@@ -117,8 +117,8 @@ It also documents Google's paid-project requirement and the `gemini-flash-latest
 
 ## Automated checks
 
-- `cargo test --locked`: 122 passed, with no ignored tests.
-- `cargo test --locked --features wgpu`: 122 passed, with no ignored tests.
+- `cargo test --locked`: 125 passed, with no ignored tests.
+- `cargo test --locked --features wgpu`: 125 passed, with no ignored tests.
 - `cargo clippy --locked --all-targets --features wgpu`: passed.
 - `cargo build --release --locked --features wgpu`: passed.
 
@@ -172,3 +172,15 @@ Idle batch actions disappear during an active job. Error details remain expandab
 The private WGPU interface check opened View label and verified the saved caption and tags.
 A local test endpoint verified the elapsed upload status, retry countdown, and expandable error details.
 The check used no paid requests. The status bar kept the batch summary compact.
+
+## Recovery without a blocked queue
+
+A regression reproduced an unconfirmed group blocking every later upload.
+Queued sheets now get a turn between recovery checks, including after a restart.
+Unconfirmed sheets stay separate and never go out again automatically.
+Tests cover a rejected new upload preserving an older unconfirmed group, and recovery checking each group.
+A missing match remains visible as pending confirmation, instead of a failed network request.
+The AI pane keeps Copy log. Settings remains on the status bar.
+
+The private WGPU check showed a new upload beside an older unconfirmed group, with separate counts.
+Copy log remained visible at the top, and the duplicate Settings button was absent.

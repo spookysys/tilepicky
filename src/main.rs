@@ -1420,7 +1420,6 @@ impl App {
     fn assist_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("AI labels");
         ui.horizontal(|ui| {
-            if stopped(ui.small_button("Settings...")).clicked() { self.settings_request = true; }
             if stopped(ui.small_button("Copy log"))
                 .on_hover_text("Copy recent AI prompts, replies, tags, and errors. Keys and images are omitted.").clicked() {
                 self.copy_ai_log(ui.ctx());

@@ -146,7 +146,8 @@ Click the batch status to open the AI pane and its controls.
 Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now** or **Cancel batch**.
 Tilepicky saves a unique reference before each Google submission. If its reply is lost, Tilepicky looks up that reference automatically.
 It checks accepted groups while submitting the remaining sheets. The progress counts separate queued sheets, provider work, and unconfirmed submissions.
-It never automatically resends an unconfirmed submission. **Advanced recovery** contains manual controls for older or ambiguous jobs.
+An unconfirmed submission does not block queued sheets. Tilepicky continues uploads and result checks while it looks for confirmation.
+It never automatically resends an unconfirmed submission. **Advanced recovery** contains manual controls for one unconfirmed group at a time.
 The pane separates **Single sheet** actions from **Library batch** progress. Each section shows its provider and model.
 A running batch keeps its original provider and model.
 The current operation shows image preparation, the actual upload count, result checks, or submission recovery, with elapsed seconds.

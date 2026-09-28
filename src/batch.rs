@@ -63,6 +63,8 @@ struct Recovery {
     page: String,
     #[serde(default)]
     matches: Vec<String>,
+    #[serde(default)]
+    not_found: bool,
 }
 
 fn key(sheet: usize) -> String { format!("sheet-{sheet}") }
@@ -85,6 +87,9 @@ pub struct Job {
     /// Alternate submissions and polling so early results can arrive before the whole library is sent.
     #[serde(default)]
     poll_next: bool,
+    /// Give queued sheets a turn after each recovery request.
+    #[serde(default)]
+    submit_next: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -95,7 +100,7 @@ impl Job {
         let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
         if self.provider.kind == Kind::OpenAi { Operation::Label }
         else if waiting && (self.poll_next || (!self.untaken() && !self.uncertain())) { Operation::Poll }
-        else if self.uncertain() { Operation::Recover }
+        else if self.uncertain() && (!self.submit_next || !self.untaken()) { Operation::Recover }
         else if self.untaken() { Operation::Submit }
         else { Operation::Poll }
     }
@@ -147,7 +152,7 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
     let open = index.entries.iter().filter(|e| all || e.side.label.is_none());
     Ok(Job {
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
-        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), poll_next: false,
+        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), poll_next: false, submit_next: false,
         sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
             .collect(),
     })
@@ -331,8 +336,8 @@ pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str,
     let result = match job.operation() {
         Operation::Label => { job.release_groups(); one(&mut job, root, dir, &mut send) }
         Operation::Poll => { job.poll_next = false; poll(&mut job, dir, &mut send) }
-        Operation::Recover => { job.poll_next = true; recover(&mut job, dir, &mut send) }
-        Operation::Submit => { job.poll_next = true; submit(&mut job, root, dir, &mut send) }
+        Operation::Recover => { job.poll_next = true; job.submit_next = true; recover(&mut job, dir, &mut send) }
+        Operation::Submit => { job.poll_next = true; job.submit_next = false; submit(&mut job, root, dir, &mut send) }
     };
     (job, result)
 }
@@ -412,7 +417,7 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
         Ok(response) => remote_id(&response).map(|id| job.groups[g].remote = Remote::Waiting(id)),
         // The provider made no batch: the sheets wait for the next try.
         Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 503, _))) => {
-            job.send_again();
+            job.send_again(g);
             Err(failure.message())
         }
         Err(failure @ Failure::Status(400..500, _)) => {
@@ -447,15 +452,19 @@ fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     recovery.page = value["nextPageToken"].as_str().unwrap_or_default().into();
     if !recovery.page.is_empty() { return job.save(dir); }
     let matches = std::mem::take(&mut recovery.matches);
+    recovery.not_found = matches.is_empty();
+    crate::ai_log::event("batch_recovery_check", json!({"reference":recovery.reference, "matches":matches.len()}));
     let result = match matches.as_slice() {
         [id] => {
             crate::ai_log::event("batch_recovered", json!({"reference":recovery.reference, "id":id}));
             job.groups[i].remote = Remote::Waiting(id.clone());
             Ok(())
         }
-        [] => Err("Google has not listed this submission yet. Recovery will retry without sending the sheets again.".into()),
+        [] => Ok(()),
         _ => Err("Google returned more than one matching batch. Open Advanced recovery; nothing was resent.".into()),
     };
+    // Give each unconfirmed group a turn after a complete lookup.
+    job.groups.rotate_left(i + 1);
     job.save(dir).and(result)
 }
 
@@ -476,11 +485,10 @@ fn poll(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
 
 impl Job {
     /// Forgets an unconfirmed submission. Its sheets go out again.
-    fn send_again(&mut self) {
-        for group in self.groups.iter().filter(|g| g.remote == Remote::Submitting) {
-            for &i in &group.sheets { self.sheets[i].taken = false; }
-        }
-        self.groups.retain(|g| g.remote != Remote::Submitting);
+    fn send_again(&mut self, group: usize) {
+        if self.groups[group].remote != Remote::Submitting { return; }
+        for &i in &self.groups[group].sheets { self.sheets[i].taken = false; }
+        self.groups.remove(group);
     }
 
     /// Lets the sheets of an unfinished group go out one at a time. An
@@ -779,10 +787,10 @@ impl Panel {
                 egui::Grid::new("batch counts").num_columns(2).show(ui, |ui| {
                     ui.label("Queued on this PC"); ui.label(queued.to_string()); ui.end_row();
                     ui.label(format!("At {}", job.provider.name)); ui.label(waiting.to_string()); ui.end_row();
-                    if uncertain > 0 {
-                        let uploading = self.task.is_some() && matches!(self.activity, Some((Activity::Uploading(_), _)));
-                        ui.label(if uploading { "Uploading now" } else { "Awaiting confirmation" });
-                        ui.label(uncertain.to_string()); ui.end_row();
+                    let uploading = if self.task.is_some() && let Some((Activity::Uploading(count), _)) = self.activity { count } else { 0 };
+                    if uploading > 0 { ui.label("Uploading now"); ui.label(uploading.to_string()); ui.end_row(); }
+                    if uncertain > uploading {
+                        ui.label("Awaiting confirmation"); ui.label((uncertain - uploading).to_string()); ui.end_row();
                     }
                 });
             }
@@ -805,28 +813,34 @@ impl Panel {
             if !self.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &self.error); }
         }
         if self.job.as_ref().is_some_and(Job::uncertain) {
+            if self.job.as_ref().unwrap().groups.iter().any(|g| g.recovery.as_ref().is_some_and(|r| r.not_found)) {
+                ui.weak("Google has not confirmed an interrupted upload. Other sheets continue; these sheets stay separate.");
+            } else { ui.weak("Tilepicky is checking an interrupted upload. Other sheets can continue."); }
             egui::CollapsingHeader::new("Advanced recovery").show(ui, |ui| {
-                ui.weak("Find the batch in the provider's batch list and attach its ID. If there is none, send the sheets again.");
-                crate::stopped(ui.text_edit_singleline(&mut self.attach_id));
-                ui.horizontal(|ui| {
-                    if crate::stopped(ui.button("Attach batch ID")).clicked() {
-                        match validate_id(self.attach_id.trim()) {
-                            Ok(()) => {
-                                let job = self.job.as_mut().unwrap();
-                                for g in job.groups.iter_mut().filter(|g| g.remote == Remote::Submitting) {
-                                    g.remote = Remote::Waiting(self.attach_id.trim().into());
+                ui.add_enabled_ui(self.task.is_none(), |ui| {
+                    ui.weak("These controls apply to the first unconfirmed group. Attach its batch ID, or resend only if no batch exists.");
+                    crate::stopped(ui.text_edit_singleline(&mut self.attach_id));
+                    ui.horizontal(|ui| {
+                        if crate::stopped(ui.button("Attach batch ID")).clicked() {
+                            match validate_id(self.attach_id.trim()) {
+                                Ok(()) => {
+                                    let job = self.job.as_mut().unwrap();
+                                    if let Some(g) = job.groups.iter_mut().find(|g| g.remote == Remote::Submitting) {
+                                        g.remote = Remote::Waiting(self.attach_id.trim().into());
+                                    }
+                                    self.retry = true;
                                 }
-                                self.retry = true;
+                                Err(e) => self.error = e,
                             }
-                            Err(e) => self.error = e,
                         }
-                    }
-                    if crate::stopped(ui.button("Send again").on_hover_text("No batch was made. The provider may bill twice if one was.")).clicked() {
-                        self.job.as_mut().unwrap().send_again();
-                        self.retry = true;
-                    }
+                        if crate::stopped(ui.button("Send again").on_hover_text("No batch was made. The provider may bill twice if one was.")).clicked() {
+                            let job = self.job.as_mut().unwrap();
+                            if let Some(i) = job.groups.iter().position(|g| g.remote == Remote::Submitting) { job.send_again(i); }
+                            self.retry = true;
+                        }
+                    });
+                    if self.retry && let Err(e) = self.job.as_ref().unwrap().save(&self.dir) { self.error = e; }
                 });
-                if self.retry && let Err(e) = self.job.as_ref().unwrap().save(&self.dir) { self.error = e; }
             });
         }
         if self.running() {
@@ -1279,11 +1293,72 @@ mod tests {
             assert!(body.is_none(), "Recovery must never send another paid request.");
             Ok(json!({"operations":[]}))
         });
-        assert!(result.is_err());
-        job.send_again();
+        result.unwrap();
+        job.send_again(0);
         let (job, result) = files.advance(job, id("batches/batch-3"));
         result.unwrap();
         assert!(!job.uncertain());
+    }
+
+    #[test]
+    fn an_unconfirmed_group_does_not_block_new_sheets() {
+        let files = Files::new();
+        let (mut job, _) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Unknown("Lost reply".into())));
+        RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255])).save(files.root.join("another.png")).unwrap();
+        let extra = files.prepare(Kind::Gemini).sheets.into_iter().find(|s| s.rel == "another.png").unwrap();
+        job.sheets.push(extra);
+        let (job, _) = files.advance(job, |_, body| {
+            assert!(body.is_none());
+            Ok(json!({"operations":[]}))
+        });
+        let job = { job.save(&files.spool).unwrap(); files.journal() };
+        let (job, result) = files.advance(job, |path, body| {
+            assert!(path.ends_with(":batchGenerateContent"), "Recovery blocked the queued sheets: {path}");
+            let requests = body.unwrap().pointer("/batch/inputConfig/requests/requests").unwrap().as_array().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["metadata"]["key"], "sheet-1");
+            Ok(json!({"name":"batches/next"}))
+        });
+        result.unwrap();
+        assert!(job.uncertain());
+        assert_eq!(job.groups.len(), 2);
+    }
+
+    #[test]
+    fn a_rejected_new_upload_does_not_resend_an_older_uncertain_group() {
+        let files = Files::new();
+        let (mut job, _) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Unknown("Lost reply".into())));
+        RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255])).save(files.root.join("another.png")).unwrap();
+        job.sheets.push(files.prepare(Kind::Gemini).sheets.into_iter().find(|s| s.rel == "another.png").unwrap());
+        job.submit_next = true;
+        let (job, result) = files.advance(job, |_, body| {
+            assert!(body.is_some());
+            Err(Failure::Status(429, "Try later".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(job.groups.len(), 1);
+        assert_eq!(job.groups[0].remote, Remote::Submitting);
+        assert!(job.sheets[0].taken);
+        assert!(!job.sheets[1].taken);
+    }
+
+    #[test]
+    fn recovery_checks_each_unconfirmed_group() {
+        let files = Files::new();
+        let (mut job, _) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Unknown("Lost reply".into())));
+        let mut second = job.groups[0].clone();
+        second.recovery.as_mut().unwrap().reference = "second".into();
+        job.groups.push(second);
+        let (job, result) = files.advance(job, |_, _| Ok(json!({"operations":[]})));
+        result.unwrap();
+        assert_eq!(job.groups[0].recovery.as_ref().unwrap().reference, "second");
+        assert!(job.groups[1].recovery.as_ref().unwrap().not_found);
+        let (job, result) = files.advance(job, |_, _| Ok(json!({"operations":[
+            {"name":"batches/second", "metadata":{"displayName":"second", "model":"models/test"}}
+        ]})));
+        result.unwrap();
+        assert!(job.groups.iter().any(|g| g.remote == Remote::Waiting("batches/second".into())));
+        assert!(job.uncertain());
     }
 
     #[test]
