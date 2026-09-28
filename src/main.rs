@@ -125,6 +125,7 @@ struct App {
     library_batch: batch::Panel,
     /// The sheet whose label waits for the user's yes to be removed.
     remove_label: Option<(PathBuf, String)>,
+    clear_labels: Option<PathBuf>,
     /// The settings popup was open at the last frame; both files are
     /// written when it closes.
     config_open: bool,
@@ -377,6 +378,7 @@ impl App {
             prompt_view: None,
             library_batch: batch::Panel::default(),
             remove_label: None,
+            clear_labels: None,
             config_open: false,
             settings_open: false,
             settings_request: false,
@@ -1430,7 +1432,12 @@ impl App {
             let done = entries.iter().filter(|e| e.side.label.is_some()).count();
             ui.label(format!("{done} of {} sheets have a label.", entries.len()));
         }
-        self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys);
+        self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys, self.label_run.is_some());
+        let can_clear = self.library.is_set() && self.library.index.error.is_none()
+            && self.label_run.is_none() && !self.library_batch.busy();
+        if stopped(ui.add_enabled(can_clear, egui::Button::new("Clear all..."))).clicked() {
+            self.clear_labels = Some(self.library.index.root.clone());
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -1467,6 +1474,15 @@ impl App {
         if let Err(e) = sidecar::store_tag_list(&self.library.index.root, &self.library.index.tag_list) {
             self.status = format!("Could not save the tag list: {e}");
         }
+    }
+
+    fn clear_library_labels(&mut self, root: &Path) -> Result<usize, String> {
+        if self.label_run.is_some() { return Err("Wait for the labeling request to finish or cancel it first.".into()); }
+        self.library_batch.discard_completed(root)?;
+        let cleared: Vec<_> = sidecar::clear_labels(root)?.into_iter().map(|rel| (rel, None)).collect();
+        self.apply_labels(root, &cleared);
+        self.label_outcome = None;
+        Ok(cleared.len())
     }
 
     /// Every UI entry point reaches this operation after it opens the target sheet.

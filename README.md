@@ -82,7 +82,7 @@ Tilepicky can generate searchable captions and tags for library sheets using mul
 
 ![Read a saved example label and find a dungeon sheet through its weapon tag](media/ai-labels.gif)
 
-The recording uses saved example labels. It shows the compact AI panel, **Show AI label...**, and a search for `weapon`.
+The recording uses saved example labels. It shows the AI panel, **Show AI label...**, and a search for `weapon`.
 The search finds the dungeon sheet through its tags. The recording sends no requests.
 
 ### Label a single sheet
@@ -115,6 +115,14 @@ To label multiple library sheets in bulk:
 2. Open **AI assist** (`I`), and under **Whole library** select **Label the unlabeled sheets...**.
 3. Choose a batch model and provider key in Settings. The default is `z-ai/glm-5.3-flash:batch` on OpenRouter.
 4. Review the unlabeled sheet count, the token limit, and the tags to look for, then click **Start batch**.
+
+Use **Rerun all...** to label every sheet again with the current batch model and tag list.
+Review the request count and confirm with **Start batch**. Existing labels stay until new results arrive.
+Failed requests keep their old labels.
+
+Use **Clear all...** to remove all saved AI captions and tags in the library, including its subfolders.
+Confirm with **Clear all**. Images, grids, animations, and the list of tags to look for stay.
+This cannot be undone. Wait for labeling to finish or cancel it before you clear labels or start another batch.
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 

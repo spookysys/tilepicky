@@ -439,8 +439,9 @@ fn providers_ui(
                     .on_hover_text("OpenRouter provider slugs to skip, separated by commas. Empty allows all providers.");
                 if edit.changed() { p.skip = Some(crate::labels::parse_list(&skip)); }
                 // Keep separators while the user types the next provider.
+                let focused = edit.has_focus();
                 ui.data_mut(|data| {
-                    if edit.has_focus() { data.insert_temp(id, skip); } else { data.remove::<String>(id); }
+                    if focused { data.insert_temp(id, skip); } else { data.remove::<String>(id); }
                 });
                 ui.end_row();
             }
@@ -522,6 +523,15 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_draw_with_an_openrouter_skip_field() {
+        let ctx = egui::Context::default();
+        let mut ai = Ai::default();
+        let mut keys = Keys::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| settings_ui(ui, &mut ai, &mut keys));
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn old_settings_default_to_phala_but_an_empty_skip_list_stays_empty() {

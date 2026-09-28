@@ -291,6 +291,18 @@ pub fn store_labels<'a>(dir: &Path, labels: impl IntoIterator<Item = (&'a str, O
     write_book(dir, &book)
 }
 
+/// Clears all labels in the book, including entries for missing files.
+pub fn clear_labels(dir: &Path) -> Result<Vec<String>, String> {
+    let mut book = load_book(dir)?;
+    let mut cleared = Vec::new();
+    for (rel, side) in &mut book.sheets {
+        if side.label.take().is_some() { cleared.push(rel.clone()); }
+    }
+    book.sheets.retain(|_, side| !side.is_empty());
+    write_book(dir, &book)?;
+    Ok(cleared)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -331,6 +343,27 @@ mod tests {
         assert_eq!(book.sheets.len(), 3);
         store_labels(dir, [("a.png", None)]).unwrap();
         assert!(!load_book(dir).unwrap().sheets.contains_key("a.png"));
+    }
+
+    #[test]
+    fn clear_all_keeps_metadata_and_refuses_damaged_books() {
+        let folder = crate::storage::tests::Folder::new();
+        let label = Label { provider: "test".into(), model: "test".into(), status: Status::Labeled,
+            caption: "Tree".into(), tags: vec!["tree".into()], tag_list: None };
+        let side = Sidecar { tile: Some(Pair::One(16)), gap: Some(Pair::One(1)),
+            provenance: vec![Provenance { source: "source.png".into(), rects: vec![[0, 0, 16, 16]] }], ..Sidecar::default() };
+        store_entry(&folder.0, "nested/sheet.png", &side).unwrap();
+        store_tag_list(&folder.0, &["tree".into()]).unwrap();
+        store_labels(&folder.0, [("nested/sheet.png", Some(label.clone())), ("missing.png", Some(label))]).unwrap();
+        let cleared = clear_labels(&folder.0).unwrap();
+        assert_eq!(cleared, ["missing.png", "nested/sheet.png"]);
+        let book = load_book(&folder.0).unwrap();
+        assert_eq!(book.sheets.len(), 1);
+        assert_eq!(book.sheets["nested/sheet.png"], side);
+        assert_eq!(book.tag_list, Some(vec!["tree".into()]));
+        std::fs::write(folder.0.join(BOOK), "broken").unwrap();
+        assert!(clear_labels(&folder.0).is_err());
+        assert_eq!(std::fs::read_to_string(folder.0.join(BOOK)).unwrap(), "broken");
     }
 
     /// Books from before whole-sheet labels hold island regions under `labels`.

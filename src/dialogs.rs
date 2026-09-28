@@ -46,6 +46,7 @@ impl App {
         self.confirm_dialog(ctx);
         self.label_dialog(ctx);
         self.remove_label_dialog(ctx);
+        self.clear_labels_dialog(ctx);
         self.prompt_dialog(ctx);
         self.library_batch.confirmation(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.has_unsaved() {
@@ -262,7 +263,7 @@ impl App {
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
         self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.prompt_view.is_some() || self.library_batch.open()
-            || self.label_view || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
+            || self.clear_labels.is_some() || self.label_view || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
             || egui::Popup::is_any_open(ctx)
     }
 
@@ -333,6 +334,31 @@ impl App {
             close = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
         });
         if close { self.prompt_view = None; }
+    }
+
+    fn clear_labels_dialog(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.clear_labels.clone() else { return };
+        let mut choice = None;
+        egui::Modal::new(Id::new("clear all AI labels")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.heading("Clear all AI labels?");
+            ui.label(root.display().to_string());
+            ui.label("This removes all saved AI captions and tags in this library, including its subfolders.");
+            ui.label("Images, grids, animations, and the list of tags to look for stay. This cannot be undone.");
+            ui.horizontal(|ui| {
+                if ui.button("Clear all").clicked() { choice = Some(true); }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) { choice = Some(false); }
+            });
+        });
+        if let Some(clear) = choice {
+            self.clear_labels = None;
+            if clear {
+                self.status = match self.clear_library_labels(&root) {
+                    Ok(n) => format!("Cleared {n} AI labels."),
+                    Err(e) => e,
+                };
+            }
+        }
     }
 
     fn remove_label_dialog(&mut self, ctx: &egui::Context) {

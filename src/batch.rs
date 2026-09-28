@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! One library job: the sheets without a label, each sent as the request that
+//! One library job: selected sheets, each sent as the request that
 //! Label with AI sends. Google's Gemini API takes them as a batch. An
 //! OpenAI-style endpoint takes them one at a time: OpenRouter's batch API
 //! reads only images at public URLs, and a library lies on this machine.
@@ -64,6 +64,9 @@ pub struct Job {
     pub groups: Vec<Group>,
     /// The sheets that had a label already.
     pub skipped: usize,
+    /// Existing labels that this job will replace.
+    #[serde(default)]
+    pub replacing: usize,
     /// The library's tag list when the job started. Every request of the job
     /// asks for it, and every label records it.
     #[serde(default)]
@@ -104,14 +107,20 @@ fn body(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
     Ok(gemini_request(&labels::request(&job.model, img, &job.tag_list)?))
 }
 
-/// Lists the sheets without a label. It reads no image and sends nothing.
-pub fn prepare(index: &Index, provider: Provider, model: String) -> Result<Job, String> {
+#[derive(Clone, Copy, PartialEq)]
+pub enum Scope { Unlabeled, All }
+
+/// Lists the requested sheets. It reads no image and sends nothing.
+pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -> Result<Job, String> {
     endpoint(&provider)?;
     if let Some(error) = &index.error { return Err(error.clone()); }
-    let (labeled, open): (Vec<_>, Vec<_>) = index.entries.iter().partition(|e| e.side.label.is_some());
+    let labeled = index.entries.iter().filter(|e| e.side.label.is_some()).count();
+    let all = scope == Scope::All;
+    let open = index.entries.iter().filter(|e| all || e.side.label.is_none());
     Ok(Job {
-        provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: labeled.len(), tag_list: index.tag_list.clone(),
-        sheets: open.iter().map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
+        provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
+        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(),
+        sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
             .collect(),
     })
 }
@@ -415,6 +424,23 @@ impl Panel {
 
     pub fn open(&self) -> bool { self.proposal.is_some() }
 
+    pub fn busy(&self) -> bool { self.running() || self.task.is_some() || self.open() }
+
+    /// Prevents a completed journal from restoring labels after Clear all.
+    pub fn discard_completed(&mut self, root: &Path) -> Result<(), String> {
+        if self.busy() { return Err("Wait for the batch to finish or cancel it first.".into()); }
+        if self.root != root { return Err("The batch panel belongs to another library.".into()); }
+        if self.dir.as_os_str().is_empty() { return Err("The batch journal directory is unavailable.".into()); }
+        match std::fs::remove_file(self.dir.join("state.json")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not remove the completed batch journal: {e}")),
+        }
+        self.job = None;
+        (self.error, self.failures, self.next_check, self.retry) = (String::new(), 0, None, false);
+        Ok(())
+    }
+
     /// Records a failure. The next try waits longer after each one, up to 8 minutes.
     pub fn fail(&mut self, error: String) {
         self.error = error;
@@ -536,7 +562,7 @@ impl Panel {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut eframe::egui::Ui, index: &Index, ai: &crate::ai::Ai, keys: &crate::ai::Keys) {
+    pub fn ui(&mut self, ui: &mut eframe::egui::Ui, index: &Index, ai: &crate::ai::Ai, keys: &crate::ai::Keys, single_running: bool) {
         use eframe::egui;
         let configured = ai.chosen(crate::ai::Mode::Batch);
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
@@ -586,15 +612,16 @@ impl Panel {
         }
         if self.retry { self.next_check = None; }
         if !ready { ui.weak("Set a batch model and its key in Settings."); }
-        let button = ui.add_enabled(ready && !self.running() && self.task.is_none() && !index.root.as_os_str().is_empty(),
-            egui::Button::new("Label the unlabeled sheets..."));
-        crate::stop(&button);
-        if button.clicked() {
-            let (provider, model) = configured.unwrap();
-            // The panel follows the open library while no batch runs; see `tick`.
-            match prepare(index, provider.clone(), model.id.clone()) {
-                Ok(job) => self.proposal = Some(job),
-                Err(e) => self.error = e,
+        let idle = !self.busy() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
+        for (text, scope) in [("Label the unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
+            let button = ui.add_enabled(ready && idle && !index.entries.is_empty(), egui::Button::new(text));
+            crate::stop(&button);
+            if button.clicked() {
+                let (provider, model) = configured.unwrap();
+                match prepare(index, provider.clone(), model.id.clone(), scope) {
+                    Ok(job) => self.proposal = Some(job),
+                    Err(e) => self.error = e,
+                }
             }
         }
     }
@@ -613,7 +640,12 @@ impl Panel {
                 ui.label("Every sheet has a label already.");
             } else {
                 ui.label(format!("Sheets to label: {}, one request each.", job.sheets.len()));
-                ui.label(format!("Skipped because they have a label: {}.", job.skipped));
+                if job.replacing > 0 {
+                    ui.label(format!("Existing labels to replace: {}.", job.replacing));
+                    ui.label("Existing labels stay until new results arrive. Failed requests keep the old labels.");
+                } else {
+                    ui.label(format!("Skipped because they have a label: {}.", job.skipped));
+                }
                 ui.label(format!("At most {} output tokens.", job.sheets.len() * 4096));
                 match job.tag_list.is_empty() {
                     true => ui.label("Tags to look for: none."),
@@ -657,7 +689,7 @@ mod tests {
             Self { base, root, spool }
         }
         fn prepare(&self, kind: Kind) -> Job {
-            prepare(&Index::scan(&self.root, [16, 16]), provider(kind), "test:batch".into()).unwrap()
+            prepare(&Index::scan(&self.root, [16, 16]), provider(kind), "test:batch".into(), Scope::Unlabeled).unwrap()
         }
         fn advance(&self, job: Job, send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
             advance(job, &self.root, &self.spool, send)
@@ -696,6 +728,41 @@ mod tests {
         assert_eq!(job.skipped, 1);
         assert_eq!(job.model, "test");
         assert!(!files.spool.exists());
+    }
+
+    #[test]
+    fn rerun_keeps_old_labels_until_a_replacement_is_imported() {
+        let files = Files::new();
+        let old = labels::response(&completion(labeled("Old")), &[]).unwrap().into_label("test", "test", &[]);
+        crate::sidecar::store_labels(&files.root, [("folder/sheet.png", Some(old.clone()))]).unwrap();
+        let index = Index::scan(&files.root, [16, 16]);
+        let job = prepare(&index, provider(Kind::OpenAi), "test:batch".into(), Scope::All).unwrap();
+        assert_eq!((job.sheets.len(), job.skipped, job.replacing), (1, 0, 1));
+        assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label, Some(old.clone()));
+        let (failed, _) = files.advance(job.clone(), |_, _| Err(Failure::Status(401)));
+        let mut panel = Panel { root: files.root.clone(), dir: files.spool.clone(), job: Some(failed), ..Panel::default() };
+        assert!(panel.import().is_empty());
+        assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label, Some(old));
+        let (job, result) = files.advance(job, |_, _| Ok(completion(labeled("New"))));
+        result.unwrap();
+        panel.job = Some(job);
+        assert_eq!(panel.import().len(), 1);
+        assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label.as_ref().unwrap().caption, "New");
+    }
+
+    #[test]
+    fn clear_discards_finished_results_but_refuses_active_batches() {
+        let files = Files::new();
+        let job = files.prepare(Kind::OpenAi);
+        let mut panel = Panel { root: files.root.clone(), dir: files.spool.clone(), job: Some(job.clone()), ..Panel::default() };
+        assert!(panel.discard_completed(&files.root).is_err());
+        let (job, result) = files.advance(job, |_, _| Ok(completion(labeled("New"))));
+        result.unwrap();
+        panel.job = Some(job);
+        panel.discard_completed(&files.root).unwrap();
+        assert!(panel.import().is_empty());
+        assert!(Job::load(&files.spool).unwrap().is_none());
+        assert!(!panel.busy());
     }
 
     /// An OpenAI-style endpoint gets one request per sheet, as Label with AI
