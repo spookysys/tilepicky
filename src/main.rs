@@ -1419,40 +1419,58 @@ impl App {
     /// The library panel shows the model, batch controls, and proposed tags.
     fn assist_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("AI labels");
-        if ui.button("Copy log").on_hover_text("Copy recent AI prompts, replies, tags, and errors. Keys and images are omitted.").clicked() {
-            self.copy_ai_log(ui.ctx());
-        }
+        ui.horizontal(|ui| {
+            if stopped(ui.small_button("Settings...")).clicked() { self.settings_request = true; }
+            if stopped(ui.small_button("Copy log"))
+                .on_hover_text("Copy recent AI prompts, replies, tags, and errors. Keys and images are omitted.").clicked() {
+                self.copy_ai_log(ui.ctx());
+            }
+        });
+        ui.add_space(6.0);
+        ui.strong("Single sheet");
         let instant = self.settings.ai.chosen(ai::Mode::Instant)
             .filter(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
+        let ready = instant.is_some();
+        match instant {
+            Some((p, m)) => { ui.weak(format!("{} / {}", p.name, m.id)); }
+            None => { ui.weak("Choose a model and key in Settings."); }
+        }
+        if let Some(sheet) = &self.library.sheet {
+            let name = Path::new(&sheet.rel).file_name().unwrap_or_default().to_string_lossy();
+            ui.label(format!("Selected: {name}")).on_hover_text(&sheet.rel);
+        }
+        else { ui.weak("Open a library sheet to label it."); }
         ui.horizontal_wrapped(|ui| {
-            match instant {
-                Some((p, m)) => { ui.weak(format!("Single-sheet model: {} / {}", p.name, m.id)); }
-                None => { ui.colored_label(ui.visuals().warn_fg_color, "Single-sheet model: no model with a key yet."); }
+            if stopped(ui.add_enabled(ready && self.library.sheet.is_some() && self.label_run.is_none(),
+                egui::Button::new("Label this sheet"))).clicked() {
+                self.label_action(&ui.ctx().clone(), labels::Action::Label);
             }
-            if stopped(ui.small_button("Settings...")).on_hover_text("Choose the models and keys (Ctrl+,).").clicked() {
-                self.settings_request = true;
+            if self.library.sheet.as_ref().is_some_and(|s| s.side.label.is_some())
+                && stopped(ui.button("View label")).clicked() {
+                self.label_action(&ui.ctx().clone(), labels::Action::Show);
             }
         });
 
+        ui.add_space(6.0);
         ui.separator();
-        ui.strong("Whole library");
-        let entries = &self.library.index.entries;
-        if self.library.is_set() {
+        ui.strong("Library batch");
+        if self.library.is_set() && self.library_batch.job.is_none() {
+            let entries = &self.library.index.entries;
             let done = entries.iter().filter(|e| e.side.label.is_some()).count();
-            ui.label(format!("{done} of {} sheets have a label.", entries.len()));
+            ui.weak(format!("{done} of {} sheets already labeled", entries.len()));
         }
         self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys, self.label_run.is_some());
         let can_clear = self.library.is_set() && self.library.index.error.is_none()
             && self.label_run.is_none() && !self.library_batch.busy();
-        if stopped(ui.add_enabled(can_clear, egui::Button::new("Clear all..."))).clicked() {
+        if !self.library_batch.busy() && stopped(ui.add_enabled(can_clear, egui::Button::new("Clear all..."))).clicked() {
             self.clear_labels = Some(self.library.index.root.clone());
         }
 
         ui.add_space(6.0);
         ui.separator();
         ui.strong("Tags to look for");
-        ui.weak("The model checks every sheet for each of these, and adds tags of its own. Commas separate them. \
-            The list is saved with the library.");
+        ui.weak("The model checks these tags and can add its own. Separate tags with commas.");
+        if self.library_batch.busy() { ui.weak("Changes apply to future requests. This batch keeps its original tags."); }
         let edit = stopped(ui.add_enabled(self.library.is_set(),
             egui::TextEdit::multiline(&mut self.tag_text).desired_rows(3).desired_width(f32::INFINITY)));
         if edit.changed() {

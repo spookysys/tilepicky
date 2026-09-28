@@ -91,7 +91,7 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 1. Open a library sheet.
 2. Open the **AI assist** panel with `I` or the header toolbar button.
 3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output. Tilepicky ships with OpenRouter and `z-ai/glm-5.3-flash`; set `OPENROUTER_API_KEY` or type the key in Settings.
-4. Right-click the sheet or its file-tree row and select **Label with AI**.
+4. Click **Label this sheet** under **Single sheet**, or select **Label with AI** from the sheet's right-click menu.
 5. The label popup opens with the request progress, provider, and model. It shows the caption and tags or the error.
    Use **Label again** to replace a label. Use **Show AI label...** to reopen the popup.
 
@@ -120,7 +120,7 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 To label multiple library sheets in bulk:
 
 1. Open the library folder.
-2. Open **AI assist** (`I`), and under **Whole library** select **Label the unlabeled sheets...**.
+2. Open **AI assist** (`I`), and under **Library batch** select **Label unlabeled sheets...**.
 3. Choose a batch model and provider key in Settings. The default is `z-ai/glm-5.3-flash:batch` on OpenRouter.
 4. Review the unlabeled sheet count, the token limit, and the tags to look for, then click **Start batch**.
 
@@ -147,7 +147,11 @@ Batch state persists in `~/.config/tilepicky/` across application restarts. If a
 Tilepicky saves a unique reference before each Google submission. If its reply is lost, Tilepicky looks up that reference automatically.
 It checks accepted groups while submitting the remaining sheets. The progress counts separate queued sheets, provider work, and unconfirmed submissions.
 It never automatically resends an unconfirmed submission. **Advanced recovery** contains manual controls for older or ambiguous jobs.
-The panel names the single-sheet model separately from the batch model. A running batch keeps its original provider and model.
+The pane separates **Single sheet** actions from **Library batch** progress. Each section shows its provider and model.
+A running batch keeps its original provider and model.
+The current operation shows image preparation, the actual upload count, result checks, or submission recovery, with elapsed seconds.
+Between requests, the pane shows the next check time. A progress bar counts processed sheets, including failures.
+Queue counts show where unfinished work waits. **Error details** and **Failed sheets** keep explanations available without filling the pane.
 
 ### Tags to look for
 

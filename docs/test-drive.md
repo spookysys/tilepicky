@@ -117,8 +117,8 @@ It also documents Google's paid-project requirement and the `gemini-flash-latest
 
 ## Automated checks
 
-- `cargo test --locked`: 118 passed, with no ignored tests.
-- `cargo test --locked --features wgpu`: 118 passed, with no ignored tests.
+- `cargo test --locked`: 122 passed, with no ignored tests.
+- `cargo test --locked --features wgpu`: 122 passed, with no ignored tests.
 - `cargo clippy --locked --all-targets --features wgpu`: passed.
 - `cargo build --release --locked --features wgpu`: passed.
 
@@ -157,3 +157,18 @@ Tests cover the saved reference, paginated recovery, ambiguity, and polling befo
 The WGPU interface check showed separate single-sheet and batch model names.
 It showed queued, provider, and unconfirmed counts, with manual controls collapsed under Advanced recovery.
 The test endpoint was local; this check sent no new paid requests.
+
+## Batch activity and AI pane layout
+
+The worker reports image preparation, actual upload size, result checks, and recovery as separate activities.
+Both the pane and status bar show elapsed seconds for the current activity.
+A regression reproduced the vague connection message before the change.
+Tests distinguish result checks from provider processing and verify actual upload counts.
+
+Single-sheet controls and library-batch controls occupy separate sections.
+The batch section has a processed-sheet progress bar and aligned queue counts.
+Idle batch actions disappear during an active job. Error details remain expandable.
+
+The private WGPU interface check opened View label and verified the saved caption and tags.
+A local test endpoint verified the elapsed upload status, retry countdown, and expandable error details.
+The check used no paid requests. The status bar kept the batch summary compact.

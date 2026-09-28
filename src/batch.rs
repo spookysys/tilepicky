@@ -87,21 +87,25 @@ pub struct Job {
     poll_next: bool,
 }
 
+#[derive(Clone, Copy)]
+enum Operation { Label, Submit, Poll, Recover }
+
 impl Job {
+    fn operation(&self) -> Operation {
+        let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
+        if self.provider.kind == Kind::OpenAi { Operation::Label }
+        else if waiting && (self.poll_next || (!self.untaken() && !self.uncertain())) { Operation::Poll }
+        else if self.uncertain() { Operation::Recover }
+        else if self.untaken() { Operation::Submit }
+        else { Operation::Poll }
+    }
+
     fn untaken(&self) -> bool { self.sheets.iter().any(|s| !s.taken) }
     pub fn done(&self) -> bool { !self.untaken() && self.groups.iter().all(|g| g.remote == Remote::Done) }
     /// A Gemini batch went out and no reply confirmed it. An OpenAI-style job
     /// is never so: its groups are released; see `release_groups`.
     pub fn uncertain(&self) -> bool {
         self.provider.kind == Kind::Gemini && self.groups.iter().any(|g| g.remote == Remote::Submitting)
-    }
-    fn progress(&self) -> String {
-        let labeled = self.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
-        let failed = self.sheets.iter().filter(|s| !s.error.is_empty()).count();
-        let base = format!("Labeled: {labeled} of {}. Failed: {failed}.", self.sheets.len());
-        if self.provider.kind != Kind::Gemini { return base; }
-        let (queued, waiting, uncertain) = self.submission_counts();
-        format!("{base}\nQueued: {queued}. At provider: {waiting}. Unconfirmed: {uncertain}.")
     }
     fn submission_counts(&self) -> (usize, usize, usize) {
         let queued = self.sheets.iter().filter(|s| !s.taken).count();
@@ -324,21 +328,11 @@ type Send<'a> = &'a mut dyn FnMut(&str, Option<&Value>) -> Result<Value, Failure
 /// of sheets, or ask about a submitted one. The job is saved before it
 /// returns, with or without error.
 pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
-    let waiting = job.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
-    let result = if job.provider.kind == Kind::OpenAi {
-        job.release_groups();
-        one(&mut job, root, dir, &mut send)
-    } else if waiting && (job.poll_next || (!job.untaken() && !job.uncertain())) {
-        job.poll_next = false;
-        poll(&mut job, dir, &mut send)
-    } else if job.uncertain() {
-        job.poll_next = true;
-        recover(&mut job, dir, &mut send)
-    } else if job.untaken() {
-        job.poll_next = true;
-        submit(&mut job, root, dir, &mut send)
-    } else {
-        poll(&mut job, dir, &mut send)
+    let result = match job.operation() {
+        Operation::Label => { job.release_groups(); one(&mut job, root, dir, &mut send) }
+        Operation::Poll => { job.poll_next = false; poll(&mut job, dir, &mut send) }
+        Operation::Recover => { job.poll_next = true; recover(&mut job, dir, &mut send) }
+        Operation::Submit => { job.poll_next = true; submit(&mut job, root, dir, &mut send) }
     };
     (job, result)
 }
@@ -504,6 +498,48 @@ impl Job {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Activity { Preparing, Uploading(usize), Checking, Recovering, Labeling }
+
+impl Activity {
+    fn before(operation: Operation) -> Self {
+        match operation {
+            Operation::Label => Self::Labeling, Operation::Submit => Self::Preparing,
+            Operation::Poll => Self::Checking, Operation::Recover => Self::Recovering,
+        }
+    }
+
+    fn request(path: &str, body: Option<&Value>) -> Self {
+        if path.ends_with(":batchGenerateContent") {
+            let count = body.and_then(|b| b.pointer("/batch/inputConfig/requests/requests"))
+                .and_then(Value::as_array).map_or(0, Vec::len);
+            Self::Uploading(count)
+        } else if path == "chat/completions" { Self::Labeling }
+        else if path.starts_with("batches?") { Self::Recovering }
+        else { Self::Checking }
+    }
+
+    fn description(self, provider: &str, seconds: u64) -> String {
+        let action = match self {
+            Self::Preparing => "Preparing images for the next upload".into(),
+            Self::Uploading(count) => format!("Uploading {count} {} to {provider}", if count == 1 { "sheet" } else { "sheets" }),
+            Self::Checking => format!("Checking results from {provider}"),
+            Self::Recovering => format!("Looking up the interrupted submission at {provider}"),
+            Self::Labeling => format!("Labeling one sheet with {provider}"),
+        };
+        format!("{action} ({seconds} s)")
+    }
+
+    fn summary(self, seconds: u64) -> String {
+        let action = match self {
+            Self::Preparing => "preparing upload".into(), Self::Uploading(n) => format!("uploading {n}"),
+            Self::Checking => "checking results".into(), Self::Recovering => "recovering submission".into(),
+            Self::Labeling => "labeling one sheet".into(),
+        };
+        format!("{action}; {seconds} s")
+    }
+}
+
 /// The part of the AI panel that runs library batches, and its state
 /// between frames. A worker thread does each network operation.
 #[derive(Default)]
@@ -516,6 +552,8 @@ pub struct Panel {
     /// A batch that waits for the user's yes. It is not in the journal yet.
     proposal: Option<Job>,
     task: Option<mpsc::Receiver<(Job, Result<(), String>)>>,
+    progress: Option<mpsc::Receiver<Activity>>,
+    activity: Option<(Activity, Instant)>,
     error: String,
     /// Failures in a row, for the wait before the next try.
     failures: u32,
@@ -532,23 +570,31 @@ impl Panel {
 
     pub fn busy(&self) -> bool { self.running() || self.task.is_some() || self.open() }
 
+    fn submission_counts(&self, job: &Job) -> (usize, usize, usize) {
+        let (queued, waiting, uncertain) = job.submission_counts();
+        if self.task.is_some() && let Some((Activity::Uploading(count), _)) = self.activity {
+            (queued.saturating_sub(count), waiting, uncertain + count)
+        } else { (queued, waiting, uncertain) }
+    }
+
     /// A compact status for the main window when no newer message takes its place.
     pub fn status(&self) -> Option<String> {
         let job = self.job.as_ref()?;
         if job.done() && self.error.is_empty() { return None; }
-        let labeled = job.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
-        let failed = job.sheets.iter().filter(|s| !s.error.is_empty()).count();
-        let pending = job.sheets.iter().filter(|s| s.label.is_none() && s.error.is_empty()).count();
-        let state = if job.uncertain() {
-                if job.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_none()) { "needs attention" } else { "recovering" }
-            }
-            else if self.task.is_some() { "working" }
-            else if !self.error.is_empty() { "retry pending" } else { "waiting" };
+        let processed = job.sheets.iter().filter(|s| s.label.is_some() || !s.error.is_empty()).count();
+        let total = job.sheets.len();
+        let state = if self.task.is_some() {
+            let (activity, seconds) = self.current_activity(job);
+            activity.summary(seconds)
+        } else if job.uncertain() {
+            if job.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_none()) { "needs attention".into() }
+            else { "recovering".into() }
+        } else if !self.error.is_empty() { "retry pending".into() } else { "waiting".into() };
         if job.provider.kind == Kind::Gemini {
-            let (queued, waiting, uncertain) = job.submission_counts();
-            Some(format!("AI batch: {queued} queued, {waiting} at provider, {uncertain} unconfirmed, {labeled} labeled, {failed} failed ({state})"))
+            let (_, waiting, _) = self.submission_counts(job);
+            Some(format!("AI batch: {state} | {waiting} at {} | {processed}/{total} processed", job.provider.name))
         } else {
-            Some(format!("AI batch: {labeled} labeled, {pending} pending, {failed} failed ({state})"))
+            Some(format!("AI batch: {state} | {processed}/{total} processed"))
         }
     }
 
@@ -586,6 +632,9 @@ impl Panel {
                 Err(e) => self.error = e,
             }
         }
+        if let Some(progress) = &self.progress {
+            while let Ok(activity) = progress.try_recv() { self.activity = Some((activity, Instant::now())); }
+        }
         if let Some(rx) = &self.task {
             let result = match rx.try_recv() {
                 Ok((job, result)) => Some((Some(job), result)),
@@ -594,6 +643,8 @@ impl Panel {
             };
             if let Some((job, result)) = result {
                 self.task = None;
+                self.progress = None;
+                self.activity = None;
                 let soon = job.as_ref().is_some_and(Job::untaken);
                 match job {
                     Some(job) if self.job.is_some() => self.job = Some(job),
@@ -622,8 +673,16 @@ impl Panel {
                     let (tx, rx) = mpsc::channel();
                     let ctx = ctx.clone();
                     self.task = Some(rx);
+                    self.activity = Some((Activity::before(job.operation()), Instant::now()));
+                    let (progress_tx, progress_rx) = mpsc::channel();
+                    self.progress = Some(progress_rx);
                     std::thread::spawn(move || {
-                        let _ = tx.send(advance(job, &root, &dir, |path, body| transport.send(path, body)));
+                        let result = advance(job, &root, &dir, |path, body| {
+                            let _ = progress_tx.send(Activity::request(path, body));
+                            ctx.request_repaint();
+                            transport.send(path, body)
+                        });
+                        let _ = tx.send(result);
                         ctx.request_repaint();
                     });
                 }
@@ -674,22 +733,28 @@ impl Panel {
         }
     }
 
-    /// What the batch does now, in one line.
+    fn current_activity(&self, job: &Job) -> (Activity, u64) {
+        self.activity.map(|(activity, started)| (activity, started.elapsed().as_secs()))
+            .unwrap_or((Activity::before(job.operation()), 0))
+    }
+
+    /// Separates network activity from time spent waiting for provider processing.
     fn state(&self, job: &Job) -> String {
         let wait = self.next_check.map_or(0, |t| t.saturating_duration_since(Instant::now()).as_secs());
-        if job.uncertain() {
-            if self.task.is_some() { "Checking the provider to recover the submission...".into() }
-            else if !self.error.is_empty() { format!("{} Next check in {wait} s.", self.error) }
-            else { "Recovering the interrupted submission...".into() }
-        } else if self.task.is_some() {
-            if job.provider.kind == Kind::OpenAi { "Labeling the sheets one by one...".into() }
-            else { format!("Contacting {}...", job.provider.name) }
+        if self.task.is_some() {
+            let (activity, seconds) = self.current_activity(job);
+            activity.description(&job.provider.name, seconds)
         } else if !self.error.is_empty() {
-            format!("{} Next try in {wait} s.", self.error)
+            if job.done() { "Attention needed. See error details.".into() }
+            else { format!("Request failed. Retrying in {wait} s.") }
+        } else if job.uncertain() {
+            format!("Waiting to recover the interrupted submission. Next check in {wait} s.")
         } else if job.done() {
             "Done.".into()
+        } else if job.provider.kind == Kind::Gemini && !job.untaken() {
+            format!("{} is processing the submitted sheets. Next results check in {wait} s.", job.provider.name)
         } else {
-            format!("Waiting for the provider, which can take up to 24 hours. Next check in {wait} s.")
+            format!("Waiting for the next batch operation in {wait} s.")
         }
     }
 
@@ -699,16 +764,43 @@ impl Panel {
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
         if self.running() && self.root != index.root { ui.weak(format!("For {}", self.root.display())); }
         if let Some(job) = &self.job {
-            ui.weak(format!("Batch model: {} / {}", job.provider.name, job.model));
-            ui.label(self.state(job));
-            ui.label(job.progress());
-            if self.running() { ui.ctx().request_repaint_after(Duration::from_secs(1)); }
-            egui::CollapsingHeader::new("Failed sheets").show(ui, |ui| {
-                for s in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", s.rel, s.error)); }
+            ui.weak(format!("{} / {}", job.provider.name, job.model));
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if self.task.is_some() { ui.spinner(); }
+                ui.strong(self.state(job));
             });
+            let processed = job.sheets.iter().filter(|s| s.label.is_some() || !s.error.is_empty()).count();
+            let total = job.sheets.len();
+            let fraction = if total == 0 { 1.0 } else { processed as f32 / total as f32 };
+            ui.add(egui::ProgressBar::new(fraction).text(format!("{processed} / {total} processed")));
+            if job.provider.kind == Kind::Gemini {
+                let (queued, waiting, uncertain) = self.submission_counts(job);
+                egui::Grid::new("batch counts").num_columns(2).show(ui, |ui| {
+                    ui.label("Queued on this PC"); ui.label(queued.to_string()); ui.end_row();
+                    ui.label(format!("At {}", job.provider.name)); ui.label(waiting.to_string()); ui.end_row();
+                    if uncertain > 0 {
+                        let uploading = self.task.is_some() && matches!(self.activity, Some((Activity::Uploading(_), _)));
+                        ui.label(if uploading { "Uploading now" } else { "Awaiting confirmation" });
+                        ui.label(uncertain.to_string()); ui.end_row();
+                    }
+                });
+            }
+            if self.running() { ui.ctx().request_repaint_after(Duration::from_secs(1)); }
+            if !self.error.is_empty() {
+                egui::CollapsingHeader::new("Error details").show(ui, |ui| {
+                    ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
+                });
+            }
+            let failed = job.sheets.iter().filter(|s| !s.error.is_empty()).count();
+            if failed > 0 {
+                egui::CollapsingHeader::new(format!("Failed sheets ({failed})")).show(ui, |ui| {
+                    for s in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", s.rel, s.error)); }
+                });
+            }
         } else {
             if let Some((provider, model)) = configured {
-                ui.weak(format!("Batch model: {} / {}", provider.name, model.id.trim_end_matches(":batch")));
+                ui.weak(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
             }
             if !self.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &self.error); }
         }
@@ -750,7 +842,8 @@ impl Panel {
         if self.retry { self.next_check = None; }
         if !ready && !self.running() { ui.weak("Set a batch model and its key in Settings."); }
         let idle = !self.busy() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
-        for (text, scope) in [("Label the unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
+        if self.busy() { return; }
+        for (text, scope) in [("Label unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
             let button = ui.add_enabled(ready && idle && !index.entries.is_empty(), egui::Button::new(text));
             crate::stop(&button);
             if button.clicked() {
@@ -854,11 +947,53 @@ mod tests {
     }
 
     #[test]
+    fn the_status_names_a_result_check_instead_of_a_connection() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::Gemini);
+        job.sheets[0].taken = true;
+        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/test".into()), recovery: None });
+        let (_tx, rx) = mpsc::channel();
+        let panel = Panel { job: Some(job), task: Some(rx), ..Panel::default() };
+        assert!(panel.state(panel.job.as_ref().unwrap()).starts_with("Checking results from test"));
+    }
+
+    #[test]
+    fn upload_progress_uses_the_actual_group_size_and_elapsed_time() {
+        let body = submit_body(&[("a".into(), json!({})), ("b".into(), json!({}))], "reference");
+        let activity = Activity::request("models/test:batchGenerateContent", Some(&body));
+        assert_eq!(activity.description("Google", 12), "Uploading 2 sheets to Google (12 s)");
+        assert_eq!(activity.summary(12), "uploading 2; 12 s");
+        assert_eq!(Activity::request("batches/test", None).description("Google", 3), "Checking results from Google (3 s)");
+    }
+
+    #[test]
+    fn uploading_sheets_are_not_also_shown_as_queued() {
+        let files = Files::new();
+        let job = files.prepare(Kind::Gemini);
+        let (_tx, rx) = mpsc::channel();
+        let panel = Panel { task: Some(rx), activity: Some((Activity::Uploading(1), Instant::now())), ..Panel::default() };
+        assert_eq!(panel.submission_counts(&job), (0, 0, 1));
+        assert_eq!(Activity::Uploading(1).description("Google", 2), "Uploading 1 sheet to Google (2 s)");
+    }
+
+    #[test]
+    fn provider_processing_is_separate_from_a_network_request() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::Gemini);
+        job.sheets[0].taken = true;
+        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/test".into()), recovery: None });
+        let panel = Panel { next_check: Some(Instant::now() + Duration::from_secs(30)), ..Panel::default() };
+        let state = panel.state(&job);
+        assert!(state.starts_with("test is processing the submitted sheets. Next results check in "));
+        assert!(!state.contains("Contacting"));
+    }
+
+    #[test]
     fn outstanding_batches_have_status_without_the_ai_pane() {
         let files = Files::new();
         let job = files.prepare(Kind::Gemini);
         let mut panel = Panel { job: Some(job), ..Panel::default() };
-        assert_eq!(panel.status().as_deref(), Some("AI batch: 1 queued, 0 at provider, 0 unconfirmed, 0 labeled, 0 failed (waiting)"));
+        assert_eq!(panel.status().as_deref(), Some("AI batch: waiting | 0 at test | 0/1 processed"));
         panel.job.as_mut().unwrap().groups.push(Group { sheets: vec![0], remote: Remote::Submitting, recovery: None });
         assert!(panel.status().unwrap().contains("needs attention"));
         panel.job.as_mut().unwrap().groups.clear();
@@ -866,7 +1001,7 @@ mod tests {
         assert!(panel.status().unwrap().contains("retry pending"));
         let (_tx, rx) = mpsc::channel();
         panel.task = Some(rx);
-        assert!(panel.status().unwrap().contains("working"));
+        assert!(panel.status().unwrap().contains("preparing upload"));
         panel.task = None;
         panel.error.clear();
         panel.job.as_mut().unwrap().sheets[0].taken = true;
