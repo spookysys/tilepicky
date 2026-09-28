@@ -117,8 +117,8 @@ It also documents Google's paid-project requirement and the `gemini-flash-latest
 
 ## Automated checks
 
-- `cargo test --locked`: 111 passed, with no ignored tests.
-- `cargo test --locked --features wgpu`: 111 passed, with no ignored tests.
+- `cargo test --locked`: 115 passed, with no ignored tests.
+- `cargo test --locked --features wgpu`: 115 passed, with no ignored tests.
 - `cargo clippy --locked --all-targets --features wgpu`: passed.
 - `cargo build --release --locked --features wgpu`: passed.
 
@@ -135,3 +135,14 @@ The reported OpenRouter failure's exact cause remains unconfirmed; its old messa
 cargo test labeling_from_the_menu_opens_the_result_dialog_on_setup_error
 cargo test a_timeout_after_response_headers_is_not_invalid_json
 ```
+
+## AI diagnostics and background status
+
+The AI pane and label popup have a Copy log button.
+The interactive WGPU check copied the log and read the clipboard back on the private display.
+The copied text contained the request and failure, without the test key or image data.
+The status bar showed an outstanding batch with the AI pane closed.
+Clicking that status opened the AI pane and its batch controls.
+
+Tests cover log redaction, rotation, persistence, raw versus saved tags, and outstanding batch states.
+The log records future requests; it cannot reconstruct responses from an older executable.

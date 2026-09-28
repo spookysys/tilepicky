@@ -179,10 +179,13 @@ impl Run {
             provider: provider.clone(), model: model.clone(), started: std::time::Instant::now(), result };
         std::thread::Builder::new().name("label sheet".into()).spawn(move || {
             // An answer in prose goes out once more; see `batch::one`.
-            let ask = |body: &Value| send(body).and_then(|reply| response(&reply, &list));
+            crate::ai_log::event("single_start", json!({"sheet":input.rel, "provider":provider, "model":model,
+                "tags_requested":list, "prompt":prompt(&list), "image_size":[input.img.width(),input.img.height()]}));
+            let ask = |body: &Value| send(body).and_then(|reply| diagnosed_response(&input.rel, &provider, &model, &reply, &list));
             let label = request(&model, &input.img, &list)
                 .and_then(|body| match ask(&body) { Err(e) if e == INVALID => ask(&body), reply => reply })
                 .map(|reply| reply.into_label(&provider, &model, &list));
+            crate::ai_log::event("single_result", json!({"sheet":input.rel, "provider":provider, "model":model, "result":label}));
             let _ = tx.send(label);
             wake();
         }).map_err(|_| "Could not start the labeling thread.")?;
@@ -283,6 +286,20 @@ pub fn response(value: &Value, list: &[String]) -> Result<Reply, String> {
     reply.validate(list)
 }
 
+/// Keeps the raw tag answers beside the validated tags for the same sheet.
+pub fn diagnosed_response(sheet: &str, provider: &str, model: &str, value: &Value, list: &[String]) -> Result<Reply, String> {
+    let result = response(value, list);
+    let parsed = match &result {
+        Ok(reply) => json!({"caption":reply.caption, "tags":reply.tags, "listed":reply.listed, "status":reply.status}),
+        Err(error) => json!({"error":error}),
+    };
+    let model_label = value.pointer("/choices/0/message/content").and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    crate::ai_log::event("label_parsed", json!({"sheet":sheet, "provider":provider, "model":model,
+        "tags_requested":list, "raw_response":value, "model_label":model_label, "parsed":parsed}));
+    result
+}
+
 /// An endpoint that a key may go to: HTTPS, and no credentials, query, or
 /// fragment in the URL. Returns the URL without a trailing slash.
 pub fn checked_url(url: &str) -> Result<String, String> {
@@ -314,18 +331,31 @@ impl Endpoint {
     }
 
     pub fn send(&self, body: &Value) -> Result<Value, String> {
+        let trace = crate::ai_log::Request::start(&self.url, Some(body), &self.key);
+        let mut status = None;
+        let result = self.send_inner(body, &mut status);
+        trace.finish(status, &result);
+        result
+    }
+
+    fn send_inner(&self, body: &Value, status: &mut Option<u16>) -> Result<Value, String> {
         let mut response = self.client.post(&self.url).header("Authorization", format!("Bearer {}", self.key)).send_json(body)
             .map_err(|e| match e {
                 ureq::Error::Timeout(_) => "The model request timed out.",
                 _ => "Could not reach the model endpoint.",
             })?;
+        *status = Some(response.status().as_u16());
         if !response.status().is_success() { return Err(http_error(&mut response, &self.key)); }
         let bytes = response.body_mut().with_config().limit(1_048_576).read_to_vec().map_err(|e| match e {
             ureq::Error::Timeout(_) => "The model request timed out while reading the response.",
             ureq::Error::BodyExceedsLimit(_) => "The model response exceeded the 1 MiB limit.",
             _ => "Could not read the model response. The connection may have been interrupted.",
         })?;
-        serde_json::from_slice(&bytes).map_err(|_| "The endpoint returned invalid JSON.".into())
+        serde_json::from_slice(&bytes).map_err(|error| {
+            crate::ai_log::event("invalid_http_body", json!({"url":self.url,
+                "body":String::from_utf8_lossy(&bytes), "error":error.to_string()}));
+            "The endpoint returned invalid JSON.".into()
+        })
     }
 }
 

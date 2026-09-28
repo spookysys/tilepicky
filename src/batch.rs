@@ -193,6 +193,14 @@ impl Transport {
         Ok(Self { client: labels::agent(), base: endpoint(provider)?, key, kind: provider.kind })
     }
     pub fn send(&self, path: &str, body: Option<&Value>) -> Result<Value, Failure> {
+        let trace = crate::ai_log::Request::start(&format!("{}/{path}", self.base), body, &self.key);
+        let mut status = None;
+        let result = self.send_inner(path, body, &mut status);
+        trace.finish(status, &result.as_ref().cloned().map_err(Failure::message));
+        result
+    }
+
+    fn send_inner(&self, path: &str, body: Option<&Value>, status: &mut Option<u16>) -> Result<Value, Failure> {
         use ureq::{Error, Timeout};
         let (header, key) = if self.kind == Kind::Gemini { ("x-goog-api-key", self.key.clone()) }
             else { ("Authorization", format!("Bearer {}", self.key)) };
@@ -206,11 +214,23 @@ impl Transport {
                 Failure::NotSent("The batch endpoint could not be reached.".into()),
             _ => Failure::Unknown("The connection to the batch endpoint failed or timed out.".into()),
         })?;
+        *status = Some(response.status().as_u16());
         if !response.status().is_success() {
             return Err(Failure::Status(response.status().as_u16(), labels::http_error(&mut response, &self.key)));
         }
-        response.body_mut().with_config().limit(32_000_000).read_json()
-            .map_err(|_| Failure::Unknown("Invalid or oversized batch response.".into()))
+        let bytes = response.body_mut().with_config().limit(32_000_000).read_to_vec().map_err(|e| {
+            let message = match e {
+                Error::Timeout(_) => "The batch request timed out while reading the response.",
+                Error::BodyExceedsLimit(_) => "The batch response exceeded the size limit.",
+                _ => "Could not read the batch response.",
+            };
+            Failure::Unknown(message.into())
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            crate::ai_log::event("invalid_http_body", json!({"url":url,
+                "body":String::from_utf8_lossy(&bytes), "error":error.to_string()}));
+            Failure::Unknown("The batch endpoint returned invalid JSON.".into())
+        })
     }
 }
 
@@ -262,7 +282,8 @@ fn record(sheet: &mut Sheet, job: (&str, &str, &[String]), reply: Result<labels:
 fn accept(job: &mut Job, group: usize, values: Vec<(String, Value)>) {
     let mut values: std::collections::BTreeMap<_, _> = values.into_iter().collect();
     for &i in &job.groups[group].sheets {
-        let reply = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v| labels::response(&v, &job.tag_list));
+        let reply = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v|
+            labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &v, &job.tag_list));
         record(&mut job.sheets[i], (&job.provider.name, &job.model, &job.tag_list), reply);
     }
 }
@@ -292,6 +313,8 @@ pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str,
 /// billed: it goes out again, up to `UNKNOWN_TRIES` times in all.
 fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
     let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
+    crate::ai_log::event("batch_sheet_start", json!({"sheet":job.sheets[i].rel, "provider":job.provider.name,
+        "model":job.model, "attempt":job.sheets[i].unknown + 1, "tags_requested":job.tag_list}));
     let request = image::open(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))
         .and_then(|img| labels::request(&job.model, &img.to_rgba8(), &job.tag_list))
         .map(|body| job.provider.route(body));
@@ -300,7 +323,7 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
         Ok(request) => match send("chat/completions", Some(&request)) {
             // One provider of a model on OpenRouter may answer in prose. The
             // next request may reach another.
-            Ok(value) => match labels::response(&value, &job.tag_list) {
+            Ok(value) => match labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &value, &job.tag_list) {
                 Err(error) if error == labels::INVALID && job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
                     job.sheets[i].unknown += 1;
                     return job.save(dir);
@@ -347,6 +370,8 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     for &i in &sheets { job.sheets[i].taken = true; }
     job.groups.push(Group { sheets, remote: Remote::Submitting });
     job.save(dir)?;
+    crate::ai_log::event("batch_submit", json!({"provider":job.provider.name, "model":job.model, "tags_requested":job.tag_list,
+        "sheets":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel})).collect::<Vec<_>>()}));
     let path = format!("models/{}:batchGenerateContent", job.model);
     let requests: Vec<_> = requests.into_iter().map(|(i, body)| (key(i), body)).collect();
     let g = job.groups.len() - 1;
@@ -434,6 +459,19 @@ impl Panel {
 
     pub fn busy(&self) -> bool { self.running() || self.task.is_some() || self.open() }
 
+    /// A compact status for the main window when no newer message takes its place.
+    pub fn status(&self) -> Option<String> {
+        let job = self.job.as_ref()?;
+        if job.done() && self.error.is_empty() { return None; }
+        let labeled = job.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
+        let failed = job.sheets.iter().filter(|s| !s.error.is_empty()).count();
+        let pending = job.sheets.iter().filter(|s| s.label.is_none() && s.error.is_empty()).count();
+        let state = if job.uncertain() { "needs attention" }
+            else if self.task.is_some() { "working" }
+            else if !self.error.is_empty() { "retry pending" } else { "waiting" };
+        Some(format!("AI batch: {labeled} labeled, {pending} pending, {failed} failed ({state})"))
+    }
+
     /// Prevents a completed journal from restoring labels after Clear all.
     pub fn discard_completed(&mut self, root: &Path) -> Result<(), String> {
         if self.busy() { return Err("Wait for the batch to finish or cancel it first.".into()); }
@@ -451,6 +489,7 @@ impl Panel {
 
     /// Records a failure. The next try waits longer after each one, up to 8 minutes.
     pub fn fail(&mut self, error: String) {
+        crate::ai_log::event("batch_error", json!({"error":error, "retry":self.failures + 1}));
         self.error = error;
         self.failures += 1;
         self.next_check = Some(Instant::now() + POLL * 2u32.pow(self.failures.min(5) - 1));
@@ -528,6 +567,7 @@ impl Panel {
             self.fail(format!("Could not save the labels: {e}"));
             return vec![];
         }
+        crate::ai_log::event("batch_saved", json!({"provider":job.provider.name, "model":job.model, "labels":labels}));
         for sheet in job.sheets.iter_mut().filter(|s| s.label.is_some()) { sheet.imported = true; }
         if let Err(e) = job.save(&self.dir) { self.fail(e); }
         labels
@@ -537,6 +577,7 @@ impl Panel {
     /// Labels already in the book stay.
     fn cancel(&mut self, keys: &crate::ai::Keys) {
         let Some(job) = self.job.take() else { return };
+        crate::ai_log::event("batch_cancel", json!({"provider":job.provider.name, "model":job.model}));
         // A running worker finishes first; `tick` forgets its result too.
         if self.task.is_none() { self.forget(&job, keys); }
         (self.error, self.failures, self.next_check) = (String::new(), 0, None);
@@ -722,6 +763,26 @@ mod tests {
     fn id(value: &str) -> impl FnMut(&str, Option<&Value>) -> Result<Value, Failure> {
         let value = value.to_string();
         move |_, _| Ok(json!({"name":value}))
+    }
+
+    #[test]
+    fn outstanding_batches_have_status_without_the_ai_pane() {
+        let files = Files::new();
+        let job = files.prepare(Kind::Gemini);
+        let mut panel = Panel { job: Some(job), ..Panel::default() };
+        assert_eq!(panel.status().as_deref(), Some("AI batch: 0 labeled, 1 pending, 0 failed (waiting)"));
+        panel.job.as_mut().unwrap().groups.push(Group { sheets: vec![0], remote: Remote::Submitting });
+        assert!(panel.status().unwrap().contains("needs attention"));
+        panel.job.as_mut().unwrap().groups.clear();
+        panel.error = "Temporary failure".into();
+        assert!(panel.status().unwrap().contains("retry pending"));
+        let (_tx, rx) = mpsc::channel();
+        panel.task = Some(rx);
+        assert!(panel.status().unwrap().contains("working"));
+        panel.task = None;
+        panel.error.clear();
+        panel.job.as_mut().unwrap().sheets[0].taken = true;
+        assert!(panel.status().is_none());
     }
 
     #[test]

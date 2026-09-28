@@ -54,6 +54,7 @@ the person who uses the tool; this file is for an agent that works on it.
   and their settings page. OpenRouter requests use the provider skip list.
   Single-sheet labeling uses the instant model.
   Library batches use the configured Google or OpenRouter batch model.
+- `src/ai_log.rs`: bounded local AI diagnostics, key and image redaction, and clipboard export.
 - `src/labels.rs`: one labeling request per sheet, the library's tag list
   in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
   thread; to cancel, drop the `Run`. Tests use fake responses.

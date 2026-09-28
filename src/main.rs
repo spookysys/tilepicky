@@ -10,6 +10,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod ai_log;
 mod detect;
 mod dialogs;
 mod index;
@@ -927,9 +928,14 @@ impl App {
                         ui.spinner();
                         ctx.request_repaint_after(Duration::from_secs(1));
                     }
-                } else if age.as_secs() < STATUS_SECS {
+                } else if !self.status.is_empty() && age.as_secs() < STATUS_SECS {
                     ui.colored_label(egui::Color32::from_rgb(190, 40, 30), egui::RichText::new(&self.status).strong());
                     ctx.request_repaint_after(Duration::from_secs(STATUS_SECS) - age);
+                } else if let Some(status) = self.library_batch.status() {
+                    if ui.link(status).on_hover_text("Open the AI pane for batch details and controls.").clicked() {
+                        self.ai_panel = true;
+                    }
+                    ctx.request_repaint_after(Duration::from_secs(1));
                 } else {
                     ui.label("");
                 }
@@ -1413,6 +1419,9 @@ impl App {
     /// The library panel shows the model, batch controls, and proposed tags.
     fn assist_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("AI labels");
+        if ui.button("Copy log").on_hover_text("Copy recent AI prompts, replies, tags, and errors. Keys and images are omitted.").clicked() {
+            self.copy_ai_log(ui.ctx());
+        }
         let instant = self.settings.ai.chosen(ai::Mode::Instant)
             .filter(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
         ui.horizontal_wrapped(|ui| {
@@ -1468,6 +1477,13 @@ impl App {
         });
     }
 
+    fn copy_ai_log(&mut self, ctx: &egui::Context) {
+        match ai_log::text() {
+            Ok(text) => { ctx.copy_text(text); self.status = "AI log copied to the clipboard.".into(); }
+            Err(error) => self.status = error,
+        }
+    }
+
     /// Writes the tag list of the library into its book, if it changed.
     fn store_tag_list(&mut self) {
         if !std::mem::take(&mut self.tag_dirty) || !self.library.is_set() { return; }
@@ -1493,6 +1509,7 @@ impl App {
             return;
         }
         if action == labels::Action::Cancel {
+            ai_log::event("single_cancel", serde_json::json!({"sheet":self.label_run.as_ref().map(|r| &r.rel)}));
             self.label_run = None;
             self.status = "Cancelled. The provider may still bill the request.".into();
             self.label_outcome = Some(self.status.clone());
@@ -1528,7 +1545,10 @@ impl App {
         self.label_outcome = None;
         match result {
             Ok(run) => { self.label_run = Some(run); ctx.request_repaint(); }
-            Err(error) => { self.status = error.clone(); self.label_outcome = Some(error); }
+            Err(error) => {
+                ai_log::event("single_setup_error", serde_json::json!({"sheet":sheet.rel, "error":error}));
+                self.status = error.clone(); self.label_outcome = Some(error);
+            }
         }
     }
 
@@ -1553,6 +1573,7 @@ impl App {
             Err(error) => format!("Labeling failed: {error}"),
         };
         self.status = format!("{}: {notice}", run.path.file_name().unwrap_or_default().to_string_lossy());
+        ai_log::event("single_saved", serde_json::json!({"sheet":run.rel, "outcome":self.status}));
         self.label_outcome = Some(self.status.clone());
     }
 
@@ -3035,6 +3056,7 @@ const WGPU: bool = cfg!(feature = "wgpu");
 fn default_renderer() -> eframe::Renderer { eframe::Renderer::default() }
 
 fn main() -> eframe::Result {
+    ai_log::init();
     let mut dirs: Vec<String> = Vec::new();
     let mut renderer = default_renderer();
     for a in std::env::args().skip(1) {

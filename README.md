@@ -98,6 +98,12 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 The model returns a caption, up to 12 freeform tags, and matching tags from your list.
 Tilepicky writes the label to `tilepicky.json`. You can continue working while the request runs.
 The popup and status bar show progress and a **Cancel** button.
+Use **Copy log** in the AI pane or label popup to copy recent diagnostics to the clipboard.
+The log includes prompts, requested tags, model replies, parsed tags, timing, and errors for single requests and batches.
+It excludes API keys and image data. It still contains sheet names and generated captions.
+Tilepicky keeps two log files of up to 2 MiB each in `~/.config/tilepicky/ai-log/`, including across restarts.
+Responses from before logging was installed are unavailable.
+
 Each request times out after 60 seconds. **Cancel** stops waiting, but the provider may still bill the request.
 
 To delete a label, select **Remove label...** in the popup, or **Remove AI label...** in the context menu, and confirm.
@@ -133,6 +139,9 @@ With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordin
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 The model ID `gemini-flash-latest` follows Google's latest Flash release; enable **batch** in Settings to use it for batches.
 Provider errors appear in the AI pane, including the provider's explanation when available.
+
+When no newer message is visible, the status bar shows the outstanding batch's progress and state.
+Click the batch status to open the AI pane and its controls.
 
 Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
 

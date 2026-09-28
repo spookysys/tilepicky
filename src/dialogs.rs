@@ -275,6 +275,7 @@ impl App {
             .is_some_and(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
         let mut action = None;
         let mut close = false;
+        let mut copy_log = false;
         egui::Modal::new(Id::new("AI label")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading("AI label");
@@ -305,6 +306,7 @@ impl App {
             }
             ui.horizontal(|ui| {
                 close = ui.button("Close").clicked();
+                copy_log = ui.button("Copy log").clicked();
                 let busy = self.label_run.is_some();
                 let text = if sheet.side.label.is_some() { "Label again" } else { "Label with AI" };
                 if ui.add_enabled(ready && !busy, egui::Button::new(text)).clicked() { action = Some(labels::Action::Label); }
@@ -315,6 +317,7 @@ impl App {
             });
             if self.prompt_view.is_none() && self.remove_label.is_none() && ui.input(|i| i.key_pressed(Key::Escape)) { close = true; }
         });
+        if copy_log { self.copy_ai_log(ctx); }
         if close { self.label_view = false; }
         if let Some(action) = action { self.label_action(ctx, action); }
     }
