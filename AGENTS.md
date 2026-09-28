@@ -9,7 +9,8 @@ the person who uses the tool; this file is for an agent that works on it.
 ## Build, run, test
 
 - `cargo run --release -- [<library dir> [<project dir>]]` starts the tool.
-  OpenGL is the default. Builds with the `wgpu` feature also accept `--wgpu`.
+  Builds without the `wgpu` feature use OpenGL. Builds with it use WGPU by default.
+  `--glow` selects OpenGL; `--wgpu` selects WGPU when available.
 - `cargo test` runs the unit tests. Most write their own files under the
   temp dir. One reads the real packs: `the_real_packs_read_as_they_did`
   checks `src/detect.rs` against `tools/grid-cases.json`, and skips every

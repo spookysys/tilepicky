@@ -2234,7 +2234,9 @@ impl App {
         let mut library_rows: Vec<tree::Row> = Vec::new();
         let mut project_rows: Vec<tree::Row> = Vec::new();
         let mut create = false;
-        if self.settings.hide_legend {
+        // Keep the layout fixed for this frame. Settings can change it while the status bar draws.
+        let hide_legend = self.settings.hide_legend;
+        if hide_legend {
             self.status_bar(ctx, ui);
         }
         egui::Panel::left("left").resizable(true).default_size(340.0).size_range(240.0..=800.0).show(ui, |ui| {
@@ -2274,7 +2276,7 @@ impl App {
                 }
             });
             ui.add_space(4.0);
-            if !self.settings.hide_legend {
+            if !hide_legend {
                 egui::Panel::bottom("legend").show(ui, |ui| {
                     ui.set_max_width(ui.available_width());
                     let ai_key = if AI_VISIBLE { " | I: AI labels" } else { "" };
@@ -2443,7 +2445,7 @@ impl App {
                 });
             });
         });
-        if !self.settings.hide_legend {
+        if !hide_legend {
             self.status_bar(ctx, ui);
         }
         self.open_trees = false;
@@ -3098,8 +3100,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "Known bug: WGPU replaces the documented default; see docs/test-drive.md"]
-    fn the_default_renderer_is_opengl_with_wgpu_available() {
+    fn the_default_renderer_matches_the_documented_build() {
+        #[cfg(feature = "wgpu")]
+        assert!(matches!(default_renderer(), eframe::Renderer::Wgpu));
+        #[cfg(not(feature = "wgpu"))]
         assert!(matches!(default_renderer(), eframe::Renderer::Glow));
     }
 
@@ -3160,7 +3164,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Known bug: Settings toggles the legend twice; see docs/test-drive.md"]
     fn settings_can_restore_the_hidden_shortcut_legend() {
         let mut b = bench(&["sheet.png"], &["canvas.png"]);
         b.app.settings.hide_legend = true;

@@ -214,6 +214,7 @@ pub fn prompt(list: &[String]) -> [String; 2] {
     if !list.is_empty() {
         system += &format!(" Put your own tags in tags. In listed, answer for each of these tags whether the sheet clearly shows it, \
             true or false: {}. Evaluate each tag independently. Mark every applicable tag true, including secondary content. \
+            Return listed as an object with those exact tag names as keys. \
             Do not infer content that is not visible. Do not repeat a listed concept with a synonymous freeform tag.", list.join(", "));
     }
     [system, "Describe the whole sprite sheet: asset type, setting, visual style, palette and overall content.".into()]
@@ -252,6 +253,9 @@ pub const INVALID: &str = "The model returned an invalid structured label.";
 
 /// Reject refusals, truncation, and malformed content.
 pub fn response(value: &Value, list: &[String]) -> Result<Reply, String> {
+    if !value["error"].is_null() {
+        return Err(format!("The provider rejected the request. {}", error_detail(&value["error"], "")).trim_end().into());
+    }
     let choice = value.get("choices").and_then(Value::as_array).filter(|c| c.len() == 1).and_then(|c| c.first())
         .ok_or("The endpoint returned no single completion.")?;
     if choice["finish_reason"] == "length" {
@@ -261,7 +265,18 @@ pub fn response(value: &Value, list: &[String]) -> Result<Reply, String> {
     let message = &choice["message"];
     if !message["refusal"].is_null() { return Err("The model refused the request.".into()); }
     let text = message["content"].as_str().ok_or("The response contains no JSON text.")?;
-    let reply: Reply = serde_json::from_str(text).map_err(|_| INVALID)?;
+    let mut value: Value = serde_json::from_str(text).map_err(|_| INVALID)?;
+    // Gemini can return positional booleans despite the object schema. Use the prompt's tag order only when every answer is present.
+    if let Some(answers) = value.get("listed").and_then(Value::as_array) {
+        let names = Reply::usable(list);
+        if names.is_empty() || names.len() != answers.len() || !answers.iter().all(Value::is_boolean) {
+            return Err(INVALID.into());
+        }
+        let named: serde_json::Map<String, Value> = names.into_iter().map(str::to_string).zip(answers.iter().cloned()).collect();
+        if named.len() != answers.len() { return Err(INVALID.into()); }
+        value["listed"] = Value::Object(named);
+    }
+    let reply: Reply = serde_json::from_value(value).map_err(|_| INVALID)?;
     reply.validate(list)
 }
 
@@ -301,12 +316,30 @@ impl Endpoint {
                 ureq::Error::Timeout(_) => "The model request timed out.",
                 _ => "Could not reach the model endpoint.",
             })?;
-        if !response.status().is_success() {
-            return Err(format!("Model endpoint returned HTTP {}. Check the key, model, credits, and structured-output support.", response.status().as_u16()));
-        }
+        if !response.status().is_success() { return Err(http_error(&mut response, &self.key)); }
         response.body_mut().with_config().limit(1_048_576).read_json()
             .map_err(|_| "The endpoint returned unreadable, oversized, or invalid JSON.".into())
     }
+}
+
+/// Keeps a bounded provider explanation. Never show an echoed API key or a whole error page.
+pub fn http_error(response: &mut ureq::http::Response<ureq::Body>, key: &str) -> String {
+    let status = response.status().as_u16();
+    let value: Value = response.body_mut().with_config().limit(65_536).read_json().unwrap_or(Value::Null);
+    let detail = error_detail(value.get("error").unwrap_or(&value), key);
+    let message = format!("The endpoint returned HTTP {status}.");
+    if detail.is_empty() { message } else { format!("{message} {detail}") }
+}
+
+/// Reads the provider's message and optional status name, with a limit on displayed text.
+pub fn error_detail(error: &Value, key: &str) -> String {
+    let code = error.get("status").and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_uppercase() || c == b'_'));
+    let detail = error.get("message").and_then(Value::as_str).or_else(|| error.as_str()).unwrap_or("");
+    let detail = if key.is_empty() { detail.to_string() } else { detail.replace(key, "[redacted]") };
+    let detail: String = detail.chars().filter(|c| !c.is_control() || c.is_whitespace()).take(1024).collect();
+    let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    match code { Some(code) => format!("{code}: {detail}"), None => detail }
 }
 
 #[cfg(test)]
@@ -319,6 +352,47 @@ pub mod tests {
 
     pub fn labeled(caption: &str) -> Value {
         json!({"status":"labeled", "caption":caption, "tags":[" Pixel-Art ", "pixel art", "TREE"]})
+    }
+
+    #[test]
+    fn provider_errors_hide_keys_and_bound_untrusted_responses() {
+        let error = |body: Vec<u8>| {
+            let mut response = ureq::http::Response::builder().status(400).body(ureq::Body::builder().data(body)).unwrap();
+            http_error(&mut response, "test-secret")
+        };
+        let message = error(serde_json::to_vec(&json!({"error":{"message":"Invalid key test-secret.\nTry another key."}})).unwrap());
+        assert_eq!(message, "The endpoint returned HTTP 400. Invalid key [redacted]. Try another key.");
+        let message = error(serde_json::to_vec(&json!({"error":{
+            "status":"FAILED_PRECONDITION", "message":"Precondition check failed."
+        }})).unwrap());
+        assert_eq!(message, "The endpoint returned HTTP 400. FAILED_PRECONDITION: Precondition check failed.");
+        for body in [b"<html>Proxy error</html>".to_vec(), vec![b'x'; 70_000], b"{}".to_vec()] {
+            assert_eq!(error(body), "The endpoint returned HTTP 400.");
+        }
+        let message = error(serde_json::to_vec(&json!({"error":{"message":"x".repeat(2000)}})).unwrap());
+        assert_eq!(message.chars().count(), "The endpoint returned HTTP 400. ".len() + 1024);
+    }
+
+    #[test]
+    fn ordered_tag_answers_use_the_requested_tag_order() {
+        let list = vec!["weapon".into(), "character".into(), "indoor".into()];
+        let value = json!({"status":"labeled", "caption":"Dungeon sprites", "tags":["pixel art"], "listed":[false,true,true]});
+        let label = response(&completion(value), &list).unwrap().into_label("test", "test", &list);
+        assert_eq!(label.tags, ["character", "indoor", "pixel art"]);
+    }
+
+    #[test]
+    fn ambiguous_tag_arrays_are_rejected() {
+        for (list, listed) in [
+            (vec!["tree".into(), "rock".into()], json!([true])),
+            (vec!["tree".into()], json!([true,false])),
+            (vec!["tree".into()], json!(["true"])),
+            (vec!["tree".into(), "tree".into()], json!([true,false])),
+            (vec![], json!([])),
+        ] {
+            let value = json!({"status":"labeled", "caption":"Forest", "tags":[], "listed":listed});
+            assert!(response(&completion(value), &list).is_err());
+        }
     }
 
     #[test]

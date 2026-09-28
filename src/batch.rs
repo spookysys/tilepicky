@@ -172,8 +172,8 @@ pub fn validate_id(id: &str) -> Result<(), String> {
 pub enum Failure {
     /// The request did not leave this machine: no DNS answer, no connection.
     NotSent(String),
-    /// The provider answered with this HTTP status.
-    Status(u16),
+    /// The provider answered with this HTTP status and explanation.
+    Status(u16, String),
     /// The request may have arrived: a timeout or a broken connection.
     Unknown(String),
 }
@@ -182,7 +182,7 @@ impl Failure {
     fn message(&self) -> String {
         match self {
             Failure::NotSent(e) | Failure::Unknown(e) => e.clone(),
-            Failure::Status(code) => format!("The batch endpoint returned HTTP {code}."),
+            Failure::Status(code, message) => if message.is_empty() { format!("The batch endpoint returned HTTP {code}.") } else { message.clone() },
         }
     }
 }
@@ -206,7 +206,9 @@ impl Transport {
                 Failure::NotSent("The batch endpoint could not be reached.".into()),
             _ => Failure::Unknown("The connection to the batch endpoint failed or timed out.".into()),
         })?;
-        if !response.status().is_success() { return Err(Failure::Status(response.status().as_u16())); }
+        if !response.status().is_success() {
+            return Err(Failure::Status(response.status().as_u16(), labels::http_error(&mut response, &self.key)));
+        }
         response.body_mut().with_config().limit(32_000_000).read_json()
             .map_err(|_| Failure::Unknown("Invalid or oversized batch response.".into()))
     }
@@ -216,7 +218,9 @@ impl Transport {
 /// `labels::response` reads. None while the batch still runs.
 fn outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
     if value["done"] != true { return Ok(None); }
-    if !value["error"].is_null() { return Err("The provider batch failed, expired, or was cancelled.".into()); }
+    if !value["error"].is_null() {
+        return Err(format!("The provider batch failed. {}", labels::error_detail(&value["error"], "")).trim_end().into());
+    }
     let values = value.pointer("/response/inlinedResponses/inlinedResponses").and_then(Value::as_array)
         .ok_or("The completed batch has no inline results.")?;
     let mut seen = BTreeSet::new();
@@ -224,7 +228,11 @@ fn outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
     for item in values {
         let key = item["metadata"]["key"].as_str().ok_or("A batch result has no request ID.")?;
         if !seen.insert(key.to_string()) { return Err("Duplicate batch request ID.".into()); }
-        if !item["error"].is_null() || item["response"]["candidates"].as_array().is_none_or(|a| a.len() != 1)
+        if !item["error"].is_null() {
+            out.push((key.into(), json!({"error":item["error"]})));
+            continue;
+        }
+        if item["response"]["candidates"].as_array().is_none_or(|a| a.len() != 1)
             || !item["response"]["promptFeedback"]["blockReason"].is_null() {
             out.push((key.into(), Value::Null));
             continue;
@@ -304,10 +312,10 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
                 return job.save(dir).and(Err(message));
             }
             Err(Failure::Unknown(message)) => Err(format!("{message} No readable answer after {UNKNOWN_TRIES} tries.")),
-            Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 500..=599))) => {
+            Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 500..=599, _))) => {
                 return job.save(dir).and(Err(failure.message()));
             }
-            Err(Failure::Status(code)) => Err(format!("The provider refused the request (HTTP {code}).")),
+            Err(failure @ Failure::Status(..)) => Err(failure.message()),
         },
     };
     record(&mut job.sheets[i], (&job.provider.name, &job.model, &job.tag_list), reply);
@@ -345,12 +353,12 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     let result = match send(&path, Some(&submit_body(&requests))) {
         Ok(response) => remote_id(&response).map(|id| job.groups[g].remote = Remote::Waiting(id)),
         // The provider made no batch: the sheets wait for the next try.
-        Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 503))) => {
+        Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 503, _))) => {
             job.send_again();
             Err(failure.message())
         }
-        Err(Failure::Status(code)) if (400..500).contains(&code) => {
-            for &i in &job.groups[g].sheets { job.sheets[i].error = format!("The provider refused the batch (HTTP {code})."); }
+        Err(failure @ Failure::Status(400..500, _)) => {
+            for &i in &job.groups[g].sheets { job.sheets[i].error = failure.message(); }
             job.groups[g].remote = Remote::Done;
             Ok(())
         }
@@ -636,6 +644,7 @@ impl Panel {
             ui.heading("Label this entire library?");
             ui.label(self.root.display().to_string());
             ui.weak(format!("{} / {} (from Settings)", job.provider.name, job.model));
+            if job.provider.kind == Kind::Gemini { ui.weak("Google batch requests require a paid API project."); }
             if job.sheets.is_empty() {
                 ui.label("Every sheet has a label already.");
             } else {
@@ -739,7 +748,7 @@ mod tests {
         let job = prepare(&index, provider(Kind::OpenAi), "test:batch".into(), Scope::All).unwrap();
         assert_eq!((job.sheets.len(), job.skipped, job.replacing), (1, 0, 1));
         assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label, Some(old.clone()));
-        let (failed, _) = files.advance(job.clone(), |_, _| Err(Failure::Status(401)));
+        let (failed, _) = files.advance(job.clone(), |_, _| Err(Failure::Status(401, String::new())));
         let mut panel = Panel { root: files.root.clone(), dir: files.spool.clone(), job: Some(failed), ..Panel::default() };
         assert!(panel.import().is_empty());
         assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label, Some(old));
@@ -829,7 +838,9 @@ mod tests {
     #[test]
     fn an_openai_request_that_failed_goes_out_again() {
         let files = Files::new();
-        for failure in [Failure::NotSent("offline".into()), Failure::Status(429), Failure::Status(503), Failure::Unknown("timeout".into())] {
+        let failures = [Failure::NotSent("offline".into()), Failure::Status(429, String::new()),
+            Failure::Status(503, String::new()), Failure::Unknown("timeout".into())];
+        for failure in failures {
             let mut failure = Some(failure);
             let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(failure.take().unwrap()));
             assert!(result.is_err());
@@ -838,7 +849,7 @@ mod tests {
             result.unwrap();
             assert!(job.done() && job.sheets[0].label.is_some());
         }
-        let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(Failure::Status(401)));
+        let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Err(Failure::Status(401, String::new())));
         result.unwrap();
         assert!(job.done() && job.sheets[0].error.contains("401"));
     }
@@ -960,7 +971,7 @@ mod tests {
     #[test]
     fn a_submission_that_never_left_goes_out_again() {
         let files = Files::new();
-        for failure in [Failure::NotSent("offline".into()), Failure::Status(429)] {
+        for failure in [Failure::NotSent("offline".into()), Failure::Status(429, String::new())] {
             let mut failure = Some(failure);
             let (job, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(failure.take().unwrap()));
             assert!(result.is_err());
@@ -990,10 +1001,38 @@ mod tests {
     #[test]
     fn a_refused_submission_fails_its_sheets() {
         let files = Files::new();
-        let (job, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Status(401)));
+        let (job, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Status(401, String::new())));
         result.unwrap();
         assert!(job.sheets[0].error.contains("401"));
         assert!(job.done());
+    }
+
+    #[test]
+    fn provider_explanations_reach_the_saved_sheet_errors() {
+        for kind in [Kind::Gemini, Kind::OpenAi] {
+            let files = Files::new();
+            let message = "The endpoint returned HTTP 400. This model does not support the requested schema.";
+            let (job, result) = files.advance(files.prepare(kind), |_, _| Err(Failure::Status(400, message.into())));
+            result.unwrap();
+            assert!(job.done());
+            assert_eq!(files.journal().sheets[0].error, message);
+        }
+    }
+
+    #[test]
+    fn completed_batches_keep_job_and_sheet_error_details() {
+        let error = json!({"code":3, "message":"The requested image format is not supported."});
+        for response in [json!({"done":true, "error":error}), json!({"done":true,
+            "response":{"inlinedResponses":{"inlinedResponses":[{"metadata":{"key":"sheet-0"}, "error":error}]}}
+        })] {
+            let files = Files::new();
+            let (job, result) = files.advance(files.prepare(Kind::Gemini), id("batches/test"));
+            result.unwrap();
+            let (job, result) = files.advance(job, |_, _| Ok(response.clone()));
+            result.unwrap();
+            assert!(job.done());
+            assert!(files.journal().sheets[0].error.contains("The requested image format is not supported."));
+        }
     }
 
     #[test]
@@ -1031,7 +1070,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Known bug: HTTP errors discard provider details; see docs/test-drive.md"]
     fn batch_errors_keep_the_provider_explanation() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

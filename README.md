@@ -21,7 +21,8 @@ You can also pass paths as command line arguments:
 
     tilepicky <library dir> <project dir>
 
-Tilepicky renders with OpenGL by default. Release builds also support WGPU with the `--wgpu` flag. To build with WGPU support from source, install with:
+Source builds use OpenGL unless you enable WGPU. Builds with WGPU support, including release downloads, use WGPU by default.
+Use `--glow` to select OpenGL, or `--wgpu` to select WGPU when available. To build with WGPU support from source, install with:
 
     cargo install tilepicky --features wgpu
 
@@ -127,6 +128,10 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
 With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
+
+Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
+The model ID `gemini-flash-latest` follows Google's latest Flash release; enable **batch** in Settings to use it for batches.
+Provider errors appear in the AI pane, including the provider's explanation when available.
 
 Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
 
