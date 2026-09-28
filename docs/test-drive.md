@@ -104,7 +104,9 @@ cargo test the_default_renderer_matches_the_documented_build
 cargo test --features wgpu the_default_renderer_matches_the_documented_build
 ```
 
-The interactive pass used explicit `--glow`.
+The full interactive pass used explicit `--glow`.
+A later WGPU check opened a sheet, Settings, and the right-click label action.
+It verified immediate progress, the active provider and model, and the retained error with a local test endpoint.
 
 ## Other changes in this pass
 
@@ -115,7 +117,21 @@ It also documents Google's paid-project requirement and the `gemini-flash-latest
 
 ## Automated checks
 
-- `cargo test --locked`: 109 passed, with no ignored tests.
-- `cargo test --locked --features wgpu`: 109 passed, with no ignored tests.
+- `cargo test --locked`: 111 passed, with no ignored tests.
+- `cargo test --locked --features wgpu`: 111 passed, with no ignored tests.
 - `cargo clippy --locked --all-targets --features wgpu`: passed.
 - `cargo build --release --locked --features wgpu`: passed.
+
+## Follow-up: single-sheet request feedback
+
+The right-click label action now opens its popup immediately.
+The popup shows the active provider and model while the request runs.
+Setup errors and completed request errors remain in the popup.
+Response reads distinguish timeouts, oversized responses, connection failures, and invalid JSON.
+A regression reproduced the old timeout message before the fix.
+The reported OpenRouter failure's exact cause remains unconfirmed; its old message combined these different failures.
+
+```sh
+cargo test labeling_from_the_menu_opens_the_result_dialog_on_setup_error
+cargo test a_timeout_after_response_headers_is_not_invalid_json
+```

@@ -1498,6 +1498,10 @@ impl App {
             self.label_outcome = Some(self.status.clone());
             return;
         }
+        if action == labels::Action::Label {
+            self.label_view = self.library.sheet.is_some();
+            ctx.request_repaint();
+        }
         if self.label_run.is_some() {
             self.status = "Wait for the current label, or cancel it.".into();
             return;
@@ -3198,12 +3202,22 @@ mod tests {
     }
 
     #[test]
+    fn labeling_from_the_menu_opens_the_result_dialog_on_setup_error() {
+        let mut b = bench(&["a.png"], &[]);
+        b.app.settings.ai.instant = None;
+        b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Label));
+        assert!(b.app.label_view, "The label action must show its progress or error immediately.");
+        assert_eq!(b.app.label_outcome.as_deref(), Some("Choose an instant model in Settings."));
+        assert!(b.app.label_run.is_none());
+    }
+
+    #[test]
     fn the_label_popup_opens_the_tree_target_during_a_request() {
         let mut b = bench(&["a.png", "b.png"], &[]);
         b.app.open_library(&b.ctx, 0);
         let (_tx, result) = std::sync::mpsc::channel();
         b.app.label_run = Some(labels::Run { path: b.library.0.join("a.png"), dir: b.library.0.clone(),
-            rel: "a.png".into(), started: std::time::Instant::now(), result });
+            rel: "a.png".into(), provider: "test".into(), model: "test".into(), started: std::time::Instant::now(), result });
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(1, labels::Action::Show));
         assert!(b.app.label_view && b.app.dialog_open(&b.ctx));
         assert_eq!(b.app.library.sheet.as_ref().unwrap().rel, "b.png");
@@ -3221,7 +3235,7 @@ mod tests {
         b.app.label_action(&b.ctx, labels::Action::Show);
         let (tx, result) = std::sync::mpsc::channel();
         b.app.label_run = Some(labels::Run { path: b.library.0.join("a.png"), dir: b.library.0.clone(),
-            rel: "a.png".into(), started: std::time::Instant::now(), result });
+            rel: "a.png".into(), provider: "test".into(), model: "test".into(), started: std::time::Instant::now(), result });
         tx.send(Ok(sidecar::Label { provider: "test".into(), model: "test".into(), status: sidecar::Status::Labeled,
             caption: "Indoor furniture".into(), tags: vec!["indoor".into()], tag_list: None })).unwrap();
         b.app.receive_label();

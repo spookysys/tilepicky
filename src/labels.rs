@@ -162,6 +162,8 @@ pub struct Run {
     pub path: PathBuf,
     pub dir: PathBuf,
     pub rel: String,
+    pub provider: String,
+    pub model: String,
     pub started: std::time::Instant,
     pub result: std::sync::mpsc::Receiver<Result<Label, String>>,
 }
@@ -173,7 +175,8 @@ impl Run {
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
         let (tx, result) = std::sync::mpsc::channel();
-        let run = Self { path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(), started: std::time::Instant::now(), result };
+        let run = Self { path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(),
+            provider: provider.clone(), model: model.clone(), started: std::time::Instant::now(), result };
         std::thread::Builder::new().name("label sheet".into()).spawn(move || {
             // An answer in prose goes out once more; see `batch::one`.
             let ask = |body: &Value| send(body).and_then(|reply| response(&reply, &list));
@@ -317,8 +320,12 @@ impl Endpoint {
                 _ => "Could not reach the model endpoint.",
             })?;
         if !response.status().is_success() { return Err(http_error(&mut response, &self.key)); }
-        response.body_mut().with_config().limit(1_048_576).read_json()
-            .map_err(|_| "The endpoint returned unreadable, oversized, or invalid JSON.".into())
+        let bytes = response.body_mut().with_config().limit(1_048_576).read_to_vec().map_err(|e| match e {
+            ureq::Error::Timeout(_) => "The model request timed out while reading the response.",
+            ureq::Error::BodyExceedsLimit(_) => "The model response exceeded the 1 MiB limit.",
+            _ => "Could not read the model response. The connection may have been interrupted.",
+        })?;
+        serde_json::from_slice(&bytes).map_err(|_| "The endpoint returned invalid JSON.".into())
     }
 }
 
@@ -352,6 +359,26 @@ pub mod tests {
 
     pub fn labeled(caption: &str) -> Value {
         json!({"status":"labeled", "caption":caption, "tags":[" Pixel-Art ", "pixel art", "TREE"]})
+    }
+
+    #[test]
+    fn a_timeout_after_response_headers_is_not_invalid_json() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut data = [0; 4096];
+            assert!(stream.read(&mut data).unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n").unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let client = ureq::Agent::config_builder().timeout_global(Some(Duration::from_millis(100))).build().new_agent();
+        let endpoint = Endpoint { client, url, key: "test-key".into() };
+        let result = endpoint.send(&json!({}));
+        server.join().unwrap();
+        assert_eq!(result.unwrap_err(), "The model request timed out while reading the response.");
     }
 
     #[test]

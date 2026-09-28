@@ -294,6 +294,7 @@ impl App {
             });
             ui.add_space(8.0);
             if let Some(run) = &self.label_run {
+                ui.label(format!("{} / {}", run.provider, run.model));
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(format!("Labeling {}: {} s", run.rel, run.started.elapsed().as_secs()));

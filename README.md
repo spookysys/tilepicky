@@ -92,7 +92,8 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 2. Open the **AI assist** panel with `I` or the header toolbar button.
 3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output. Tilepicky ships with OpenRouter and `z-ai/glm-5.3-flash`; set `OPENROUTER_API_KEY` or type the key in Settings.
 4. Right-click the sheet or its file-tree row and select **Label with AI**.
-5. Select **Show AI label...** from that menu to read the caption and tags. Use **Label again** in this popup to replace them.
+5. The label popup opens with the request progress, provider, and model. It shows the caption and tags or the error.
+   Use **Label again** to replace a label. Use **Show AI label...** to reopen the popup.
 
 The model returns a caption, up to 12 freeform tags, and matching tags from your list.
 Tilepicky writes the label to `tilepicky.json`. You can continue working while the request runs.
