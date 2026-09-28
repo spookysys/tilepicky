@@ -4,7 +4,7 @@ Tilepicky is a desktop tool to extract tiles from sprite sheets and assemble the
 
 <https://github.com/spookysys/tilepicky>
 
-![A tilesheet of your own is built from two packs, found through the search box](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/demo.gif)
+![A tilesheet of your own is built from two packs, found through the search box](media/demo.gif)
 
 Open a project sheet, search the library for the tiles you need, select a region, and drag or copy the tiles onto the canvas.
 
@@ -51,7 +51,7 @@ The window splits into two main columns:
 - **Left column**: File trees. The library tree sits above, and the project tree sits below.
 - **Right column**: Sheet viewports. The source sheet from the library sits above, and your project canvas sits below.
 
-![The left column with both trees, the source sheet above, and the tilesheet being built below](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/screenshot.png)
+![The left column with both trees, the source sheet above, and the tilesheet being built below](media/screenshot.png)
 
 Each sheet viewport includes a header toolbar. The toolbar displays grid parameters (tile size, gap, offset), current zoom level, selection coordinates, sheet filename, and hover tile coordinates. Buttons on the right edge open side panels.
 
@@ -80,7 +80,7 @@ Search runs locally and synchronously on your machine. It makes no network reque
 
 Tilepicky can generate searchable captions and tags for library sheets using multimodal vision models.
 
-![I opens AI assist, weapon joins the tags to look for, Label with AI describes the open sheet and tags it weapon, Label the unlabeled sheets describes the rest, and a search for weapon finds the dungeon pack through its tags](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/ai-labels.gif)
+![I opens AI assist, weapon joins the tags to look for, Label with AI describes the open sheet and tags it weapon, Label the unlabeled sheets describes the rest, and a search for weapon finds the dungeon pack through its tags](media/ai-labels.gif)
 
 In the recording, `I` opens the AI assist panel, and "weapon" joins the tags to look for. **Label with AI** describes the open sheet in a few seconds. The tags from the list show in bold, weapon among them. **Label the unlabeled sheets...** then labels the other 31 sheets, one request each, in about three minutes. The waits play sped up. A search for "weapon" finds three sheets of the Tiny Dungeon pack, although no file or folder carries that word: the tags do.
 
@@ -127,7 +127,7 @@ API keys are stored separately in `~/.config/tilepicky/keys.json` with restricte
 
 Tilepicky supports complete operation using the keyboard.
 
-![A house and two trees go from the Tiny Town pack into a new tilesheet without the mouse: the arrows open the pack, Ctrl+Tab moves between panes, Shift and the arrows select, Ctrl+C and Ctrl+V copy, Ctrl+T trims, and Ctrl+S saves](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/keyboard.gif)
+![A house and two trees go from the Tiny Town pack into a new tilesheet without the mouse: the arrows open the pack, Ctrl+Tab moves between panes, Shift and the arrows select, Ctrl+C and Ctrl+V copy, Ctrl+T trims, and Ctrl+S saves](media/keyboard.gif)
 
 In the recording, the arrows walk the library tree and open the Tiny Town pack. `Ctrl+Tab` moves to the source sheet, and `Shift` with the arrows selects a house. `Ctrl+C` copies it, and `Ctrl+Tab` into the empty canvas starts a new tilesheet, where `Ctrl+V` pastes it. Two trees follow the same way. `Ctrl+T` trims the canvas to what it holds, and `Ctrl+S` names and saves it.
 
@@ -164,13 +164,13 @@ You can define tile animations directly on a sheet:
 4. Set the `ms` parameter to configure frame duration in milliseconds.
 5. Press `M` or click **Store** to save the animation. Pressing `M` again removes the definition.
 
-![Two blocks of water tiles become animations: paste, A, set the frames, Store](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation-panel.gif)
+![Two blocks of water tiles become animations: paste, A, set the frames, Store](media/animation-panel.gif)
 
 Stored animations are saved in `tilepicky.json` using pixel coordinates. Changing a sheet's tile size preserves existing animations. Stored animations transfer automatically when copying or dragging tiles.
 
 Animated GIFs play directly in the library panel. Copying an animated region extracts moving frames into an unrolled strip with an animation definition applied. Static regions copy as single frames.
 
-![A waterfall is taken out of an animated GIF and lands as a marked strip](https://raw.githubusercontent.com/spookysys/tilepicky/main/media/animation.gif)
+![A waterfall is taken out of an animated GIF and lands as a marked strip](media/animation.gif)
 
 ## Formats
 
