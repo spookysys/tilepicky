@@ -9,12 +9,12 @@ use serde_json::{Value, json};
 use std::{io::Cursor, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action { Label, Remove, Cancel }
+pub enum Action { Label, Show, Remove, Cancel }
 
 /// The same commands appear on the library sheet and its file-tree row.
 pub fn menu(ui: &mut eframe::egui::Ui) -> Option<Action> {
     let mut action = None;
-    for (text, command) in [("Label with AI", Action::Label), ("Remove AI label...", Action::Remove)] {
+    for (text, command) in [("Label with AI", Action::Label), ("Show AI label...", Action::Show), ("Remove AI label...", Action::Remove)] {
         if ui.button(text).clicked() {
             action = Some(command);
             ui.close();
@@ -213,7 +213,8 @@ pub fn prompt(list: &[String]) -> [String; 2] {
     let list = Reply::usable(list);
     if !list.is_empty() {
         system += &format!(" Put your own tags in tags. In listed, answer for each of these tags whether the sheet clearly shows it, \
-            true or false: {}. Most sheets show only a few of them.", list.join(", "));
+            true or false: {}. Evaluate each tag independently. Mark every applicable tag true, including secondary content. \
+            Do not infer content that is not visible. Do not repeat a listed concept with a synonymous freeform tag.", list.join(", "));
     }
     [system, "Describe the whole sprite sheet: asset type, setting, visual style, palette and overall content.".into()]
 }
@@ -354,6 +355,18 @@ pub mod tests {
         let prose = json!({"choices":[{"finish_reason":"stop", "message":{"content":"**Caption:** Trees"}}]});
         assert_eq!(run(vec![prose.clone(), completion(labeled("Trees"))]).unwrap().caption, "Trees");
         assert_eq!(run(vec![prose.clone(), prose, completion(labeled("Trees"))]).unwrap_err(), INVALID);
+    }
+
+    #[test]
+    fn every_fitting_listed_tag_survives_the_freeform_limit() {
+        let list: Vec<String> = (0..20).map(|i| format!("category {i}")).collect();
+        let listed: serde_json::Map<String, Value> = list.iter().map(|t| (t.clone(), json!(true))).collect();
+        let reply = response(&completion(json!({"status":"labeled", "caption":"A varied sheet",
+            "tags":["pixel art"], "listed":listed})), &list).unwrap();
+        assert_eq!(reply.tags.len(), 21);
+        for tag in &list { assert!(reply.tags.contains(tag)); }
+        let schema = request("vision", &RgbaImage::new(1, 1), &list).unwrap();
+        assert_eq!(schema["response_format"]["json_schema"]["schema"]["properties"]["listed"]["required"], json!(list));
     }
 
     #[test]

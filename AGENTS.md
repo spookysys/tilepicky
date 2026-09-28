@@ -32,12 +32,12 @@ the person who uses the tool; this file is for an agent that works on it.
 ## Where things are
 
 - `src/main.rs`: the app: the panels, the headers, the keys, the popups,
-  and the drag of a block between the panels.
+  and the drag of a block between the panels. The status bar shows label progress.
 - `src/half.rs`: one half of the window, the library or the project: its
   folder, its tree, the sheet open from it, and where the keys stand.
 - `src/dialogs.rs`: the dialogs that ask first: names, deletions, unsaved
   changes, the removal of a label, the legend, and a damaged settings or
-  keys file.
+  keys file. The AI label popup also lives here.
 - `src/sheet.rs`: one sheet on screen: the grid, the selection, the copy
   and paste, the provenance map, the eye mode, and the animations.
 - `src/files.rs`: project file operations, separate from the UI.
@@ -50,7 +50,8 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
-  and their settings page. Single-sheet labeling uses the instant model.
+  and their settings page. OpenRouter requests use the provider skip list.
+  Single-sheet labeling uses the instant model.
   Library batches use the configured Google or OpenRouter batch model.
 - `src/labels.rs`: one labeling request per sheet, the library's tag list
   in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker

@@ -3,7 +3,7 @@
 //! changes, the removal of a label, the legend, and a damaged settings file. Each waits in a field of
 //! the app until the user answers.
 
-use crate::{App, sidecar};
+use crate::{App, ai, labels, sidecar};
 use eframe::egui::{self, Id, Key};
 
 /// What to do once the user has decided about unsaved changes. A file is
@@ -44,6 +44,7 @@ impl App {
     pub fn dialogs(&mut self, ctx: &egui::Context) {
         self.name_dialog(ctx);
         self.confirm_dialog(ctx);
+        self.label_dialog(ctx);
         self.remove_label_dialog(ctx);
         self.prompt_dialog(ctx);
         self.library_batch.confirmation(ctx);
@@ -261,8 +262,59 @@ impl App {
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
         self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.prompt_view.is_some() || self.library_batch.open()
-            || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
+            || self.label_view || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
             || egui::Popup::is_any_open(ctx)
+    }
+
+    /// Reads the current sheet again each frame, so a completed request updates the popup.
+    fn label_dialog(&mut self, ctx: &egui::Context) {
+        if !self.label_view { return; }
+        let Some(sheet) = &self.library.sheet else { self.label_view = false; return };
+        let ready = self.settings.ai.chosen(ai::Mode::Instant)
+            .is_some_and(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
+        let mut action = None;
+        let mut close = false;
+        egui::Modal::new(Id::new("AI label")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("AI label");
+            ui.label(&sheet.rel);
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                if let Some(label) = &sheet.side.label {
+                    label.show(ui);
+                    ui.weak(format!("{} / {}", label.provider, label.model));
+                    if ui.button("Prompt...").clicked() {
+                        let title = if label.tag_list.is_some() { "Current prompt with this label's tag list" }
+                            else { "Current prompt without a recorded tag list" };
+                        self.prompt_view = Some((title.into(), labels::prompt(label.tag_list.as_deref().unwrap_or_default())));
+                    }
+                } else {
+                    ui.weak("No label yet.");
+                }
+            });
+            ui.add_space(8.0);
+            if let Some(run) = &self.label_run {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Labeling {}: {} s", run.rel, run.started.elapsed().as_secs()));
+                });
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            } else if let Some(outcome) = &self.label_outcome {
+                ui.label(outcome);
+            }
+            ui.horizontal(|ui| {
+                close = ui.button("Close").clicked();
+                let busy = self.label_run.is_some();
+                let text = if sheet.side.label.is_some() { "Label again" } else { "Label with AI" };
+                if ui.add_enabled(ready && !busy, egui::Button::new(text)).clicked() { action = Some(labels::Action::Label); }
+                if ui.add_enabled(sheet.side.label.is_some() && !busy, egui::Button::new("Remove label...")).clicked() {
+                    action = Some(labels::Action::Remove);
+                }
+                if busy && ui.button("Cancel").clicked() { action = Some(labels::Action::Cancel); }
+            });
+            if self.prompt_view.is_none() && self.remove_label.is_none() && ui.input(|i| i.key_pressed(Key::Escape)) { close = true; }
+        });
+        if close { self.label_view = false; }
+        if let Some(action) = action { self.label_action(ctx, action); }
     }
 
     /// Shows a prompt as it goes to the model. The text can be selected and copied.

@@ -67,6 +67,9 @@ pub struct Provider {
     /// is set wins.
     #[serde(default)]
     pub key_env: Vec<String>,
+    /// None uses the OpenRouter default. An empty list explicitly skips nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<Vec<String>>,
 }
 
 /// Where a provider's key comes from.
@@ -82,7 +85,26 @@ pub enum KeySource {
 impl Provider {
     fn new(name: &str, kind: Kind) -> Self {
         let (url, env) = kind.defaults();
-        Provider { name: name.into(), kind, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
+        Provider { name: name.into(), kind, skip: None, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
+    }
+
+    pub fn is_openrouter(&self) -> bool {
+        self.kind == Kind::OpenAi && crate::labels::checked_url(&self.url).ok()
+            .and_then(|url| url.parse::<ureq::http::Uri>().ok())
+            .is_some_and(|url| url.host().is_some_and(|host| host.eq_ignore_ascii_case("openrouter.ai")))
+    }
+
+    pub fn skipped(&self) -> Vec<String> {
+        self.skip.clone().unwrap_or_else(|| if self.is_openrouter() { vec!["phala".into()] } else { vec![] })
+    }
+
+    /// Only OpenRouter receives its routing options.
+    pub fn route(&self, mut body: serde_json::Value) -> serde_json::Value {
+        if self.is_openrouter() {
+            let skip = self.skipped();
+            if !skip.is_empty() { body["provider"]["ignore"] = serde_json::json!(skip); }
+        }
+        body
     }
 
     /// Resolve the key only when the user starts a request. It comes from
@@ -409,6 +431,19 @@ fn providers_ui(
             ui.label("URL");
             ui.add(egui::TextEdit::singleline(&mut p.url).desired_width(f32::INFINITY));
             ui.end_row();
+            if p.is_openrouter() {
+                ui.label("skip");
+                let id = ui.make_persistent_id(("provider skip", &p.name, &p.url));
+                let mut skip = ui.data_mut(|data| data.get_temp::<String>(id)).unwrap_or_else(|| p.skipped().join(", "));
+                let edit = ui.add(egui::TextEdit::singleline(&mut skip).id(id).desired_width(f32::INFINITY))
+                    .on_hover_text("OpenRouter provider slugs to skip, separated by commas. Empty allows all providers.");
+                if edit.changed() { p.skip = Some(crate::labels::parse_list(&skip)); }
+                // Keep separators while the user types the next provider.
+                ui.data_mut(|data| {
+                    if edit.has_focus() { data.insert_temp(id, skip); } else { data.remove::<String>(id); }
+                });
+                ui.end_row();
+            }
             ui.label("key");
             let typed = keys.entry(&p.name);
             ui.add(egui::TextEdit::singleline(typed).password(true).hint_text("empty: the environment variable below").desired_width(f32::INFINITY));
@@ -487,6 +522,35 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_settings_default_to_phala_but_an_empty_skip_list_stays_empty() {
+        let mut p: Provider = serde_json::from_value(serde_json::json!({
+            "name":"Router", "kind":"open_ai", "url":"https://openrouter.ai/api/v1"
+        })).unwrap();
+        assert_eq!(p.skipped(), ["phala"]);
+        assert_eq!(p.route(serde_json::json!({}))["provider"]["ignore"], serde_json::json!(["phala"]));
+        p.skip = Some(vec![]);
+        let saved = serde_json::to_value(&p).unwrap();
+        let p: Provider = serde_json::from_value(saved).unwrap();
+        assert!(p.skipped().is_empty());
+        assert!(p.route(serde_json::json!({})).get("provider").is_none());
+    }
+
+    #[test]
+    fn skip_lists_only_reach_openrouter() {
+        let mut p = Ai::default().providers.remove(0);
+        p.skip = Some(vec!["phala".into(), "another-provider".into()]);
+        let body = serde_json::json!({"model":"vision", "messages":[]});
+        assert_eq!(p.route(body.clone())["provider"]["ignore"], serde_json::json!(["phala", "another-provider"]));
+        for url in ["https://api.openai.com/v1", "https://openrouter.ai.example/v1", "https://example.test/openrouter.ai"] {
+            p.url = url.into();
+            assert_eq!(p.route(body.clone()), body);
+        }
+        p.url = "https://openrouter.ai/api/v1".into();
+        p.kind = Kind::Gemini;
+        assert_eq!(p.route(body.clone()), body);
+    }
 
     #[test]
     fn the_defaults_name_a_model_for_each_mode() {

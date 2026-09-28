@@ -80,21 +80,30 @@ Search runs locally and synchronously on your machine. It makes no network reque
 
 Tilepicky can generate searchable captions and tags for library sheets using multimodal vision models.
 
-![I opens AI assist, weapon joins the tags to look for, Label with AI describes the open sheet and tags it weapon, Label the unlabeled sheets describes the rest, and a search for weapon finds the dungeon pack through its tags](media/ai-labels.gif)
+![Read a saved example label and find a dungeon sheet through its weapon tag](media/ai-labels.gif)
 
-In the recording, `I` opens the AI assist panel, and "weapon" joins the tags to look for. **Label with AI** describes the open sheet in a few seconds. The tags from the list show in bold, weapon among them. **Label the unlabeled sheets...** then labels the other 31 sheets, one request each, in about three minutes. The waits play sped up. A search for "weapon" finds three sheets of the Tiny Dungeon pack, although no file or folder carries that word: the tags do.
+The recording uses saved example labels. It shows the compact AI panel, **Show AI label...**, and a search for `weapon`.
+The search finds the dungeon sheet through its tags. The recording sends no requests.
 
 ### Label a single sheet
 
 1. Open a library sheet.
 2. Open the **AI assist** panel with `I` or the header toolbar button.
 3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output. Tilepicky ships with OpenRouter and `z-ai/glm-5.3-flash`; set `OPENROUTER_API_KEY` or type the key in Settings.
-4. Select **Label with AI** in the panel or from the sheet context menu. On a sheet that has a label, the panel button reads **Label again**.
+4. Right-click the sheet or its file-tree row and select **Label with AI**.
+5. Select **Show AI label...** from that menu to read the caption and tags. Use **Label again** in this popup to replace them.
 
-The model returns one caption and up to 12 tags of its own, plus the tags from your list that fit; see below. Tilepicky writes this label to `tilepicky.json`. You can continue working while the request runs in the background. Requests abort after 60 seconds, or when you click **Cancel**.
+The model returns a caption, up to 12 freeform tags, and matching tags from your list.
+Tilepicky writes the label to `tilepicky.json`. You can continue working while the request runs.
+The popup and status bar show progress and a **Cancel** button.
+Each request times out after 60 seconds. **Cancel** stops waiting, but the provider may still bill the request.
 
-To delete a label, select **Remove label...** in the panel, or **Remove AI label...** in the context menu, and confirm.
-**Prompt...** beside the label shows the prompt that made it.
+To delete a label, select **Remove label...** in the popup, or **Remove AI label...** in the context menu, and confirm.
+**Prompt...** in the popup shows the current prompt with the tag list recorded for that label.
+
+OpenRouter settings have a **skip** field for provider slugs, separated by commas. It defaults to `phala`, including for older settings.
+Clear the field to allow all providers. Single requests and library batches use this list.
+A batch keeps the provider settings it started with.
 
 GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixels are scaled down before submission.
 
@@ -115,11 +124,16 @@ Batch state persists in `~/.config/tilepicky/` across application restarts. If a
 
 ### Tags to look for
 
-The bottom of the AI assist panel holds a list of tags, separated by commas. Every request asks the model to check the sheet for each of them, and to add each one that fits, spelled as in your list. If characters matter to you, keep `character` in the list, and every sheet that shows one gets that tag. These tags do not count toward the 12 the model adds of its own.
+The bottom of the AI assist panel holds a list of tags, separated by commas.
+The prompt asks the model to check each tag independently, including secondary content.
+It asks for every matching tag, with the spelling from your list, and no duplicate synonyms.
+The model can still miss visible content. These tags do not count toward the 12 the model adds of its own.
 
 A new library starts with `character, NPC, hero, landscape, building, indoor, UI, font, animation, props, background`. **Reset** brings that list back. The list belongs to the library: Tilepicky writes it at the top of the library's `tilepicky.json`.
 
-Each label records the list its request used. **Prompt...** beside a label shows the prompt with that list, and **Prompt...** under the list shows the prompt of the next request. Changing the list does not relabel anything. To label a sheet with the new list, select **Label again**, or remove its label and label the library again.
+Each label records the list its request used. **Prompt...** in the label popup uses that list with the current prompt text.
+**Prompt...** under the list shows the prompt of the next request. Changing the list does not relabel anything.
+To apply the new list, select **Label again**, or remove the label and label the library again.
 
 API keys are stored separately in `~/.config/tilepicky/keys.json` with restricted file permissions (`0600`).
 

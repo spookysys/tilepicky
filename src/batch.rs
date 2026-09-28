@@ -276,7 +276,8 @@ pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str,
 fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
     let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
     let request = image::open(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))
-        .and_then(|img| labels::request(&job.model, &img.to_rgba8(), &job.tag_list));
+        .and_then(|img| labels::request(&job.model, &img.to_rgba8(), &job.tag_list))
+        .map(|body| job.provider.route(body));
     let reply = match request {
         Err(error) => Err(error),
         Ok(request) => match send("chat/completions", Some(&request)) {
@@ -665,7 +666,7 @@ mod tests {
     }
     impl Drop for Files { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.base); } }
     fn provider(kind: Kind) -> Provider {
-        Provider { name: "test".into(), kind, key_env: vec![], url: match kind {
+        Provider { name: "test".into(), kind, skip: None, key_env: vec![], url: match kind {
             Kind::Gemini => "https://generativelanguage.googleapis.com/v1beta".into(),
             Kind::OpenAi => "https://openrouter.ai/api/v1".into(),
         } }
@@ -741,6 +742,19 @@ mod tests {
         assert_eq!(label.tags, ["pines", "tree"]);
         assert_eq!(label.tag_list, Some(vec!["tree".to_string()]));
         assert_eq!(files.journal().tag_list, ["tree"]);
+    }
+
+    #[test]
+    fn a_resumed_batch_keeps_its_provider_skip_list() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::OpenAi);
+        job.provider.skip = Some(vec!["phala".into(), "another-provider".into()]);
+        job.save(&files.spool).unwrap();
+        let (_, result) = files.advance(files.journal(), |_, body| {
+            assert_eq!(body.unwrap()["provider"]["ignore"], json!(["phala", "another-provider"]));
+            Ok(completion(labeled("Tree")))
+        });
+        result.unwrap();
     }
 
     /// A request that did not arrive, or that the provider could not take
