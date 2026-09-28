@@ -276,6 +276,7 @@ impl App {
         let mut action = None;
         let mut close = false;
         let mut copy_log = false;
+        let has_log = self.single_log_available();
         egui::Modal::new(Id::new("AI label")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading("AI label");
@@ -306,18 +307,19 @@ impl App {
             }
             ui.horizontal(|ui| {
                 close = ui.button("Close").clicked();
-                copy_log = ui.button("Copy log").clicked();
-                let busy = self.label_run.is_some();
+                copy_log = ui.add_enabled(has_log, egui::Button::new("Copy log"))
+                    .on_hover_text("Copy the single-sheet request log for this sheet. Removed on exit when the job has finished.").clicked();
+                let busy = self.label_run.is_some() || !self.library_batch.allows_single();
                 let text = if sheet.side.label.is_some() { "Label again" } else { "Label with AI" };
                 if ui.add_enabled(ready && !busy, egui::Button::new(text)).clicked() { action = Some(labels::Action::Label); }
                 if ui.add_enabled(sheet.side.label.is_some() && !busy, egui::Button::new("Remove label...")).clicked() {
                     action = Some(labels::Action::Remove);
                 }
-                if busy && ui.button("Cancel").clicked() { action = Some(labels::Action::Cancel); }
+                if self.label_run.is_some() && ui.button("Cancel").clicked() { action = Some(labels::Action::Cancel); }
             });
             if self.prompt_view.is_none() && self.remove_label.is_none() && ui.input(|i| i.key_pressed(Key::Escape)) { close = true; }
         });
-        if copy_log { self.copy_ai_log(ctx); }
+        if copy_log { self.copy_single_log(ctx); }
         if close { self.label_view = false; }
         if let Some(action) = action { self.label_action(ctx, action); }
     }

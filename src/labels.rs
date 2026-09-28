@@ -159,6 +159,7 @@ pub struct Input {
 /// result arrives on `result`. To cancel, drop the `Run`: the result then
 /// has nowhere to go. The provider may still bill the request.
 pub struct Run {
+    pub log: crate::ai_log::Log,
     pub path: PathBuf,
     pub dir: PathBuf,
     pub rel: String,
@@ -174,10 +175,12 @@ impl Run {
         send: impl Fn(&Value) -> Result<Value, String> + Send + 'static,
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
+        let log = crate::ai_log::current().unwrap_or_else(|| crate::ai_log::Log::single_file(&input.dir, &input.rel));
         let (tx, result) = std::sync::mpsc::channel();
-        let run = Self { path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(),
+        let run = Self { log: log.clone(), path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(),
             provider: provider.clone(), model: model.clone(), started: std::time::Instant::now(), result };
         std::thread::Builder::new().name("label sheet".into()).spawn(move || {
+            let _scope = log.enter();
             // An answer in prose goes out once more; see `batch::one`.
             crate::ai_log::event("single_start", json!({"sheet":input.rel, "provider":provider, "model":model,
                 "tags_requested":list, "prompt":prompt(&list), "image_size":[input.img.width(),input.img.height()]}));
@@ -478,6 +481,7 @@ pub mod tests {
     #[test]
     fn worker_returns_while_the_request_waits() {
         use std::sync::mpsc;
+        let log = crate::ai_log::Log::single("sheet.png"); let _scope = log.enter();
         let input = Input { path: "sheet.png".into(), dir: "".into(), rel: "sheet.png".into(), img: RgbaImage::new(2, 2) };
         let (started, waiting) = mpsc::channel();
         let (release, gate) = mpsc::channel::<()>();
@@ -501,6 +505,7 @@ pub mod tests {
     #[test]
     fn a_label_in_prose_is_asked_for_once_more() {
         let run = |answers: Vec<Value>| {
+            let log = crate::ai_log::Log::single("s.png"); let _scope = log.enter();
             let input = Input { path: "s.png".into(), dir: "".into(), rel: "s.png".into(), img: RgbaImage::new(2, 2) };
             let answers = std::sync::Mutex::new(answers);
             let run = Run::start(input, "p".into(), "m".into(), vec![], move |_| Ok(answers.lock().unwrap().remove(0)), || {}).unwrap();

@@ -227,3 +227,22 @@ After the storage change, the native fixture retained its paused job across rest
 It then replayed the captured Google response and saved both test labels before showing Finished.
 Both predefined tags and freeform tags appeared in the saved labels. No image was sent to Google during replay.
 Default and WGPU test suites passed. Clippy passed with all targets and WGPU enabled.
+
+## Logs for the current labeling job
+
+Each library now has one log file for either job type. Single-sheet requests and library jobs cannot run together.
+The UI has separate Copy log buttons under Single sheet and Library labeling. Missing logs disable their buttons.
+The single-sheet popup copies the same log as the single-sheet section.
+New jobs replace the file. Exit removes finished logs and preserves unfinished logs.
+An interrupted single-sheet job becomes a finished interruption after restart. It does not resend automatically.
+
+The private native UI pass checked disabled buttons before a request, a failed single-sheet request, and both clipboard entry points.
+The popup and sidebar copied identical single-sheet logs. Exit removed that finished log.
+A two-sheet batch disabled single-sheet requests. Its clipboard contained batch events without the earlier single-sheet events.
+The unfinished batch retained its log and job ID across restart. After results were saved, exit removed the finished batch log.
+The batch used a loopback provider. The single-sheet check used an unreachable example endpoint. No paid request was sent.
+
+Unit tests cover separate job IDs, late replies, redaction, size limits, restart, replacement, and exit cleanup for both job types.
+
+Final verification: 156 tests passed in each build configuration. Clippy passed with all targets and WGPU enabled.
+The interactive fixture remains excluded from automatic tests and was exercised separately.

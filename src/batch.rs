@@ -107,6 +107,8 @@ fn key(sheet: usize) -> String { format!("sheet-{sheet}") }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    log_id: String,
     pub provider: Provider,
     pub model: String,
     pub sheets: Vec<Sheet>,
@@ -260,6 +262,7 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
     let all = scope == Scope::All;
     let open = index.entries.iter().filter(|e| all || e.side.label.is_none());
     Ok(Job {
+        log_id: crate::ai_log::id(),
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
         replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), prompt: Some(labels::prompt(&index.tag_list)),
         poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
@@ -699,6 +702,7 @@ impl Activity {
 /// The pane displays coordinator snapshots. It never changes a running job's journal.
 #[derive(Default)]
 pub struct Panel {
+    log: Option<crate::ai_log::Log>,
     pub root: PathBuf,
     dir: PathBuf,
     pub job: Option<Job>,
@@ -718,6 +722,21 @@ impl Panel {
     fn running(&self) -> bool { self.job.as_ref().is_some_and(|j| !j.done()) }
     pub fn open(&self) -> bool { self.proposal.is_some() || self.resend_confirm }
     pub fn busy(&self) -> bool { self.running() || self.open() }
+    pub fn allows_single(&self) -> bool {
+        !self.busy() && (self.root.as_os_str().is_empty() || self.lock.is_some())
+    }
+    pub fn cleanup_log(&self, root: &Path) -> Result<(), String> {
+        let _lock = if self.root == root && self.lock.is_some() { None } else {
+            match runner::lock(root) { Ok(lock) => Some(lock), Err(_) => return Ok(()) }
+        };
+        crate::ai_log::cleanup_finished(root).map_err(|error| error.to_string())
+    }
+    pub fn finish_before_single(&mut self) {
+        if !self.busy() {
+            self.stop_runner();
+            if let Some(log) = &self.log { log.retire(); }
+        }
+    }
 
     fn submission_counts(&self, job: &Job) -> (usize, usize, usize) {
         let (queued, waiting, uncertain) = job.submission_counts();
@@ -732,13 +751,7 @@ impl Panel {
         Some(format!("AI labels: {} saved / {} | {}", job.saved(), job.sheets.len(), self.state(job)))
     }
 
-    pub fn diagnostics(&self) -> String {
-        self.job.as_ref().map_or(String::new(), |job| format!("Library job summary\n{}\n\n", json!({
-            "provider":job.provider.name, "model":job.model, "sheets":job.sheets.len(), "saved":job.saved(),
-            "mode":job.mode, "groups":job.groups, "issues":job.issues, "last_response_ms":job.last_response_ms,
-            "tags":job.tag_list, "prompt":job.prompt
-        })))
-    }
+    fn log_available(&self) -> bool { self.log.as_ref().is_some_and(crate::ai_log::Log::available) }
 
     pub fn discard_completed(&mut self, root: &Path) -> Result<(), String> {
         if self.busy() { return Err("Wait for the job to finish or cancel it first.".into()); }
@@ -747,6 +760,7 @@ impl Panel {
         self.stop_runner();
         store::clear(&self.dir)?;
         self.job = None;
+        self.log = None;
         self.error.clear();
         Ok(())
     }
@@ -759,12 +773,15 @@ impl Panel {
         let revision = now_ms().max(self.control.revision + 1);
         let control = runner::Control { revision, mode };
         match store::set_control(&self.dir, &control) {
-            Ok(()) => { self.control = control; self.command(runner::Command::Wake); }
+            Ok(()) => {
+                if let Some(log) = &self.log { log.event("batch_control", json!({"mode":mode})); }
+                self.control = control; self.command(runner::Command::Wake);
+            }
             Err(error) => self.error = error,
         }
     }
 
-    pub fn tick(&mut self, ctx: &eframe::egui::Context, root: &Path, keys: &crate::ai::Keys) -> bool {
+    pub fn tick(&mut self, ctx: &eframe::egui::Context, root: &Path, keys: &crate::ai::Keys, single_running: bool) -> bool {
         if !self.running() && self.root != root && !root.as_os_str().is_empty() {
             self.stop_runner();
             *self = Panel { root: root.into(), ..Panel::default() };
@@ -776,7 +793,14 @@ impl Panel {
             match opened {
                 Ok((lock, dir)) => {
                     self.lock = Some(lock); self.dir = dir;
-                    match Job::load(&self.dir) { Ok(job) => self.job = job, Err(error) => self.error = error }
+                    match Job::load(&self.dir) {
+                        Ok(job) => {
+                            self.log = job.as_ref().map(|job| crate::ai_log::Log::batch(&self.root, &job.log_id));
+                            if job.as_ref().is_some_and(Job::done) && let Some(log) = &self.log && log.available() { log.complete(); }
+                            self.job = job;
+                        }
+                        Err(error) => self.error = error,
+                    }
                     match store::control(&self.dir) {
                         Ok(control) => self.control = control, Err(error) => self.error = error,
                     }
@@ -786,9 +810,9 @@ impl Panel {
         }
         if let Some(job) = &self.job {
             let key = job.provider.key(keys).unwrap_or_default();
-            if self.runner.is_none() && self.storage_error.is_empty() && !job.done() && let Some(lock) = &self.lock {
+            if !single_running && self.runner.is_none() && self.storage_error.is_empty() && !job.done() && let Some(lock) = &self.lock {
                 self.key = key.clone();
-                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), self.dir.clone(), key, lock.clone(), ctx.clone()));
+                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), key, lock.clone(), ctx.clone(), self.log.clone().unwrap()));
             } else if key != self.key {
                 self.key = key.clone(); self.command(runner::Command::Key(key));
             }
@@ -824,6 +848,7 @@ impl Panel {
     pub fn import(&mut self) -> Vec<(String, Option<Label>)> {
         let Some(reply) = self.pending_save.take() else { return vec![] };
         let Some(job) = &self.job else { return vec![] };
+        let _scope = self.log.as_ref().map(crate::ai_log::Log::enter);
         let (report, labels) = save_labels(job, &self.root);
         let _ = reply.send(report);
         labels
@@ -865,6 +890,11 @@ impl Panel {
 
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, index: &Index, ai: &crate::ai::Ai, keys: &crate::ai::Keys, single_running: bool) {
         use eframe::egui;
+        if crate::stopped(ui.add_enabled(self.log_available(), egui::Button::new("Copy log")))
+            .on_hover_text("Copy this library job's log. A new job replaces it. Finished logs are removed on exit.").clicked()
+            && let Some(log) = &self.log {
+            match log.text() { Ok(text) => ui.ctx().copy_text(text), Err(error) => self.error = error }
+        }
         let configured = ai.chosen(crate::ai::Mode::Batch);
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
         for error in [&self.error, &self.storage_error] {
@@ -919,7 +949,8 @@ impl Panel {
                     if crate::stopped(ui.button("Cancel job")).clicked() { cancel = true; }
                 }
                 if !job.issues.is_empty() && crate::stopped(ui.button("Retry now")).clicked() { retry = true; }
-                if job.done() && failed > 0 && crate::stopped(ui.button("Retry failed sheets")).clicked() { retry_failed = true; }
+                if job.done() && failed > 0
+                    && crate::stopped(ui.add_enabled(!single_running, egui::Button::new("Retry failed sheets"))).clicked() { retry_failed = true; }
             });
             if !job.done() {
                 ui.weak(if job.provider.kind == Kind::Gemini {
@@ -957,7 +988,7 @@ impl Panel {
         if let Some(mode) = pause { self.set_mode(mode); }
         if cancel { self.cancel(keys); }
         if retry { self.command(runner::Command::Wake); }
-        if retry_failed { self.start_retry(runner::Command::RetryFailed, ui.ctx(), keys); }
+        if retry_failed && !single_running { self.start_retry(runner::Command::RetryFailed, ui.ctx(), keys); }
         if self.busy() { return; }
         let idle = self.lock.is_some() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
         if !ready { ui.weak("Set a library model and its key in Settings."); }
@@ -975,8 +1006,8 @@ impl Panel {
 
     fn start_retry(&mut self, command: runner::Command, ctx: &eframe::egui::Context, keys: &crate::ai::Keys) {
         if self.runner.is_none() && let (Some(job), Some(lock)) = (&self.job, &self.lock) {
-            self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), self.dir.clone(),
-                job.provider.key(keys).unwrap_or_default(), lock.clone(), ctx.clone()));
+            self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(),
+                job.provider.key(keys).unwrap_or_default(), lock.clone(), ctx.clone(), self.log.clone().unwrap()));
         }
         self.command(command);
     }
@@ -1038,7 +1069,12 @@ impl Panel {
             let mut job = self.proposal.take().unwrap();
             job.control_revision = self.control.revision;
             match store::start(&self.dir, &job) {
-                Ok(()) => { self.job = Some(job); self.error.clear(); }
+                Ok(()) => {
+                    let log = crate::ai_log::Log::batch(&self.root, &job.log_id);
+                    log.event("batch_start", json!({"provider":job.provider.name,"model":job.model,
+                        "sheets":job.sheets.len(),"tags_requested":job.tag_list,"prompt":job.prompt}));
+                    self.log = Some(log); self.job = Some(job); self.error.clear();
+                }
                 Err(e) => self.error = e,
             }
         }
@@ -1150,6 +1186,18 @@ mod tests {
     }
 
     #[test]
+    fn another_window_cannot_start_a_single_request_or_remove_the_owners_log() {
+        let files = Files::new();
+        let log = crate::ai_log::Log::single_file(&files.root, "folder/sheet.png");
+        log.event("finished", json!({})); log.complete();
+        let owner = Panel { root: files.root.clone(), lock: Some(runner::lock(&files.root).unwrap()), ..Panel::default() };
+        let other = Panel { root: files.root.clone(), ..Panel::default() };
+        assert!(owner.allows_single()); assert!(!other.allows_single());
+        other.cleanup_log(&files.root).unwrap(); assert!(log.available());
+        owner.cleanup_log(&files.root).unwrap(); assert!(!log.available());
+    }
+
+    #[test]
     fn outstanding_batches_have_status_without_the_ai_pane() {
         let files = Files::new();
         let panel = Panel { job: Some(files.prepare(Kind::Gemini)), ..Panel::default() };
@@ -1162,7 +1210,7 @@ mod tests {
         let job = files.prepare(Kind::Gemini);
         let mut panel = Panel { root: files.root.clone(), dir: files.spool.clone(), job: Some(job),
             runner: Some(runner::Runner::disconnected()), activity: Some((Activity::Checking, Instant::now())), ..Panel::default() };
-        panel.tick(&eframe::egui::Context::default(), &files.root, &crate::ai::Keys::default());
+        panel.tick(&eframe::egui::Context::default(), &files.root, &crate::ai::Keys::default(), false);
         assert!(panel.runner.is_none()); assert!(panel.activity.is_none());
         assert!(panel.storage_error.contains("worker stopped"));
         assert_eq!(panel.state(panel.job.as_ref().unwrap()), "Job needs attention");

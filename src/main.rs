@@ -115,6 +115,9 @@ struct App {
     ai_panel: bool,
     /// The Label with AI request in flight, and what the last one ended with.
     label_run: Option<labels::Run>,
+    single_log: Option<(PathBuf, ai_log::Log)>,
+    log_roots: std::collections::HashSet<PathBuf>,
+    log_library: PathBuf,
     label_outcome: Option<String>,
     label_view: bool,
     /// The tag list of the library as the user types it, and whether the
@@ -372,6 +375,9 @@ impl App {
             keys,
             ai_panel: false,
             label_run: None,
+            single_log: None,
+            log_roots: Default::default(),
+            log_library: PathBuf::new(),
             label_outcome: None,
             label_view: false,
             tag_text: String::new(),
@@ -1419,14 +1425,12 @@ impl App {
     /// The library panel shows the model, batch controls, and proposed tags.
     fn assist_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("AI labels");
-        ui.horizontal(|ui| {
-            if stopped(ui.small_button("Copy log"))
-                .on_hover_text("Copy recent AI prompts, replies, tags, and errors. Keys and images are omitted.").clicked() {
-                self.copy_ai_log(ui.ctx());
-            }
-        });
         ui.add_space(6.0);
         ui.strong("Single sheet");
+        if stopped(ui.add_enabled(self.single_log_available(), egui::Button::new("Copy log")))
+            .on_hover_text("Copy the latest single-sheet request log for the selected sheet. Removed on exit when the job has finished.").clicked() {
+            self.copy_single_log(ui.ctx());
+        }
         let instant = self.settings.ai.chosen(ai::Mode::Instant)
             .filter(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
         let ready = instant.is_some();
@@ -1440,7 +1444,7 @@ impl App {
         }
         else { ui.weak("Open a library sheet to label it."); }
         ui.horizontal_wrapped(|ui| {
-            if stopped(ui.add_enabled(ready && self.library.sheet.is_some() && self.label_run.is_none(),
+            if stopped(ui.add_enabled(ready && self.library.sheet.is_some() && self.label_run.is_none() && self.library_batch.allows_single(),
                 egui::Button::new("Label this sheet"))).clicked() {
                 self.label_action(&ui.ctx().clone(), labels::Action::Label);
             }
@@ -1496,9 +1500,17 @@ impl App {
         });
     }
 
-    fn copy_ai_log(&mut self, ctx: &egui::Context) {
-        match ai_log::text() {
-            Ok(text) => { ctx.copy_text(self.library_batch.diagnostics() + &text); self.status = "AI log copied to the clipboard.".into(); }
+    fn selected_single_log(&self) -> Option<&ai_log::Log> {
+        let sheet = self.library.sheet.as_ref()?;
+        self.single_log.as_ref().filter(|(path, _)| *path == sheet.dir.join(&sheet.rel)).map(|(_, log)| log)
+    }
+
+    fn single_log_available(&self) -> bool { self.selected_single_log().is_some_and(ai_log::Log::available) }
+
+    fn copy_single_log(&mut self, ctx: &egui::Context) {
+        let result = self.selected_single_log().ok_or_else(|| "No log is available for this sheet.".to_string()).and_then(ai_log::Log::text);
+        match result {
+            Ok(text) => { ctx.copy_text(text); self.status = "Single-sheet log copied to the clipboard.".into(); }
             Err(error) => self.status = error,
         }
     }
@@ -1528,7 +1540,9 @@ impl App {
             return;
         }
         if action == labels::Action::Cancel {
-            ai_log::event("single_cancel", serde_json::json!({"sheet":self.label_run.as_ref().map(|r| &r.rel)}));
+            if let Some(run) = &self.label_run {
+                run.log.event("single_cancel", serde_json::json!({"sheet":run.rel})); run.log.complete(); run.log.retire();
+            }
             self.label_run = None;
             self.status = "Cancelled. The provider may still bill the request.".into();
             self.label_outcome = Some(self.status.clone());
@@ -1538,8 +1552,8 @@ impl App {
             self.label_view = self.library.sheet.is_some();
             ctx.request_repaint();
         }
-        if self.label_run.is_some() {
-            self.status = "Wait for the current label, or cancel it.".into();
+        if self.label_run.is_some() || !self.library_batch.allows_single() {
+            self.status = "Wait for the current labeling job to finish, or cancel it.".into();
             return;
         }
         self.store_tag_list();
@@ -1549,6 +1563,13 @@ impl App {
             ctx.request_repaint();
             return;
         }
+        self.library_batch.finish_before_single();
+        if let Some((_, old)) = &self.single_log { old.retire(); }
+        let log = ai_log::Log::single_file(&sheet.dir, &sheet.rel);
+        self.log_roots.insert(sheet.dir.clone());
+        self.log_library = self.library.index.root.clone();
+        self.single_log = Some((sheet.dir.join(&sheet.rel), log.clone()));
+        let _scope = log.enter();
         let result = (|| {
             let (provider, model) = self.settings.ai.chosen(ai::Mode::Instant).ok_or("Choose an instant model in Settings.")?;
             if provider.kind != ai::Kind::OpenAi { return Err("Choose an OpenAI-compatible provider in Settings.".into()); }
@@ -1566,6 +1587,7 @@ impl App {
             Ok(run) => { self.label_run = Some(run); ctx.request_repaint(); }
             Err(error) => {
                 ai_log::event("single_setup_error", serde_json::json!({"sheet":sheet.rel, "error":error}));
+                log.complete();
                 self.status = error.clone(); self.label_outcome = Some(error);
             }
         }
@@ -1592,7 +1614,8 @@ impl App {
             Err(error) => format!("Labeling failed: {error}"),
         };
         self.status = format!("{}: {notice}", run.path.file_name().unwrap_or_default().to_string_lossy());
-        ai_log::event("single_saved", serde_json::json!({"sheet":run.rel, "outcome":self.status}));
+        run.log.event("single_saved", serde_json::json!({"sheet":run.rel, "outcome":self.status}));
+        run.log.complete();
         self.label_outcome = Some(self.status.clone());
     }
 
@@ -2198,6 +2221,14 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        for root in &self.log_roots {
+            if let Err(error) = self.library_batch.cleanup_log(root) { eprintln!("Could not remove the finished job log: {error}"); }
+        }
+    }
+}
+
 impl eframe::App for App {
     /// Keeps the Tab and arrow keys away from egui, which would walk the
     /// focus with them on its own, and Escape, which would drop the focus.
@@ -2233,10 +2264,17 @@ impl App {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = &ui.ctx().clone();
         self.receive_label();
-        if self.library_batch.tick(ctx, &self.library.index.root, &self.keys) {
+        let root = &self.library.index.root;
+        if !root.as_os_str().is_empty() { self.log_roots.insert(root.clone()); }
+        if self.library_batch.tick(ctx, &self.library.index.root, &self.keys, self.label_run.is_some()) {
             let root = self.library_batch.root.clone();
             let labels = self.library_batch.import();
             self.apply_labels(&root, &labels);
+        }
+        let root = &self.library.index.root;
+        if self.log_library != *root && self.label_run.is_none() && self.library_batch.allows_single() {
+            self.single_log = ai_log::Log::reopen_single(root);
+            self.log_library = root.clone();
         }
         // A right click first closes any open menu. egui closes a menu on any
         // click while it is open, and it does that after the same click has
@@ -3151,7 +3189,6 @@ mod tests {
         use winit::platform::x11::EventLoopBuilderExtX11;
         assert!(std::env::var("TILEPICKY_TEST_TRANSPORT").is_ok());
         assert!(std::env::var("XDG_CONFIG_HOME").is_ok());
-        ai_log::init();
         let (settings, damaged) = settings::Settings::load();
         let options = eframe::NativeOptions {
             renderer: default_renderer(),
@@ -3275,11 +3312,40 @@ mod tests {
     }
 
     #[test]
+    fn an_outstanding_batch_blocks_single_sheet_requests() {
+        let mut b = bench(&["a.png"], &[]); b.app.open_library(&b.ctx, 0);
+        let (provider, model) = b.app.settings.ai.chosen(ai::Mode::Batch).unwrap();
+        b.app.library_batch.job = Some(batch::prepare(&b.app.library.index, provider.clone(), model.id.clone(), batch::Scope::All).unwrap());
+        b.app.label_action(&b.ctx, labels::Action::Label);
+        assert!(b.app.label_run.is_none()); assert!(b.app.single_log.is_none());
+        assert!(b.app.status.contains("current labeling job"));
+    }
+
+    #[test]
+    fn copy_log_follows_the_sheet_and_retries_replace_the_previous_log() {
+        let mut b = bench(&["a.png", "b.png"], &[]);
+        b.app.open_library(&b.ctx, 0);
+        assert!(!b.app.single_log_available());
+        b.app.settings.ai.instant = None;
+        b.app.label_action(&b.ctx, labels::Action::Label);
+        assert!(b.app.single_log_available());
+        let first = b.app.selected_single_log().unwrap().clone();
+        assert!(first.text().unwrap().contains("single_setup_error"));
+        first.event("previous_request_marker", serde_json::json!({}));
+        b.app.open_library(&b.ctx, 1); assert!(!b.app.single_log_available());
+        b.app.open_library(&b.ctx, 0); assert!(b.app.single_log_available());
+        b.app.label_action(&b.ctx, labels::Action::Label);
+        assert!(!b.app.selected_single_log().unwrap().text().unwrap().contains("previous_request_marker"));
+        let restarted = App::new(settings::Settings::default(), None);
+        assert!(restarted.single_log.is_none());
+    }
+
+    #[test]
     fn the_label_popup_opens_the_tree_target_during_a_request() {
         let mut b = bench(&["a.png", "b.png"], &[]);
         b.app.open_library(&b.ctx, 0);
         let (_tx, result) = std::sync::mpsc::channel();
-        b.app.label_run = Some(labels::Run { path: b.library.0.join("a.png"), dir: b.library.0.clone(),
+        b.app.label_run = Some(labels::Run { log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
             rel: "a.png".into(), provider: "test".into(), model: "test".into(), started: std::time::Instant::now(), result });
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(1, labels::Action::Show));
         assert!(b.app.label_view && b.app.dialog_open(&b.ctx));
@@ -3297,7 +3363,7 @@ mod tests {
         b.app.open_library(&b.ctx, 0);
         b.app.label_action(&b.ctx, labels::Action::Show);
         let (tx, result) = std::sync::mpsc::channel();
-        b.app.label_run = Some(labels::Run { path: b.library.0.join("a.png"), dir: b.library.0.clone(),
+        b.app.label_run = Some(labels::Run { log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
             rel: "a.png".into(), provider: "test".into(), model: "test".into(), started: std::time::Instant::now(), result });
         tx.send(Ok(sidecar::Label { provider: "test".into(), model: "test".into(), status: sidecar::Status::Labeled,
             caption: "Indoor furniture".into(), tags: vec!["indoor".into()], tag_list: None })).unwrap();

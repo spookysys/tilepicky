@@ -98,11 +98,23 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 The model returns a caption, up to 12 freeform tags, and matching tags from your list.
 Tilepicky writes the label to `tilepicky.json`. You can continue working while the request runs.
 The popup and status bar show progress and a **Cancel** button.
-Use **Copy log** in the AI pane or label popup to copy recent diagnostics to the clipboard.
-The log includes prompts, requested tags, model replies, parsed tags, timing, and errors for single requests and batches.
-It excludes API keys and image data. It still contains sheet names and generated captions.
-Tilepicky keeps two log files of up to 2 MiB each in `~/.config/tilepicky/ai-log/`, including across restarts.
-Responses from before logging was installed are unavailable.
+**Single sheet** and **Library labeling** each have their own **Copy log** button.
+The label popup copies the same single-sheet log as the sidebar.
+A button stays disabled when its job has no log. A saved label alone does not provide a request log.
+
+Only one labeling job can run at a time. An outstanding batch also blocks single-sheet requests while paused.
+Each library stores one current job log in `.tilepicky-ai-log.jsonl`, beside `tilepicky.json`.
+A new job replaces that file, whether it labels one sheet or the library.
+The single-sheet button refers to the selected sheet's request. The library button refers to the library batch.
+
+Finished jobs keep their log until you exit. Exiting removes finished logs and keeps unfinished logs.
+Restarting a batch continues its log. An interrupted single-sheet request keeps its log for diagnosis and does not resend automatically.
+On restart, that single-sheet job becomes a finished interruption. Its log remains available until the next exit.
+Retrying sheets within a batch continues that batch's log unless another job has replaced it.
+
+Logs include prompts, requested tags, model replies, parsed tags, timing, and errors. They exclude API keys and image data.
+Each log keeps up to 2 MiB of recent entries. Copied logs report when earlier entries were discarded.
+Sheet names and generated captions remain in the log. Older shared logs are removed when the updated app starts.
 
 Each request times out after 60 seconds. **Cancel** stops waiting, but the provider may still bill the request.
 

@@ -49,13 +49,17 @@ impl Runner {
         if let Some(thread) = self.thread.take() { let _ = thread.join(); }
     }
     pub fn command(&self, command: Command) { let _ = self.commands.send(command); }
-    pub fn start(job: Job, root: PathBuf, dir: PathBuf, key: String, lock: Arc<std::fs::File>, ctx: egui::Context) -> Self {
+    pub fn start(job: Job, root: PathBuf, key: String, lock: Arc<std::fs::File>, ctx: egui::Context, log: crate::ai_log::Log) -> Self {
         let (tx, events) = mpsc::channel();
         let (commands, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let thread = std::thread::spawn(move || {
             let _lock = lock;
+            let _scope = log.enter();
+            log.resume();
+            log.event("batch_resume", json!({"provider":job.provider.name,"model":job.model,"mode":job.mode}));
+            let dir = root.clone();
             let notify = |event| { let _ = tx.send(event); ctx.request_repaint(); };
             let mut coordinator = Coordinator { job, root, dir };
             for group in &mut coordinator.job.groups {
@@ -90,7 +94,10 @@ impl Runner {
                     if let Ok(Command::Key(value)) = rx.recv_timeout(Duration::from_secs(2)) { key = value; }
                     continue;
                 }
-                if dirty { notify(Event::Snapshot(coordinator.job.clone())); dirty = false; }
+                if dirty {
+                    if coordinator.job.done() { log.complete(); }
+                    notify(Event::Snapshot(coordinator.job.clone())); dirty = false;
+                }
                 let now = now_ms();
                 if coordinator.job.pending_save() && coordinator.job.due("save", now) {
                     let (reply, saved) = mpsc::channel();
@@ -503,7 +510,8 @@ mod tests {
     #[test]
     fn the_runner_waits_for_the_library_acknowledgement() {
         let f = Fixture::new(); let mut c = f.coordinator(); receive(&mut c);
-        let runner = Runner::start(c.job, f.root.clone(), f.dir.clone(), String::new(), lock(&f.dir).unwrap(), egui::Context::default());
+        let runner = Runner::start(c.job, f.root.clone(), String::new(), lock(&f.dir).unwrap(), egui::Context::default(),
+            crate::ai_log::Log::batch(&f.root, "test"));
         let mut reply = None;
         for _ in 0..4 {
             match runner.events.recv_timeout(Duration::from_secs(2)).unwrap() {
