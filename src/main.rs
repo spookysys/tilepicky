@@ -1426,8 +1426,8 @@ impl App {
             .filter(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
         ui.horizontal_wrapped(|ui| {
             match instant {
-                Some((_, m)) => { ui.weak(format!("Model: {}", m.id)); }
-                None => { ui.colored_label(ui.visuals().warn_fg_color, "No model with a key yet."); }
+                Some((p, m)) => { ui.weak(format!("Single-sheet model: {} / {}", p.name, m.id)); }
+                None => { ui.colored_label(ui.visuals().warn_fg_color, "Single-sheet model: no model with a key yet."); }
             }
             if stopped(ui.small_button("Settings...")).on_hover_text("Choose the models and keys (Ctrl+,).").clicked() {
                 self.settings_request = true;

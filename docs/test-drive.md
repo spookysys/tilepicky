@@ -117,8 +117,8 @@ It also documents Google's paid-project requirement and the `gemini-flash-latest
 
 ## Automated checks
 
-- `cargo test --locked`: 115 passed, with no ignored tests.
-- `cargo test --locked --features wgpu`: 115 passed, with no ignored tests.
+- `cargo test --locked`: 118 passed, with no ignored tests.
+- `cargo test --locked --features wgpu`: 118 passed, with no ignored tests.
 - `cargo clippy --locked --all-targets --features wgpu`: passed.
 - `cargo build --release --locked --features wgpu`: passed.
 
@@ -146,3 +146,14 @@ Clicking that status opened the AI pane and its batch controls.
 
 Tests cover log redaction, rotation, persistence, raw versus saved tags, and outstanding batch states.
 The log records future requests; it cannot reconstruct responses from an older executable.
+
+## Batch recovery and model names
+
+Google submissions now carry a unique reference saved before the network request.
+Recovery searches Google's batch list across pages and resumes after restart.
+It refuses ambiguous matches and never automatically resends an uncertain submission.
+Tests cover the saved reference, paginated recovery, ambiguity, and polling before all sheets are submitted.
+
+The WGPU interface check showed separate single-sheet and batch model names.
+It showed queued, provider, and unconfirmed counts, with manual controls collapsed under Advanced recovery.
+The test endpoint was local; this check sent no new paid requests.

@@ -143,7 +143,11 @@ Provider errors appear in the AI pane, including the provider's explanation when
 When no newer message is visible, the status bar shows the outstanding batch's progress and state.
 Click the batch status to open the AI pane and its controls.
 
-Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now**, **Cancel batch**, or **Send again**.
+Batch state persists in `~/.config/tilepicky/` across application restarts. If a network error occurs, the batch worker retries automatically with exponential backoff up to 8 minutes. You can also click **Try again now** or **Cancel batch**.
+Tilepicky saves a unique reference before each Google submission. If its reply is lost, Tilepicky looks up that reference automatically.
+It checks accepted groups while submitting the remaining sheets. The progress counts separate queued sheets, provider work, and unconfirmed submissions.
+It never automatically resends an unconfirmed submission. **Advanced recovery** contains manual controls for older or ambiguous jobs.
+The panel names the single-sheet model separately from the batch model. A running batch keeps its original provider and model.
 
 ### Tags to look for
 

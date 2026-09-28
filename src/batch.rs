@@ -38,7 +38,7 @@ pub struct Sheet {
 /// may have been billed, so the sheet fails after this many.
 const UNKNOWN_TRIES: u32 = 3;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Remote {
     /// The request went out, and no reply confirmed it yet. The provider
     /// may have made the batch, so the tool does not send it again.
@@ -52,6 +52,17 @@ pub enum Remote {
 pub struct Group {
     pub sheets: Vec<usize>,
     pub remote: Remote,
+    #[serde(default)]
+    recovery: Option<Recovery>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Recovery {
+    reference: String,
+    #[serde(default)]
+    page: String,
+    #[serde(default)]
+    matches: Vec<String>,
 }
 
 fn key(sheet: usize) -> String { format!("sheet-{sheet}") }
@@ -71,6 +82,9 @@ pub struct Job {
     /// asks for it, and every label records it.
     #[serde(default)]
     pub tag_list: Vec<String>,
+    /// Alternate submissions and polling so early results can arrive before the whole library is sent.
+    #[serde(default)]
+    poll_next: bool,
 }
 
 impl Job {
@@ -84,8 +98,18 @@ impl Job {
     fn progress(&self) -> String {
         let labeled = self.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
         let failed = self.sheets.iter().filter(|s| !s.error.is_empty()).count();
-        format!("Labeled: {labeled} of {}. Failed: {failed}.", self.sheets.len())
+        let base = format!("Labeled: {labeled} of {}. Failed: {failed}.", self.sheets.len());
+        if self.provider.kind != Kind::Gemini { return base; }
+        let (queued, waiting, uncertain) = self.submission_counts();
+        format!("{base}\nQueued: {queued}. At provider: {waiting}. Unconfirmed: {uncertain}.")
     }
+    fn submission_counts(&self) -> (usize, usize, usize) {
+        let queued = self.sheets.iter().filter(|s| !s.taken).count();
+        let waiting = self.groups.iter().filter(|g| matches!(g.remote, Remote::Waiting(_))).map(|g| g.sheets.len()).sum();
+        let uncertain = self.groups.iter().filter(|g| g.remote == Remote::Submitting).map(|g| g.sheets.len()).sum();
+        (queued, waiting, uncertain)
+    }
+
     pub fn save(&self, dir: &Path) -> Result<(), String> {
         crate::storage::write_private(&dir.join("state.json"), self)
     }
@@ -119,7 +143,7 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
     let open = index.entries.iter().filter(|e| all || e.side.label.is_none());
     Ok(Job {
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
-        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(),
+        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), poll_next: false,
         sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(), imported: false, unknown: 0 })
             .collect(),
     })
@@ -147,8 +171,8 @@ pub fn endpoint(provider: &Provider) -> Result<String, String> {
     })
 }
 
-fn submit_body(requests: &[(String, Value)]) -> Value {
-    json!({"batch":{"displayName":"Tilepicky library labels", "inputConfig":{"requests":{"requests":
+fn submit_body(requests: &[(String, Value)], reference: &str) -> Value {
+    json!({"batch":{"displayName":reference, "inputConfig":{"requests":{"requests":
         requests.iter().map(|(key, body)| json!({"metadata":{"key":key}, "request":body})).collect::<Vec<_>>()}}}})
 }
 
@@ -196,7 +220,13 @@ impl Transport {
         let trace = crate::ai_log::Request::start(&format!("{}/{path}", self.base), body, &self.key);
         let mut status = None;
         let result = self.send_inner(path, body, &mut status);
-        trace.finish(status, &result.as_ref().cloned().map_err(Failure::message));
+        let logged = result.as_ref().map(|value| {
+            if path.starts_with("batches?") {
+                json!({"listed_batches":value["operations"].as_array().map_or(0, Vec::len),
+                    "more_pages":value["nextPageToken"].as_str().is_some_and(|s| !s.is_empty())})
+            } else { value.clone() }
+        }).map_err(Failure::message);
+        trace.finish(status, &logged);
         result
     }
 
@@ -294,12 +324,18 @@ type Send<'a> = &'a mut dyn FnMut(&str, Option<&Value>) -> Result<Value, Failure
 /// of sheets, or ask about a submitted one. The job is saved before it
 /// returns, with or without error.
 pub fn advance(mut job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
+    let waiting = job.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
     let result = if job.provider.kind == Kind::OpenAi {
         job.release_groups();
         one(&mut job, root, dir, &mut send)
+    } else if waiting && (job.poll_next || (!job.untaken() && !job.uncertain())) {
+        job.poll_next = false;
+        poll(&mut job, dir, &mut send)
     } else if job.uncertain() {
-        Err("The provider did not confirm the last submission.".into())
+        job.poll_next = true;
+        recover(&mut job, dir, &mut send)
     } else if job.untaken() {
+        job.poll_next = true;
         submit(&mut job, root, dir, &mut send)
     } else {
         poll(&mut job, dir, &mut send)
@@ -368,14 +404,17 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     if requests.is_empty() { return job.save(dir); }
     let sheets: Vec<_> = requests.iter().map(|(i, _)| *i).collect();
     for &i in &sheets { job.sheets[i].taken = true; }
-    job.groups.push(Group { sheets, remote: Remote::Submitting });
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let reference = format!("Tilepicky-{}-{stamp}", std::process::id());
+    job.groups.push(Group { sheets, remote: Remote::Submitting,
+        recovery: Some(Recovery { reference: reference.clone(), ..Recovery::default() }) });
     job.save(dir)?;
     crate::ai_log::event("batch_submit", json!({"provider":job.provider.name, "model":job.model, "tags_requested":job.tag_list,
         "sheets":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel})).collect::<Vec<_>>()}));
     let path = format!("models/{}:batchGenerateContent", job.model);
     let requests: Vec<_> = requests.into_iter().map(|(i, body)| (key(i), body)).collect();
     let g = job.groups.len() - 1;
-    let result = match send(&path, Some(&submit_body(&requests))) {
+    let result = match send(&path, Some(&submit_body(&requests, &reference))) {
         Ok(response) => remote_id(&response).map(|id| job.groups[g].remote = Remote::Waiting(id)),
         // The provider made no batch: the sheets wait for the next try.
         Err(failure @ (Failure::NotSent(_) | Failure::Status(429 | 503, _))) => {
@@ -388,6 +427,40 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
             Ok(())
         }
         Err(failure) => Err(failure.message()),
+    };
+    job.save(dir).and(result)
+}
+
+/// Recover by the unique reference saved before submission. Never resend an uncertain request.
+fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
+    let i = job.groups.iter().position(|g| g.remote == Remote::Submitting).ok_or("No submission needs recovery.")?;
+    let Some(recovery) = &mut job.groups[i].recovery else {
+        return Err("This older submission has no recovery reference. Open Advanced recovery for help.".into());
+    };
+    let token: String = recovery.page.bytes().map(|b| format!("%{b:02X}")).collect();
+    let path = if token.is_empty() { "batches?pageSize=100".into() } else { format!("batches?pageSize=100&pageToken={token}") };
+    let value = send(&path, None).map_err(|f| f.message())?;
+    let empty = Vec::new();
+    let operations = if value["operations"].is_null() { &empty }
+        else { value["operations"].as_array().ok_or("Google returned an invalid batch list.")? };
+    for operation in operations {
+        if operation["metadata"]["displayName"] == recovery.reference
+            && operation["metadata"]["model"] == format!("models/{}", job.model) {
+            let id = remote_id(operation)?;
+            if !recovery.matches.contains(&id) { recovery.matches.push(id); }
+        }
+    }
+    recovery.page = value["nextPageToken"].as_str().unwrap_or_default().into();
+    if !recovery.page.is_empty() { return job.save(dir); }
+    let matches = std::mem::take(&mut recovery.matches);
+    let result = match matches.as_slice() {
+        [id] => {
+            crate::ai_log::event("batch_recovered", json!({"reference":recovery.reference, "id":id}));
+            job.groups[i].remote = Remote::Waiting(id.clone());
+            Ok(())
+        }
+        [] => Err("Google has not listed this submission yet. Recovery will retry without sending the sheets again.".into()),
+        _ => Err("Google returned more than one matching batch. Open Advanced recovery; nothing was resent.".into()),
     };
     job.save(dir).and(result)
 }
@@ -466,10 +539,17 @@ impl Panel {
         let labeled = job.sheets.iter().filter(|s| s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
         let failed = job.sheets.iter().filter(|s| !s.error.is_empty()).count();
         let pending = job.sheets.iter().filter(|s| s.label.is_none() && s.error.is_empty()).count();
-        let state = if job.uncertain() { "needs attention" }
+        let state = if job.uncertain() {
+                if job.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_none()) { "needs attention" } else { "recovering" }
+            }
             else if self.task.is_some() { "working" }
             else if !self.error.is_empty() { "retry pending" } else { "waiting" };
-        Some(format!("AI batch: {labeled} labeled, {pending} pending, {failed} failed ({state})"))
+        if job.provider.kind == Kind::Gemini {
+            let (queued, waiting, uncertain) = job.submission_counts();
+            Some(format!("AI batch: {queued} queued, {waiting} at provider, {uncertain} unconfirmed, {labeled} labeled, {failed} failed ({state})"))
+        } else {
+            Some(format!("AI batch: {labeled} labeled, {pending} pending, {failed} failed ({state})"))
+        }
     }
 
     /// Prevents a completed journal from restoring labels after Clear all.
@@ -534,7 +614,7 @@ impl Panel {
             }
         }
         let due = self.next_check.is_none_or(|t| t <= Instant::now());
-        if self.task.is_none() && due && let Some(job) = &self.job && !job.done() && !job.uncertain() {
+        if self.task.is_none() && due && let Some(job) = &self.job && !job.done() {
             match job.provider.key(keys).ok_or("The batch provider key is missing in Settings.".to_string())
                 .and_then(|key| Transport::new(&job.provider, key)) {
                 Ok(transport) => {
@@ -598,10 +678,12 @@ impl Panel {
     fn state(&self, job: &Job) -> String {
         let wait = self.next_check.map_or(0, |t| t.saturating_duration_since(Instant::now()).as_secs());
         if job.uncertain() {
-            "The provider did not confirm the last submission.".into()
+            if self.task.is_some() { "Checking the provider to recover the submission...".into() }
+            else if !self.error.is_empty() { format!("{} Next check in {wait} s.", self.error) }
+            else { "Recovering the interrupted submission...".into() }
         } else if self.task.is_some() {
             if job.provider.kind == Kind::OpenAi { "Labeling the sheets one by one...".into() }
-            else if job.untaken() { "Sending sheets to the provider...".into() } else { "Asking the provider...".into() }
+            else { format!("Contacting {}...", job.provider.name) }
         } else if !self.error.is_empty() {
             format!("{} Next try in {wait} s.", self.error)
         } else if job.done() {
@@ -617,37 +699,43 @@ impl Panel {
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
         if self.running() && self.root != index.root { ui.weak(format!("For {}", self.root.display())); }
         if let Some(job) = &self.job {
+            ui.weak(format!("Batch model: {} / {}", job.provider.name, job.model));
             ui.label(self.state(job));
             ui.label(job.progress());
             if self.running() { ui.ctx().request_repaint_after(Duration::from_secs(1)); }
             egui::CollapsingHeader::new("Failed sheets").show(ui, |ui| {
                 for s in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", s.rel, s.error)); }
             });
-        } else if !self.error.is_empty() {
-            ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
+        } else {
+            if let Some((provider, model)) = configured {
+                ui.weak(format!("Batch model: {} / {}", provider.name, model.id.trim_end_matches(":batch")));
+            }
+            if !self.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &self.error); }
         }
         if self.job.as_ref().is_some_and(Job::uncertain) {
-            ui.weak("Find the batch in the provider's batch list and attach its ID. If there is none, send the sheets again.");
-            crate::stopped(ui.text_edit_singleline(&mut self.attach_id));
-            ui.horizontal(|ui| {
-                if crate::stopped(ui.button("Attach batch ID")).clicked() {
-                    match validate_id(self.attach_id.trim()) {
-                        Ok(()) => {
-                            let job = self.job.as_mut().unwrap();
-                            for g in job.groups.iter_mut().filter(|g| g.remote == Remote::Submitting) {
-                                g.remote = Remote::Waiting(self.attach_id.trim().into());
+            egui::CollapsingHeader::new("Advanced recovery").show(ui, |ui| {
+                ui.weak("Find the batch in the provider's batch list and attach its ID. If there is none, send the sheets again.");
+                crate::stopped(ui.text_edit_singleline(&mut self.attach_id));
+                ui.horizontal(|ui| {
+                    if crate::stopped(ui.button("Attach batch ID")).clicked() {
+                        match validate_id(self.attach_id.trim()) {
+                            Ok(()) => {
+                                let job = self.job.as_mut().unwrap();
+                                for g in job.groups.iter_mut().filter(|g| g.remote == Remote::Submitting) {
+                                    g.remote = Remote::Waiting(self.attach_id.trim().into());
+                                }
+                                self.retry = true;
                             }
-                            self.retry = true;
+                            Err(e) => self.error = e,
                         }
-                        Err(e) => self.error = e,
                     }
-                }
-                if crate::stopped(ui.button("Send again").on_hover_text("No batch was made. The provider may bill twice if one was.")).clicked() {
-                    self.job.as_mut().unwrap().send_again();
-                    self.retry = true;
-                }
+                    if crate::stopped(ui.button("Send again").on_hover_text("No batch was made. The provider may bill twice if one was.")).clicked() {
+                        self.job.as_mut().unwrap().send_again();
+                        self.retry = true;
+                    }
+                });
+                if self.retry && let Err(e) = self.job.as_ref().unwrap().save(&self.dir) { self.error = e; }
             });
-            if self.retry && let Err(e) = self.job.as_ref().unwrap().save(&self.dir) { self.error = e; }
         }
         if self.running() {
             ui.horizontal(|ui| {
@@ -660,7 +748,7 @@ impl Panel {
             self.retry = true;
         }
         if self.retry { self.next_check = None; }
-        if !ready { ui.weak("Set a batch model and its key in Settings."); }
+        if !ready && !self.running() { ui.weak("Set a batch model and its key in Settings."); }
         let idle = !self.busy() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
         for (text, scope) in [("Label the unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
             let button = ui.add_enabled(ready && idle && !index.entries.is_empty(), egui::Button::new(text));
@@ -770,8 +858,8 @@ mod tests {
         let files = Files::new();
         let job = files.prepare(Kind::Gemini);
         let mut panel = Panel { job: Some(job), ..Panel::default() };
-        assert_eq!(panel.status().as_deref(), Some("AI batch: 0 labeled, 1 pending, 0 failed (waiting)"));
-        panel.job.as_mut().unwrap().groups.push(Group { sheets: vec![0], remote: Remote::Submitting });
+        assert_eq!(panel.status().as_deref(), Some("AI batch: 1 queued, 0 at provider, 0 unconfirmed, 0 labeled, 0 failed (waiting)"));
+        panel.job.as_mut().unwrap().groups.push(Group { sheets: vec![0], remote: Remote::Submitting, recovery: None });
         assert!(panel.status().unwrap().contains("needs attention"));
         panel.job.as_mut().unwrap().groups.clear();
         panel.error = "Temporary failure".into();
@@ -970,8 +1058,8 @@ mod tests {
         RgbaImage::new(4, 4).save(files.root.join("more.png")).unwrap();
         let mut job = files.prepare(Kind::OpenAi);
         for s in &mut job.sheets { s.taken = true; }
-        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batch-1".into()) },
-            Group { sheets: vec![1], remote: Remote::Submitting }];
+        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batch-1".into()), recovery: None },
+            Group { sheets: vec![1], remote: Remote::Submitting, recovery: None }];
         assert!(!job.uncertain() && !job.done());
         while !job.done() {
             let result;
@@ -1051,12 +1139,81 @@ mod tests {
         assert!(result.is_err());
         let mut job = files.journal();
         assert!(job.uncertain());
-        let (_, result) = files.advance(job.clone(), |_, _| panic!("a paid submission must not go out twice"));
+        let (_, result) = files.advance(job.clone(), |path, body| {
+            assert_eq!(path, "batches?pageSize=100");
+            assert!(body.is_none(), "Recovery must never send another paid request.");
+            Ok(json!({"operations":[]}))
+        });
         assert!(result.is_err());
         job.send_again();
         let (job, result) = files.advance(job, id("batches/batch-3"));
         result.unwrap();
         assert!(!job.uncertain());
+    }
+
+    #[test]
+    fn recovery_finds_the_saved_reference_across_pages_after_restart() {
+        let files = Files::new();
+        let (_, result) = files.advance(files.prepare(Kind::Gemini), |_, body| {
+            let saved = files.journal();
+            let reference = &saved.groups[0].recovery.as_ref().unwrap().reference;
+            assert_eq!(body.unwrap()["batch"]["displayName"], *reference);
+            Err(Failure::Unknown("Lost reply".into()))
+        });
+        assert!(result.is_err());
+        let mut job = files.journal();
+        let reference = job.groups[0].recovery.as_ref().unwrap().reference.clone();
+        let (next, result) = files.advance(job, |path, body| {
+            assert_eq!(path, "batches?pageSize=100");
+            assert!(body.is_none());
+            Ok(json!({"operations":[], "nextPageToken":"a/b"}))
+        });
+        result.unwrap();
+        assert!(next.uncertain());
+        job = files.journal();
+        let (job, result) = files.advance(job, |path, body| {
+            assert_eq!(path, "batches?pageSize=100&pageToken=%61%2F%62");
+            assert!(body.is_none());
+            Ok(json!({"operations":[{"name":"batches/recovered", "metadata":{"displayName":reference, "model":"models/test"}}]}))
+        });
+        result.unwrap();
+        assert_eq!(job.groups[0].remote, Remote::Waiting("batches/recovered".into()));
+        assert!(!files.journal().uncertain());
+    }
+
+    #[test]
+    fn ambiguous_recovery_never_attaches_or_resubmits() {
+        let files = Files::new();
+        let (job, _) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Unknown("Lost reply".into())));
+        let reference = job.groups[0].recovery.as_ref().unwrap().reference.clone();
+        let (job, result) = files.advance(job, |_, body| {
+            assert!(body.is_none());
+            Ok(json!({"operations":[
+                {"name":"batches/first", "metadata":{"displayName":reference, "model":"models/test"}},
+                {"name":"batches/second", "metadata":{"displayName":reference, "model":"models/test"}}
+            ]}))
+        });
+        assert!(result.unwrap_err().contains("more than one"));
+        assert!(job.uncertain());
+    }
+
+    #[test]
+    fn accepted_groups_are_polled_while_other_sheets_wait_for_submission() {
+        let files = Files::new();
+        RgbaImage::from_pixel(8, 4, Rgba([80, 90, 100, 255])).save(files.root.join("another.png")).unwrap();
+        let mut job = files.prepare(Kind::Gemini);
+        job.sheets[0].taken = true;
+        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/accepted".into()), recovery: None });
+        job.poll_next = true;
+        let reply = completed(&job, 0, "Crystals");
+        let (job, result) = files.advance(job, |path, body| {
+            assert_eq!(path, "batches/accepted");
+            assert!(body.is_none());
+            Ok(reply.clone())
+        });
+        result.unwrap();
+        assert!(job.sheets[0].label.is_some());
+        assert!(!job.sheets[1].taken);
     }
 
     #[test]
@@ -1101,7 +1258,7 @@ mod tests {
         let files = Files::new();
         let mut job = files.prepare(Kind::Gemini);
         job.sheets.push(job.sheets[0].clone());
-        job.groups.push(Group { sheets: vec![0, 1], remote: Remote::Waiting("batches/x".into()) });
+        job.groups.push(Group { sheets: vec![0, 1], remote: Remote::Waiting("batches/x".into()), recovery: None });
         accept(&mut job, 0, vec![(key(1), completion(labeled("Second"))), ("unknown".into(), Value::Null)]);
         assert!(job.sheets[0].label.is_none());
         assert!(!job.sheets[0].error.is_empty());
@@ -1113,8 +1270,8 @@ mod tests {
         let files = Files::new();
         let mut job = files.prepare(Kind::Gemini);
         job.sheets[0].taken = true;
-        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batches/first".into()) },
-            Group { sheets: vec![0], remote: Remote::Waiting("batches/second".into()) }];
+        job.groups = vec![Group { sheets: vec![0], remote: Remote::Waiting("batches/first".into()), recovery: None },
+            Group { sheets: vec![0], remote: Remote::Waiting("batches/second".into()), recovery: None }];
         let (job, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/first"); Ok(json!({"done":false})) });
         let (_, _) = files.advance(job, |path, _| { assert_eq!(path, "batches/second"); Ok(json!({"done":false})) });
     }
