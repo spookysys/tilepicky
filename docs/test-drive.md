@@ -24,12 +24,16 @@ The pass did not change the user's sheets or application settings.
 | Single-sheet AI | OpenRouter returned and saved a caption and tags for a copied sample sheet. A cancelled repeat kept the prior label. |
 | Batch controls | Tested Rerun all, replacement counts, skipping labeled sheets, and confirmation cancellation. |
 | Batch recovery | Used a loopback endpoint to test errors, Try again now, restart, and Cancel batch. |
-| Gemini batch | Submitted one sample sheet with the normal prompt and tag list. Google returned HTTP 400. |
+| Gemini batch | Submitted one sample sheet with the normal prompt and tag list. Google returned HTTP 400, including on retry. |
 | Shortcut legend | Updated the text and inspected its layout. Found the visibility bug below. |
+| Installed app | Opened the installed binary, loaded a sheet, opened the AI pane, and opened Settings without a crash. |
+| Native folder chooser | Opened both folder choosers, cancelled them, and selected different library and project folders. |
+| File manager | Used "Open location". The file manager opened the correct folder and selected the requested image. |
 
 The live Gemini failure prevented checks of remote cancellation and result import.
 Existing transport tests cover those operations with fake responses; they do not prove live service compatibility.
-The native folder chooser and desktop file-manager integration were not exercised on the private display.
+The native desktop checks used a separate D-Bus session and private display.
+The installed executable matched the release build.
 
 ## Fixes for later
 
@@ -73,7 +77,7 @@ cargo test --features wgpu batch_errors_keep_the_provider_explanation -- --ignor
 Preserve a bounded, safe provider error message, then repeat the live Gemini test.
 Verify submission, restart, import, and cancellation after the cause is known.
 
-### Keep OpenGL as the default with WGPU enabled
+### Resolve the documented renderer default
 
 The README says OpenGL is the default.
 A build with both renderers selects WGPU through `eframe::Renderer::default()`.
@@ -83,7 +87,10 @@ The interactive pass used explicit `--glow`; this discrepancy came from checking
 cargo test --features wgpu the_default_renderer_is_opengl_with_wgpu_available -- --ignored
 ```
 
-Choose OpenGL explicitly as the default while keeping `--wgpu` available.
+The test checks the README's current promise; it does not establish which renderer is preferable.
+Choose the intended default, then align the documentation and test with that decision.
+Keeping WGPU and updating the README is also an option.
+This pass did not change the renderer default.
 
 ## Changes made in this pass
 
