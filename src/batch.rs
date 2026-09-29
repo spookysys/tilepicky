@@ -727,6 +727,7 @@ pub struct Panel {
     control: runner::Control,
     resend_confirm: bool,
     copied: Option<Instant>,
+    pub settings_requested: bool,
 }
 
 impl Panel {
@@ -759,9 +760,34 @@ impl Panel {
         } else { (queued, waiting, uncertain) }
     }
 
+    fn problems(&self) -> Vec<(String, usize)> {
+        let mut messages = Vec::<(String, usize)>::new();
+        let mut add = |text: &str, count: usize| {
+            if text.is_empty() { return; }
+            if let Some((_, n)) = messages.iter_mut().find(|(message, _)| message == text) { *n += count; }
+            else { messages.push((text.into(), count)); }
+        };
+        add(&self.storage_error, 0); add(&self.error, 0);
+        if let Some(job) = &self.job {
+            if let Some(issue) = job.issues.get("save") { add(&issue.message, 0); }
+            for (operation, issue) in &job.issues { if operation != "save" { add(&issue.message, 0); } }
+            for sheet in &job.sheets {
+                if sheet.label.is_none() && !sheet.cancelled { add(&sheet.error, 1); }
+            }
+        }
+        messages
+    }
+
+    pub fn attention(&self) -> Option<String> {
+        self.problems().first().map(|(message, _)| {
+            let provider = self.job.as_ref().map_or("AI", |job| job.provider.name.as_str());
+            format!("{provider}: {}", labels::problem(message).title)
+        })
+    }
+
     pub fn status(&self) -> Option<String> {
         let job = self.job.as_ref()?;
-        if job.done() && job.issues.is_empty() && self.error.is_empty() { return None; }
+        if job.done() && self.problems().is_empty() { return None; }
         Some(format!("AI labels: {} saved / {} | {}", job.saved(), job.sheets.len(), self.state(job)))
     }
 
@@ -878,7 +904,9 @@ impl Panel {
         if job.done() {
             if job.mode == Mode::Cancelling { return "Cancelled; saved labels kept".into(); }
             let failed = job.sheets.iter().filter(|s| !s.error.is_empty() && s.label.is_none()).count();
-            return if failed == 0 { "Finished".into() } else { format!("Finished; {failed} sheets need attention") };
+            return if failed == 0 { "Finished".into() }
+                else if job.saved() == 0 { format!("Labeling failed; {failed} sheets failed") }
+                else { format!("Finished with errors; {failed} sheets failed") };
         }
         if self.mode(job) == Mode::Cancelling { return "Cancellation pending".into(); }
         if job.pending_save() {
@@ -911,8 +939,9 @@ impl Panel {
         use eframe::egui;
         let configured = ai.chosen(crate::ai::Mode::Batch);
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
-        for error in [&self.error, &self.storage_error] {
-            if !error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, labels::summary(error)); }
+        let problems = self.problems();
+        if self.job.is_none() {
+            for (message, _) in &problems { self.settings_requested |= labels::problem(message).show(ui, message, false); }
         }
         if (self.lock.is_none() || (!self.storage_error.is_empty() && self.runner.is_none()))
             && crate::stopped(ui.button("Reload saved job")).clicked() {
@@ -926,10 +955,19 @@ impl Panel {
             ui.small(if job.provider.kind == Kind::Gemini { "Google batch" } else { "One sheet at a time" });
             ui.add_space(6.0);
             ui.strong(self.state(job));
+            for (message, count) in problems.iter().take(2) {
+                ui.group(|ui| {
+                    self.settings_requested |= labels::problem(message).show(ui, message,
+                        job.provider.url.starts_with("https://generativelanguage.googleapis.com/"));
+                    if *count > 0 { ui.small(format!("Affected sheets: {count}. Saved labels are kept.")); }
+                });
+            }
+            if problems.len() > 2 { ui.label(format!("{} other errors. Open Error details below.", problems.len() - 2)); }
             let [saved, failed, unusable, cancelled] = job.outcomes();
             let finished = saved + failed + unusable + cancelled;
             let total = job.sheets.len();
             ui.add(egui::ProgressBar::new(if total == 0 { 1.0 } else { finished as f32 / total as f32 })
+                .fill(if failed > 0 { ui.visuals().warn_fg_color } else { ui.visuals().selection.bg_fill })
                 .text(format!("{finished} / {total} finished")));
             ui.label(format!("{saved} saved, {failed} failed, {unusable} unlabelable, {cancelled} cancelled"));
             let mode = self.mode(job);
@@ -956,8 +994,8 @@ impl Panel {
             ui.label(format!("{queued} not sent, {waiting} at {}, {uncertain} unconfirmed", job.provider.name));
             if job.last_response_ms > 0 { ui.small(format!("Last provider response: {} s ago", now.saturating_sub(job.last_response_ms) / 1000)); }
             if waiting > 0 && job.poll_ms > now { ui.small(format!("Next results check in {} s", (job.poll_ms - now).div_ceil(1000))); }
-            if let Some(issue) = job.issues.values().min_by_key(|issue| issue.retry_ms) {
-                ui.label(format!("Next retry in {} s. See Details for the error.", issue.retry_ms.saturating_sub(now).div_ceil(1000)));
+            if mode != Mode::Paused && let Some(issue) = job.issues.values().min_by_key(|issue| issue.retry_ms) {
+                ui.label(format!("Automatic retry in {} s.", issue.retry_ms.saturating_sub(now).div_ceil(1000)));
             }
             egui::ScrollArea::vertical().id_salt("library job details").max_height((ui.available_height() - 180.0).max(60.0)).show(ui, |ui| {
                 if let Some(estimate) = &job.estimate {
@@ -976,22 +1014,24 @@ impl Panel {
                         "Closing pauses local work. Google can continue accepted work. Reopen this library to collect results."
                     } else { "Closing pauses labeling. Reopen this library to continue." });
                 }
-                egui::CollapsingHeader::new("Details").show(ui, |ui| {
-                    for error in [&self.error, &self.storage_error] { if !error.is_empty() { ui.label(error); } }
-                    for (operation, issue) in &job.issues {
-                        ui.colored_label(ui.visuals().error_fg_color, format!("{operation}: {}", issue.message));
-                    }
+                egui::CollapsingHeader::new(if problems.is_empty() { "Details" } else { "Error details" })
+                    .id_salt("library full details").show(ui, |ui| {
                     if job.uncertain() {
                         ui.label("Tilepicky checks interrupted uploads automatically. It will not send these sheets twice automatically.");
                         if mode != Mode::Cancelling && crate::stopped(ui.button("Retry unconfirmed sheets...")).clicked() { self.resend_confirm = true; }
                     }
-                    for group in job.groups.iter().filter(|g| !g.tracking.error.is_empty()) {
+                    for group in job.groups.iter().filter(|g| !g.tracking.error.is_empty() && !problems.iter().any(|(text, _)| text == &g.tracking.error)) {
                         ui.colored_label(ui.visuals().error_fg_color, format!("{} sheets: {}", group.sheets.len(), group.tracking.error));
                     }
+                    for (message, count) in &problems {
+                        ui.label(message);
+                        if *count > 0 {
+                            egui::CollapsingHeader::new(format!("Affected sheets ({count})")).id_salt(message).show(ui, |ui| {
+                                for sheet in job.sheets.iter().filter(|s| s.error == *message) { ui.label(&sheet.rel); }
+                            });
+                        }
+                    }
                     ui.label(format!("Tags used for this job: {}", job.tag_list.join(", ")));
-                    egui::CollapsingHeader::new("Sheet errors").show(ui, |ui| {
-                        for sheet in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", sheet.rel, sheet.error)); }
-                    });
                     egui::CollapsingHeader::new("Provider batches").show(ui, |ui| {
                         for group in &job.groups {
                             if !group.tracking.id.is_empty() {
@@ -1304,6 +1344,44 @@ mod tests {
         assert!(owner.allows_single()); assert!(!other.allows_single());
         other.cleanup_log(&files.root).unwrap(); assert!(log.available());
         owner.cleanup_log(&files.root).unwrap(); assert!(!log.available());
+    }
+
+    #[test]
+    fn rejected_submissions_keep_the_reason_visible_after_restart() {
+        let files = Files::new();
+        std::fs::copy(files.root.join("folder/sheet.png"), files.root.join("second.png")).unwrap();
+        let error = "The endpoint returned HTTP 402. RESOURCE_EXHAUSTED: Your prepayment credits are depleted.";
+        let (job, _) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Status(402, error.into())));
+        assert!(job.done());
+        let panel = Panel { job: Some(files.journal()), ..Panel::default() };
+        assert_eq!(panel.problems(), vec![(error.into(), 2)]);
+        assert_eq!(panel.attention().as_deref(), Some("test: Prepaid credits depleted"));
+        assert!(panel.status().unwrap().contains("Labeling failed"));
+        assert_eq!(panel.job.as_ref().unwrap().outcomes(), [0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn partial_results_and_retry_errors_keep_their_own_state() {
+        let files = Files::new();
+        std::fs::copy(files.root.join("folder/sheet.png"), files.root.join("second.png")).unwrap();
+        let mut job = files.prepare(Kind::Gemini);
+        job.sheets[0].label = Some(labels::response(&completion(labeled("Saved")), &[]).unwrap().into_label("test", "test", &[]));
+        job.sheets[0].imported = true;
+        job.sheets[1].error = "Image could not be processed".into();
+        job.sheets[0].taken = true; job.sheets[1].taken = true;
+        job.groups.push(Group { sheets: vec![0, 1], remote: Remote::Done, recovery: None, tracking: Tracking::default() });
+        let mut panel = Panel { job: Some(job), ..Panel::default() };
+        assert!(panel.state(panel.job.as_ref().unwrap()).starts_with("Finished with errors"));
+        assert_eq!(panel.problems(), vec![("Image could not be processed".into(), 1)]);
+        assert_eq!(panel.job.as_ref().unwrap().outcomes(), [1, 1, 0, 0]);
+        panel.job.as_mut().unwrap().sheets[1].cancelled = true;
+        assert!(panel.attention().is_none());
+        panel.job.as_mut().unwrap().issue("poll", "The endpoint returned HTTP 503.".into(), 100);
+        assert!(panel.attention().unwrap().contains("temporarily unavailable"));
+        panel.storage_error = "Could not write the job".into();
+        assert!(panel.attention().unwrap().contains("Could not save"));
+        panel.storage_error.clear(); panel.job.as_mut().unwrap().issues.clear();
+        assert!(panel.attention().is_none());
     }
 
     #[test]

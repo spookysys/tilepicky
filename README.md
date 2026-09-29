@@ -176,15 +176,19 @@ The previously shipped Google default migrates to this alias. Existing jobs keep
 The internal `:batch` suffix in saved settings identifies a library model; it is not part of the provider's model ID.
 The model editor uses **Use for: Single sheet / Library** and shows the provider model ID without that suffix.
 Library models show **One sheet at a time** for OpenAI-compatible providers, including OpenRouter, or **Google batch** for Gemini.
-Provider errors appear in the AI pane, including the provider's explanation when available.
+Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
+API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
+Repeated errors appear once, with the affected sheet count. **Error details** keeps the full explanations and affected sheet paths.
 
 When no newer message is visible, the status bar shows the outstanding batch's progress and state.
 Click the batch status to open the AI pane and its controls.
+A library failure keeps a status-bar notice, including after the job finishes. Click it to open the recovery actions.
+A failed single-sheet request keeps a clickable notice while its current request log remains available.
 
 The job view separates saved labels, provider work, unsent sheets, and uploads awaiting confirmation.
 The progress bar counts finished outcomes, including failures and cancellations. **Labels saved** counts usable labels written to the library.
 The main message distinguishes queued work, processing, and an unknown provider state. The last provider response, next check, and current request appear below it.
-**Details** keeps provider errors, sheet errors, and the job's original tags available.
+**Details**, or **Error details** after a failure, keeps the job's original tags and provider batch information available.
 
 **Pause uploads** stops new submissions after the current request finishes. Tilepicky still collects accepted results.
 For a provider that labels sheets one by one, the button is **Pause**. **Resume** continues the same job.

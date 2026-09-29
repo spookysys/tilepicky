@@ -181,6 +181,50 @@ pub fn summary(text: &str) -> String {
     if text.chars().count() > 180 { format!("{}...", cut(text, 180)) } else { text.into() }
 }
 
+/// A short explanation and a next step. The original error stays in the job details.
+pub struct Problem {
+    pub title: String,
+    pub next: &'static str,
+    pub settings: bool,
+    pub billing: bool,
+}
+
+pub fn problem(message: &str) -> Problem {
+    let lower = message.to_lowercase();
+    let code = lower.split("http ").nth(1).and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u16>().ok());
+    let (title, next, settings, billing) = if lower.contains("prepayment credits are depleted") {
+        ("Prepaid credits depleted".into(), "Add credits to the API project, then retry.", false, true)
+    } else if code == Some(402) {
+        ("Provider billing needs attention".into(), "Check the provider's billing account before you retry.", false, true)
+    } else if code == Some(401) {
+        ("Provider rejected the API key".into(), "Check this provider's API key in Settings, then retry.", true, false)
+    } else if code == Some(403) {
+        ("Provider denied access".into(), "Check the API key's project and model access in Settings and at the provider.", true, false)
+    } else if code == Some(429) {
+        ("Provider limit reached".into(), "Check the provider's quota. Wait for the limit to reset before you retry.", false, false)
+    } else if lower.contains("could not save") || lower.contains("cannot write") || lower.contains("could not write") {
+        ("Could not save the results".into(), "Check free disk space and folder permissions before you retry.", false, false)
+    } else if code.is_some_and(|n| (500..600).contains(&n)) {
+        ("Provider is temporarily unavailable".into(), "Wait for the provider to recover. You can retry later.", false, false)
+    } else if lower.contains("timed out") || lower.contains("timeout") || lower.contains("could not connect") || lower.contains("dns") {
+        ("Connection to the provider failed".into(), "Check the connection. An interrupted upload may still have reached the provider.", false, false)
+    } else {
+        (summary(message), "Read the full error below. Copy log includes diagnostic information.", false, false)
+    };
+    Problem { title, next, settings, billing }
+}
+
+impl Problem {
+    /// Returns true when the user asks to check the AI settings.
+    pub fn show(&self, ui: &mut eframe::egui::Ui, message: &str, google: bool) -> bool {
+        ui.colored_label(ui.visuals().error_fg_color, &self.title).on_hover_text(message);
+        ui.label(self.next);
+        if self.billing && google { ui.hyperlink_to("Open Google billing", "https://ai.studio/projects"); }
+        self.settings && ui.button("Check AI settings...").clicked()
+    }
+}
+
 pub struct Options { pub root: PathBuf, pub text: String, pub error: String }
 
 /// Check both the image bytes and the saved label before replacing a result.
@@ -497,6 +541,21 @@ pub mod tests {
 
     pub fn labeled(caption: &str) -> Value {
         json!({"status":"labeled", "caption":caption, "tags":[" Pixel-Art ", "pixel art", "TREE"]})
+    }
+
+    #[test]
+    fn provider_errors_offer_specific_recovery_without_losing_unknown_errors() {
+        let depleted = problem("The endpoint returned HTTP 402. RESOURCE_EXHAUSTED: Your prepayment credits are depleted.");
+        assert_eq!(depleted.title, "Prepaid credits depleted"); assert!(depleted.billing); assert!(!depleted.settings);
+        for (code, title, settings) in [(401, "Provider rejected the API key", true), (403, "Provider denied access", true),
+            (429, "Provider limit reached", false), (503, "Provider is temporarily unavailable", false)] {
+            let info = problem(&format!("The endpoint returned HTTP {code}. Provider explanation."));
+            assert_eq!(info.title, title); assert_eq!(info.settings, settings); assert!(!info.billing);
+        }
+        assert_eq!(problem("Request timed out").title, "Connection to the provider failed");
+        assert_eq!(problem("Could not save labels: disk full").title, "Could not save the results");
+        let unknown = "The endpoint returned HTTP 4020. Unknown provider response.";
+        assert_eq!(problem(unknown).title, unknown); assert!(!problem(unknown).billing);
     }
 
     #[test]

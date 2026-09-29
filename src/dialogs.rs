@@ -307,7 +307,11 @@ impl App {
                 ui.label("Closing this dialog keeps the request running.");
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
             } else if let Some(outcome) = &outcome {
-                if outcome.failed { ui.colored_label(ui.visuals().error_fg_color, labels::summary(&outcome.message)); }
+                if outcome.failed {
+                    settings |= labels::problem(&outcome.message).show(ui, &outcome.message,
+                        outcome.message.contains("ai.studio/projects") || outcome.message.contains("ai.google.dev"));
+                    ui.small("Existing saved labels are kept.");
+                }
                 else { ui.label(&outcome.message); }
             }
             if !target.error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, labels::summary(&target.error)); }
@@ -342,7 +346,7 @@ impl App {
             ui.separator();
             let body_height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0 - footer_height(ui)).max(80.0);
             egui::ScrollArea::vertical().max_height(body_height).show(ui, |ui| {
-                if let Some(outcome) = &outcome && outcome.message.chars().count() > 180 {
+                if let Some(outcome) = &outcome && (outcome.failed || outcome.message.chars().count() > 180) {
                     egui::CollapsingHeader::new("Error details").show(ui, |ui| { ui.label(&outcome.message); });
                 }
                 if !target.error.is_empty() { ui.label(&target.error); }

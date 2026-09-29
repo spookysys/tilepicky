@@ -361,3 +361,19 @@ The OpenRouter UI check used a loopback price catalog. A separate public catalog
 The loopback Google job completed with its estimate and reported usage saved in the library book.
 Restarting the native fixture kept those values. Expanded cost details use the job's scroll area so the controls remain accessible.
 All 184 tests passed in both build configurations. Clippy passed for all targets in both configurations.
+
+
+## Failure explanations and recovery
+
+The job view now shows the cause and a next step without opening details or copying a log.
+Billing, credentials, quota, connection, provider availability, and local save failures have specific explanations.
+Unknown errors retain the provider's text. Error details keeps the complete message and groups affected sheet paths.
+A failed library job keeps a clickable status notice after completion and restart. Failed progress uses a warning color.
+A failed sheet request keeps a clickable notice while its request log remains available.
+
+Regression tests cover rejected submissions after restart, grouped failures, partial results, resolved retries, storage errors, and error classification.
+The native pass used a loopback provider in a 1000 x 700 window at 125 percent text scale.
+It checked the depleted-credit notice, billing link, unchanged saved labels, Copy log feedback, and status links.
+Restarting kept the library failure visible. Closing a failed sheet dialog and clicking its notice reopened the correct sheet.
+Long error text stays inside the status bar, with the full text on hover.
+All 187 tests passed in both build configurations. Clippy passed with WGPU enabled.

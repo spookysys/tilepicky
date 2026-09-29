@@ -930,6 +930,10 @@ impl App {
                 set_pane(ui, (Panel::Project, Spot::Status));
                 stop(&gear);
                 self.settings_popup(&gear, ui);
+                let failure_link = |ui: &mut egui::Ui, text: &str| {
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(ui.visuals().error_fg_color).underline())
+                        .truncate().sense(egui::Sense::click())).on_hover_text(text).on_hover_cursor(egui::CursorIcon::PointingHand)
+                };
                 if let Some(run) = &self.label_run {
                     if ui.small_button("Cancel").clicked() {
                         self.label_action(ctx, labels::Action::Cancel);
@@ -939,8 +943,17 @@ impl App {
                         ui.spinner();
                         ctx.request_repaint_after(Duration::from_secs(1));
                     }
+                } else if let Some(outcome) = self.label_outcome.clone().filter(|out| out.failed
+                    && out.path.starts_with(&self.library.index.root) && self.target_log(&out.path).is_some_and(ai_log::Log::available)) {
+                    let text = format!("Sheet labeling failed: {}", labels::problem(&outcome.message).title);
+                    if failure_link(ui, &text).clicked()
+                        && let Ok(rel) = outcome.path.strip_prefix(&self.library.index.root) {
+                        self.open_label_target(ctx, self.library.index.root.clone(), rel.to_string_lossy().into());
+                    }
+                } else if let Some(message) = self.library_batch.attention() {
+                    if failure_link(ui, &message).clicked() { self.ai_panel = true; }
                 } else if !self.status.is_empty() && age.as_secs() < STATUS_SECS {
-                    ui.label(&self.status);
+                    ui.add(egui::Label::new(&self.status).truncate()).on_hover_text(&self.status);
                     ctx.request_repaint_after(Duration::from_secs(STATUS_SECS) - age);
                 } else if let Some(status) = self.library_batch.status() {
                     if ui.link(status).on_hover_text("Open the AI pane for batch details and controls.").clicked() {
@@ -1453,6 +1466,7 @@ impl App {
             if stopped(ui.button("Open current job")).clicked() { self.open_active_label_job(ui.ctx()); }
         }
         self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys, self.label_run.is_some());
+        if std::mem::take(&mut self.library_batch.settings_requested) { self.settings_request = true; }
         ui.separator();
         if !self.library_batch.busy() {
             let can_clear = self.library.is_set() && self.library.index.error.is_none() && self.label_run.is_none()
