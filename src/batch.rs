@@ -124,6 +124,9 @@ pub struct Job {
     pub tag_list: Vec<String>,
     #[serde(default)]
     prompt: Option<[String; 2]>,
+    /// Older jobs keep their original requests without file context.
+    #[serde(default)]
+    file_context: bool,
     /// Alternate submissions and polling so early results can arrive before the whole library is sent.
     #[serde(default)]
     poll_next: bool,
@@ -193,16 +196,16 @@ fn legacy_directory(root: &Path) -> Result<PathBuf, String> {
 }
 
 /// The request body for one sheet in a Gemini batch.
-fn body(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
-    Ok(gemini_request(&chat_request(job, img)?))
+fn body(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, String> {
+    Ok(gemini_request(&chat_request(job, img, rel)?))
 }
 
-fn chat_request(job: &Job, img: &image::RgbaImage) -> Result<Value, String> {
+fn chat_request(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, String> {
     let mut request = labels::request(&job.model, img, &job.tag_list)?;
-    if let Some([system, user]) = &job.prompt {
-        request["messages"][0]["content"] = json!(system);
-        request["messages"][1]["content"][0]["text"] = json!(user);
-    }
+    let texts = job.prompt.clone().unwrap_or_else(|| labels::prompt(&job.tag_list));
+    let [system, user] = if job.file_context { labels::sheet_prompt(texts, rel) } else { texts };
+    request["messages"][0]["content"] = json!(system);
+    request["messages"][1]["content"][0]["text"] = json!(user);
     Ok(request)
 }
 
@@ -213,8 +216,8 @@ fn image_request(job: &mut Job, root: &Path, i: usize) -> Result<Value, String> 
     let book = crate::sidecar::load_book(root)?;
     job.sheets[i].guard = Some(InputGuard { hash: format!("{:x}", Sha256::digest(&bytes)),
         label: book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone()) });
-    if job.provider.kind == Kind::Gemini { body(job, &image.to_rgba8()) }
-    else { Ok(job.provider.route(chat_request(job, &image.to_rgba8())?)) }
+    if job.provider.kind == Kind::Gemini { body(job, &image.to_rgba8(), &job.sheets[i].rel) }
+    else { Ok(job.provider.route(chat_request(job, &image.to_rgba8(), &job.sheets[i].rel)?)) }
 }
 
 fn save_labels(job: &Job, root: &Path) -> (runner::SaveReport, Vec<(String, Option<Label>)>) {
@@ -265,7 +268,7 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
         log_id: crate::ai_log::id(),
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
         replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), prompt: Some(labels::prompt(&index.tag_list)),
-        poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
+        file_context: true, poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
         issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0,
         sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(),
             imported: false, unknown: 0, cancelled: false, guard: None })
@@ -716,15 +719,19 @@ pub struct Panel {
     key: String,
     control: runner::Control,
     resend_confirm: bool,
+    pub notice: Option<String>,
 }
 
 impl Panel {
     fn running(&self) -> bool { self.job.as_ref().is_some_and(|j| !j.done()) }
     pub fn open(&self) -> bool { self.proposal.is_some() || self.resend_confirm }
     pub fn busy(&self) -> bool { self.running() || self.open() }
-    pub fn allows_single(&self) -> bool {
-        !self.busy() && (self.root.as_os_str().is_empty() || self.lock.is_some())
+    pub fn single_block_reason(&self) -> Option<&'static str> {
+        if self.busy() { Some("Finish or cancel the library job before labeling a single sheet.") }
+        else if !self.root.as_os_str().is_empty() && self.lock.is_none() { Some("Another window controls labeling for this library.") }
+        else { None }
     }
+    pub fn allows_single(&self) -> bool { self.single_block_reason().is_none() }
     pub fn cleanup_log(&self, root: &Path) -> Result<(), String> {
         let _lock = if self.root == root && self.lock.is_some() { None } else {
             match runner::lock(root) { Ok(lock) => Some(lock), Err(_) => return Ok(()) }
@@ -890,11 +897,6 @@ impl Panel {
 
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, index: &Index, ai: &crate::ai::Ai, keys: &crate::ai::Keys, single_running: bool) {
         use eframe::egui;
-        if crate::stopped(ui.add_enabled(self.log_available(), egui::Button::new("Copy log")))
-            .on_hover_text("Copy this library job's log. A new job replaces it. Finished logs are removed on exit.").clicked()
-            && let Some(log) = &self.log {
-            match log.text() { Ok(text) => ui.ctx().copy_text(text), Err(error) => self.error = error }
-        }
         let configured = ai.chosen(crate::ai::Mode::Batch);
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
         for error in [&self.error, &self.storage_error] {
@@ -985,6 +987,14 @@ impl Panel {
                 });
             });
         } else if let Some((provider, model)) = configured { ui.weak(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch"))); }
+        if crate::stopped(ui.add_enabled(self.log_available(), egui::Button::new("Copy log")))
+            .on_hover_text("Copy this library job's log. A new job replaces it. Finished logs are removed on exit.").clicked()
+            && let Some(log) = &self.log {
+            match log.text() {
+                Ok(text) => { ui.ctx().copy_text(text); self.notice = Some("Library log copied to the clipboard.".into()); }
+                Err(error) => self.error = error,
+            }
+        }
         if let Some(mode) = pause { self.set_mode(mode); }
         if cancel { self.cancel(keys); }
         if retry { self.command(runner::Command::Wake); }
@@ -1125,6 +1135,25 @@ mod tests {
     fn id(value: &str) -> impl FnMut(&str, Option<&Value>) -> Result<Value, Failure> {
         let value = value.to_string();
         move |_, _| Ok(json!({"name":value}))
+    }
+
+    #[test]
+    fn new_jobs_send_file_context_and_old_jobs_keep_their_saved_prompt() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::OpenAi);
+        let request = image_request(&mut job, &files.root, 0).unwrap();
+        let expected = labels::sheet_prompt(job.prompt.clone().unwrap(), "folder/sheet.png");
+        assert_eq!(request["messages"][1]["content"][0]["text"], expected[1]);
+        job.provider = provider(Kind::Gemini);
+        let google = image_request(&mut job, &files.root, 0).unwrap();
+        assert_eq!(google, gemini_request(&request));
+        let mut saved = serde_json::to_value(&job).unwrap();
+        saved.as_object_mut().unwrap().remove("file_context");
+        saved["prompt"] = json!(["Original system", "Original user"]);
+        let mut legacy: Job = serde_json::from_value(saved).unwrap();
+        let google = image_request(&mut legacy, &files.root, 0).unwrap();
+        assert_eq!(google["systemInstruction"]["parts"][0]["text"], "Original system");
+        assert_eq!(google["contents"][0]["parts"][0]["text"], "Original user");
     }
 
     #[test]

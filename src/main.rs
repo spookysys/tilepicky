@@ -118,7 +118,7 @@ struct App {
     single_log: Option<(PathBuf, ai_log::Log)>,
     log_roots: std::collections::HashSet<PathBuf>,
     log_library: PathBuf,
-    label_outcome: Option<String>,
+    label_outcome: Option<(PathBuf, String)>,
     label_view: bool,
     /// The tag list of the library as the user types it, and whether the
     /// list changed since the book last got it.
@@ -1427,10 +1427,6 @@ impl App {
         ui.heading("AI labels");
         ui.add_space(6.0);
         ui.strong("Single sheet");
-        if stopped(ui.add_enabled(self.single_log_available(), egui::Button::new("Copy log")))
-            .on_hover_text("Copy the latest single-sheet request log for the selected sheet. Removed on exit when the job has finished.").clicked() {
-            self.copy_single_log(ui.ctx());
-        }
         let instant = self.settings.ai.chosen(ai::Mode::Instant)
             .filter(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
         let ready = instant.is_some();
@@ -1454,6 +1450,16 @@ impl App {
             }
         });
 
+        if let Some(run) = &self.label_run {
+            ui.label(format!("Labeling {}: {} s", run.rel, run.started.elapsed().as_secs()));
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        } else if let Some(outcome) = self.selected_label_outcome() { ui.label(outcome); }
+        if let Some(reason) = self.library_batch.single_block_reason() { ui.label(reason); }
+        if stopped(ui.add_enabled(self.single_log_available(), egui::Button::new("Copy log")))
+            .on_hover_text("Copy the latest single-sheet request log for the selected sheet. Removed on exit when the job has finished.").clicked() {
+            self.copy_single_log(ui.ctx());
+        }
+
         ui.add_space(6.0);
         ui.separator();
         ui.strong("Library labeling");
@@ -1463,6 +1469,8 @@ impl App {
             ui.weak(format!("{done} of {} sheets already labeled", entries.len()));
         }
         self.library_batch.ui(ui, &self.library.index, &self.settings.ai, &self.keys, self.label_run.is_some());
+        if let Some(notice) = self.library_batch.notice.take() { self.status = notice; }
+        if self.label_run.is_some() { ui.label("Wait for the single-sheet job to finish, or cancel it."); }
         let can_clear = self.library.is_set() && self.library.index.error.is_none()
             && self.label_run.is_none() && !self.library_batch.busy();
         if !self.library_batch.busy() && stopped(ui.add_enabled(can_clear, egui::Button::new("Clear all..."))).clicked() {
@@ -1494,10 +1502,19 @@ impl App {
                     self.store_tag_list();
                 }
                 if stopped(ui.button("Prompt...")).on_hover_text("The prompt that the next request sends.").clicked() {
-                    self.prompt_view = Some(("The prompt of the next request".into(), labels::prompt(&self.library.index.tag_list)));
+                    let texts = labels::prompt(&self.library.index.tag_list);
+                    self.prompt_view = Some(match &self.library.sheet {
+                        Some(sheet) => ("Next request for the selected sheet".into(), labels::sheet_prompt(texts, &sheet.rel)),
+                        None => ("Prompt template: each request adds its sheet's filename and relative folder".into(), texts),
+                    });
                 }
             });
         });
+    }
+
+    fn selected_label_outcome(&self) -> Option<&str> {
+        let sheet = self.library.sheet.as_ref()?;
+        self.label_outcome.as_ref().filter(|(path, _)| *path == sheet.dir.join(&sheet.rel)).map(|(_, text)| text.as_str())
     }
 
     fn selected_single_log(&self) -> Option<&ai_log::Log> {
@@ -1536,16 +1553,15 @@ impl App {
     fn label_action(&mut self, ctx: &egui::Context, action: labels::Action) {
         if action == labels::Action::Show {
             self.label_view = self.library.sheet.is_some();
-            self.label_outcome = None;
             return;
         }
         if action == labels::Action::Cancel {
             if let Some(run) = &self.label_run {
+                self.label_outcome = Some((run.path.clone(), "Cancelled. The provider may still bill the request.".into()));
                 run.log.event("single_cancel", serde_json::json!({"sheet":run.rel})); run.log.complete(); run.log.retire();
             }
             self.label_run = None;
             self.status = "Cancelled. The provider may still bill the request.".into();
-            self.label_outcome = Some(self.status.clone());
             return;
         }
         if action == labels::Action::Label {
@@ -1588,7 +1604,7 @@ impl App {
             Err(error) => {
                 ai_log::event("single_setup_error", serde_json::json!({"sheet":sheet.rel, "error":error}));
                 log.complete();
-                self.status = error.clone(); self.label_outcome = Some(error);
+                self.status = error.clone(); self.label_outcome = Some((sheet.dir.join(&sheet.rel), error));
             }
         }
     }
@@ -1616,7 +1632,7 @@ impl App {
         self.status = format!("{}: {notice}", run.path.file_name().unwrap_or_default().to_string_lossy());
         run.log.event("single_saved", serde_json::json!({"sheet":run.rel, "outcome":self.status}));
         run.log.complete();
-        self.label_outcome = Some(self.status.clone());
+        self.label_outcome = Some((run.path.clone(), self.status.clone()));
     }
 
     /// Puts labels that the book now holds into the open sheets and the search.
@@ -3307,8 +3323,23 @@ mod tests {
         b.app.settings.ai.instant = None;
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Label));
         assert!(b.app.label_view, "The label action must show its progress or error immediately.");
-        assert_eq!(b.app.label_outcome.as_deref(), Some("Choose an instant model in Settings."));
+        assert_eq!(b.app.selected_label_outcome(), Some("Choose an instant model in Settings."));
         assert!(b.app.label_run.is_none());
+    }
+
+    #[test]
+    fn reopening_a_popup_keeps_its_outcome_without_showing_it_on_another_sheet() {
+        let mut b = bench(&["a.png", "b.png"], &[]);
+        b.app.settings.ai.instant = None;
+        b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Label));
+        let error = b.app.selected_label_outcome().unwrap().to_string();
+        b.app.label_view = false;
+        b.app.label_action(&b.ctx, labels::Action::Show);
+        assert_eq!(b.app.selected_label_outcome(), Some(error.as_str()));
+        b.app.library_tree_action(&b.ctx, TreeAction::Labels(1, labels::Action::Show));
+        assert!(b.app.selected_label_outcome().is_none());
+        b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Show));
+        assert_eq!(b.app.selected_label_outcome(), Some(error.as_str()));
     }
 
     #[test]

@@ -277,6 +277,7 @@ impl App {
         let mut close = false;
         let mut copy_log = false;
         let has_log = self.single_log_available();
+        let outcome = self.selected_label_outcome().map(str::to_string);
         egui::Modal::new(Id::new("AI label")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading("AI label");
@@ -285,10 +286,11 @@ impl App {
                 if let Some(label) = &sheet.side.label {
                     label.show(ui);
                     ui.weak(format!("{} / {}", label.provider, label.model));
-                    if ui.button("Prompt...").clicked() {
+                    if ui.button("Current prompt...").clicked() {
                         let title = if label.tag_list.is_some() { "Current prompt with this label's tag list" }
                             else { "Current prompt without a recorded tag list" };
-                        self.prompt_view = Some((title.into(), labels::prompt(label.tag_list.as_deref().unwrap_or_default())));
+                        self.prompt_view = Some((title.into(),
+                            labels::sheet_prompt(labels::prompt(label.tag_list.as_deref().unwrap_or_default()), &sheet.rel)));
                     }
                 } else {
                     ui.weak("No label yet.");
@@ -302,9 +304,10 @@ impl App {
                     ui.label(format!("Labeling {}: {} s", run.rel, run.started.elapsed().as_secs()));
                 });
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
-            } else if let Some(outcome) = &self.label_outcome {
+            } else if let Some(outcome) = &outcome {
                 ui.label(outcome);
             }
+            if let Some(reason) = self.library_batch.single_block_reason() { ui.label(reason); }
             ui.horizontal(|ui| {
                 close = ui.button("Close").clicked();
                 copy_log = ui.add_enabled(has_log, egui::Button::new("Copy log"))

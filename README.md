@@ -98,6 +98,8 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 The model returns a caption, up to 12 freeform tags, and matching tags from your list.
 Tilepicky writes the label to `tilepicky.json`. You can continue working while the request runs.
 The popup and status bar show progress and a **Cancel** button.
+The sidebar and popup keep the latest outcome for its sheet during the session.
+Reopening the popup does not clear the outcome.
 **Single sheet** and **Library labeling** each have their own **Copy log** button.
 The label popup copies the same single-sheet log as the sidebar.
 A button stays disabled when its job has no log. A saved label alone does not provide a request log.
@@ -119,11 +121,15 @@ Sheet names and generated captions remain in the log. Older shared logs are remo
 Each request times out after 60 seconds. **Cancel** stops waiting, but the provider may still bill the request.
 
 To delete a label, select **Remove label...** in the popup, or **Remove AI label...** in the context menu, and confirm.
-**Prompt...** in the popup shows the current prompt with the tag list recorded for that label.
+**Current prompt...** in the popup shows the current prompt with the tag list recorded for that label.
 
 OpenRouter settings have a **skip** field for provider slugs, separated by commas. It defaults to `phala`, including for older settings.
 Clear the field to allow all providers. Single requests and library batches use this list.
 A batch keeps the provider settings it started with.
+
+New requests include the filename and library-relative folder as optional clues. They never include the absolute path.
+The prompt tells the model to use visible content and treat names as data, not instructions.
+Existing batches keep their original prompt and context policy. The request log includes the exact context sent.
 
 GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixels are scaled down before submission.
 
@@ -196,8 +202,9 @@ The model can still miss visible content. These tags do not count toward the 12 
 
 A new library starts with `character, NPC, hero, landscape, building, indoor, UI, font, animation, props, background`. **Reset** brings that list back. The list belongs to the library: Tilepicky writes it at the top of the library's `tilepicky.json`.
 
-Each label records the list its request used. **Prompt...** in the label popup uses that list with the current prompt text.
-**Prompt...** under the list shows the prompt of the next request. Changing the list does not relabel anything.
+Each label records the list its request used. **Current prompt...** in the label popup uses that list with the current prompt text.
+**Prompt...** under the list includes the selected sheet's context, or shows the template when no sheet is open.
+The log contains the original request. The popup's current prompt can differ from that request. Changing the list does not relabel anything.
 To apply the new list, select **Label again**, or remove the label and label the library again.
 
 API keys are stored separately in `~/.config/tilepicky/keys.json` with restricted file permissions (`0600`).

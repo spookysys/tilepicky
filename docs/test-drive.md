@@ -246,3 +246,15 @@ Unit tests cover separate job IDs, late replies, redaction, size limits, restart
 
 Final verification: 156 tests passed in each build configuration. Clippy passed with all targets and WGPU enabled.
 The interactive fixture remains excluded from automatic tests and was exercised separately.
+
+
+## File context and AI controls
+
+New single-sheet and library requests include the filename and library-relative folder as optional context.
+The model must use visible content and treat names as data. Existing batches retain their saved prompt and context policy.
+The prompt preview includes the selected sheet's context. The saved-label popup calls its preview Current prompt.
+
+Regression tests cover context in both provider formats, unchanged legacy prompts, and rejection of absolute or parent paths.
+They also check that an outcome survives reopening its popup and does not appear on another sheet.
+The AI pane explains why an outstanding library job blocks a single-sheet request.
+Both Copy log actions report success. The buttons follow the relevant job information.
