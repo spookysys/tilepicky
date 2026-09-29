@@ -69,6 +69,7 @@ the person who uses the tool; this file is for an agent that works on it.
   User pause and cancel requests persist in the library book before the coordinator applies them.
   Tests use fake transports and explicit times. The native UI fixture uses a loopback provider in a test build only.
 
+- `src/batch/cost.rs`: local token estimates and library cost ranges, with provider price sources and saved usage.
 - `src/batch/store.rs`: one job and its commands in the root book, with migration from older configuration journals.
   `sidecar::update_book` locks each read-modify-write operation for batch state, labels, and grid metadata.
 

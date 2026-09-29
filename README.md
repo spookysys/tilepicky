@@ -146,6 +146,20 @@ To label multiple library sheets in bulk:
 
 Use **Rerun all...** to label every sheet again with the current library model and tag list.
 Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
+
+The confirmation estimates the job's cost in USD before you start. **Estimate details** shows input and output token ranges and price sources.
+It reads local image sizes and fetches OpenRouter's public model prices. It does not upload sheets to calculate the estimate.
+Google estimates use a dated table of batch prices. The table expires instead of silently keeping old prices.
+For `gemini-flash-latest`, the confirmation names its price assumption because the alias can change.
+Unsupported models, expired prices, or a failed price lookup show an unavailable estimate. You can still start the job.
+
+The range includes estimated image, prompt, response, and reasoning tokens. It is not a spending limit.
+Without prior usage, output assumes 256 to 1536 tokens per sheet. Actual use can exceed that range.
+For a matching fixed model and tag list, at least five reported requests from the previous job refine the output range.
+Retries, taxes, route prices, and provider fees can change the final bill.
+**Job cost estimate** retains the initial estimate and shows reported usage at those rates while the job runs.
+The library book keeps the estimate and usage across restarts. Missing usage and unconfirmed requests are not included in reported usage.
+
 Failed and unlabelable requests keep their old usable labels.
 
 Use **Clear all labels...** to remove all saved AI captions and tags in the library, including its subfolders.

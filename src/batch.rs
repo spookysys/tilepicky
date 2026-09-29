@@ -11,6 +11,7 @@
 use crate::{ai::{Kind, Provider}, index::Index, labels, sidecar::{Label, Status}};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+mod cost;
 mod runner;
 mod store;
 
@@ -145,6 +146,10 @@ pub struct Job {
     poll_ms: u64,
     #[serde(default)]
     recovery_ms: u64,
+    #[serde(default)]
+    estimate: Option<cost::Estimate>,
+    #[serde(default)]
+    usage: cost::Usage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,7 +287,7 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
         replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), prompt: Some(labels::prompt(&index.tag_list)),
         file_context: true, poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
-        issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0,
+        issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0, estimate: None, usage: cost::Usage::default(),
         sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(),
             imported: false, unknown: 0, cancelled: false, guard: None })
             .collect(),
@@ -423,7 +428,9 @@ fn outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
             out.push((key.into(), json!({"error":item["error"]})));
             continue;
         }
-        out.push((key.into(), crate::gemini::response(&item["response"])));
+        let mut response = crate::gemini::response(&item["response"]);
+        response["usageMetadata"] = item["response"]["usageMetadata"].clone();
+        out.push((key.into(), response));
     }
     Ok(Some(out))
 }
@@ -444,8 +451,10 @@ fn record(sheet: &mut Sheet, job: (&str, &str, &[String]), reply: Result<labels:
 fn accept(job: &mut Job, group: usize, values: Vec<(String, Value)>) {
     let mut values: std::collections::BTreeMap<_, _> = values.into_iter().collect();
     for &i in &job.groups[group].sheets {
-        let reply = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v|
-            labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &v, &job.tag_list));
+        let reply = values.remove(&key(i)).ok_or("No result returned for this request.".into()).and_then(|v| {
+            job.usage.record(&v);
+            labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &v, &job.tag_list)
+        });
         record(&mut job.sheets[i], (&job.provider.name, &job.model, &job.tag_list), reply);
     }
 }
@@ -487,12 +496,15 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
         Ok(request) => match send("chat/completions", Some(&request)) {
             // One provider of a model on OpenRouter may answer in prose. The
             // next request may reach another.
-            Ok(value) => match labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &value, &job.tag_list) {
+            Ok(value) => {
+                job.usage.record(&value);
+                match labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &value, &job.tag_list) {
                 Err(error) if error == labels::INVALID && job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
                     job.sheets[i].unknown += 1;
                     return job.save(dir);
                 }
                 reply => reply,
+                }
             },
             Err(Failure::Unknown(message)) if job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
                 job.sheets[i].unknown += 1;
@@ -703,6 +715,8 @@ pub struct Panel {
     dir: PathBuf,
     pub job: Option<Job>,
     proposal: Option<Job>,
+    cost_preview: Option<cost::Preview>,
+    cost_error: String,
     runner: Option<runner::Runner>,
     lock: Option<std::sync::Arc<std::fs::File>>,
     pending_save: Option<mpsc::Sender<runner::SaveReport>>,
@@ -946,6 +960,17 @@ impl Panel {
                 ui.label(format!("Next retry in {} s. See Details for the error.", issue.retry_ms.saturating_sub(now).div_ceil(1000)));
             }
             egui::ScrollArea::vertical().id_salt("library job details").max_height((ui.available_height() - 180.0).max(60.0)).show(ui, |ui| {
+                if let Some(estimate) = &job.estimate {
+                    egui::CollapsingHeader::new("Job cost estimate").show(ui, |ui| {
+                        estimate.ui(ui);
+                        if job.usage.requests > 0 {
+                            if let Some(text) = estimate.usage_summary(&job.usage) { ui.label(text); }
+                            ui.small(format!("{} reported requests: {} input, {} output tokens including reasoning.",
+                                job.usage.requests, job.usage.input, job.usage.output));
+                            ui.small("Reported usage can include retries. Missing usage and unconfirmed requests are not included.");
+                        }
+                    });
+                }
                 if !job.done() {
                     ui.small(if job.provider.kind == Kind::Gemini {
                         "Closing pauses local work. Google can continue accepted work. Reopen this library to collect results."
@@ -1005,7 +1030,14 @@ impl Panel {
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
                 match prepare(index, provider.clone(), model.id.clone(), scope) {
-                    Ok(job) => self.proposal = Some(job), Err(e) => self.error = e,
+                    Ok(job) => {
+                        self.cost_error.clear();
+                        self.cost_preview = match cost::Preview::start(job.clone(), index.root.clone(), self.job.as_ref(), ui.ctx().clone()) {
+                            Ok(preview) => Some(preview), Err(error) => { self.cost_error = error; None }
+                        };
+                        self.proposal = Some(job);
+                    }
+                    Err(e) => self.error = e,
                 }
             }
         }
@@ -1038,39 +1070,56 @@ impl Panel {
             });
             return;
         }
+        if let Some(preview) = &self.cost_preview {
+            match preview.receiver.try_recv() {
+                Ok(estimate) => {
+                    if let Some(job) = &mut self.proposal { job.estimate = Some(estimate); }
+                    self.cost_preview = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.cost_error = "Could not calculate the estimate. You can still start the job.".into();
+                    self.cost_preview = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
+            }
+        }
         let Some(job) = &self.proposal else { return };
         let (mut start, mut close) = (false, false);
         egui::Modal::new(egui::Id::new("library batch confirmation")).show(ctx, |ui| {
-            ui.set_width(430.0);
+            ui.set_width(500.0_f32.min(ctx.content_rect().width() - 48.0));
+            ui.set_max_height((ctx.content_rect().height() - 96.0).max(160.0));
             ui.heading("Label this entire library?");
-            ui.label(self.root.display().to_string());
-            ui.weak(format!("{} / {} (from Settings)", job.provider.name, job.model));
-            if job.provider.kind == Kind::Gemini { ui.weak("Google batch requests require a paid API project."); }
-            if job.sheets.is_empty() {
-                ui.label("Every sheet has a label already.");
-            } else {
-                ui.label(format!("Sheets to label: {}, one request each.", job.sheets.len()));
-                if job.replacing > 0 {
-                    ui.label(format!("Existing labels to replace: {}.", job.replacing));
-                    ui.label("Existing labels stay until new results arrive. Failed requests keep the old labels.");
+            let height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0 - crate::dialogs::footer_height(ui)).max(80.0);
+            egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                ui.label(self.root.display().to_string());
+                ui.weak(format!("{} / {} (from Settings)", job.provider.name, job.model));
+                if job.provider.kind == Kind::Gemini { ui.weak("Google batch requests require a paid API project."); }
+                if job.sheets.is_empty() {
+                    ui.label("Every sheet has a label already.");
                 } else {
-                    ui.label(format!("Skipped because they have a label: {}.", job.skipped));
+                    ui.label(format!("Sheets to label: {}, one request each.", job.sheets.len()));
+                    if job.replacing > 0 {
+                        ui.label(format!("Existing labels to replace: {}.", job.replacing));
+                        ui.label("Existing labels stay until new results arrive. Failed requests keep the old labels.");
+                    } else {
+                        ui.label(format!("Skipped because they have a label: {}.", job.skipped));
+                    }
+                    match job.tag_list.is_empty() {
+                        true => ui.label("Tags to look for: none."),
+                        false => ui.label(format!("Tags to look for: {}.", job.tag_list.join(", "))),
+                    };
+                    if let Some(estimate) = &job.estimate { estimate.ui(ui); }
+                    else if self.cost_preview.is_some() {
+                        ui.horizontal(|ui| { ui.spinner(); ui.label("Estimating cost..."); });
+                        ui.small("Reading local image sizes and model prices. No sheets are uploaded.");
+                    } else { ui.label(&self.cost_error); }
+                    ui.weak(if job.provider.kind == Kind::Gemini {
+                        "Closing pauses uploads and saves. Google continues accepted work. Reopen this library to collect results."
+                    } else { "This provider labels sheets one by one. Closing pauses the job until you reopen this library." });
                 }
-                match job.tag_list.is_empty() {
-                    true => ui.label("Tags to look for: none."),
-                    false => ui.label(format!("Tags to look for: {}.", job.tag_list.join(", "))),
-                };
-                ui.label("Cost estimate unavailable for this job. Your provider charges for the images, prompt, and generated labels.");
-                egui::CollapsingHeader::new("Token limit details").show(ui, |ui| {
-                    ui.label(format!("Output limit: {} tokens per sheet, {} across this job.", 4096, job.sheets.len() * 4096));
-                    ui.small("This is a limit, not an estimate. It excludes input tokens and retries.");
-                });
-                ui.weak(if job.provider.kind == Kind::Gemini {
-                    "Closing pauses uploads and saves. Google continues accepted work. Reopen this library to collect results."
-                } else { "This provider labels sheets one by one. Closing pauses the job until you reopen this library." });
-            }
+            });
             crate::dialogs::footer(ui, |ui| {
-                start = !job.sheets.is_empty() && ui.button("Start labeling").clicked();
+                start = ui.add_enabled(!job.sheets.is_empty() && self.cost_preview.is_none(), egui::Button::new("Start labeling")).clicked();
                 close = ui.button(if job.sheets.is_empty() { "Close" } else { "Cancel" }).clicked()
                     || ui.input(|i| i.key_pressed(egui::Key::Escape));
             });
@@ -1083,13 +1132,13 @@ impl Panel {
                 Ok(()) => {
                     let log = crate::ai_log::Log::batch(&self.root, &job.log_id);
                     log.event("batch_start", json!({"provider":job.provider.name,"model":job.model,
-                        "sheets":job.sheets.len(),"tags_requested":job.tag_list,"prompt":job.prompt}));
+                        "sheets":job.sheets.len(),"tags_requested":job.tag_list,"prompt":job.prompt,"estimate":job.estimate}));
                     self.log = Some(log); self.job = Some(job); self.error.clear();
                 }
                 Err(e) => self.error = e,
             }
         }
-        if close { self.proposal = None; }
+        if close { self.proposal = None; self.cost_preview = None; self.cost_error.clear(); }
     }
 }
 
@@ -1834,4 +1883,33 @@ mod tests {
         p.url = "https://user:password@example.test".into();
         assert!(endpoint(&p).is_err());
     }
+
+    #[test]
+    fn library_usage_includes_paid_invalid_retries() {
+        let files = Files::new();
+        let mut invalid = json!({"choices":[{"finish_reason":"stop", "message":{"content":"**Caption:** Trees"}}]});
+        invalid["usage"] = json!({"prompt_tokens":500, "completion_tokens":80});
+        let (job, result) = files.advance(files.prepare(Kind::OpenAi), |_, _| Ok(invalid.clone()));
+        result.unwrap(); assert!(!job.done());
+        let mut valid = completion(labeled("Tile"));
+        valid["usage"] = json!({"prompt_tokens":510, "completion_tokens":100});
+        let (job, result) = files.advance(job, |_, _| Ok(valid.clone()));
+        result.unwrap();
+        assert_eq!(job.usage.requests, 2); assert_eq!(job.usage.input, 1010); assert_eq!(job.usage.output, 180);
+        assert_eq!(files.journal().usage.output, 180);
+    }
+
+    #[test]
+    fn google_usage_survives_batch_response_conversion() {
+        let files = Files::new();
+        let (job, result) = files.advance(files.prepare(Kind::Gemini), id("batches/test")); result.unwrap();
+        let mut response = completed(&job, 0, "Tile");
+        response["response"]["inlinedResponses"]["inlinedResponses"][0]["response"]["usageMetadata"] =
+            json!({"promptTokenCount":1000, "candidatesTokenCount":200, "thoughtsTokenCount":800});
+        let (job, result) = files.advance(job, |_, _| Ok(response.clone())); result.unwrap();
+        assert_eq!(job.usage.requests, 1); assert_eq!(job.usage.output, 1000);
+        let (job, result) = files.advance(job, |_, _| panic!("A completed group must not be counted again.")); result.unwrap();
+        assert_eq!(job.usage.requests, 1);
+    }
+
 }

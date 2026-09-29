@@ -343,3 +343,21 @@ The native pass changed the keyboard legend setting and closed the app with Sett
 The saved configuration contained the change before the next launch.
 The Settings click regression now waits for a stable layout before it clicks the checkbox.
 All 173 tests passed in each build configuration. Clippy passed for all targets with WGPU enabled.
+
+
+## Library cost estimates
+
+Library confirmations now show an estimated USD range. Expanded details show token ranges, price sources, and assumptions.
+The Google estimate uses batch rates. The OpenRouter estimate uses its catalog rates without a batch discount.
+The latest Gemini alias names the assumed price model. Missing prices never appear as a free job.
+The estimate and provider-reported usage persist with the library job. Single-sheet dialogs have no cost controls.
+
+Tests cover rate conversion, fixed fees, invalid and expired prices, image resizing, missing headers, and cancellation.
+They also cover selected-sheet scope, prior usage, old journals, saved estimates, reasoning tokens, and paid invalid-response retries.
+Native screenshots checked Google and OpenRouter confirmations in a 1000 x 700 window at 125 percent text scale.
+The price range stayed visible with details collapsed. Start and Cancel stayed visible with details expanded.
+The OpenRouter UI check used a loopback price catalog. A separate public catalog read verified the configured model's price fields.
+
+The loopback Google job completed with its estimate and reported usage saved in the library book.
+Restarting the native fixture kept those values. Expanded cost details use the job's scroll area so the controls remain accessible.
+All 184 tests passed in both build configurations. Clippy passed for all targets in both configurations.

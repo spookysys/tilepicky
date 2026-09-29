@@ -203,7 +203,7 @@ Serial jobs require the app to stay open. Google continues work on sheets that i
 Both descriptions explain what happens when the user reopens the library.
 Settings also saves open edits when the app closes. A failed save prevents that close.
 
-The library confirmation no longer presents the output limit as expected usage.
-Token limit details contains the per-sheet limit and total, with a statement that these are not estimates.
-A monetary estimate still needs model prices, image input counts, and measured output usage, including reasoning.
-The UI states when an estimate is unavailable.
+The library confirmation shows an estimated USD range. Estimate details explains prices, token ranges, and assumptions.
+The response limit stays in those details. It is separate from estimated use.
+OpenRouter uses public catalog prices. Google uses dated batch rates and names the price assumption for the latest alias.
+The library job keeps its estimate and reported usage, including reasoning. The UI states when a price is unavailable.
