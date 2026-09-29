@@ -984,11 +984,7 @@ impl App {
                 // content, and wraps a long line instead of growing wide
                 // enough to keep it on one.
                 ui.set_max_width(480.0);
-                ui.horizontal(|ui| {
-                    ui.strong("Settings");
-                    let label = if self.settings_error.is_empty() { "Done" } else { "Retry save" };
-                    if ui.button(label).clicked() { self.settings_open = false; }
-                });
+                ui.strong("Settings");
                 ui.small("Changes are saved when you close Settings.");
                 if !self.settings_error.is_empty() {
                     ui.colored_label(ui.visuals().error_fg_color, labels::summary(&self.settings_error)).on_hover_text(&self.settings_error);
@@ -1001,10 +997,14 @@ impl App {
                 popup_keys(ui, gear, &first);
                 if AI_VISIBLE {
                     ui.add_space(8.0);
-                    egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 160.0).max(180.0)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 160.0 - dialogs::footer_height(ui)).max(100.0)).show(ui, |ui| {
                         ai::settings_ui(ui, &mut self.settings.ai, &mut self.keys);
                     });
                 }
+                dialogs::footer(ui, |ui| {
+                    let label = if self.settings_error.is_empty() { "Done" } else { "Retry save" };
+                    if ui.button(label).clicked() { self.settings_open = false; }
+                });
             });
         let open = self.settings_open;
         if self.config_open && !open {
@@ -2566,6 +2566,10 @@ impl App {
         if create {
             self.request(ctx, Pending::Create);
         }
+        if self.config_open && ctx.input(|i| i.viewport().close_requested()) {
+            self.settings_save_result(self.settings.save(), self.keys.save());
+            if !self.settings_error.is_empty() { ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose); }
+        }
         self.dialogs(ctx);
 
         if self.ai_panel {
@@ -3309,13 +3313,20 @@ mod tests {
         let mut b = bench(&["sheet.png"], &["canvas.png"]);
         b.app.settings.hide_legend = true;
         b.app.settings_open = true;
-        for _ in 0..3 {
+        let mut previous = None;
+        let mut stable = 0;
+        for _ in 0..20 {
             let mut out = b.ctx.run_ui(egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
                 ..Default::default()
             }, |ui| b.app.draw(ui));
             out.textures_delta.clear();
+            let rect = b.ctx.memory(|m| m.focused()).and_then(|id| b.ctx.read_response(id)).map(|r| r.rect);
+            stable = if rect.is_some() && rect == previous { stable + 1 } else { 0 };
+            previous = rect;
+            if stable >= 2 { break; }
         }
+        assert!(stable >= 2, "Settings must settle before the click.");
         let checkbox = b.ctx.memory(|m| m.focused()).and_then(|id| b.ctx.read_response(id)).unwrap();
         let at = checkbox.rect.center();
         for pressed in [true, false] {

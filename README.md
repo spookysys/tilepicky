@@ -142,10 +142,10 @@ To label multiple library sheets in bulk:
 1. Open the library folder.
 2. Open **Library AI labels** (`I`) and select **Label unlabeled sheets...**.
 3. Choose the **Library** model under **Active models** and set its provider key in Settings. The initial selection is `z-ai/glm-5.3-flash` on OpenRouter.
-4. Review the unlabeled sheet count, the token limit, and the tags to look for, then click **Start batch**.
+4. Review the unlabeled sheet count and the tags to look for, then click **Start labeling**.
 
 Use **Rerun all...** to label every sheet again with the current library model and tag list.
-Review the request count and confirm with **Start batch**. Existing labels stay until new results arrive.
+Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
 Failed and unlabelable requests keep their old usable labels.
 
 Use **Clear all labels...** to remove all saved AI captions and tags in the library, including its subfolders.
@@ -357,14 +357,15 @@ Library files are read-only and cannot be moved, renamed, or deleted within Tile
 Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
 
 **Active models** selects the models for new single-sheet requests and library jobs. Existing jobs keep their saved configuration.
-The OpenRouter library notice explains sequential processing. **Configure Gemini...** opens its key field without changing the active model.
+The OpenRouter library notice explains sequential processing. **Set up Gemini...** opens its key field without changing the active model.
 Select a Gemini **Library** model to use Google's batch processing.
 
 **API keys** shows one field per configured provider. The built-in providers and models are ready for their keys.
 Open **Provider and model setup** to add custom models or change connections. It starts collapsed.
 Removing a provider or model asks for confirmation and explains which active selections it clears.
 
-Click **Done** to save and close Settings. Escape or an outside click also saves.
+Click **Done** at the bottom right to save and close Settings. Escape or an outside click also saves.
+Closing Tilepicky also saves edits from an open Settings popup. A save error keeps the app open.
 If saving fails, Settings stays open with the error and a **Retry save** button.
 The keyboard-shortcut checkbox controls the legend below the file trees.
 

@@ -367,10 +367,11 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
     if let Some(selected) = batch.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
         && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
         ui.add_space(4.0);
-        if provider.kind == Kind::OpenAi { configure |= serial_notice(ui, provider); }
+        if provider.kind == Kind::OpenAi { configure |= serial_notice(ui); }
         else {
             ui.strong("Google batch");
-            ui.label("Google processes uploaded sheets as a batch. Submitted work can continue after you close Tilepicky.");
+            ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
+            ui.label("Reopen this library to collect the labels. Sheets not yet uploaded wait until you return.");
         }
     }
     let focus = if configure {
@@ -414,12 +415,12 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
 }
 
 /// Explain the library execution method where the user chooses it.
-fn serial_notice(ui: &mut egui::Ui, provider: &Provider) -> bool {
-    ui.colored_label(ui.visuals().warn_fg_color, "One sheet at a time");
-    ui.label("Tilepicky sends one image request at a time. Closing Tilepicky pauses the job.");
-    if provider.is_openrouter() { ui.small("Tilepicky does not use OpenRouter's batch API for local images."); }
-    ui.label("For batches processed by Google, configure Gemini and select it for Library.");
-    ui.button("Configure Gemini...").clicked()
+fn serial_notice(ui: &mut egui::Ui) -> bool {
+    ui.strong("One sheet at a time");
+    ui.label("Keep Tilepicky open while it labels the library. Closing Tilepicky pauses the job.");
+    ui.label("Reopen this library to continue.");
+    ui.small("Want processing to continue while Tilepicky is closed? Add a Google key and choose Gemini for Library.");
+    ui.button("Set up Gemini...").clicked()
 }
 
 /// Prepare the editor without changing either active model or sending a request.
@@ -617,8 +618,8 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
                 ui.end_row();
             }
         });
-        if m.mode() == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
-            configure = serial_notice(ui, provider);
+        if m.mode() == Mode::Batch && providers.iter().any(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
+            configure = serial_notice(ui);
         }
         let after = m.reference();
         if after != before {

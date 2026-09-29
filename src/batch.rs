@@ -1029,7 +1029,7 @@ impl Panel {
                 ui.heading("Retry unconfirmed sheets?");
                 ui.label("Google may already have accepted these sheets. Sending them again can charge you twice.");
                 ui.label("Only the unconfirmed sheets will be retried. Accepted batches will keep their IDs.");
-                ui.horizontal(|ui| {
+                crate::dialogs::footer(ui, |ui| {
                     if ui.button("Send these sheets again").clicked() {
                         self.command(runner::Command::RetryUnconfirmed); self.resend_confirm = false;
                     }
@@ -1056,18 +1056,21 @@ impl Panel {
                 } else {
                     ui.label(format!("Skipped because they have a label: {}.", job.skipped));
                 }
-                ui.label(format!("At most {} output tokens.", job.sheets.len() * 4096));
                 match job.tag_list.is_empty() {
                     true => ui.label("Tags to look for: none."),
                     false => ui.label(format!("Tags to look for: {}.", job.tag_list.join(", "))),
                 };
-                ui.weak("Price estimate unavailable. Image token charges and model output vary.");
+                ui.label("Cost estimate unavailable for this job. Your provider charges for the images, prompt, and generated labels.");
+                egui::CollapsingHeader::new("Token limit details").show(ui, |ui| {
+                    ui.label(format!("Output limit: {} tokens per sheet, {} across this job.", 4096, job.sheets.len() * 4096));
+                    ui.small("This is a limit, not an estimate. It excludes input tokens and retries.");
+                });
                 ui.weak(if job.provider.kind == Kind::Gemini {
                     "Closing pauses uploads and saves. Google continues accepted work. Reopen this library to collect results."
                 } else { "This provider labels sheets one by one. Closing pauses the job until you reopen this library." });
             }
-            ui.horizontal(|ui| {
-                start = !job.sheets.is_empty() && ui.button("Start batch").clicked();
+            crate::dialogs::footer(ui, |ui| {
+                start = !job.sheets.is_empty() && ui.button("Start labeling").clicked();
                 close = ui.button(if job.sheets.is_empty() { "Close" } else { "Cancel" }).clicked()
                     || ui.input(|i| i.key_pressed(egui::Key::Escape));
             });

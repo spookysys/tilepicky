@@ -329,3 +329,17 @@ The final native pass used a 1000 x 700 window at 125 percent text scale.
 It verified visible keys, collapsed setup, Gemini key focus, unchanged active selections, missing-key feedback, and removal confirmation.
 A deliberately invalid settings target produced a persistent error. Restoring the target and clicking Retry save closed Settings successfully.
 Final validation: 173 tests passed in each build configuration. Clippy passed for all targets in both configurations.
+
+
+## Dialog footers and Settings close
+
+Native screenshots checked Settings, the saved sheet label, prompt preview, library options, and library confirmation.
+The window measured 1000 x 700 pixels at 125 percent text scale.
+Close, Done, and Save options appeared at the bottom right. Cancel appeared beside the primary action.
+The prompt and sheet content fit above their footers.
+The library confirmation kept the token limit under collapsed details.
+
+The native pass changed the keyboard legend setting and closed the app with Settings open.
+The saved configuration contained the change before the next launch.
+The Settings click regression now waits for a stable layout before it clicks the checkbox.
+All 173 tests passed in each build configuration. Clippy passed for all targets with WGPU enabled.

@@ -38,6 +38,16 @@ pub struct NamePrompt {
     pub focus: bool,
 }
 
+/// Put the primary action at the right edge, with secondary actions to its left.
+pub(crate) fn footer(ui: &mut egui::Ui, buttons: impl FnOnce(&mut egui::Ui)) {
+    ui.separator();
+    ui.horizontal(|ui| { ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons); });
+}
+
+pub(crate) fn footer_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y + 3.0 * ui.spacing().item_spacing.y + 1.0
+}
+
 impl App {
     /// Shows the dialog that waits, if any. A close of the window with
     /// unsaved changes waits for the save dialog.
@@ -77,7 +87,7 @@ impl App {
             ui.add_space(4.0);
             ui.label("Tilepicky starts with the defaults and will write them over the damaged file. To mend the file by hand instead, quit now.");
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            footer(ui, |ui| {
                 if ui.button("Continue").clicked() {
                     choice = Some(true);
                 }
@@ -117,7 +127,7 @@ impl App {
             ui.heading("Hide the legend?");
             ui.label("You can show it again in the settings: the gear at the right end of the status line.");
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            footer(ui, |ui| {
                 if ui.button("Hide").clicked() {
                     self.settings.hide_legend = true;
                     if let Err(e) = self.settings.save() { self.status = e; }
@@ -152,7 +162,7 @@ impl App {
                 apply = true;
             }
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            footer(ui, |ui| {
                 if ui.button("Ok").clicked() {
                     apply = true;
                 }
@@ -185,7 +195,7 @@ impl App {
             ui.heading("Delete");
             ui.label(&message);
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            footer(ui, |ui| {
                 if ui.button("Delete").clicked() {
                     choice = Some(true);
                 }
@@ -216,7 +226,7 @@ impl App {
             ui.heading("Unsaved changes");
             ui.label(format!("{name} has changes that are not saved."));
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            footer(ui, |ui| {
                 if ui.button("Save").clicked() {
                     choice = Some(true);
                 }
@@ -327,11 +337,10 @@ impl App {
                 if self.label_copied.is_some_and(|at| at.elapsed().as_secs() < 3) {
                     ui.label("Copied"); ctx.request_repaint_after(std::time::Duration::from_secs(1));
                 }
-                close = ui.button("Close").clicked();
             });
             if !self.label_copy_error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, labels::summary(&self.label_copy_error)); }
             ui.separator();
-            let body_height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0).max(80.0);
+            let body_height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0 - footer_height(ui)).max(80.0);
             egui::ScrollArea::vertical().max_height(body_height).show(ui, |ui| {
                 if let Some(outcome) = &outcome && outcome.message.chars().count() > 180 {
                     egui::CollapsingHeader::new("Error details").show(ui, |ui| { ui.label(&outcome.message); });
@@ -352,6 +361,7 @@ impl App {
                     }
                 });
             });
+            footer(ui, |ui| { close = ui.button("Close").clicked(); });
             if self.prompt_view.is_none() && self.label_options.is_none() && self.remove_label.is_none()
                 && ui.input(|i| i.key_pressed(Key::Escape)) { close = true; }
         });
@@ -376,13 +386,15 @@ impl App {
             ui.add(egui::TextEdit::multiline(&mut options.text).desired_width(f32::INFINITY).desired_rows(4));
             if !options.error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, &options.error); }
             ui.horizontal_wrapped(|ui| {
-                save = ui.button("Save options").clicked();
-                close = ui.button("Cancel").clicked() || (self.prompt_view.is_none() && ui.input(|i| i.key_pressed(Key::Escape)));
                 if ui.button("Reset tags").clicked() { options.text = sidecar::TAG_LIST.join(", "); }
                 if ui.button("Prompt template...").clicked() {
                     self.prompt_view = Some(("New requests add each sheet's filename and relative folder".into(),
                         labels::prompt(&labels::parse_list(&options.text))));
                 }
+            });
+            footer(ui, |ui| {
+                save = ui.button("Save options").clicked();
+                close = ui.button("Cancel").clicked() || (self.prompt_view.is_none() && ui.input(|i| i.key_pressed(Key::Escape)));
             });
         });
         if save {
@@ -405,15 +417,17 @@ impl App {
         let mut close = false;
         egui::Modal::new(Id::new("labeling prompt")).show(ctx, |ui| {
             ui.set_width(460.0_f32.min(ctx.content_rect().width() - 48.0));
+            ui.set_max_height((ctx.content_rect().height() - 96.0).max(160.0));
             ui.heading(title.as_str());
-            close = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
-            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 150.0).max(80.0)).show(ui, |ui| {
+            let height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0 - footer_height(ui)).max(80.0);
+            egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
                 for (name, text) in ["System", "User, with the image"].iter().zip(texts) {
                     ui.add_space(4.0);
                     ui.strong(*name);
                     ui.add(egui::TextEdit::multiline(&mut text.as_str()).desired_width(f32::INFINITY));
                 }
             });
+            footer(ui, |ui| { close = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)); });
         });
         if close { self.prompt_view = None; }
     }
@@ -427,7 +441,7 @@ impl App {
             ui.label(root.display().to_string());
             ui.label("This removes all saved AI captions and tags in this library, including its subfolders.");
             ui.label("Images, grids, animations, and the list of tags to look for stay. This cannot be undone.");
-            ui.horizontal(|ui| {
+            footer(ui, |ui| {
                 if ui.button("Clear all").clicked() { choice = Some(true); }
                 if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) { choice = Some(false); }
             });
@@ -452,7 +466,7 @@ impl App {
             ui.heading("Remove the AI label?");
             ui.label(path.display().to_string());
             ui.label("This removes the caption and the tags. The image and the grid stay.");
-            ui.horizontal(|ui| {
+            footer(ui, |ui| {
                 if ui.button("Remove label").clicked() { choice = Some(true); }
                 if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) { choice = Some(false); }
             });

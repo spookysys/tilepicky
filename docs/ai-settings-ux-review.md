@@ -190,3 +190,20 @@ The independent advanced selectors remain a possible refinement.
 The implementation agent reported that all 173 automated tests passed.
 This reviewer inspected the code and screenshots but did not independently rerun those tests.
 No live provider request was needed for these Settings checks.
+
+
+## Follow-up: dialog actions and processing descriptions
+
+Completion actions now use a shared bottom-right footer. Cancel sits beside the primary action.
+The sheet dialog and prompt preview scroll above Close. Settings scrolls above Done or Retry save.
+Library options keeps Reset tags and Prompt template in the content, separate from Cancel and Save options.
+
+The two processing descriptions now explain the effect of closing Tilepicky.
+Serial jobs require the app to stay open. Google continues work on sheets that it has accepted.
+Both descriptions explain what happens when the user reopens the library.
+Settings also saves open edits when the app closes. A failed save prevents that close.
+
+The library confirmation no longer presents the output limit as expected usage.
+Token limit details contains the per-sheet limit and total, with a statement that these are not estimates.
+A monetary estimate still needs model prices, image input counts, and measured output usage, including reasoning.
+The UI states when an estimate is unavailable.
