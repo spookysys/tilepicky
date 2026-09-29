@@ -89,12 +89,12 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 ### Label a single sheet
 
 1. Open a library sheet and click **AI label...** beside the source header.
+   You can also choose **Label with AI...** from the sheet or file-tree context menu.
 2. Choose the **Single sheet** model and its provider key in Settings (`Ctrl+,`).
    Both Google Gemini and OpenAI-compatible image models are supported.
 3. Click **Label this sheet**. The dialog shows progress, the result, or the error.
-   The context-menu action **Label with AI** starts the same operation and opens the dialog.
 4. Use **Label again** to replace a saved label, or **Retry** after a failed request.
-   **Show AI label...** reopens the dialog without sending a request.
+   Opening the dialog does not send a request.
 
 The model returns a caption, up to 12 freeform tags, and matching tags from your list.
 Tilepicky writes the label to `tilepicky.json`. The dialog shows the saved model separately from the next request's model.
@@ -122,7 +122,7 @@ Sheet names and generated captions remain in the log. Older shared logs are remo
 
 Each request times out after 60 seconds. **Cancel** stops waiting, but the provider may still bill the request.
 
-To delete a label, select **Remove label...** in the popup, or **Remove AI label...** in the context menu, and confirm.
+To delete a label, select **Remove label...** in the sheet dialog and confirm.
 **Current prompt...** shows what a new request for this sheet would send, including its current library tags and filename context.
 
 OpenRouter settings have a **skip** field for provider slugs, separated by commas. It defaults to `phala`, including for older settings.

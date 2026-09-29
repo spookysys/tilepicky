@@ -11,16 +11,12 @@ use std::{io::Cursor, path::{Path, PathBuf}, time::Duration};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action { Label, Show, Remove, Cancel }
 
-/// The same commands appear on the library sheet and its file-tree row.
+/// Both context menus open the sheet dialog without starting a request.
 pub fn menu(ui: &mut eframe::egui::Ui) -> Option<Action> {
-    let mut action = None;
-    for (text, command) in [("Label with AI", Action::Label), ("Show AI label...", Action::Show), ("Remove AI label...", Action::Remove)] {
-        if ui.button(text).clicked() {
-            action = Some(command);
-            ui.close();
-        }
-    }
-    action
+    if ui.button("Label with AI...").clicked() {
+        ui.close();
+        Some(Action::Show)
+    } else { None }
 }
 
 /// The most a label holds: characters of the caption, tags, and characters

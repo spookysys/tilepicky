@@ -290,3 +290,14 @@ Completion counts distinguish saved, failed, unlabelable, and cancelled attempts
 Validation: 170 tests passed in each build configuration. Clippy passed for all targets in both configurations.
 The interactive fixture remains ignored in automatic runs. No paid requests or real library jobs were used in this pass.
 Live provider behavior remains a separate check. The existing README recording describes its earlier layout.
+
+
+## One context-menu entry for AI labels
+
+The sheet and file-tree menus now have one AI item, **Label with AI...**.
+It opens the sheet dialog without starting a request. The dialog shows existing labels and provides generation and removal controls.
+The source-header button opens the same dialog.
+
+The native pass clicked both menu entries and inspected their screenshots. Both opened the same saved-label view.
+The local provider received no request, and neither action created a log.
+All 170 WGPU tests passed, and Clippy passed for all targets with WGPU enabled.

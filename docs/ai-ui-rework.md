@@ -16,14 +16,13 @@ Both scopes support Gemini and OpenAI-compatible providers.
 | Entry point | Action | Owner of the result and log |
 | --- | --- | --- |
 | Source header: AI label... | Open the selected sheet's dialog without sending a request | That sheet's dialog |
-| Sheet context menu: Label with AI | Start that sheet's request and open its dialog | That sheet's dialog |
-| Sheet context menu: Show AI label... | Open that sheet's dialog without sending a request | That sheet's dialog |
+| Sheet and file-tree context menus: Label with AI... | Open that sheet's dialog without sending a request | That sheet's dialog |
 | Library AI panel | Start, monitor, pause, resume, or cancel a library job | Library panel |
 | Active job in the status bar | Reopen its dialog or panel | The existing job |
 
 Remove the duplicated Single sheet section from the side panel.
-Keep Remove label in the sheet dialog and its existing context-menu shortcut.
-Multiple entry points can share one operation. Do not remove useful shortcuts merely because the dialog also has that action.
+Keep generation and removal controls in the sheet dialog.
+Both context menus have one AI item that opens that dialog.
 Keep the existing AI panel shortcut and update its tooltip and shortcut legend.
 The source header action must have a text label and keyboard focus.
 
@@ -211,7 +210,7 @@ The interactive fixture remains excluded from automatic tests and was run separa
 | Small windows | Native 1000 x 700 and 1200 x 900 views, including 125 percent text scale |
 | Overflow | A failing regression exposed toolbar overlap; bounded toolbars now pass and native screenshots confirm the fix |
 | Prompt preview | The long preview scrolls and keeps Close visible in the small window |
-| Entry points | Native source-header and context-menu requests use the same dialog |
+| Entry points | The source header and both context menus open the same dialog without sending a request |
 | Keyboard | Native Escape, Tab, Shift+Tab, and the panel shortcut; automated focus and modal checks |
 | Clear and retry | Native confirmation, label removal, and retry of a failed batch sheet |
 
@@ -229,7 +228,8 @@ The implementation and native review described above followed this preparation.
 
 ## Review adjustments
 
-Keep useful context-menu shortcuts. Consolidate their implementation and job state rather than removing familiar entry points.
+The subsequent menu review consolidates the context-menu actions into one dialog entry.
+Generate and remove labels from that dialog.
 Keep shared options reachable from the sheet dialog after removing the duplicated side-panel controls.
 Protect single-sheet results from intervening image or label edits, using the same principle as the existing batch save guard.
 Keep attempt outcomes separate from existing label coverage.
