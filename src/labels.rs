@@ -155,10 +155,71 @@ pub struct Input {
     pub img: RgbaImage,
 }
 
+/// The dialog owns its target even when the user browses another sheet.
+#[derive(Clone)]
+pub struct Target {
+    pub dir: PathBuf,
+    pub rel: String,
+    pub label: Option<Label>,
+    pub tags: Vec<String>,
+    pub error: String,
+}
+impl Target {
+    pub fn load(dir: PathBuf, rel: String) -> Self {
+        let mut target = Self { dir, rel, label: None, tags: vec![], error: String::new() };
+        match crate::sidecar::load_book(&target.dir) {
+            Ok(book) => { target.label = book.sheets.get(&target.rel).and_then(|s| s.label.clone()); target.tags = crate::sidecar::tag_list(&book); }
+            Err(error) => target.error = error,
+        }
+        if !target.path().is_file() { target.error = "The sheet moved or was removed.".into(); }
+        target
+    }
+    pub fn path(&self) -> PathBuf { self.dir.join(&self.rel) }
+}
+
+#[derive(Clone)]
+pub struct Outcome { pub path: PathBuf, pub message: String, pub retry: bool, pub failed: bool }
+
+/// Keep controls visible when a provider returns a long explanation.
+pub fn summary(text: &str) -> String {
+    if text.chars().count() > 180 { format!("{}...", cut(text, 180)) } else { text.into() }
+}
+
+pub struct Options { pub root: PathBuf, pub text: String, pub error: String }
+
+/// Check both the image bytes and the saved label before replacing a result.
+pub struct Guard { hash: String, label: Option<Label> }
+impl Guard {
+    pub fn read(dir: &Path, rel: &str) -> Result<(Input, Self), String> {
+        use sha2::{Digest, Sha256};
+        let path = dir.join(rel);
+        let bytes = std::fs::read(&path).map_err(|e| format!("Could not read the sheet: {e}"))?;
+        let img = image::load_from_memory(&bytes).map_err(|e| format!("Could not read the image: {e}"))?.to_rgba8();
+        let label = crate::sidecar::load_book(dir)?.sheets.get(rel).and_then(|s| s.label.clone());
+        Ok((Input { path, dir: dir.into(), rel: rel.into(), img }, Self { hash: format!("{:x}", Sha256::digest(&bytes)), label }))
+    }
+}
+
+pub fn save_result(dir: &Path, rel: &str, guard: Option<&Guard>, label: Label) -> Result<Option<Label>, String> {
+    use sha2::{Digest, Sha256};
+    crate::sidecar::update_book(dir, |book| {
+        let current = book.sheets.get(rel).and_then(|s| s.label.clone());
+        if let Some(guard) = guard {
+            let bytes = std::fs::read(dir.join(rel)).map_err(|_| "The sheet moved or was removed.".to_string())?;
+            if format!("{:x}", Sha256::digest(&bytes)) != guard.hash { return Err("The image changed. Its previous label was kept.".into()); }
+            if current != guard.label { return Err("The label changed during the request. The newer label was kept.".into()); }
+        }
+        if label.status == Status::Unlabelable && current.as_ref().is_some_and(|l| l.status == Status::Labeled) { return Ok(current); }
+        book.sheets.entry(rel.into()).or_default().label = Some(label.clone());
+        Ok(Some(label))
+    })
+}
+
 /// One request that the user started. A worker thread sends it, and the
 /// result arrives on `result`. To cancel, drop the `Run`: the result then
 /// has nowhere to go. The provider may still bill the request.
 pub struct Run {
+    pub guard: Option<Guard>,
     pub log: crate::ai_log::Log,
     pub path: PathBuf,
     pub dir: PathBuf,
@@ -177,7 +238,7 @@ impl Run {
     ) -> Result<Self, String> {
         let log = crate::ai_log::current().unwrap_or_else(|| crate::ai_log::Log::single_file(&input.dir, &input.rel));
         let (tx, result) = std::sync::mpsc::channel();
-        let run = Self { log: log.clone(), path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(),
+        let run = Self { guard: None, log: log.clone(), path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(),
             provider: provider.clone(), model: model.clone(), started: std::time::Instant::now(), result };
         std::thread::Builder::new().name("label sheet".into()).spawn(move || {
             let _scope = log.enter();
@@ -351,25 +412,46 @@ pub struct Endpoint {
     client: ureq::Agent,
     url: String,
     key: String,
+    kind: crate::ai::Kind,
 }
 
 impl Endpoint {
     pub fn new(url: &str, key: String) -> Result<Self, String> {
         let url = checked_url(url)?;
         let url = if url.ends_with("/chat/completions") { url } else { format!("{url}/chat/completions") };
-        Ok(Self { client: agent(), url, key })
+        Ok(Self { client: agent(), url, key, kind: crate::ai::Kind::OpenAi })
+    }
+
+    pub fn for_provider(provider: &crate::ai::Provider, model: &str, key: String) -> Result<Self, String> {
+        if provider.kind == crate::ai::Kind::OpenAi { return Self::new(&provider.url, key); }
+        let base = checked_url(&provider.url)?;
+        let model = model.strip_prefix("models/").unwrap_or(model);
+        if model.is_empty() || !model.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+            return Err("Use a Gemini model ID, such as gemini-flash-latest.".into());
+        }
+        Ok(Self { client: agent(), url: format!("{base}/models/{model}:generateContent"), key, kind: crate::ai::Kind::Gemini })
     }
 
     pub fn send(&self, body: &Value) -> Result<Value, String> {
-        let trace = crate::ai_log::Request::start(&self.url, Some(body), &self.key);
+        let wire = if self.kind == crate::ai::Kind::Gemini { crate::gemini::request(body) } else { body.clone() };
+        let trace = crate::ai_log::Request::start(&self.url, Some(&wire), &self.key);
         let mut status = None;
-        let result = self.send_inner(body, &mut status);
+        let result = self.send_inner(&wire, &mut status);
         trace.finish(status, &result);
-        result
+        result.map(|value| if self.kind == crate::ai::Kind::Gemini { crate::gemini::response(&value) } else { value })
     }
 
     fn send_inner(&self, body: &Value, status: &mut Option<u16>) -> Result<Value, String> {
-        let mut response = self.client.post(&self.url).header("Authorization", format!("Bearer {}", self.key)).send_json(body)
+        let (header, credential) = if self.kind == crate::ai::Kind::Gemini { ("x-goog-api-key", self.key.clone()) }
+            else { ("Authorization", format!("Bearer {}", self.key)) };
+        let url = self.url.clone();
+        #[cfg(test)]
+        let url = if let Ok(base) = std::env::var("TILEPICKY_TEST_TRANSPORT") {
+            let uri: ureq::http::Uri = base.parse().map_err(|_| "Invalid test endpoint.")?;
+            if uri.scheme_str() != Some("http") || uri.host() != Some("127.0.0.1") { return Err("Test transport must use loopback.".into()); }
+            format!("{base}/{}", if self.kind == crate::ai::Kind::Gemini { "generateContent" } else { "chat/completions" })
+        } else { url };
+        let mut response = self.client.post(&url).header(header, credential).send_json(body)
             .map_err(|e| match e {
                 ureq::Error::Timeout(_) => "The model request timed out.",
                 _ => "Could not reach the model endpoint.",
@@ -435,7 +517,7 @@ pub mod tests {
             std::thread::sleep(Duration::from_millis(250));
         });
         let client = ureq::Agent::config_builder().timeout_global(Some(Duration::from_millis(100))).build().new_agent();
-        let endpoint = Endpoint { client, url, key: "test-key".into() };
+        let endpoint = Endpoint { client, url, key: "test-key".into(), kind: crate::ai::Kind::OpenAi };
         let result = endpoint.send(&json!({}));
         server.join().unwrap();
         assert_eq!(result.unwrap_err(), "The model request timed out while reading the response.");
@@ -632,6 +714,60 @@ pub mod tests {
         assert_eq!((reply.status, reply.caption.as_str(), reply.tags.as_slice()), (Status::Labeled, "Snowy hills", &["snow".to_string()][..]));
         let reply = response(&completion(json!({"status":"unlabelable", "caption":"", "tags":["x"]})), &[]).unwrap();
         assert!(reply.status == Status::Unlabelable && reply.tags.is_empty());
+    }
+
+    #[test]
+    fn gemini_single_uses_the_native_endpoint_schema_and_key_header() {
+        use std::io::{BufRead, Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new(); let mut length = 0;
+            loop {
+                let mut line = String::new(); reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = value.trim().parse().unwrap(); }
+                headers += &line;
+            }
+            let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
+            let reply = json!({"modelVersion":"resolved-model", "candidates":[{"finishReason":"STOP",
+                "content":{"parts":[{"text":labeled("Torch").to_string()}]}}]}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()).unwrap();
+            (headers, serde_json::from_slice::<Value>(&bytes).unwrap())
+        });
+        let provider = crate::ai::Provider { name: "Google".into(), kind: crate::ai::Kind::Gemini,
+            url: "https://generativelanguage.googleapis.com/v1beta".into(), key_env: vec![], skip: None };
+        let mut endpoint = Endpoint::for_provider(&provider, "gemini-flash-latest", "test-key".into()).unwrap();
+        assert!(endpoint.url.ends_with("/models/gemini-flash-latest:generateContent"));
+        assert!(Endpoint::for_provider(&provider, "../other?key=x", "test".into()).is_err());
+        endpoint.url = format!("http://{address}/models/gemini-flash-latest:generateContent");
+        let body = request_for_sheet("gemini-flash-latest", &RgbaImage::new(1, 1), &[], "props/torch.png").unwrap();
+        assert!(response(&endpoint.send(&body).unwrap(), &[]).is_ok());
+        let (headers, wire) = worker.join().unwrap();
+        assert!(headers.to_ascii_lowercase().contains("x-goog-api-key: test-key"));
+        assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+        assert!(wire["contents"][0]["parts"][0]["text"].as_str().unwrap().contains("torch.png"));
+        assert_eq!(wire["generationConfig"]["responseJsonSchema"], body["response_format"]["json_schema"]["schema"]);
+    }
+
+    #[test]
+    fn single_results_keep_newer_images_and_labels() {
+        let f = crate::storage::tests::Folder::new();
+        let path = f.0.join("sheet.png");
+        RgbaImage::new(2, 2).save(&path).unwrap();
+        let label = response(&completion(labeled("Original")), &[]).unwrap().into_label("test", "test", &[]);
+        let (_, guard) = Guard::read(&f.0, "sheet.png").unwrap();
+        RgbaImage::new(3, 3).save(&path).unwrap();
+        assert!(save_result(&f.0, "sheet.png", Some(&guard), label.clone()).unwrap_err().contains("image changed"));
+        let (_, guard) = Guard::read(&f.0, "sheet.png").unwrap();
+        crate::sidecar::store_labels(&f.0, [("sheet.png", Some(label.clone()))]).unwrap();
+        let next = Label { caption: "New response".into(), ..label.clone() };
+        assert!(save_result(&f.0, "sheet.png", Some(&guard), next).unwrap_err().contains("label changed"));
+        assert_eq!(crate::sidecar::load_book(&f.0).unwrap().sheets["sheet.png"].label, Some(label));
     }
 
     #[test]

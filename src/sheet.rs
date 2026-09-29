@@ -697,7 +697,7 @@ impl Sheet {
         if read {
             sheet.side.tile = Some(Pair::of(sheet.tile));
             sheet.side.read = true;
-            let _ = sidecar::store_entry(dir, rel, &sheet.side);
+            if let Ok(label) = sidecar::store_layout(dir, rel, &sheet.side) { sheet.side.label = label; }
         }
         Ok(sheet)
     }
@@ -948,8 +948,10 @@ impl Sheet {
     }
 
     /// A GIF label describes the first frame, whichever frame plays.
+    #[cfg(test)]
     fn label_image(&self) -> &RgbaImage { self.frames.first().unwrap_or(&self.img) }
 
+    #[cfg(test)]
     pub fn label_input(&self) -> crate::labels::Input {
         crate::labels::Input { path: self.dir.join(&self.rel), dir: self.dir.clone(), rel: self.rel.clone(), img: self.label_image().clone() }
     }
@@ -2054,7 +2056,7 @@ impl Sheet {
         // Saving is a person acting, so the grid is no longer a reading.
         side.read = false;
         self.side.read = false;
-        sidecar::store_entry(&self.dir, &self.rel, &side)?;
+        self.side.label = sidecar::store_layout(&self.dir, &self.rel, &side)?;
         self.dirty = false;
         Ok(())
     }

@@ -47,6 +47,7 @@ impl App {
         self.label_dialog(ctx);
         self.remove_label_dialog(ctx);
         self.clear_labels_dialog(ctx);
+        self.label_options_dialog(ctx);
         self.prompt_dialog(ctx);
         self.library_batch.confirmation(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.has_unsaved() {
@@ -263,68 +264,137 @@ impl App {
     /// A dialog or a popup is up: the keys belong to it, Escape first of all.
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
         self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.prompt_view.is_some() || self.library_batch.open()
-            || self.clear_labels.is_some() || self.label_view || self.pending.is_some() || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
+            || self.clear_labels.is_some() || self.label_options.is_some() || self.label_view || self.pending.is_some()
+            || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
             || egui::Popup::is_any_open(ctx)
     }
 
-    /// Reads the current sheet again each frame, so a completed request updates the popup.
+    /// The dialog keeps its target when the selected sheet changes.
     fn label_dialog(&mut self, ctx: &egui::Context) {
         if !self.label_view { return; }
-        let Some(sheet) = &self.library.sheet else { self.label_view = false; return };
-        let ready = self.settings.ai.chosen(ai::Mode::Instant)
-            .is_some_and(|(p, _)| p.kind == ai::Kind::OpenAi && p.key_source(&self.keys) != ai::KeySource::None);
-        let mut action = None;
-        let mut close = false;
-        let mut copy_log = false;
-        let has_log = self.single_log_available();
-        let outcome = self.selected_label_outcome().map(str::to_string);
+        let Some(target) = self.label_target.clone() else { return };
+        let path = target.path();
+        let chosen = self.settings.ai.chosen(ai::Mode::Instant);
+        let ready = chosen.is_some_and(|(p, _)| p.key_source(&self.keys) != ai::KeySource::None);
+        let next_model = chosen.map(|(p, m)| format!("{} / {}", p.name, m.id));
+        let current_run = self.label_run.as_ref().filter(|run| run.path == path);
+        let running = current_run.is_some();
+        let progress = current_run.map(|r| format!("{} / {}. Elapsed: {} s", r.provider, r.model, r.started.elapsed().as_secs()));
+        let outcome = self.label_outcome.as_ref().filter(|out| out.path == path).cloned();
+        let busy = self.label_run.is_some() || !self.library_batch.allows_single();
+        let has_log = self.target_log(&path).is_some_and(crate::ai_log::Log::available);
+        let mut action = None; let mut close = false; let mut copy = false;
+        let mut options = false; let mut open_job = false; let mut settings = false;
         egui::Modal::new(Id::new("AI label")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.heading("AI label");
-            ui.label(&sheet.rel);
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                if let Some(label) = &sheet.side.label {
-                    label.show(ui);
-                    ui.weak(format!("{} / {}", label.provider, label.model));
-                    if ui.button("Current prompt...").clicked() {
-                        let title = if label.tag_list.is_some() { "Current prompt with this label's tag list" }
-                            else { "Current prompt without a recorded tag list" };
-                        self.prompt_view = Some((title.into(),
-                            labels::sheet_prompt(labels::prompt(label.tag_list.as_deref().unwrap_or_default()), &sheet.rel)));
-                    }
-                } else {
-                    ui.weak("No label yet.");
-                }
-            });
-            ui.add_space(8.0);
-            if let Some(run) = &self.label_run {
-                ui.label(format!("{} / {}", run.provider, run.model));
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Labeling {}: {} s", run.rel, run.started.elapsed().as_secs()));
-                });
+            ui.set_width(500.0_f32.min(ctx.content_rect().width() - 48.0));
+            ui.heading("Sheet AI label");
+            ui.add(egui::Label::new(&target.rel).truncate()).on_hover_text(&target.rel);
+            ui.small(format!("Library: {}", target.dir.file_name().unwrap_or_default().to_string_lossy()))
+                .on_hover_text(target.dir.display().to_string());
+            if let Some(progress) = &progress {
+                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label(progress); });
+                ui.label("Closing this dialog keeps the request running.");
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
             } else if let Some(outcome) = &outcome {
-                ui.label(outcome);
+                if outcome.failed { ui.colored_label(ui.visuals().error_fg_color, labels::summary(&outcome.message)); }
+                else { ui.label(&outcome.message); }
             }
-            if let Some(reason) = self.library_batch.single_block_reason() { ui.label(reason); }
-            ui.horizontal(|ui| {
-                close = ui.button("Close").clicked();
-                copy_log = ui.add_enabled(has_log, egui::Button::new("Copy log"))
-                    .on_hover_text("Copy the single-sheet request log for this sheet. Removed on exit when the job has finished.").clicked();
-                let busy = self.label_run.is_some() || !self.library_batch.allows_single();
-                let text = if sheet.side.label.is_some() { "Label again" } else { "Label with AI" };
-                if ui.add_enabled(ready && !busy, egui::Button::new(text)).clicked() { action = Some(labels::Action::Label); }
-                if ui.add_enabled(sheet.side.label.is_some() && !busy, egui::Button::new("Remove label...")).clicked() {
-                    action = Some(labels::Action::Remove);
+            if !target.error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, labels::summary(&target.error)); }
+            if busy && !running {
+                ui.label(self.library_batch.single_block_reason().unwrap_or("Another sheet is being labeled."));
+                open_job = ui.button("Open current job").clicked();
+            }
+            if !ready {
+                ui.label(if chosen.is_none() { "Choose a single-sheet model in Settings." } else { "Add this provider's API key in Settings." });
+                settings = ui.button("Configure AI...").clicked();
+            }
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if running {
+                    if ui.button("Cancel request").on_hover_text("Stops local waiting. The provider may still bill the request.").clicked() {
+                        action = Some(labels::Action::Cancel);
+                    }
+                } else {
+                    let text = if outcome.as_ref().is_some_and(|out| out.retry) { "Retry" }
+                        else if target.label.is_some() { "Label again" } else { "Label this sheet" };
+                    if ui.add_enabled(ready && !busy && target.error.is_empty(), egui::Button::new(text).selected(true)).clicked() {
+                        action = Some(labels::Action::Label);
+                    }
                 }
-                if self.label_run.is_some() && ui.button("Cancel").clicked() { action = Some(labels::Action::Cancel); }
+                copy = ui.add_enabled(has_log, egui::Button::new("Copy log"))
+                    .on_hover_text("This sheet's latest request. A new job replaces the log; exit removes it after completion.").clicked();
+                if self.label_copied.is_some_and(|at| at.elapsed().as_secs() < 3) {
+                    ui.label("Copied"); ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                }
+                close = ui.button("Close").clicked();
             });
-            if self.prompt_view.is_none() && self.remove_label.is_none() && ui.input(|i| i.key_pressed(Key::Escape)) { close = true; }
+            if !self.label_copy_error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, labels::summary(&self.label_copy_error)); }
+            ui.separator();
+            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 440.0).max(80.0)).show(ui, |ui| {
+                if let Some(outcome) = &outcome && outcome.message.chars().count() > 180 {
+                    egui::CollapsingHeader::new("Error details").show(ui, |ui| { ui.label(&outcome.message); });
+                }
+                if !target.error.is_empty() { ui.label(&target.error); }
+                if let Some(label) = &target.label {
+                    ui.strong("Saved label"); label.show(ui);
+                    ui.small(format!("Created with {} / {}", label.provider, label.model));
+                    if ui.add_enabled(!busy, egui::Button::new("Remove label...")).clicked() { action = Some(labels::Action::Remove); }
+                } else { ui.label("No saved label."); }
+                ui.separator();
+                if let Some(model) = &next_model { ui.label(format!("Next request: {model}")); }
+                ui.label(format!("Tags to look for: {}", target.tags.join(", ")));
+                ui.horizontal_wrapped(|ui| {
+                    options = ui.button("Edit library options...").clicked();
+                    if ui.button("Current prompt...").clicked() {
+                        self.prompt_view = Some(("Next request for this sheet".into(), labels::sheet_prompt(labels::prompt(&target.tags), &target.rel)));
+                    }
+                });
+            });
+            if self.prompt_view.is_none() && self.label_options.is_none() && self.remove_label.is_none()
+                && ui.input(|i| i.key_pressed(Key::Escape)) { close = true; }
         });
-        if copy_log { self.copy_single_log(ctx); }
-        if close { self.label_view = false; }
-        if let Some(action) = action { self.label_action(ctx, action); }
+        if copy { self.label_copy_error = self.copy_single_log(ctx, &path).err().unwrap_or_default(); }
+        if close { self.close_label_view(ctx); }
+        if options { self.open_label_options(target.dir); }
+        if open_job { self.open_active_label_job(ctx); }
+        if settings { self.close_label_view(ctx); self.settings_request = true; }
+        if let Some(action) = action { self.label_target_action(ctx, action); }
+    }
+
+    fn label_options_dialog(&mut self, ctx: &egui::Context) {
+        let Some(options) = &mut self.label_options else { return };
+        let mut save = false; let mut close = false;
+        egui::Modal::new(Id::new("AI library options")).show(ctx, |ui| {
+            ui.set_width(480.0_f32.min(ctx.content_rect().width() - 48.0));
+            ui.heading("Options for new labels");
+            ui.label(options.root.display().to_string());
+            ui.label("These tags apply to new single-sheet and library requests. Existing jobs keep their original tags.");
+            ui.strong("Tags to look for");
+            ui.label("Separate tags with commas. The model checks each tag and can add its own.");
+            ui.add(egui::TextEdit::multiline(&mut options.text).desired_width(f32::INFINITY).desired_rows(4));
+            if !options.error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, &options.error); }
+            ui.horizontal_wrapped(|ui| {
+                save = ui.button("Save options").clicked();
+                close = ui.button("Cancel").clicked() || (self.prompt_view.is_none() && ui.input(|i| i.key_pressed(Key::Escape)));
+                if ui.button("Reset tags").clicked() { options.text = sidecar::TAG_LIST.join(", "); }
+                if ui.button("Prompt template...").clicked() {
+                    self.prompt_view = Some(("New requests add each sheet's filename and relative folder".into(),
+                        labels::prompt(&labels::parse_list(&options.text))));
+                }
+            });
+        });
+        if save {
+            let tags = labels::parse_list(&options.text);
+            match sidecar::store_tag_list(&options.root, &tags) {
+                Ok(()) => {
+                    if self.library.index.root == options.root { self.library.index.tag_list = tags.clone(); }
+                    if let Some(target) = &mut self.label_target && target.dir == options.root { target.tags = tags; }
+                    close = true;
+                }
+                Err(error) => options.error = error,
+            }
+        }
+        if close { self.label_options = None; }
     }
 
     /// Shows a prompt as it goes to the model. The text can be selected and copied.
@@ -332,15 +402,16 @@ impl App {
         let Some((title, texts)) = &self.prompt_view else { return };
         let mut close = false;
         egui::Modal::new(Id::new("labeling prompt")).show(ctx, |ui| {
-            ui.set_width(460.0);
+            ui.set_width(460.0_f32.min(ctx.content_rect().width() - 48.0));
             ui.heading(title.as_str());
-            for (name, text) in ["System", "User, with the image"].iter().zip(texts) {
-                ui.add_space(4.0);
-                ui.strong(*name);
-                ui.add(egui::TextEdit::multiline(&mut text.as_str()).desired_width(f32::INFINITY));
-            }
-            ui.add_space(4.0);
             close = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 150.0).max(80.0)).show(ui, |ui| {
+                for (name, text) in ["System", "User, with the image"].iter().zip(texts) {
+                    ui.add_space(4.0);
+                    ui.strong(*name);
+                    ui.add(egui::TextEdit::multiline(&mut text.as_str()).desired_width(f32::INFINITY));
+                }
+            });
         });
         if close { self.prompt_view = None; }
     }

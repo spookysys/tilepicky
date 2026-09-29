@@ -292,6 +292,18 @@ pub fn store_entry(dir: &Path, rel: &str, side: &Sidecar) -> Result<(), String> 
     })
 }
 
+/// Grid and animation saves preserve the label currently stored in the book.
+pub fn store_layout(dir: &Path, rel: &str, side: &Sidecar) -> Result<Option<Label>, String> {
+    update_book(dir, |book| {
+        let mut updated = side.clone();
+        updated.label = book.sheets.get(rel).and_then(|s| s.label.clone());
+        let label = updated.label.clone();
+        if updated.is_empty() { book.sheets.remove(rel); }
+        else { book.sheets.insert(rel.into(), updated); }
+        Ok(label)
+    })
+}
+
 /// Writes or removes the labels of some sheets, in one write of the book.
 /// The rest of each entry stays.
 pub fn store_labels<'a>(dir: &Path, labels: impl IntoIterator<Item = (&'a str, Option<Label>)>) -> Result<(), String> {

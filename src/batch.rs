@@ -167,6 +167,17 @@ impl Job {
     fn saved(&self) -> usize {
         self.sheets.iter().filter(|s| s.imported && s.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count()
     }
+    fn outcomes(&self) -> [usize; 4] {
+        let mut counts = [0; 4];
+        for sheet in &self.sheets {
+            if sheet.imported && let Some(label) = &sheet.label {
+                counts[if label.status == Status::Labeled { 0 } else { 2 }] += 1;
+            } else if sheet.cancelled { counts[3] += 1; }
+            else if sheet.label.is_none() && !sheet.error.is_empty() { counts[1] += 1; }
+        }
+        counts
+    }
+
     /// A Gemini batch went out and no reply confirmed it. An OpenAI-style job
     /// is never so: its groups are released; see `release_groups`.
     pub fn uncertain(&self) -> bool {
@@ -197,7 +208,7 @@ fn legacy_directory(root: &Path) -> Result<PathBuf, String> {
 
 /// The request body for one sheet in a Gemini batch.
 fn body(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, String> {
-    Ok(gemini_request(&chat_request(job, img, rel)?))
+    Ok(crate::gemini::request(&chat_request(job, img, rel)?))
 }
 
 fn chat_request(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, String> {
@@ -239,6 +250,8 @@ fn save_labels(job: &Job, root: &Path) -> (runner::SaveReport, Vec<(String, Opti
         });
         match checked {
             Ok(()) => {
+                if sheet.label.as_ref().is_some_and(|l| l.status == Status::Unlabelable)
+                    && current.is_some_and(|l| l.status == Status::Labeled) { report.saved.push(i); continue; }
                 book.sheets.entry(sheet.rel.clone()).or_default().label = sheet.label.clone();
                 labels.push((sheet.rel.clone(), sheet.label.clone())); report.saved.push(i);
             }
@@ -276,17 +289,6 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
     })
 }
 
-fn gemini_request(chat: &Value) -> Value {
-    let parts: Vec<_> = chat["messages"][1]["content"].as_array().unwrap().iter().map(|part| {
-        if part["type"] == "text" { json!({"text":part["text"]}) } else {
-            let data = part["image_url"]["url"].as_str().unwrap().strip_prefix("data:image/png;base64,").unwrap();
-            json!({"inlineData":{"mimeType":"image/png", "data":data}})
-        }
-    }).collect();
-    json!({"systemInstruction":{"parts":[{"text":chat["messages"][0]["content"]}]},
-        "contents":[{"role":"user", "parts":parts}], "generationConfig":{"maxOutputTokens":4096,
-            "responseMimeType":"application/json", "responseJsonSchema":chat["response_format"]["json_schema"]["schema"]}})
-}
 
 /// The URL the requests of a job go under. An OpenAI-style one loses a
 /// `/chat/completions` it ends in, since that is the path of each request.
@@ -421,16 +423,7 @@ fn outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
             out.push((key.into(), json!({"error":item["error"]})));
             continue;
         }
-        if item["response"]["candidates"].as_array().is_none_or(|a| a.len() != 1)
-            || !item["response"]["promptFeedback"]["blockReason"].is_null() {
-            out.push((key.into(), Value::Null));
-            continue;
-        }
-        let candidate = &item["response"]["candidates"][0];
-        let parts = candidate["content"]["parts"].as_array();
-        let text = parts.map(|p| p.iter().filter(|p| p["thought"] != true).filter_map(|p| p["text"].as_str()).collect::<String>());
-        out.push((key.into(), json!({"choices":[{"finish_reason": if candidate["finishReason"] == "STOP" {"stop"} else {"invalid"},
-            "message":{"content":text}}]})));
+        out.push((key.into(), crate::gemini::response(&item["response"])));
     }
     Ok(Some(out))
 }
@@ -719,7 +712,7 @@ pub struct Panel {
     key: String,
     control: runner::Control,
     resend_confirm: bool,
-    pub notice: Option<String>,
+    copied: Option<Instant>,
 }
 
 impl Panel {
@@ -789,7 +782,7 @@ impl Panel {
     }
 
     pub fn tick(&mut self, ctx: &eframe::egui::Context, root: &Path, keys: &crate::ai::Keys, single_running: bool) -> bool {
-        if !self.running() && self.root != root && !root.as_os_str().is_empty() {
+        if !single_running && !self.running() && self.root != root && !root.as_os_str().is_empty() {
             self.stop_runner();
             *self = Panel { root: root.into(), ..Panel::default() };
             let opened = (|| {
@@ -889,7 +882,12 @@ impl Panel {
             return if job.provider.kind == Kind::Gemini { "Uploading remaining sheets".into() } else { "Labeling sheets".into() };
         }
         if job.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_))) {
-            return format!("{} is processing your sheets", job.provider.name);
+            let states: Vec<_> = job.groups.iter().filter(|g| matches!(g.remote, Remote::Waiting(_)))
+                .map(|g| g.tracking.state.as_str()).collect();
+            let action = if states.iter().all(|s| *s == "BATCH_STATE_PENDING") { "Queued at" }
+                else if states.iter().all(|s| *s == "BATCH_STATE_RUNNING") { "Processing at" }
+                else { "Waiting for results from" };
+            return format!("{action} {}", job.provider.name);
         }
         if job.uncertain() { return "Some sheets need confirmation".into(); }
         "Waiting for the next operation".into()
@@ -900,98 +898,88 @@ impl Panel {
         let configured = ai.chosen(crate::ai::Mode::Batch);
         let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
         for error in [&self.error, &self.storage_error] {
-            if !error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, error); }
+            if !error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, labels::summary(error)); }
         }
         if (self.lock.is_none() || (!self.storage_error.is_empty() && self.runner.is_none()))
             && crate::stopped(ui.button("Reload saved job")).clicked() {
             self.stop_runner(); self.job = None; self.root = PathBuf::new();
         }
-        if self.running() && self.root != index.root { ui.weak(format!("For {}", self.root.display())); }
-        let mut pause = None;
-        let mut cancel = false;
-        let mut retry = false;
-        let mut retry_failed = false;
+        let (mut pause, mut cancel, mut retry, mut retry_failed, mut copy) = (None, false, false, false, false);
+        let now = now_ms();
         if let Some(job) = &self.job {
-            ui.weak(format!("{} / {}", job.provider.name, job.model));
-            ui.add_space(5.0);
+            if self.root != index.root { ui.label(format!("Active job for {}", self.root.display())); }
+            ui.label(format!("{} / {}", job.provider.name, job.model));
+            ui.small(if job.provider.kind == Kind::Gemini { "Google batch" } else { "One sheet at a time" });
+            ui.add_space(6.0);
             ui.strong(self.state(job));
-            let mode = self.mode(job);
-            let total = job.sheets.len();
-            let saved = job.saved();
-            let failed = job.sheets.iter().filter(|s| !s.error.is_empty() && s.label.is_none()).count();
-            let unusable = job.sheets.iter().filter(|s| s.imported && s.label.as_ref().is_some_and(|l| l.status == Status::Unlabelable)).count();
-            let cancelled = job.sheets.iter().filter(|s| s.cancelled).count();
+            let [saved, failed, unusable, cancelled] = job.outcomes();
             let finished = saved + failed + unusable + cancelled;
+            let total = job.sheets.len();
             ui.add(egui::ProgressBar::new(if total == 0 { 1.0 } else { finished as f32 / total as f32 })
                 .text(format!("{finished} / {total} finished")));
-            let (queued, waiting, uncertain) = self.submission_counts(job);
-            let uploading = match self.activity { Some((Activity::Uploading(count), _)) => count, _ => 0 };
-            egui::Grid::new("batch counts").num_columns(2).show(ui, |ui| {
-                for (name, count) in [("Labels saved".to_string(), saved), (format!("Waiting at {}", job.provider.name), waiting),
-                    ("Not sent yet".into(), queued), ("Uploading now".into(), uploading),
-                    ("Needs confirmation".into(), uncertain.saturating_sub(uploading)), ("Failed sheets".into(), failed),
-                    ("No usable label".into(), unusable), ("Cancelled sheets".into(), cancelled)] {
-                    if count > 0 || name == "Labels saved" || name == "Not sent yet" {
-                        ui.label(name); ui.label(count.to_string()); ui.end_row();
-                    }
-                }
-            });
-            let now = now_ms();
-            if job.last_response_ms > 0 { ui.weak(format!("Last provider response: {} s ago", now.saturating_sub(job.last_response_ms) / 1000)); }
-            if waiting > 0 && job.poll_ms > now { ui.weak(format!("Next results check in {} s", (job.poll_ms - now).div_ceil(1000))); }
-            if let Some((activity, started)) = self.activity {
-                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.weak(activity.description(&job.provider.name, started.elapsed().as_secs())); });
-            }
-            if job.uncertain() { ui.label("Some uploads need confirmation. Their sheets will not be sent twice automatically."); }
+            ui.label(format!("{saved} saved, {failed} failed, {unusable} unlabelable, {cancelled} cancelled"));
+            let mode = self.mode(job);
             ui.horizontal_wrapped(|ui| {
-                if !job.done() && self.mode(job) != Mode::Cancelling {
-                    let paused = self.mode(job) == Mode::Paused;
-                    let text = if paused { "Resume" } else if job.provider.kind == Kind::Gemini { "Pause uploads" } else { "Pause" };
-                    if crate::stopped(ui.button(text)).clicked() { pause = Some(if paused { Mode::Running } else { Mode::Paused }); }
+                if !job.done() && mode != Mode::Cancelling {
+                    let text = if mode == Mode::Paused { "Resume" }
+                        else if job.provider.kind == Kind::Gemini { "Pause uploads" } else { "Pause" };
+                    if crate::stopped(ui.button(text)).clicked() { pause = Some(if mode == Mode::Paused { Mode::Running } else { Mode::Paused }); }
                     if crate::stopped(ui.button("Cancel job")).clicked() { cancel = true; }
                 }
                 if !job.issues.is_empty() && crate::stopped(ui.button("Retry now")).clicked() { retry = true; }
                 if job.done() && failed > 0
                     && crate::stopped(ui.add_enabled(!single_running, egui::Button::new("Retry failed sheets"))).clicked() { retry_failed = true; }
+                copy = crate::stopped(ui.add_enabled(self.log_available(), egui::Button::new("Copy log")))
+                    .on_hover_text("This library job's log. A new job replaces it; exit removes it after completion.").clicked();
+                if self.copied.is_some_and(|at| at.elapsed().as_secs() < 3) {
+                    ui.label("Copied"); ui.ctx().request_repaint_after(Duration::from_secs(1));
+                }
             });
-            if !job.done() {
-                ui.weak(if job.provider.kind == Kind::Gemini {
-                    "Closing pauses local work. Google can continue work it has accepted."
-                } else { "Closing pauses labeling. Reopen this library to continue." });
+            if let Some((activity, started)) = self.activity {
+                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label(activity.description(&job.provider.name, started.elapsed().as_secs())); });
             }
-            egui::CollapsingHeader::new("Details").show(ui, |ui| {
-                for (operation, issue) in &job.issues {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("{operation}: {}", issue.message));
-                    ui.weak(format!("Next retry in {} s", issue.retry_ms.saturating_sub(now).div_ceil(1000)));
+            let (queued, waiting, uncertain) = self.submission_counts(job);
+            ui.label(format!("{queued} not sent, {waiting} at {}, {uncertain} unconfirmed", job.provider.name));
+            if job.last_response_ms > 0 { ui.small(format!("Last provider response: {} s ago", now.saturating_sub(job.last_response_ms) / 1000)); }
+            if waiting > 0 && job.poll_ms > now { ui.small(format!("Next results check in {} s", (job.poll_ms - now).div_ceil(1000))); }
+            if let Some(issue) = job.issues.values().min_by_key(|issue| issue.retry_ms) {
+                ui.label(format!("Next retry in {} s. See Details for the error.", issue.retry_ms.saturating_sub(now).div_ceil(1000)));
+            }
+            egui::ScrollArea::vertical().id_salt("library job details").max_height((ui.available_height() - 180.0).max(60.0)).show(ui, |ui| {
+                if !job.done() {
+                    ui.small(if job.provider.kind == Kind::Gemini {
+                        "Closing pauses local work. Google can continue accepted work. Reopen this library to collect results."
+                    } else { "Closing pauses labeling. Reopen this library to continue." });
                 }
-                if job.uncertain() {
-                    ui.label("Tilepicky checks the provider automatically. An upload can remain uncertain after an interrupted connection.");
-                    if mode != Mode::Cancelling && crate::stopped(ui.button("Retry unconfirmed sheets...")).clicked() { self.resend_confirm = true; }
-                }
-                for group in job.groups.iter().filter(|g| !g.tracking.error.is_empty()) {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("{} sheets: {}", group.sheets.len(), group.tracking.error));
-                }
-                let pending = job.sheets.iter().filter(|s| s.label.is_some() && !s.imported).count();
-                if pending > 0 { ui.label(format!("{pending} received results still need to be saved.")); }
-                ui.label(format!("Tags used for this job: {}", job.tag_list.join(", ")));
-                egui::CollapsingHeader::new("Sheet errors").show(ui, |ui| {
-                    for sheet in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", sheet.rel, sheet.error)); }
-                });
-                egui::CollapsingHeader::new("Provider batches").show(ui, |ui| {
-                    for group in &job.groups {
-                        if !group.tracking.id.is_empty() {
-                            ui.label(format!("{} sheets: {}", group.sheets.len(), group.tracking.state));
-                            ui.weak(&group.tracking.id);
-                        }
+                egui::CollapsingHeader::new("Details").show(ui, |ui| {
+                    for error in [&self.error, &self.storage_error] { if !error.is_empty() { ui.label(error); } }
+                    for (operation, issue) in &job.issues {
+                        ui.colored_label(ui.visuals().error_fg_color, format!("{operation}: {}", issue.message));
                     }
+                    if job.uncertain() {
+                        ui.label("Tilepicky checks interrupted uploads automatically. It will not send these sheets twice automatically.");
+                        if mode != Mode::Cancelling && crate::stopped(ui.button("Retry unconfirmed sheets...")).clicked() { self.resend_confirm = true; }
+                    }
+                    for group in job.groups.iter().filter(|g| !g.tracking.error.is_empty()) {
+                        ui.colored_label(ui.visuals().error_fg_color, format!("{} sheets: {}", group.sheets.len(), group.tracking.error));
+                    }
+                    ui.label(format!("Tags used for this job: {}", job.tag_list.join(", ")));
+                    egui::CollapsingHeader::new("Sheet errors").show(ui, |ui| {
+                        for sheet in job.sheets.iter().filter(|s| !s.error.is_empty()) { ui.label(format!("{}: {}", sheet.rel, sheet.error)); }
+                    });
+                    egui::CollapsingHeader::new("Provider batches").show(ui, |ui| {
+                        for group in &job.groups {
+                            if !group.tracking.id.is_empty() {
+                                ui.label(format!("{} sheets: {}", group.sheets.len(), group.tracking.state)); ui.small(&group.tracking.id);
+                            }
+                        }
+                    });
                 });
             });
-        } else if let Some((provider, model)) = configured { ui.weak(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch"))); }
-        if crate::stopped(ui.add_enabled(self.log_available(), egui::Button::new("Copy log")))
-            .on_hover_text("Copy this library job's log. A new job replaces it. Finished logs are removed on exit.").clicked()
-            && let Some(log) = &self.log {
+        }
+        if copy && let Some(log) = &self.log {
             match log.text() {
-                Ok(text) => { ui.ctx().copy_text(text); self.notice = Some("Library log copied to the clipboard.".into()); }
+                Ok(text) => { ui.ctx().copy_text(text); self.copied = Some(Instant::now()); }
                 Err(error) => self.error = error,
             }
         }
@@ -1001,9 +989,18 @@ impl Panel {
         if retry_failed && !single_running { self.start_retry(runner::Command::RetryFailed, ui.ctx(), keys); }
         if self.busy() { return; }
         let idle = self.lock.is_some() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
-        if !ready { ui.weak("Set a library model and its key in Settings."); }
+        ui.add_space(8.0);
+        ui.strong("New library job");
+        if let Some((provider, model)) = configured {
+            ui.label(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
+            ui.small(if provider.kind == Kind::Gemini { "Google batch" } else { "One sheet at a time" });
+        }
+        let done = index.entries.iter().filter(|e| e.side.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
+        ui.label(format!("{done} of {} sheets have usable labels", index.entries.len()));
+        if !ready { ui.label("Set a library model and its key in Settings (Ctrl+,)."); }
         for (text, scope) in [("Label unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
-            let button = ui.add_enabled(ready && idle && !index.entries.is_empty(), egui::Button::new(text));
+            let enabled = ready && idle && index.entries.iter().any(|e| scope == Scope::All || e.side.label.is_none());
+            let button = ui.add_enabled(enabled, egui::Button::new(text).selected(scope == Scope::Unlabeled));
             crate::stop(&button);
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
@@ -1012,6 +1009,7 @@ impl Panel {
                 }
             }
         }
+        if self.job.is_none() { ui.add_enabled(false, egui::Button::new("Copy log")); }
     }
 
     fn start_retry(&mut self, command: runner::Command, ctx: &eframe::egui::Context, keys: &crate::ai::Keys) {
@@ -1146,7 +1144,7 @@ mod tests {
         assert_eq!(request["messages"][1]["content"][0]["text"], expected[1]);
         job.provider = provider(Kind::Gemini);
         let google = image_request(&mut job, &files.root, 0).unwrap();
-        assert_eq!(google, gemini_request(&request));
+        assert_eq!(google, crate::gemini::request(&request));
         let mut saved = serde_json::to_value(&job).unwrap();
         saved.as_object_mut().unwrap().remove("file_context");
         saved["prompt"] = json!(["Original system", "Original user"]);
@@ -1154,6 +1152,36 @@ mod tests {
         let google = image_request(&mut legacy, &files.root, 0).unwrap();
         assert_eq!(google["systemInstruction"]["parts"][0]["text"], "Original system");
         assert_eq!(google["contents"][0]["parts"][0]["text"], "Original user");
+    }
+
+    #[test]
+    fn rework_provider_pending_is_not_processing() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::Gemini);
+        for sheet in &mut job.sheets { sheet.taken = true; }
+        job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/test".into()), recovery: None,
+            tracking: Tracking { state: "BATCH_STATE_PENDING".into(), ..Default::default() } });
+        assert_eq!(Panel::default().state(&job), "Queued at test");
+        job.groups[0].tracking.state = "BATCH_STATE_RUNNING".into();
+        assert_eq!(Panel::default().state(&job), "Processing at test");
+        job.groups[0].tracking.state.clear();
+        assert_eq!(Panel::default().state(&job), "Waiting for results from test");
+    }
+
+    #[test]
+    fn terminal_outcomes_do_not_count_a_sheet_twice() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::Gemini);
+        let original = job.sheets[0].clone();
+        job.sheets = vec![original; 4];
+        let label = crate::sidecar::Label { status: Status::Labeled, caption: "Torch".into(), tags: vec![],
+            provider: "test".into(), model: "test".into(), tag_list: None };
+        job.sheets[0].label = Some(label.clone()); job.sheets[0].imported = true;
+        job.sheets[1].error = "Failed".into();
+        job.sheets[2].label = Some(crate::sidecar::Label { status: Status::Unlabelable, ..label }); job.sheets[2].imported = true;
+        job.sheets[3].cancelled = true; job.sheets[3].error = "Cancelled after a failed attempt".into();
+        assert_eq!(job.outcomes(), [1, 1, 1, 1]);
+        assert_eq!(job.saved(), 1);
     }
 
     #[test]
@@ -1182,7 +1210,7 @@ mod tests {
         let files = Files::new();
         let (job, _) = files.advance(files.prepare(Kind::Gemini), id("batches/test"));
         let panel = Panel { activity: Some((Activity::Checking, Instant::now())), ..Panel::default() };
-        assert_eq!(panel.state(&job), "test is processing your sheets");
+        assert_eq!(panel.state(&job), "Waiting for results from test");
     }
 
     #[test]
@@ -1210,7 +1238,7 @@ mod tests {
         job.groups.push(Group { sheets: vec![0], remote: Remote::Waiting("batches/test".into()), recovery: None, tracking: Tracking::default() });
         let panel = Panel::default();
         let state = panel.state(&job);
-        assert_eq!(state, "test is processing your sheets");
+        assert_eq!(state, "Waiting for results from test");
         assert!(!state.contains("Contacting"));
     }
 
@@ -1766,7 +1794,7 @@ mod tests {
     #[test]
     fn gemini_request_and_response_use_the_same_structured_label() {
         let request = labels::request("test", &RgbaImage::new(2, 2), &[]).unwrap();
-        let gemini = gemini_request(&request);
+        let gemini = crate::gemini::request(&request);
         assert_eq!(gemini["generationConfig"]["responseMimeType"], "application/json");
         assert!(gemini["generationConfig"]["responseJsonSchema"].is_object());
         assert!(gemini.to_string().contains("inlineData"));

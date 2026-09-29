@@ -258,3 +258,35 @@ Regression tests cover context in both provider formats, unchanged legacy prompt
 They also check that an outcome survives reopening its popup and does not appear on another sheet.
 The AI pane explains why an outstanding library job blocks a single-sheet request.
 Both Copy log actions report success. The buttons follow the relevant job information.
+
+
+## Sheet dialog and library panel rework
+
+The sheet dialog now owns single-sheet actions, progress, and its log.
+The full-height library panel owns library jobs and shared options. The status bar reopens the active job.
+Google single-sheet requests share the Gemini conversion and validation used by library jobs.
+The shipped Google defaults now use the latest alias. Existing jobs keep their saved models and prompts.
+
+The native pass used copied game art and a loopback provider with isolated settings.
+Screenshots covered both provider formats, success, failure, unlabelable results, cancellation, and retained labels.
+Closing a running dialog, selecting another sheet, and clicking the status bar reopened the original target.
+The source header and context menu opened the same dialog. Opening options or prompt previews did not send a request.
+Both Copy log actions displayed neutral feedback beside their buttons.
+A library job showed queued, processing, paused, connection failure, partial completion, and final completion states.
+Retry failed sheets completed the remaining sheet. Restart retained the accepted provider ID, pause, and unfinished log.
+Exit removed the finished log. Clear all labels removed the fixture labels after confirmation.
+
+The review used 1200 x 900 and 1000 x 700 windows, with default and larger text.
+The smaller view exposed source-toolbar overflow over the AI panel. A regression failed before bounded toolbars fixed it.
+New screenshots confirmed that job controls and expanded errors stayed visible.
+The long prompt preview now scrolls and keeps its Close button visible.
+Escape, Tab, Shift+Tab, and the panel shortcut were exercised in the native fixture.
+
+A separate regression found that stale grid metadata could overwrite a newer saved label when opening a sheet.
+Grid writes now retain the label from the current book. The regression also checks that deleted labels do not return.
+Single-sheet save guards reject image changes and newer label changes during requests.
+Completion counts distinguish saved, failed, unlabelable, and cancelled attempts without counting a sheet twice.
+
+Validation: 170 tests passed in each build configuration. Clippy passed for all targets in both configurations.
+The interactive fixture remains ignored in automatic runs. No paid requests or real library jobs were used in this pass.
+Live provider behavior remains a separate check. The existing README recording describes its earlier layout.

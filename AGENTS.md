@@ -52,14 +52,15 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
   and their settings page. OpenRouter requests use the provider skip list.
-  Single-sheet labeling uses the instant model.
-  Library batches use the configured Google or OpenRouter batch model.
+  Single-sheet labeling uses the Single sheet model, through Google Gemini or an OpenAI-compatible endpoint.
+  Library jobs use the Library model through Google batches or sequential OpenAI-compatible requests.
 - `src/ai_log.rs`: diagnostics scoped to each job, with key and image redaction.
   Each library has one current log file for either job type. New jobs replace it; exit removes it after completion.
   Only one labeling job runs at a time. An outstanding batch blocks single-sheet requests.
+- `src/gemini.rs`: shared Gemini request conversion and response validation for both job scopes.
 - `src/labels.rs`: one labeling request per sheet, the library's tag list
   in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
-  thread; to cancel, drop the `Run`. Tests use fake responses.
+  thread; to cancel, drop the `Run`. Save guards preserve newer local changes. Tests use fake responses.
 - `src/batch.rs`: library batches, one request per sheet: through the
   Gemini batch API, or one at a time to an OpenAI-style endpoint, whose
   batch API (OpenRouter's) takes no local images. It also displays job snapshots and saves labels from the UI thread.

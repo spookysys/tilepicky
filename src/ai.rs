@@ -52,8 +52,8 @@ pub enum Mode {
 impl Mode {
     pub fn label(self) -> &'static str {
         match self {
-            Mode::Instant => "instant",
-            Mode::Batch => "batch",
+            Mode::Instant => "Single sheet",
+            Mode::Batch => "Library",
         }
     }
 }
@@ -165,7 +165,7 @@ impl Model {
 
     /// How a list names the model: its id, then its provider.
     fn label(&self) -> String {
-        format!("{} ({})", self.id, self.provider)
+        format!("{} ({}, {})", self.id.trim_end_matches(BATCH), self.provider, self.mode().label())
     }
 }
 
@@ -203,7 +203,8 @@ impl Default for Ai {
         let models = vec![
             on("OpenRouter", "z-ai/glm-5.3-flash"),
             on("OpenRouter", "z-ai/glm-5.3-flash:batch"),
-            on("Google", "gemini-3.7-flash:batch"),
+            on("Google", "gemini-flash-latest:batch"),
+            on("Google", "gemini-flash-latest"),
         ];
         let (instant, batch) = (Some(models[0].reference()), Some(models[1].reference()));
         Ai { providers: vec![openrouter, google], models, instant, batch }
@@ -224,6 +225,20 @@ impl Ai {
     /// choice that names no model falls back to the shipped one, when that
     /// exists.
     pub fn heal(&mut self) {
+        let google = self.providers.iter().any(|p| p.name == "Google" && p.kind == Kind::Gemini
+            && p.url.trim_end_matches('/') == "https://generativelanguage.googleapis.com/v1beta");
+        if google {
+            for model in self.models.iter_mut().filter(|m| m.provider == "Google") {
+                if model.id == "gemini-3.7-flash" { model.id = "gemini-flash-latest".into(); }
+                if model.id == "gemini-3.7-flash:batch" { model.id = "gemini-flash-latest:batch".into(); }
+            }
+            for slot in [&mut self.instant, &mut self.batch].into_iter().flatten().filter(|s| s.provider == "Google") {
+                if slot.model == "gemini-3.7-flash" { slot.model = "gemini-flash-latest".into(); }
+                if slot.model == "gemini-3.7-flash:batch" { slot.model = "gemini-flash-latest:batch".into(); }
+            }
+            let mut seen = std::collections::HashSet::new();
+            self.models.retain(|m| seen.insert((m.provider.clone(), m.id.clone())));
+        }
         let before = self.models.len();
         self.models.retain(|m| !m.id.is_empty() && !RETIRED.contains(&(m.provider.as_str(), m.id.as_str())));
         let retired = self.models.len() < before;
@@ -234,6 +249,9 @@ impl Ai {
                     self.models.push(m);
                 }
             }
+        }
+        if google && !self.models.iter().any(|m| m.provider == "Google" && m.id == "gemini-flash-latest") {
+            self.models.push(Model { provider: "Google".into(), id: "gemini-flash-latest".into() });
         }
         for (mode, fallback) in [(Mode::Instant, shipped.instant), (Mode::Batch, shipped.batch)] {
             if self.chosen(mode).is_none() {
@@ -583,7 +601,7 @@ mod tests {
         };
         ai.heal();
         let ids: Vec<_> = ai.models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["mine/vision", "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-3.7-flash:batch"]);
+        assert_eq!(ids, ["mine/vision", "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-flash-latest:batch", "gemini-flash-latest"]);
         assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash"));
         assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash:batch"));
     }
@@ -598,6 +616,22 @@ mod tests {
         assert_eq!(ai.models, Ai::default().models);
         assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash"));
         assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash:batch"));
+    }
+
+    #[test]
+    fn google_defaults_migrate_without_changing_custom_models_or_other_defaults() {
+        let mut ai = Ai::default();
+        ai.models.retain(|m| m.provider != "Google");
+        ai.models.push(Model { provider: "Google".into(), id: "gemini-3.7-flash:batch".into() });
+        ai.models.push(Model { provider: "Google".into(), id: "custom-model".into() });
+        ai.batch = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash:batch".into() });
+        let instant = ai.instant.clone(); let providers = ai.providers.clone();
+        ai.heal();
+        assert_eq!(ai.instant, instant); assert_eq!(ai.providers, providers);
+        assert_eq!(ai.batch.as_ref().unwrap().model, "gemini-flash-latest:batch");
+        assert!(ai.models.iter().any(|m| m.id == "custom-model"));
+        assert!(ai.models.iter().any(|m| m.id == "gemini-flash-latest" && m.mode() == Mode::Instant));
+        let healed = ai.clone(); ai.heal(); assert_eq!(ai, healed);
     }
 
     #[test]

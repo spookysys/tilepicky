@@ -83,31 +83,33 @@ Tilepicky can generate searchable captions and tags for library sheets using mul
 
 ![Read a saved example label and find a dungeon sheet through its weapon tag](media/ai-labels.gif)
 
-The recording uses saved example labels. It shows the AI panel, **Show AI label...**, and a search for `weapon`.
+The recording shows an earlier layout with saved example labels. It shows the AI panel, **Show AI label...**, and a search for `weapon`.
 The search finds the dungeon sheet through its tags. The recording sends no requests.
 
 ### Label a single sheet
 
-1. Open a library sheet.
-2. Open the **AI assist** panel with `I` or the header toolbar button.
-3. Configure an OpenAI-compatible provider URL, API key, and model in Settings (`Ctrl+,`). The model must support image input and structured JSON output. Tilepicky ships with OpenRouter and `z-ai/glm-5.3-flash`; set `OPENROUTER_API_KEY` or type the key in Settings.
-4. Click **Label this sheet** under **Single sheet**, or select **Label with AI** from the sheet's right-click menu.
-5. The label popup opens with the request progress, provider, and model. It shows the caption and tags or the error.
-   Use **Label again** to replace a label. Use **Show AI label...** to reopen the popup.
+1. Open a library sheet and click **AI label...** beside the source header.
+2. Choose the **Single sheet** model and its provider key in Settings (`Ctrl+,`).
+   Both Google Gemini and OpenAI-compatible image models are supported.
+3. Click **Label this sheet**. The dialog shows progress, the result, or the error.
+   The context-menu action **Label with AI** starts the same operation and opens the dialog.
+4. Use **Label again** to replace a saved label, or **Retry** after a failed request.
+   **Show AI label...** reopens the dialog without sending a request.
 
 The model returns a caption, up to 12 freeform tags, and matching tags from your list.
-Tilepicky writes the label to `tilepicky.json`. You can continue working while the request runs.
-The popup and status bar show progress and a **Cancel** button.
-The sidebar and popup keep the latest outcome for its sheet during the session.
-Reopening the popup does not clear the outcome.
-**Single sheet** and **Library labeling** each have their own **Copy log** button.
-The label popup copies the same single-sheet log as the sidebar.
-A button stays disabled when its job has no log. A saved label alone does not provide a request log.
+Tilepicky writes the label to `tilepicky.json`. The dialog shows the saved model separately from the next request's model.
+Closing the dialog or pressing Escape keeps the request running. Click its status-bar entry to reopen it.
+The dialog remains attached to its sheet when you select another sheet or library.
+A failed or unlabelable replacement keeps an existing usable label. Results cannot overwrite an image or label changed during the request.
+
+The sheet dialog and the library panel each have a **Copy log** button for their own job.
+Copying shows **Copied** beside that button. A button stays disabled when the matching job has no log.
+A saved label alone does not provide a request log.
 
 Only one labeling job can run at a time. An outstanding batch also blocks single-sheet requests while paused.
 Each library stores one current job log in `.tilepicky-ai-log.jsonl`, beside `tilepicky.json`.
 A new job replaces that file, whether it labels one sheet or the library.
-The single-sheet button refers to the selected sheet's request. The library button refers to the library batch.
+The sheet dialog's button refers to that dialog's target request. The library button refers to the library batch.
 
 Finished jobs keep their log until you exit. Exiting removes finished logs and keeps unfinished logs.
 Restarting a batch continues its log. An interrupted single-sheet request keeps its log for diagnosis and does not resend automatically.
@@ -121,7 +123,7 @@ Sheet names and generated captions remain in the log. Older shared logs are remo
 Each request times out after 60 seconds. **Cancel** stops waiting, but the provider may still bill the request.
 
 To delete a label, select **Remove label...** in the popup, or **Remove AI label...** in the context menu, and confirm.
-**Current prompt...** in the popup shows the current prompt with the tag list recorded for that label.
+**Current prompt...** shows what a new request for this sheet would send, including its current library tags and filename context.
 
 OpenRouter settings have a **skip** field for provider slugs, separated by commas. It defaults to `phala`, including for older settings.
 Clear the field to allow all providers. Single requests and library batches use this list.
@@ -138,24 +140,26 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 To label multiple library sheets in bulk:
 
 1. Open the library folder.
-2. Open **AI assist** (`I`), and under **Library labeling** select **Label unlabeled sheets...**.
-3. Choose a batch model and provider key in Settings. The default is `z-ai/glm-5.3-flash:batch` on OpenRouter.
+2. Open **Library AI labels** (`I`) and select **Label unlabeled sheets...**.
+3. Choose the **Library** model and provider key in Settings. The default is `z-ai/glm-5.3-flash` on OpenRouter.
 4. Review the unlabeled sheet count, the token limit, and the tags to look for, then click **Start batch**.
 
-Use **Rerun all...** to label every sheet again with the current batch model and tag list.
+Use **Rerun all...** to label every sheet again with the current library model and tag list.
 Review the request count and confirm with **Start batch**. Existing labels stay until new results arrive.
-Failed requests keep their old labels.
+Failed and unlabelable requests keep their old usable labels.
 
-Use **Clear all...** to remove all saved AI captions and tags in the library, including its subfolders.
+Use **Clear all labels...** to remove all saved AI captions and tags in the library, including its subfolders.
 Confirm with **Clear all**. Images, grids, animations, and the list of tags to look for stay.
 This cannot be undone. Wait for labeling to finish or cancel it before you clear labels or start another batch.
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The AI assist panel displays progress and current state. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends one ordinary request per sheet in the background, one after another. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
-The model ID `gemini-flash-latest` follows Google's latest Flash release; enable **batch** in Settings to use it for batches.
+Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
+The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
+The internal `:batch` suffix in saved settings identifies a library model; it is not part of the provider's model ID.
 Provider errors appear in the AI pane, including the provider's explanation when available.
 
 When no newer message is visible, the status bar shows the outstanding batch's progress and state.
@@ -163,7 +167,7 @@ Click the batch status to open the AI pane and its controls.
 
 The job view separates saved labels, provider work, unsent sheets, and uploads awaiting confirmation.
 The progress bar counts finished outcomes, including failures and cancellations. **Labels saved** counts usable labels written to the library.
-A stable message describes the job. The last provider response, next check, and current request appear below it.
+The main message distinguishes queued work, processing, and an unknown provider state. The last provider response, next check, and current request appear below it.
 **Details** keeps provider errors, sheet errors, and the job's original tags available.
 
 **Pause uploads** stops new submissions after the current request finishes. Tilepicky still collects accepted results.
@@ -189,21 +193,24 @@ A successful status check does not discard an upload or cancellation error. **Re
 A failed library write retries from stored results without another model request.
 New jobs record the image and existing label before submission, so delayed results cannot silently replace newer work.
 
-The pane separates **Single sheet** actions from **Library labeling**. Each section shows its provider and model.
+Single-sheet actions live in the sheet dialog. Library jobs live in the side panel.
+The panel identifies its execution method as **Google batch** or **One sheet at a time**.
 A running job keeps its original provider, model, prompt, and tags.
 **Copy log** includes the current job summary and recent diagnostics, without keys or image data.
 
 ### Tags to look for
 
-**Options for new labels** holds the tag list at the bottom of the AI pane. Separate tags with commas.
+Open **Edit library options...** from the sheet dialog or the library panel.
+Both links open the same form for their stated library. Separate tags with commas, then select **Save options**.
+Changes apply to new requests in both scopes. Existing jobs keep their original tags.
 The prompt asks the model to check each tag independently, including secondary content.
 It asks for every matching tag, with the spelling from your list, and no duplicate synonyms.
 The model can still miss visible content. These tags do not count toward the 12 the model adds of its own.
 
-A new library starts with `character, NPC, hero, landscape, building, indoor, UI, font, animation, props, background`. **Reset** brings that list back. The list belongs to the library: Tilepicky writes it at the top of the library's `tilepicky.json`.
+A new library starts with `character, NPC, hero, landscape, building, indoor, UI, font, animation, props, background`. **Reset tags** brings that list back. The list belongs to the library: Tilepicky writes it at the top of the library's `tilepicky.json`.
 
-Each label records the list its request used. **Current prompt...** in the label popup uses that list with the current prompt text.
-**Prompt...** under the list includes the selected sheet's context, or shows the template when no sheet is open.
+Each label records the list its request used. **Current prompt...** in the sheet dialog previews the next request.
+**Prompt template...** in library options shows the shared text before each request adds its filename context.
 The log contains the original request. The popup's current prompt can differ from that request. Changing the list does not relabel anything.
 To apply the new list, select **Label again**, or remove the label and label the library again.
 
@@ -349,7 +356,7 @@ Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
 
 Settings configure:
 
-- AI provider endpoints, API keys, and model selections for instant labeling and batch jobs.
+- AI provider endpoints, API keys, and model selections for single-sheet requests and library jobs.
 - Visibility of the keyboard shortcut legend below the file trees.
 
 Use the menu beside the search field to choose folders, files, captions, and tags for search matching.
