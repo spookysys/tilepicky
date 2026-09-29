@@ -216,6 +216,10 @@ New jobs record the image and existing label before submission, so delayed resul
 Single-sheet actions live in the sheet dialog. Library jobs live in the side panel.
 The panel identifies its execution method as **Google batch** or **One sheet at a time**.
 A running job keeps its original provider, model, prompt, and tags.
+Resume and retry also use the saved model. Changing Settings selects the model for new jobs.
+The panel shows a notice when the saved job and Settings use different models.
+To use the selected model, cancel the saved job or let it finish. Then choose **Label unlabeled sheets...**.
+Saved labels stay. **Rerun all...** also replaces existing labels.
 **Copy log** includes the current job summary and recent diagnostics, without keys or image data.
 
 ### Tags to look for

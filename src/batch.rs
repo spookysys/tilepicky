@@ -951,8 +951,23 @@ impl Panel {
         let now = now_ms();
         if let Some(job) = &self.job {
             if self.root != index.root { ui.label(format!("Active job for {}", self.root.display())); }
+            ui.strong("Saved library job");
             ui.label(format!("{} / {}", job.provider.name, job.model));
             ui.small(if job.provider.kind == Kind::Gemini { "Google batch" } else { "One sheet at a time" });
+            if let Some((provider, model)) = configured
+                && (provider.name != job.provider.name || provider.kind != job.provider.kind || provider.url != job.provider.url
+                    || model.id.trim_end_matches(":batch") != job.model.trim_end_matches(":batch")) {
+                ui.group(|ui| {
+                    ui.label(format!("Settings select {} / {} for new jobs.", provider.name, model.id.trim_end_matches(":batch")));
+                    ui.label("This saved job keeps its original model, including resume and retry.");
+                    ui.label(if job.done() {
+                        "Start a new library job below to use the selected model."
+                    } else {
+                        "Cancel this job or let it finish. Then start a new library job to use the selected model."
+                    });
+                    ui.small("Saved labels are kept. Use Label unlabeled sheets to continue without replacing them.");
+                });
+            }
             ui.add_space(6.0);
             ui.strong(self.state(job));
             for (message, count) in problems.iter().take(2) {
