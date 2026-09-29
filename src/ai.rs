@@ -207,6 +207,8 @@ impl Default for Ai {
         let google = Provider::new("Google", Kind::Gemini);
         let on = |provider: &str, id: &str| Model { provider: provider.into(), id: id.into() };
         let models = vec![
+            on("OpenRouter", "~deepseek/deepseek-flash-latest"),
+            on("OpenRouter", "~deepseek/deepseek-flash-latest:batch"),
             on("OpenRouter", "z-ai/glm-5.3-flash"),
             on("OpenRouter", "z-ai/glm-5.3-flash:batch"),
             on("Google", "gemini-flash-latest:batch"),
@@ -710,8 +712,8 @@ mod tests {
     fn the_defaults_name_a_model_for_each_mode() {
         let ai = Ai::default();
         let name = |c: Option<(&Provider, &Model)>| c.map(|(p, m)| (p.name.clone(), m.id.clone()));
-        assert_eq!(name(ai.chosen(Mode::Instant)), Some(("OpenRouter".into(), "z-ai/glm-5.3-flash".into())));
-        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "z-ai/glm-5.3-flash:batch".into())));
+        assert_eq!(name(ai.chosen(Mode::Instant)), Some(("OpenRouter".into(), "~deepseek/deepseek-flash-latest".into())));
+        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "~deepseek/deepseek-flash-latest:batch".into())));
     }
 
     /// A file from 0.2 names the models it shipped. They go, the new ones
@@ -727,9 +729,10 @@ mod tests {
         };
         ai.heal();
         let ids: Vec<_> = ai.models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["mine/vision", "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-flash-latest:batch", "gemini-flash-latest"]);
-        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash"));
-        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash:batch"));
+        assert_eq!(ids, ["mine/vision", "~deepseek/deepseek-flash-latest", "~deepseek/deepseek-flash-latest:batch",
+            "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-flash-latest:batch", "gemini-flash-latest"]);
+        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
+        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest:batch"));
     }
 
     /// A file from the tool that kept models inside the providers: no
@@ -740,8 +743,8 @@ mod tests {
         ai.batch = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash".into() });
         ai.heal();
         assert_eq!(ai.models, Ai::default().models);
-        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash"));
-        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("z-ai/glm-5.3-flash:batch"));
+        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
+        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest:batch"));
     }
 
     #[test]

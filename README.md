@@ -141,7 +141,7 @@ To label multiple library sheets in bulk:
 
 1. Open the library folder.
 2. Open **Library AI labels** (`I`) and select **Label unlabeled sheets...**.
-3. Choose the **Library** model under **Active models** and set its provider key in Settings. The initial selection is `z-ai/glm-5.3-flash` on OpenRouter.
+3. Choose the **Library** model under **Active models** and set its provider key in Settings. The initial selection is `~deepseek/deepseek-flash-latest` on OpenRouter.
 4. Review the unlabeled sheet count and the tags to look for, then click **Start labeling**.
 
 Use **Rerun all...** to label every sheet again with the current library model and tag list.
