@@ -301,3 +301,31 @@ The source-header button opens the same dialog.
 The native pass clicked both menu entries and inspected their screenshots. Both opened the same saved-label view.
 The local provider received no request, and neither action created a log.
 All 170 WGPU tests passed, and Clippy passed for all targets with WGPU enabled.
+
+
+## Active models and dialog size
+
+Settings now calls the chosen models Active models. The model editor separates the provider ID from the Single sheet or Library scope.
+OpenRouter library models show One sheet at a time. Google library models show Google batch.
+The internal suffix remains compatible with saved settings and stays out of the ID field.
+The native pass checked both processing descriptions and edited a library model ID without changing its scope.
+
+The sheet dialog now uses the available window height instead of reserving a fixed amount for its header.
+Native screenshots checked saved labels and a running request at 125 percent text scale in a 1000 x 700 window.
+The complete normal content fits without a scrollbar. Longer content can still scroll while the actions remain visible.
+All 170 WGPU tests passed, and Clippy passed for all targets with WGPU enabled.
+
+
+## Settings review and routine setup
+
+An independent review inspected the Settings code and native screenshots.
+Active models and API keys now appear first. Provider and model setup starts collapsed and explains when to use it.
+The serial-processing notice explains that closing Tilepicky pauses the job. Configure Gemini focuses its key without changing either active choice.
+Gemini's Library choice describes processing at Google after upload.
+Provider and model removal require confirmation. Changing a provider's API type updates stock connection defaults and preserves custom values.
+Done saves and closes Settings. Save failures keep Settings open and retain both settings and key errors until a successful retry.
+
+The final native pass used a 1000 x 700 window at 125 percent text scale.
+It verified visible keys, collapsed setup, Gemini key focus, unchanged active selections, missing-key feedback, and removal confirmation.
+A deliberately invalid settings target produced a persistent error. Restoring the target and clicking Retry save closed Settings successfully.
+Final validation: 173 tests passed in each build configuration. Clippy passed for all targets in both configurations.

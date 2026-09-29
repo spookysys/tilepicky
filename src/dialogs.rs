@@ -287,6 +287,7 @@ impl App {
         let mut options = false; let mut open_job = false; let mut settings = false;
         egui::Modal::new(Id::new("AI label")).show(ctx, |ui| {
             ui.set_width(500.0_f32.min(ctx.content_rect().width() - 48.0));
+            ui.set_max_height((ctx.content_rect().height() - 96.0).max(160.0));
             ui.heading("Sheet AI label");
             ui.add(egui::Label::new(&target.rel).truncate()).on_hover_text(&target.rel);
             ui.small(format!("Library: {}", target.dir.file_name().unwrap_or_default().to_string_lossy()))
@@ -330,7 +331,8 @@ impl App {
             });
             if !self.label_copy_error.is_empty() { ui.colored_label(ui.visuals().error_fg_color, labels::summary(&self.label_copy_error)); }
             ui.separator();
-            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 440.0).max(80.0)).show(ui, |ui| {
+            let body_height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0).max(80.0);
+            egui::ScrollArea::vertical().max_height(body_height).show(ui, |ui| {
                 if let Some(outcome) = &outcome && outcome.message.chars().count() > 180 {
                     egui::CollapsingHeader::new("Error details").show(ui, |ui| { ui.label(&outcome.message); });
                 }

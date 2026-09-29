@@ -136,6 +136,7 @@ struct App {
     /// The settings popup was open at the last frame; both files are
     /// written when it closes.
     config_open: bool,
+    settings_error: String,
     /// The settings popup is open. See `settings_popup`.
     settings_open: bool,
     /// Something outside the gear asked for the settings.
@@ -389,6 +390,7 @@ impl App {
             remove_label: None,
             clear_labels: None,
             config_open: false,
+            settings_error: String::new(),
             settings_open: false,
             settings_request: false,
             legend_prompt: false,
@@ -953,7 +955,7 @@ impl App {
     }
 
     /// The settings, in a popup above the gear, opening up and to the left:
-    /// the legend, and the AI providers, models, and defaults. Both files
+    /// the legend, active models, and provider settings. Both files
     /// are written when the popup closes.
     fn settings_popup(&mut self, gear: &egui::Response, ui: &egui::Ui) {
         let id = Id::new("settings popup");
@@ -982,7 +984,15 @@ impl App {
                 // content, and wraps a long line instead of growing wide
                 // enough to keep it on one.
                 ui.set_max_width(480.0);
-                ui.strong("Settings");
+                ui.horizontal(|ui| {
+                    ui.strong("Settings");
+                    let label = if self.settings_error.is_empty() { "Done" } else { "Retry save" };
+                    if ui.button(label).clicked() { self.settings_open = false; }
+                });
+                ui.small("Changes are saved when you close Settings.");
+                if !self.settings_error.is_empty() {
+                    ui.colored_label(ui.visuals().error_fg_color, labels::summary(&self.settings_error)).on_hover_text(&self.settings_error);
+                }
                 let mut legend = !self.settings.hide_legend;
                 let first = ui.checkbox(&mut legend, "Show keyboard shortcuts");
                 if first.changed() {
@@ -991,17 +1001,23 @@ impl App {
                 popup_keys(ui, gear, &first);
                 if AI_VISIBLE {
                     ui.add_space(8.0);
-                    egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 160.0).max(180.0)).show(ui, |ui| {
                         ai::settings_ui(ui, &mut self.settings.ai, &mut self.keys);
                     });
                 }
             });
         let open = self.settings_open;
         if self.config_open && !open {
-            if let Err(e) = self.settings.save() { self.status = e; }
-            if let Err(e) = self.keys.save() { self.status = e; }
+            self.settings_save_result(self.settings.save(), self.keys.save());
         }
-        self.config_open = open;
+        self.config_open = self.settings_open;
+    }
+
+    fn settings_save_result(&mut self, settings: Result<(), String>, keys: Result<(), String>) {
+        self.settings_error = [("Settings", settings), ("API keys", keys)].into_iter()
+            .filter_map(|(name, result)| result.err().map(|error| format!("Could not save {name}: {error}")))
+            .collect::<Vec<_>>().join("\n");
+        if !self.settings_error.is_empty() { self.settings_open = true; }
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -3313,6 +3329,21 @@ mod tests {
             out.textures_delta.clear();
         }
         assert!(!b.app.settings.hide_legend, "The Settings checkbox must restore the legend.");
+    }
+
+    #[test]
+    fn failed_settings_saves_keep_both_errors_visible_until_retry() {
+        let mut b = bench(&[], &[]);
+        b.app.settings_open = false;
+        b.app.settings_save_result(Err("disk full".into()), Err("permission denied".into()));
+        assert!(b.app.settings_open);
+        assert!(b.app.settings_error.contains("Settings: disk full"));
+        assert!(b.app.settings_error.contains("API keys: permission denied"));
+        b.app.status = "An unrelated request is running".into();
+        assert!(b.app.settings_error.contains("disk full"));
+        b.app.settings_open = false;
+        b.app.settings_save_result(Ok(()), Ok(()));
+        assert!(b.app.settings_error.is_empty()); assert!(!b.app.settings_open);
     }
 
     #[test]

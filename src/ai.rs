@@ -2,16 +2,15 @@
 //! The AI providers and models the tool may call, and the settings page
 //! that edits them. A provider is an endpoint of one of two kinds: an
 //! OpenAI-style chat endpoint (OpenAI, OpenRouter), or Google's Gemini API.
-//! A model names its provider; a model id that ends in `:batch` is a batch
-//! model. The API keys live in a file of their own, readable by the owner
-//! alone; see `Keys`.
+//! A model names its provider; the stored `:batch` suffix marks library scope.
+//! API keys live in a separate file, readable by the owner alone; see `Keys`.
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// The end of a model id that marks a batch model.
+/// The stored suffix for library scope. It does not select a provider API.
 const BATCH: &str = ":batch";
 
 /// The kind of endpoint a provider speaks.
@@ -42,7 +41,7 @@ impl Kind {
     }
 }
 
-/// How a model is used: one request with one answer, or a batch job.
+/// The scope of a model: one sheet or a library job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Instant,
@@ -83,6 +82,13 @@ pub enum KeySource {
 }
 
 impl Provider {
+    fn update_kind_defaults(&mut self, old: Kind) {
+        let (old_url, old_env) = old.defaults();
+        let (url, env) = self.kind.defaults();
+        if self.url == old_url { self.url = url.into(); }
+        if self.key_env == old_env { self.key_env = env.iter().map(|s| s.to_string()).collect(); }
+    }
+
     fn new(name: &str, kind: Kind) -> Self {
         let (url, env) = kind.defaults();
         Provider { name: name.into(), kind, skip: None, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
@@ -137,7 +143,7 @@ impl Provider {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub provider: String,
-    /// The id the endpoint knows, with `:batch` at the end for a batch model.
+    /// The provider model ID, with the internal `:batch` suffix for library scope.
     pub id: String,
 }
 
@@ -191,8 +197,8 @@ pub struct Ai {
 }
 
 /// A fresh install offers OpenRouter and Google models, without keys.
-/// Instant labeling uses the OpenAI-compatible endpoint. Library batches
-/// use OpenRouter's batch endpoint or Google's Gemini batch endpoint.
+/// Single-sheet requests use either provider format. Library jobs use sequential
+/// chat requests or Google's Gemini batch endpoint.
 impl Default for Ai {
     fn default() -> Self {
         let mut openrouter = Provider::new("OpenRouter", Kind::OpenAi);
@@ -335,32 +341,99 @@ impl Keys {
     }
 }
 
-/// The settings page: the providers, the models, and the two defaults.
+/// The settings page: providers, configured models, and active models.
 /// Each of the first two shows one item, chosen in a selector, so the page
 /// stays short. Edits land in place; the caller writes both files when the
 /// dialog closes.
 pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
     let Ai { providers, models, instant, batch } = ai;
-    ui.strong("Providers");
-    providers_ui(ui, providers, models, instant, batch, keys);
-    ui.add_space(8.0);
-    ui.strong("Models");
-    models_ui(ui, providers, models, instant, batch);
-    ui.add_space(8.0);
-    ui.strong("Defaults");
+    ui.strong("Active models");
+    ui.small("Used for new requests. Existing jobs keep their original models.");
     egui::Grid::new("defaults").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
         for (mode, slot) in [(Mode::Instant, &mut *instant), (Mode::Batch, &mut *batch)] {
             ui.label(mode.label());
             let current = slot.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.mode() == mode));
-            let text = current.map_or("none".to_string(), Model::label);
+            let active_name = |m: &Model| format!("{} ({})", m.id.trim_end_matches(BATCH), m.provider);
+            let text = current.map_or("none".to_string(), active_name);
             egui::ComboBox::from_id_salt(("default", mode.label())).selected_text(text).show_ui(ui, |ui| {
                 for m in models.iter().filter(|m| m.mode() == mode) {
-                    ui.selectable_value(slot, Some(m.reference()), m.label());
+                    ui.selectable_value(slot, Some(m.reference()), active_name(m));
                 }
             });
             ui.end_row();
         }
     });
+    let mut configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
+    if let Some(selected) = batch.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
+        && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
+        ui.add_space(4.0);
+        if provider.kind == Kind::OpenAi { configure |= serial_notice(ui, provider); }
+        else {
+            ui.strong("Google batch");
+            ui.label("Google processes uploaded sheets as a batch. Submitted work can continue after you close Tilepicky.");
+        }
+    }
+    let focus = if configure {
+        let (provider, model) = gemini_setup(providers, models);
+        show(ui, "provider", provider); show(ui, "model", model);
+        Some(provider)
+    } else { None };
+    ui.separator();
+    ui.strong("API keys");
+    ui.label("Add a key for each provider you want to use. The built-in models are already configured.");
+    egui::Grid::new("provider keys").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+        for (i, provider) in providers.iter().enumerate() {
+            ui.label(&provider.name);
+            let field = ui.add(egui::TextEdit::singleline(keys.entry(&provider.name)).password(true)
+                .id(egui::Id::new(("provider key", &provider.name))).hint_text("API key").desired_width(f32::INFINITY));
+            if focus == Some(i) { field.request_focus(); field.scroll_to_me(None); }
+            ui.end_row();
+            ui.label("");
+            ui.small(match provider.key_source(keys) {
+                KeySource::Typed => "Key entered".to_string(),
+                KeySource::Env(name) => format!("Using environment variable {name}"),
+                KeySource::None => "No key configured".to_string(),
+            });
+            ui.end_row();
+        }
+    });
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new("Provider and model setup").show(ui, |ui| {
+        ui.label("Use this section to add custom models or providers, or change their connection settings.");
+        ui.small("A provider is the service you connect to. A model is the AI you choose from that service.");
+        ui.strong("Providers");
+        providers_ui(ui, providers, models, instant, batch, keys);
+        ui.separator();
+        ui.strong("Models");
+        if models_ui(ui, providers, models, instant, batch) {
+            ui.data_mut(|d| d.insert_temp(egui::Id::new("configure Gemini"), true));
+            ui.ctx().request_repaint();
+        }
+    });
+
+}
+
+/// Explain the library execution method where the user chooses it.
+fn serial_notice(ui: &mut egui::Ui, provider: &Provider) -> bool {
+    ui.colored_label(ui.visuals().warn_fg_color, "One sheet at a time");
+    ui.label("Tilepicky sends one image request at a time. Closing Tilepicky pauses the job.");
+    if provider.is_openrouter() { ui.small("Tilepicky does not use OpenRouter's batch API for local images."); }
+    ui.label("For batches processed by Google, configure Gemini and select it for Library.");
+    ui.button("Configure Gemini...").clicked()
+}
+
+/// Prepare the editor without changing either active model or sending a request.
+fn gemini_setup(providers: &mut Vec<Provider>, models: &mut Vec<Model>) -> (usize, usize) {
+    let provider = providers.iter().position(|p| p.kind == Kind::Gemini).unwrap_or_else(|| {
+        let name = (1..).map(|n| if n == 1 { "Google".to_string() } else { format!("Google {n}") })
+            .find(|name| providers.iter().all(|p| &p.name != name)).unwrap();
+        providers.push(Provider::new(&name, Kind::Gemini)); providers.len() - 1
+    });
+    let name = &providers[provider].name;
+    let model = models.iter().position(|m| &m.provider == name && m.mode() == Mode::Batch).unwrap_or_else(|| {
+        models.push(Model { provider: name.clone(), id: "gemini-flash-latest:batch".into() }); models.len() - 1
+    });
+    (provider, model)
 }
 
 /// Which item a section shows. egui remembers it while the tool runs; the
@@ -394,6 +467,20 @@ fn selector(ui: &mut egui::Ui, what: &str, names: Vec<String>, add: &mut dyn FnM
             remove = true;
         }
     });
+    let confirmation = ui.make_persistent_id(("remove configuration", what));
+    if remove { ui.data_mut(|d| d.insert_temp(confirmation, sel)); }
+    remove = false;
+    if ui.data(|d| d.get_temp::<usize>(confirmation)) == Some(sel) && let Some(name) = names.get(sel) {
+        ui.group(|ui| {
+            ui.label(format!("Remove {name}?"));
+            ui.label(if what == "provider" { "This also removes its models and clears their active selections." }
+                else { "This clears any active selection that uses this model." });
+            ui.horizontal(|ui| {
+                remove = ui.button(format!("Remove {what}")).clicked();
+                if remove || ui.button("Keep").clicked() { ui.data_mut(|d| { d.remove::<usize>(confirmation); }); }
+            });
+        });
+    }
     show(ui, what, sel);
     (sel, remove)
 }
@@ -416,7 +503,7 @@ fn providers_ui(
     let (sel, remove) = selector(ui, "provider", names.clone(), &mut || providers.push(Provider::new(&fresh, Kind::OpenAi)));
     if let Some(p) = providers.get_mut(sel) {
         egui::Grid::new("provider fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-            ui.label("name");
+            ui.label("Name");
             let old = p.name.clone();
             let field = ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(f32::INFINITY));
             let taken = names.iter().enumerate().any(|(i, n)| i != sel && *n == p.name);
@@ -435,7 +522,8 @@ fn providers_ui(
                 keys.rename(&old, &p.name);
             }
             ui.end_row();
-            ui.label("kind");
+            ui.label("API type");
+            let old_kind = p.kind;
             egui::ComboBox::from_id_salt("kind")
                 .selected_text(p.kind.label())
                 .show_ui(ui, |ui| {
@@ -445,12 +533,13 @@ fn providers_ui(
                 })
                 .response
                 .on_hover_text("OpenAI: chat completions, as OpenAI and OpenRouter speak them. Gemini: Google's Gemini API.");
+            if old_kind != p.kind { p.update_kind_defaults(old_kind); }
             ui.end_row();
             ui.label("URL");
             ui.add(egui::TextEdit::singleline(&mut p.url).desired_width(f32::INFINITY));
             ui.end_row();
             if p.is_openrouter() {
-                ui.label("skip");
+                ui.label("Excluded hosts");
                 let id = ui.make_persistent_id(("provider skip", &p.name, &p.url));
                 let mut skip = ui.data_mut(|data| data.get_temp::<String>(id)).unwrap_or_else(|| p.skipped().join(", "));
                 let edit = ui.add(egui::TextEdit::singleline(&mut skip).id(id).desired_width(f32::INFINITY))
@@ -463,11 +552,7 @@ fn providers_ui(
                 });
                 ui.end_row();
             }
-            ui.label("key");
-            let typed = keys.entry(&p.name);
-            ui.add(egui::TextEdit::singleline(typed).password(true).hint_text("empty: the environment variable below").desired_width(f32::INFINITY));
-            ui.end_row();
-            ui.label("env");
+            ui.label("Environment variables");
             let mut env = p.key_env.join(", ");
             if ui.add(egui::TextEdit::singleline(&mut env).desired_width(f32::INFINITY)).changed() {
                 p.key_env = env.split([',', ' ']).filter(|s| !s.is_empty()).map(str::to_string).collect();
@@ -493,9 +578,9 @@ fn providers_ui(
     }
 }
 
-/// One model at a time: its provider, its id, and the batch mark. A default
-/// follows the model it named through an edit.
-fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>, instant: &mut Option<ModelRef>, batch: &mut Option<ModelRef>) {
+/// One model at a time: its provider, ID, and scope. Active selections follow edits.
+fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>, instant: &mut Option<ModelRef>, batch: &mut Option<ModelRef>) -> bool {
+    let mut configure = false;
     let names = models.iter().map(Model::label).collect();
     let first = providers.first().map(|p| p.name.clone()).unwrap_or_default();
     let (sel, remove) = selector(ui, "model", names, &mut || models.push(Model { provider: first.clone(), id: String::new() }));
@@ -509,16 +594,32 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
                 }
             });
             ui.end_row();
-            ui.label("id");
-            ui.add(egui::TextEdit::singleline(&mut m.id).desired_width(f32::INFINITY));
-            ui.end_row();
-            ui.label("");
-            let mut on = m.mode() == Mode::Batch;
-            if ui.checkbox(&mut on, "batch").on_hover_text("A batch model: the id ends in \":batch\".").changed() {
-                m.set_batch(on);
+            ui.label("Model ID");
+            let mut mode = m.mode();
+            let mut id = m.id.trim_end_matches(BATCH).to_string();
+            if ui.add(egui::TextEdit::singleline(&mut id).desired_width(f32::INFINITY)).changed() {
+                m.id = id.trim_end_matches(BATCH).to_string();
+                m.set_batch(mode == Mode::Batch);
             }
             ui.end_row();
+            ui.label("Use for");
+            egui::ComboBox::from_id_salt("model scope").selected_text(mode.label()).show_ui(ui, |ui| {
+                for scope in [Mode::Instant, Mode::Batch] { ui.selectable_value(&mut mode, scope, scope.label()); }
+            });
+            m.set_batch(mode == Mode::Batch);
+            ui.end_row();
+            if mode == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider) {
+                ui.label("Processing");
+                ui.label(match provider.kind {
+                    Kind::OpenAi => "One sheet at a time",
+                    Kind::Gemini => "Google batch",
+                });
+                ui.end_row();
+            }
         });
+        if m.mode() == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
+            configure = serial_notice(ui, provider);
+        }
         let after = m.reference();
         if after != before {
             for r in [&mut *instant, &mut *batch].into_iter().flatten() {
@@ -536,11 +637,35 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
             }
         }
     }
+    configure
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_setup_reuses_configuration_and_keeps_active_models() {
+        let mut ai = Ai::default(); let instant = ai.instant.clone(); let batch = ai.batch.clone();
+        ai.providers.retain(|p| p.kind != Kind::Gemini); ai.models.retain(|m| m.provider != "Google");
+        let (provider, model) = gemini_setup(&mut ai.providers, &mut ai.models);
+        assert_eq!(ai.providers[provider].url, Kind::Gemini.defaults().0);
+        assert_eq!(ai.models[model].id, "gemini-flash-latest:batch");
+        let configured = ai.clone();
+        assert_eq!(gemini_setup(&mut ai.providers, &mut ai.models), (provider, model));
+        assert_eq!(ai, configured); assert_eq!(ai.instant, instant); assert_eq!(ai.batch, batch);
+    }
+
+    #[test]
+    fn changing_provider_kind_updates_only_stock_connection_fields() {
+        let mut provider = Provider::new("test", Kind::OpenAi);
+        provider.kind = Kind::Gemini; provider.update_kind_defaults(Kind::OpenAi);
+        assert_eq!(provider.url, Kind::Gemini.defaults().0);
+        assert_eq!(provider.key_env, Kind::Gemini.defaults().1);
+        provider.url = "https://example.test/api".into(); provider.key_env = vec!["CUSTOM_KEY".into()];
+        provider.kind = Kind::OpenAi; provider.update_kind_defaults(Kind::Gemini);
+        assert_eq!(provider.url, "https://example.test/api"); assert_eq!(provider.key_env, ["CUSTOM_KEY"]);
+    }
 
     #[test]
     fn settings_draw_with_an_openrouter_skip_field() {

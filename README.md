@@ -141,7 +141,7 @@ To label multiple library sheets in bulk:
 
 1. Open the library folder.
 2. Open **Library AI labels** (`I`) and select **Label unlabeled sheets...**.
-3. Choose the **Library** model and provider key in Settings. The default is `z-ai/glm-5.3-flash` on OpenRouter.
+3. Choose the **Library** model under **Active models** and set its provider key in Settings. The initial selection is `z-ai/glm-5.3-flash` on OpenRouter.
 4. Review the unlabeled sheet count, the token limit, and the tags to look for, then click **Start batch**.
 
 Use **Rerun all...** to label every sheet again with the current library model and tag list.
@@ -160,6 +160,8 @@ Google batch requests require an API key from a project with billing enabled. Th
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
 The internal `:batch` suffix in saved settings identifies a library model; it is not part of the provider's model ID.
+The model editor uses **Use for: Single sheet / Library** and shows the provider model ID without that suffix.
+Library models show **One sheet at a time** for OpenAI-compatible providers, including OpenRouter, or **Google batch** for Gemini.
 Provider errors appear in the AI pane, including the provider's explanation when available.
 
 When no newer message is visible, the status bar shows the outstanding batch's progress and state.
@@ -354,10 +356,17 @@ Library files are read-only and cannot be moved, renamed, or deleted within Tile
 
 Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
 
-Settings configure:
+**Active models** selects the models for new single-sheet requests and library jobs. Existing jobs keep their saved configuration.
+The OpenRouter library notice explains sequential processing. **Configure Gemini...** opens its key field without changing the active model.
+Select a Gemini **Library** model to use Google's batch processing.
 
-- AI provider endpoints, API keys, and model selections for single-sheet requests and library jobs.
-- Visibility of the keyboard shortcut legend below the file trees.
+**API keys** shows one field per configured provider. The built-in providers and models are ready for their keys.
+Open **Provider and model setup** to add custom models or change connections. It starts collapsed.
+Removing a provider or model asks for confirmation and explains which active selections it clears.
+
+Click **Done** to save and close Settings. Escape or an outside click also saves.
+If saving fails, Settings stays open with the error and a **Retry save** button.
+The keyboard-shortcut checkbox controls the legend below the file trees.
 
 Use the menu beside the search field to choose folders, files, captions, and tags for search matching.
 
