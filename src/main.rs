@@ -1348,6 +1348,23 @@ impl App {
         self.after_edit();
     }
 
+    /// The header row of a sheet panel, in a scroll area of its own, so a
+    /// row of fields wider than the panel can be read by scrolling. The
+    /// scrollbar is floating in the light theme and would lie on the fields,
+    /// so a row wider than the panel leaves it a strip under itself.
+    fn sheet_toolbar<R>(ui: &mut egui::Ui, id: &'static str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let width = ui.available_width();
+        egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, |ui| {
+            let out = add(ui);
+            // The content is as wide as the panel whatever the row needs, so
+            // the cursor, not the rect, says how wide the row really is.
+            if ui.cursor().max.x - ui.min_rect().min.x > width {
+                ui.add_space(ui.spacing().scroll.bar_width);
+            }
+            out
+        }).inner
+    }
+
     /// Returns the new grid when the user finished editing a field
     /// (tile, gap, offset), and whether a header button was clicked: the
     /// caller makes this panel active on a click, so a key like `A` or `E`
@@ -1361,42 +1378,48 @@ impl App {
         ai: Option<&mut bool>,
         eye: Option<&mut bool>,
     ) -> (Option<Grid>, bool) {
-        let mut new_grid = None;
-        let mut clicked = false;
-        ui.horizontal(|ui| {
-            ui.label(title_text(title, keys));
-            let Some(s) = sheet else {
-                ui.weak("nothing open");
-                clicked = Self::header_tail(ui, None, ai, eye, String::new(), None);
-                return;
-            };
-            ui.weak(format!("{}x{} tiles", s.cols(), s.rows()));
-            ui.label("tile");
-            if let Some(t) = tile_field(library).ui(ui, s.tile) {
-                new_grid = Some((t, s.gap, s.offset));
-            }
-            if library {
-                // Sheets drawn with gaps between the tiles, and a border
-                // before the first one.
-                ui.label("gap");
-                if let Some(g) = gap_field(library).ui(ui, s.gap) {
-                    new_grid = Some((s.tile, g, s.offset));
-                }
-                ui.label("offset");
-                if let Some(o) = offset_field(library).ui(ui, s.offset) {
-                    new_grid = Some((s.tile, s.gap, o));
-                }
-            }
-            ui.weak(format!("{}x", s.zoom.level));
-            if let Some(b) = s.sel.bounds() {
-                ui.weak(format!("sel {} tiles, {}x{} at {},{}", s.sel.len(), b.cols(), b.rows(), b.x0, b.y0));
-            }
-            let name = if s.rel.is_empty() { "(unnamed)" } else { s.rel.as_str() };
-            let name = if s.dirty { format!("{name} *") } else { name.to_string() };
-            let cell = s.hover.map(|(x, y)| format!("tile {x},{y}"));
-            clicked = Self::header_tail(ui, Some(s), ai, eye, name, cell);
+        // The fields read the sheet and the tail takes it, so the numbers
+        // the fields show are read here, before the tail borrows it.
+        let fields = sheet.as_ref().map(|s| {
+            let sel = s.sel.bounds().map(|b| format!("sel {} tiles, {}x{} at {},{}", s.sel.len(), b.cols(), b.rows(), b.x0, b.y0));
+            (s.cols(), s.rows(), s.tile, s.gap, s.offset, s.zoom.level, sel)
         });
-        (new_grid, clicked)
+        let (name, cell) = match &sheet {
+            Some(s) if s.rel.is_empty() => ("(unnamed)".to_string(), s.hover),
+            Some(s) if s.dirty => (format!("{} *", s.rel), s.hover),
+            Some(s) => (s.rel.clone(), s.hover),
+            None => (String::new(), None),
+        };
+        let cell = cell.map(|(x, y)| format!("tile {x},{y}"));
+        let heading = title_text(title, keys);
+        // The fields keep their width and the tail keeps the right edge, so
+        // a long name or a narrow panel trims the tail's texts, and it never
+        // takes a button away.
+        egui::containers::Sides::new().shrink_right().truncate().show(
+            ui,
+            |ui| {
+                ui.label(heading);
+                let Some((cols, rows, tile, gap, offset, zoom, sel)) = fields else {
+                    ui.weak("nothing open");
+                    return None;
+                };
+                ui.weak(format!("{cols}x{rows} tiles"));
+                ui.label("tile");
+                let mut new_grid = tile_field(library).ui(ui, tile).map(|t| (t, gap, offset));
+                if library {
+                    // Sheets drawn with gaps between the tiles, and a border
+                    // before the first one.
+                    ui.label("gap");
+                    if let Some(g) = gap_field(library).ui(ui, gap) { new_grid = Some((tile, g, offset)); }
+                    ui.label("offset");
+                    if let Some(o) = offset_field(library).ui(ui, offset) { new_grid = Some((tile, gap, o)); }
+                }
+                ui.weak(format!("{zoom}x"));
+                if let Some(sel) = sel { ui.weak(sel); }
+                new_grid
+            },
+            |ui| Self::header_tail(ui, sheet, ai, eye, name, cell),
+        )
     }
 
     /// The right end of a header: the buttons that open the side panels,
@@ -1990,7 +2013,7 @@ impl App {
     fn library_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, keys: (Panel, Spot), dragging: bool) -> PanelOut {
         let mut out = PanelOut::default();
         set_pane(ui, (Panel::Library, Spot::Sheet));
-        egui::ScrollArea::horizontal().id_salt("source toolbar").auto_shrink([false, true]).show(ui, |ui| {
+        Self::sheet_toolbar(ui, "source toolbar", |ui| {
             ui.horizontal(|ui| {
                 let live = keys == (Panel::Library, Spot::Sheet);
                 if stopped(ui.add_enabled(self.library.sheet.is_some(), egui::Button::new("AI label..."))).clicked() {
@@ -2046,10 +2069,10 @@ impl App {
         self.project_rect = ui.max_rect();
         set_pane(ui, (Panel::Project, Spot::Sheet));
         let live = keys == (Panel::Project, Spot::Sheet);
-        let clicked = egui::ScrollArea::horizontal().id_salt("canvas toolbar").auto_shrink([false, true]).show(ui, |ui| {
+        let clicked = Self::sheet_toolbar(ui, "canvas toolbar", |ui| {
             let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye));
             out.grid = grid; clicked
-        }).inner;
+        });
         if clicked {
             self.active = Panel::Project;
             if self.project.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(project_id())); }
