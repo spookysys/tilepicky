@@ -284,7 +284,7 @@ In the recording, the arrows walk the library tree and open the Tiny Town pack. 
 - `Up` / `Down`: Moves cursor between rows without opening files.
 - `Right` / `Left`: Expands or collapses the selected folder.
 - `Enter` or `Space`: Opens the selected file, or toggles folder expansion.
-- `Shift+Up` / `Shift+Down` (Project tree only): Extends multi-file selection.
+- `Shift+Up` / `Shift+Down`: Extends the marked group from where the cursor started. In the library tree it marks folders and files alike.
 
 ### Sheet controls
 

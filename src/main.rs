@@ -171,6 +171,8 @@ struct App {
     library_marked: HashSet<usize>,
     /// Folders marked with Ctrl+click in the LIBRARY tree.
     library_marked_dirs: HashSet<String>,
+    /// Where a Shift+arrow range in the library tree started.
+    library_shift_anchor: Option<crate::tree::Row>,
     /// The last plainly clicked library file, for shift ranges.
     library_anchor: Option<usize>,
     /// A drag across the library files started here; it marks a group while it lasts.
@@ -434,6 +436,7 @@ impl App {
             sweep: None,
             library_marked: HashSet::new(),
             library_marked_dirs: HashSet::new(),
+            library_shift_anchor: None,
             library_anchor: None,
             library_sweep: None,
             library_order: Vec::new(),
@@ -741,6 +744,19 @@ impl App {
             self.project.scroll = Some(tree::Row::File(i));
             return;
         }
+        // Shift in the library walks the rows: files and folders both mark,
+        // and a fresh range replaces the marks already there.
+        if grow != 0 && library {
+            let anchor = self.library_shift_anchor.clone().or_else(|| at.clone());
+            let Some(row) = walk_rows(rows, at.as_ref(), grow) else { return };
+            if let Some(anchor) = anchor {
+                self.library_mark_rows(rows, &anchor, &row);
+                self.library_shift_anchor = Some(anchor);
+            }
+            self.stand_on(panel, row);
+            return;
+        }
+        self.library_shift_anchor = None;
         if enter && step == 0 && grow == 0 {
             if let Some(row) = &at {
                 self.open_row(ctx, panel, row);
@@ -771,9 +787,12 @@ impl App {
     /// or unfolds the folder it stands on.
     fn open_row(&mut self, ctx: &egui::Context, panel: Panel, row: &tree::Row) {
         match row {
-            tree::Row::Dir(d) => self.half_mut(panel).open_dir = Some((d.clone(), true)),
-            tree::Row::File(i) if panel == Panel::Library => self.open_library(ctx, *i),
-            tree::Row::File(i) => self.request(ctx, Pending::Open(self.project.index.entries[*i].rel.clone())),
+            tree::Row::Dir(d) => {
+                self.half_mut(panel).open_dir = Some((d.clone(), true));
+                if panel == Panel::Library { self.library_tree_action(ctx, TreeAction::SelectDir(d.clone())); }
+            }
+            tree::Row::File(i) if panel == Panel::Library => self.library_tree_action(ctx, TreeAction::Open(*i)),
+            tree::Row::File(i) => self.project_tree_action(ctx, TreeAction::Open(*i), &[]),
         }
     }
 
@@ -804,6 +823,22 @@ impl App {
             self.library_marked.clear();
         }
         self.library_marked.extend(range);
+    }
+
+    /// Marks every library row from `a` to `b` in the order shown, replacing
+    /// the marks already there. A folder brings every sheet below it.
+    fn library_mark_rows(&mut self, rows: &[tree::Row], a: &tree::Row, b: &tree::Row) {
+        let (pa, pb) = (rows.iter().position(|r| r == a), rows.iter().position(|r| r == b));
+        let (Some(pa), Some(pb)) = (pa, pb) else { return };
+        self.library_marked.clear();
+        self.library_marked_dirs.clear();
+        for row in &rows[pa.min(pb)..=pa.max(pb)] {
+            match row {
+                tree::Row::File(i) => { self.library_marked.insert(*i); }
+                tree::Row::Dir(d) => { self.library_marked_dirs.insert(d.clone()); }
+            }
+        }
+        self.library_batch.choice = None;
     }
 
     fn open_library(&mut self, ctx: &egui::Context, i: usize) {
