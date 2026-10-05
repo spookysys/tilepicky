@@ -213,6 +213,9 @@ pub fn problem(message: &str) -> Problem {
         ("Provider is temporarily unavailable".into(), "Wait for the provider to recover. You can retry later.", false, false)
     } else if lower.contains("timed out") || lower.contains("timeout") || lower.contains("could not connect") || lower.contains("dns") {
         ("Connection to the provider failed".into(), "Check the connection. An interrupted upload may still have reached the provider.", false, false)
+    } else if lower.contains("does not support image inputs in batch") || lower.contains("no image url map")
+        || lower.contains("only public http(s) image urls") {
+        ("This model cannot take images in a batch".into(), "Choose a Library model on a provider that carries images, or label these sheets one at a time.", false, false)
     } else {
         (summary(message), "Read the full error below. Copy log includes diagnostic information.", false, false)
     };

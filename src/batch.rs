@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! One library job: selected sheets, each sent as the request that
 //! Label with AI sends. Google's Gemini API takes them as a batch. An
-//! OpenAI-style endpoint has no batch API that reads a local image, so
-//! several of its ordinary requests run at once instead.
+//! OpenAI-style endpoint takes them as an OpenRouter batch when the provider
+//! has object storage; without it, several ordinary requests run at once.
 //!
 //! The library book holds the job state, so that a batch
 //! continues after a restart. It never holds a key. The state of a sheet:
@@ -1016,7 +1016,7 @@ impl Panel {
             return if job.issues.contains_key("save") { "Could not save labels; retry pending".into() } else { "Saving received labels".into() };
         }
         if self.mode(job) == Mode::Paused {
-            return if job.provider.kind == Kind::Gemini { "Uploads paused; submitted work can continue".into() } else { "Labeling paused".into() };
+            return if job.provider.kind == Kind::Gemini || job.provider.store.is_some() { "Uploads paused; submitted work can continue".into() } else { "Labeling paused".into() };
         }
         if job.issues.contains_key("upload")
             || (job.provider.kind == Kind::OpenAi && job.sheets.iter().any(|s| !s.taken && s.retry_ms > now_ms())) {
@@ -1027,13 +1027,13 @@ impl Panel {
             return "Waiting for upload confirmations".into();
         }
         if job.untaken() {
-            return if job.provider.kind == Kind::Gemini { "Uploading remaining sheets".into() } else { "Labeling sheets".into() };
+            return if job.provider.kind == Kind::Gemini || job.provider.store.is_some() { "Uploading remaining sheets".into() } else { "Labeling sheets".into() };
         }
         if job.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_))) {
             let states: Vec<_> = job.groups.iter().filter(|g| matches!(g.remote, Remote::Waiting(_)))
                 .map(|g| g.tracking.state.as_str()).collect();
-            let action = if states.iter().all(|s| *s == "BATCH_STATE_PENDING") { "Queued at" }
-                else if states.iter().all(|s| *s == "BATCH_STATE_RUNNING") { "Processing at" }
+            let action = if states.iter().all(|s| *s == "BATCH_STATE_PENDING" || *s == "validating") { "Queued at" }
+                else if states.iter().all(|s| *s == "BATCH_STATE_RUNNING" || *s == "in_progress") { "Processing at" }
                 else { "Waiting for results from" };
             return format!("{action} {}", job.provider.name);
         }
@@ -1059,7 +1059,7 @@ impl Panel {
             if self.root != index.root { ui.label(format!("Active job for {}", self.root.display())); }
             ui.strong("Saved library job");
             ui.label(format!("{} / {}", job.provider.name, job.model));
-            ui.small(if job.provider.kind == Kind::Gemini { "Google batch" } else { "Several sheets at a time" });
+            ui.small(crate::ai::method(&job.provider));
             if let Some((provider, model)) = configured
                 && (provider.name != job.provider.name || provider.kind != job.provider.kind || provider.url != job.provider.url
                     || model.id.trim_end_matches(":batch") != job.model.trim_end_matches(":batch")) {
@@ -1201,7 +1201,7 @@ impl Panel {
         }
         if let Some((provider, model)) = configured {
             ui.label(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
-            ui.small(if provider.kind == Kind::Gemini { "Google batch" } else { "Several sheets at a time" });
+            ui.small(crate::ai::method(provider));
         }
         ui.label(format!("{done} of {total} sheets have usable labels"));
         if !ready { ui.label("Set a library model and its key in Settings (Ctrl+,)."); }

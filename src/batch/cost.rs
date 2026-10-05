@@ -164,9 +164,14 @@ fn prices(job: &Job, now: u64) -> (Option<Rates>, String) {
         return (rates, note.into());
     }
     if !job.provider.is_openrouter() { return (None, "This endpoint does not provide a supported price catalog.".into()); }
-    let result = fetch_router_prices(&job.model).and_then(|v| router_rates(&v, &job.model));
+    let batch = job.provider.store.is_some();
+    let result = fetch_router_prices(&job.model).and_then(|v| router_rates(&v, &job.model, batch));
     match result {
-        Ok(rates) => (Some(rates), "OpenRouter catalog prices. The selected route, caching, or account fees can change the bill.".into()),
+        Ok(rates) => (Some(rates), if batch {
+            "OpenRouter batch prices, about half the standard rates. The selected route, caching, or account fees can change the bill.".into()
+        } else {
+            "OpenRouter catalog prices. The selected route, caching, or account fees can change the bill.".into()
+        }),
         Err(error) => (None, error),
     }
 }
@@ -184,7 +189,7 @@ fn fetch_router_prices(model: &str) -> Result<Value, String> {
         .map_err(|_| "OpenRouter returned an unreadable price catalog.".into())
 }
 
-fn router_rates(value: &Value, model: &str) -> Result<Rates, String> {
+fn router_rates(value: &Value, model: &str, batch: bool) -> Result<Rates, String> {
     let entry = value["data"].as_array().and_then(|a| a.iter().find(|m| m["id"] == model))
         .ok_or("The price catalog does not contain this model.")?;
     let price = &entry["pricing"];
@@ -193,9 +198,12 @@ fn router_rates(value: &Value, model: &str) -> Result<Rates, String> {
             else { price[key].as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| price[key].as_f64()) };
         n.filter(|n| n.is_finite() && *n >= 0.0 && *n <= 1000.0).ok_or_else(|| format!("The catalog has no usable {key} price."))
     };
-    Ok(Rates { input: number("prompt", false)? * 1_000_000.0, output: number("completion", false)? * 1_000_000.0,
+    let scale = if batch { 0.5 } else { 1.0 };
+    Ok(Rates { input: number("prompt", false)? * 1_000_000.0 * scale, output: number("completion", false)? * 1_000_000.0 * scale,
         per_request: number("image", true)? + number("request", true)?,
-        basis: format!("OpenRouter live catalog: {model}. Standard requests, with no batch discount."), source: ROUTER_PRICES.into() })
+        basis: format!("OpenRouter live catalog: {model}. {}", if batch {
+            "Batch requests bill at about half the standard rate."
+        } else { "Standard requests, with no batch discount." }), source: ROUTER_PRICES.into() })
 }
 
 fn image_tokens(kind: Kind, model: &str, dimensions: Option<(u32, u32)>) -> [u64; 2] {
@@ -253,8 +261,10 @@ mod tests {
 
     #[test]
     fn catalog_prices_are_per_token_and_fixed_fees_are_per_request() {
-        let rates = router_rates(&catalog(), "test/vision").unwrap();
+        let rates = router_rates(&catalog(), "test/vision", false).unwrap();
         assert_eq!(rates.input, 2.0); assert_eq!(rates.output, 6.0); assert_eq!(rates.per_request, 0.003);
+        let batch = router_rates(&catalog(), "test/vision", true).unwrap();
+        assert_eq!(batch.input, 1.0); assert_eq!(batch.output, 3.0);
         let estimate = Estimate { count: 1000, input: [1_000_000; 2], output: [500_000; 2], rates: Some(rates),
             price_note: String::new(), token_note: String::new(), failed_headers: 0, usage_basis: 0 };
         assert_eq!(estimate.cost(0), Some(8.0));
@@ -263,14 +273,14 @@ mod tests {
 
     #[test]
     fn unknown_invalid_and_missing_prices_do_not_become_free() {
-        assert!(router_rates(&catalog(), "another/vision").is_err());
+        assert!(router_rates(&catalog(), "another/vision", false).is_err());
         for value in [Value::Null, json!("-1"), json!("NaN"), json!("inf"), json!("1e300")] {
             let mut catalog = catalog(); catalog["data"][0]["pricing"]["prompt"] = value;
-            assert!(router_rates(&catalog, "test/vision").is_err());
+            assert!(router_rates(&catalog, "test/vision", false).is_err());
         }
         let mut free = catalog();
         free["data"][0]["pricing"] = json!({"prompt":"0", "completion":"0"});
-        assert_eq!(router_rates(&free, "test/vision").unwrap().input, 0.0);
+        assert_eq!(router_rates(&free, "test/vision", false).unwrap().input, 0.0);
     }
 
     #[test]

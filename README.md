@@ -174,14 +174,14 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends ordinary requests for the sheets in the background, several at a time. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky labels a library two ways. If the provider has **Sheet storage**, Tilepicky uploads each sheet to your bucket and submits one OpenRouter batch: it runs while Tilepicky is closed, and OpenRouter bills batch requests at about half rate. The sheets leave your machine only to that bucket, and Tilepicky deletes them when the batch finishes. Without storage, Tilepicky sends ordinary requests in the background, several at a time, and the app must stay open. OpenRouter's batch API accepts images only at public URLs, which is why storage is needed for a batch. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
 The internal `:batch` suffix in saved settings identifies a library model; it is not part of the provider's model ID.
 The model editor uses **Use for: Single sheet / Library** and shows the provider model ID without that suffix.
-Library models show **Several sheets at a time** for OpenAI-compatible providers, including OpenRouter, or **Google batch** for Gemini.
+Library models show **OpenRouter batch**, **Several sheets at a time**, or **Google batch**, depending on the provider and its storage.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
 Repeated errors appear once, with the affected sheet count. **Error details** keeps the full explanations and affected sheet paths.
@@ -220,7 +220,7 @@ A failed library write retries from stored results without another model request
 New jobs record the image and existing label before submission, so delayed results cannot silently replace newer work.
 
 Single-sheet actions live in the sheet dialog. Library jobs live in the side panel.
-The panel identifies its execution method as **Google batch** or **Several sheets at a time**.
+The panel identifies its execution method as **Google batch**, **OpenRouter batch**, or **Several sheets at a time**.
 A running job keeps its original provider, model, prompt, and tags.
 Resume and retry also use the saved model. Changing Settings selects the model for new jobs.
 The panel shows a notice when the saved job and Settings use different models.
@@ -387,8 +387,10 @@ Library files are read-only and cannot be moved, renamed, or deleted within Tile
 Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
 
 **Active models** selects the models for new single-sheet requests and library jobs. Existing jobs keep their saved configuration.
-The OpenRouter library notice explains that it labels sheets in the background, several at a time. **Set up Gemini...** opens its key field without changing the active model.
+The OpenRouter library notice explains its execution method. **Set up Gemini...** opens its key field without changing the active model.
 Select a Gemini **Library** model to use Google's batch processing.
+
+Give an OpenAI-compatible provider **Sheet storage** to use OpenRouter batch processing. The fields are the S3 endpoint (host only, no path), region, bucket, access key, and a path-style switch for MinIO. The secret key sits with the API keys, readable by your user alone. The bucket may stay private: Tilepicky hands OpenRouter a signed URL for each sheet. Any S3-compatible store works, for example Cloudflare R2, Backblaze B2, or MinIO.
 
 **API keys** shows one field per configured provider. The built-in providers and models are ready for their keys.
 Open **Provider and model setup** to add custom models or change connections. It starts collapsed.

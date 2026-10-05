@@ -153,6 +153,15 @@ impl Provider {
     }
 }
 
+/// How a Library job on this provider runs, for the panel and the model editor.
+pub fn method(provider: &Provider) -> &'static str {
+    match (provider.kind, provider.store.is_some()) {
+        (Kind::OpenAi, true) => "OpenRouter batch",
+        (Kind::OpenAi, false) => "Several sheets at a time",
+        (Kind::Gemini, _) => "Google batch",
+    }
+}
+
 /// A model on one of the providers.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Model {
@@ -382,7 +391,7 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
     if let Some(selected) = batch.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
         && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
         ui.add_space(4.0);
-        if provider.kind == Kind::OpenAi { configure |= endpoint_notice(ui); }
+        if provider.kind == Kind::OpenAi { configure |= endpoint_notice(ui, provider.store.is_some()); }
         else {
             ui.strong("Google batch");
             ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
@@ -430,11 +439,17 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
 }
 
 /// Explain the library execution method where the user chooses it.
-fn endpoint_notice(ui: &mut egui::Ui) -> bool {
+fn endpoint_notice(ui: &mut egui::Ui, batch: bool) -> bool {
+    if batch {
+        ui.strong("OpenRouter batch");
+        ui.label("OpenRouter labels the uploaded sheets together. After upload, you can close Tilepicky while OpenRouter works.");
+        ui.label("Reopen this library to collect the labels. Sheets not yet uploaded wait until you return.");
+        return false;
+    }
     ui.strong("Several sheets at a time");
     ui.label("Keep Tilepicky open while it labels the library. Closing Tilepicky pauses the job.");
     ui.label("Reopen this library to continue.");
-    ui.small("Want processing to continue while Tilepicky is closed? Add a Google key and choose Gemini for Library.");
+    ui.small("Want processing to continue while Tilepicky is closed? Add a Google key, or give this provider sheet storage.");
     ui.button("Set up Gemini...").clicked()
 }
 
@@ -653,15 +668,12 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
             ui.end_row();
             if mode == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider) {
                 ui.label("Processing");
-                ui.label(match provider.kind {
-                    Kind::OpenAi => "Several sheets at a time",
-                    Kind::Gemini => "Google batch",
-                });
+                ui.label(method(provider));
                 ui.end_row();
             }
         });
-        if m.mode() == Mode::Batch && providers.iter().any(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
-            configure = endpoint_notice(ui);
+        if m.mode() == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
+            configure = endpoint_notice(ui, provider.store.is_some());
         }
         let after = m.reference();
         if after != before {
