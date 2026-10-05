@@ -621,6 +621,9 @@ fn providers_ui(
                     ui.label("");
                     ui.weak(if has_secret { "The secret key is set" } else { "No secret key yet" });
                     ui.end_row();
+                    ui.label("");
+                    ui.small("Tilepicky deletes each object when its batch ends. Add a bucket rule to delete objects older than two days, for a crash or a discarded job.");
+                    ui.end_row();
                 }
             }
         });

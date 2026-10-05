@@ -72,7 +72,9 @@ the person who uses the tool; this file is for an agent that works on it.
   OpenAI-compatible requests at once. It also displays job snapshots and saves
   labels from the UI thread.
 - `src/batch/openrouter.rs`: the OpenRouter batch path: upload each sheet,
-  build the batch, poll it, save the labels, and delete the objects.
+  build the batch, poll it, save the labels, and delete the objects. OpenRouter
+  has no client reference, so a submit whose reply is lost ends those sheets
+  with an error instead of sending the batch again.
 - `src/batch/runner.rs`: one coordinator owns the job journal under a file lock.
   It performs network operations and waits for the UI to acknowledge library writes.
   User pause and cancel requests persist in the library book before the coordinator applies them.

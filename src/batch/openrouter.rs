@@ -26,8 +26,9 @@ impl Objects for Storage {
     fn delete(&self, key: &str) { let _ = self.0.delete(key); }
 }
 
-/// The lifetime of a sheet URL. The batch window is 24 hours.
-const URL_SECONDS: u64 = 3 * 24 * 60 * 60;
+/// The lifetime of a sheet URL, and the age a bucket lifecycle rule should
+/// delete objects at. The batch window is 24 hours.
+const URL_SECONDS: u64 = 2 * 24 * 60 * 60;
 
 /// The object key for one sheet, by content, so a repeat reuses it.
 fn object_key(png: &[u8]) -> String {
@@ -85,10 +86,11 @@ pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), 
             return job.save(dir).and(Err(failure.message()));
         }
         Err(failure) => {
-            // The batch may exist. The objects go, and the sheets end with a
-            // reason rather than being submitted twice.
+            // The batch may exist. OpenRouter has no client reference to find
+            // it again, so the sheets end here rather than being sent twice.
             delete_group(job, group);
-            for &i in &taken { job.sheets[i].error = failure.message(); }
+            for &i in &taken { job.sheets[i].error =
+                format!("{} The batch may have been accepted, so it was not sent again; retrying can bill twice.", failure.message()); }
             job.groups[group].remote = Remote::Done;
         }
     }
@@ -106,12 +108,17 @@ fn delete_group(job: &mut Job, group: usize) {
 /// OpenRouter has no cancel call. The batch may still finish upstream, so the
 /// tool stops waiting, lets go of the objects, and marks the sheets cancelled.
 pub fn cancel(job: &mut Job, dir: &Path) -> Result<(), String> {
+    let mut left = false;
     for i in 0..job.groups.len() {
         if matches!(job.groups[i].remote, Remote::Waiting(_)) {
+            left = true;
             delete_group(job, i);
             for &s in &job.groups[i].sheets { job.sheets[s].cancelled = true; }
             job.groups[i].remote = Remote::Done;
         }
+    }
+    if left {
+        job.issue("cancel", "A batch already sent to OpenRouter may still finish and bill; its labels are not collected.".into(), now_ms());
     }
     job.save(dir)
 }
@@ -207,6 +214,37 @@ mod tests {
         }
         assert!(job.remote_done());
         assert_eq!(job.sheets[0].label.as_ref().unwrap().caption, "Tree");
+        assert!(job.sheets[0].stored.is_none());
+        assert_eq!(fake.deleted.lock().unwrap().len(), 1);
+    }
+
+    /// A submit whose reply is lost does not send the batch again. The sheets
+    /// end with a reason, the objects go, and the group closes.
+    #[test]
+    fn a_lost_submit_reply_does_not_resend_the_batch() {
+        let dir = crate::storage::tests::Folder::new();
+        let root = dir.0.join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])).save(root.join("sheet.png")).unwrap();
+        let mut provider = crate::batch::tests::provider(Kind::OpenAi);
+        provider.store = Some(crate::s3::Store { endpoint: "https://example.test".into(), region: "auto".into(),
+            bucket: "b".into(), access_key: "k".into(), path_style: false });
+        let mut job = crate::batch::prepare(&crate::index::Index::scan(&root, [16, 16]), provider,
+            "openai/gpt-5-nano".into(), crate::batch::Scope::Unlabeled).unwrap();
+        let fake = Arc::new(Fake { uploaded: Mutex::new(Vec::new()), deleted: Mutex::new(Vec::new()) });
+        job.objects = Some(fake.clone());
+        let mut sent = 0;
+        {
+            let mut send = |_path: &str, _body: Option<&Value>| -> Result<Value, Failure> {
+                sent += 1;
+                Err(Failure::Unknown("timed out".into()))
+            };
+            submit(&mut job, &root, &root, &mut send).unwrap();
+        }
+        assert_eq!(sent, 1, "a lost reply must not send the batch twice");
+        assert!(job.sheets[0].taken);
+        assert!(job.sheets[0].error.contains("not sent again"));
+        assert!(matches!(job.groups[0].remote, Remote::Done));
         assert!(job.sheets[0].stored.is_none());
         assert_eq!(fake.deleted.lock().unwrap().len(), 1);
     }

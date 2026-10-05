@@ -392,6 +392,10 @@ Select a Gemini **Library** model to use Google's batch processing.
 
 Give an OpenAI-compatible provider **Sheet storage** to use OpenRouter batch processing. The fields are the S3 endpoint (host only, no path), region, bucket, access key, and a path-style switch for MinIO. The secret key sits with the API keys, readable by your user alone. The bucket may stay private: Tilepicky hands OpenRouter a signed URL for each sheet. Any S3-compatible store works, for example Cloudflare R2, Backblaze B2, or MinIO.
 
+Tilepicky deletes each object as soon as its batch ends. Add a bucket lifecycle rule that deletes objects older than two days, to cover a crash after upload or a discarded job. Two days also matches the signed URL, which outlives the 24-hour batch window.
+
+If the reply to a batch submission is lost, Tilepicky does not send that batch again, because OpenRouter offers no client reference to find it. Those sheets end with an error. Retrying them can bill twice.
+
 **API keys** shows one field per configured provider. The built-in providers and models are ready for their keys.
 Open **Provider and model setup** to add custom models or change connections. It starts collapsed.
 Removing a provider or model asks for confirmation and explains which active selections it clears.
