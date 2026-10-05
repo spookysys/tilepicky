@@ -121,6 +121,26 @@ impl Client {
         let signature = signature("GET", &uri, &query, &headers, "UNSIGNED-PAYLOAD", &ctx);
         Ok(format!("{}?{query}&X-Amz-Signature={signature}", self.url(&host, &uri)?))
     }
+
+    /// Puts a small object, fetches it through its signed URL, and deletes it.
+    /// It proves the endpoint, the keys, and both URL styles work.
+    pub fn check(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
+        self.put(key, bytes, "image/png")?;
+        let url = self.presigned_get(key, 300)?;
+        let response = self.agent.get(&url).call().map_err(|e| format!("The signed URL did not fetch: {}", http_message(e)))?;
+        let status = response.status().as_u16();
+        let _ = self.delete(key);
+        if status == 200 { Ok(()) } else { Err(format!("The signed URL returned HTTP {status}.")) }
+    }
+}
+
+/// A one-pixel upload, signed fetch, and delete, to check a bucket.
+pub fn self_test(store: Store, secret: String) -> Result<(), String> {
+    let client = Client::new(store, secret)?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::new(1, 1).write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|_| "Could not build a test image.".to_string())?;
+    client.check(&format!("tilepicky/connection-test-{}-{}.png", std::process::id(), now_secs()), &png.into_inner())
 }
 
 fn check(status: u16, action: &str) -> Result<(), String> {
@@ -297,5 +317,24 @@ mod tests {
     fn the_date_converts_from_unix_seconds() {
         assert_eq!(amz_time(1_369_353_600), (AMZ.to_string(), DATE.to_string()));
         assert_eq!(amz_time(0), ("19700101T000000Z".to_string(), "19700101".to_string()));
+    }
+
+    /// A real bucket round trip: upload, signed fetch, delete. Run with:
+    ///   TILEPICKY_S3_ENDPOINT=... TILEPICKY_S3_REGION=... TILEPICKY_S3_BUCKET=... \
+    ///   TILEPICKY_S3_ACCESS_KEY=... TILEPICKY_S3_SECRET_KEY=... \
+    ///   cargo test -- --ignored a_real_bucket_round_trip --nocapture
+    #[test]
+    #[ignore = "Needs a real bucket; set TILEPICKY_S3_ENDPOINT, _REGION, _BUCKET, _ACCESS_KEY, _SECRET_KEY."]
+    fn a_real_bucket_round_trip() {
+        let var = |name: &str| std::env::var(name).ok();
+        let (Some(endpoint), Some(region), Some(bucket), Some(access_key), Some(secret)) = (
+            var("TILEPICKY_S3_ENDPOINT"), var("TILEPICKY_S3_REGION"), var("TILEPICKY_S3_BUCKET"),
+            var("TILEPICKY_S3_ACCESS_KEY"), var("TILEPICKY_S3_SECRET_KEY")) else {
+            eprintln!("S3 environment variables are unset; skipping");
+            return;
+        };
+        let store = Store { endpoint, region, bucket, access_key,
+            path_style: var("TILEPICKY_S3_PATH_STYLE").is_some() };
+        self_test(store, secret).unwrap();
     }
 }

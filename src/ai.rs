@@ -603,7 +603,8 @@ fn providers_ui(
                     p.store = on.then(crate::s3::Store::default);
                 }
                 ui.end_row();
-                let has_secret = p.store_secret(keys).is_some();
+                let secret = p.store_secret(keys);
+                let has_secret = secret.is_some();
                 if let Some(store) = &mut p.store {
                     for (label, value) in [("Endpoint", &mut store.endpoint), ("Region", &mut store.region),
                         ("Bucket", &mut store.bucket), ("Access key", &mut store.access_key)] {
@@ -623,6 +624,33 @@ fn providers_ui(
                     ui.end_row();
                     ui.label("");
                     ui.small("Tilepicky deletes each object when its batch ends. Add a bucket rule to delete objects older than two days, for a crash or a discarded job.");
+                    ui.end_row();
+                    ui.label("");
+                    let test_id = egui::Id::new(("s3 test", &p.name));
+                    let slot = ui.data_mut(|d| d.get_temp::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id));
+                    if let Some(slot) = slot {
+                        match slot.lock().unwrap().take() {
+                            None => { ui.weak("Testing the connection..."); ui.ctx().request_repaint_after(std::time::Duration::from_millis(250)); }
+                            Some(Ok(())) => {
+                                ui.weak("Connection ok: upload, signed URL, and delete all work.");
+                                ui.data_mut(|d| d.remove::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id));
+                            }
+                            Some(Err(error)) => {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                                ui.data_mut(|d| d.remove::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id));
+                            }
+                        }
+                    } else if ui.add_enabled(has_secret, egui::Button::new("Test connection")).clicked()
+                        && let Some(secret) = secret.clone() {
+                        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                        ui.data_mut(|d| d.insert_temp(test_id, slot.clone()));
+                        let store = store.clone();
+                        let ctx = ui.ctx().clone();
+                        std::thread::spawn(move || {
+                            *slot.lock().unwrap() = Some(crate::s3::self_test(store, secret));
+                            ctx.request_repaint();
+                        });
+                    }
                     ui.end_row();
                 }
             }
