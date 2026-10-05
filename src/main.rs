@@ -2341,7 +2341,10 @@ impl App {
     fn library_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
         match action {
             TreeAction::Open(i) => {
+                // A plain click selects this file alone: every other mark goes.
                 self.library_marked.clear();
+                self.library_marked_dirs.clear();
+                self.library_batch.choice = None;
                 self.library_marked.insert(i);
                 self.library_anchor = Some(i);
                 self.open_library(ctx, i);
