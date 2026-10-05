@@ -3512,7 +3512,7 @@ mod tests {
     #[test]
     fn labeling_from_the_menu_opens_the_result_dialog_on_setup_error() {
         let mut b = bench(&["a.png"], &[]);
-        b.app.settings.ai.instant = None;
+        b.app.settings.ai.single = None;
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Label));
         assert!(b.app.label_view, "The label action must show its progress or error immediately.");
         assert_eq!(b.app.selected_label_outcome(), Some("Choose a single-sheet model in Settings."));
@@ -3522,7 +3522,7 @@ mod tests {
     #[test]
     fn reopening_a_popup_keeps_its_outcome_without_showing_it_on_another_sheet() {
         let mut b = bench(&["a.png", "b.png"], &[]);
-        b.app.settings.ai.instant = None;
+        b.app.settings.ai.single = None;
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Label));
         let error = b.app.selected_label_outcome().unwrap().to_string();
         b.app.label_view = false;
@@ -3549,7 +3549,7 @@ mod tests {
         let mut b = bench(&["a.png", "b.png"], &[]);
         b.app.open_library(&b.ctx, 0);
         assert!(!b.app.single_log_available());
-        b.app.settings.ai.instant = None;
+        b.app.settings.ai.single = None;
         b.app.label_action(&b.ctx, labels::Action::Label);
         assert!(b.app.single_log_available());
         let first = b.app.selected_single_log().unwrap().clone();
