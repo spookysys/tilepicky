@@ -137,7 +137,7 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 
 ### Search by meaning
 
-**Generate Embeddings (AI)...** turns each labeled sheet into one vector, so that search can match a query by meaning rather than by prefix. The button sits in the library AI panel and beside the source header.
+**Generate Embeddings (AI)...** turns each labeled sheet into one vector, so that search can match a query by meaning rather than by prefix. The button sits in the library AI panel and beside the source header, and also in the right-click menu of a library file or folder.
 
 The caption and the tags of each sheet go to the embedding model. The images stay on this machine. The confirm names the model and the number of sheets before anything is sent.
 
@@ -162,7 +162,7 @@ Use **Rerun all...** to label every sheet again with the current library model a
 Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
 
 To label part of a library, choose the sheets in the tree first.
-Right-click a folder and select **Generate Tags (AI)...**. That target is every sheet below the folder, in its subfolders too.
+Ctrl+click a folder to choose every sheet below it, in its subfolders too; the chosen folder wears the selection colour. Right-click a folder and select **Generate Tags (AI)...** does the same.
 To choose single files, Ctrl+click each one, then right-click one of them and select **Label N sheets with AI...**.
 The panel names the target and offers **Label unlabeled in selection...** and **Rerun all in selection...**.
 Use **Whole library** to clear the choice. A folder and loose files cannot share one selection.

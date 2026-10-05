@@ -169,6 +169,8 @@ struct App {
     sweep: Option<usize>,
     /// Files marked with Ctrl+click in the LIBRARY tree, for a library batch.
     library_marked: HashSet<usize>,
+    /// The folder chosen as the library batch target, if any.
+    library_dir: Option<String>,
     /// The last plainly clicked library file, for shift ranges.
     library_anchor: Option<usize>,
     /// A drag across the library files started here; it marks a group while it lasts.
@@ -431,6 +433,7 @@ impl App {
             tree_cursor: None,
             sweep: None,
             library_marked: HashSet::new(),
+            library_dir: None,
             library_anchor: None,
             library_sweep: None,
             library_order: Vec::new(),
@@ -2343,15 +2346,18 @@ impl App {
                 if !self.library_marked.remove(&i) {
                     self.library_marked.insert(i);
                 }
+                self.library_dir = None;
                 self.library_anchor = Some(i);
             }
             TreeAction::Range(i, additive) => {
                 let a = self.library_anchor.unwrap_or(i);
                 self.mark_library_range(a, i, additive);
+                self.library_dir = None;
             }
             TreeAction::SweepStart(i) => {
                 self.library_sweep = Some(i);
                 self.library_anchor = Some(i);
+                self.library_dir = None;
                 self.library_marked.clear();
                 self.library_marked.insert(i);
             }
@@ -2364,6 +2370,7 @@ impl App {
                 if !rels.is_empty() {
                     let count = rels.len();
                     self.library_batch.choose(rels, format!("{count} sheets"));
+                    self.library_dir = None;
                     self.ai_panel = true;
                 }
             }
@@ -2374,8 +2381,16 @@ impl App {
                 if !rels.is_empty() {
                     let count = rels.len();
                     self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
+                    self.library_marked.clear();
+                    self.library_dir = Some(dir.clone());
                     self.ai_panel = true;
                 }
+            }
+            TreeAction::Embeddings => {
+                let can = self.library.is_set() && self.library.index.error.is_none()
+                    && self.library.index.entries.iter().any(|e| e.side.label.is_some());
+                if can { self.embed_confirm = Some(self.embed_plan()); }
+                else { self.status = "Label at least one sheet before generating embeddings.".into(); }
             }
             TreeAction::Labels(i, action) => {
                 let rel = self.library.index.entries[i].rel.clone();
@@ -2398,6 +2413,8 @@ impl App {
     /// `project_order` is the files in the order the tree shows them.
     fn project_tree_action(&mut self, ctx: &egui::Context, action: TreeAction, project_order: &[usize]) {
         match action {
+            // The project tree never offers embeddings; only the library does.
+            TreeAction::Embeddings => {}
             TreeAction::Open(i) => {
                 // The plainly clicked file is the start of any group.
                 self.marked.clear();
@@ -2697,6 +2714,7 @@ impl App {
                             visible: self.library.visible.as_deref(),
                             selected: self.library.sel,
                             marked: Some(&self.library_marked),
+                            selected_dir: self.library_dir.as_deref(),
                             query: &self.qwords,
                             apply_query: self.open_trees,
                             menus: false,
@@ -2778,6 +2796,7 @@ impl App {
                         visible: self.project.visible.as_deref(),
                         selected: self.project.sel,
                         marked: Some(&self.marked),
+                        selected_dir: None,
                         query: &self.qwords,
                         apply_query: self.open_trees,
                         menus: true,
@@ -2835,6 +2854,9 @@ impl App {
         if let Some(action) = library_action {
             self.library_tree_action(ctx, action);
         }
+        // The folder highlight follows the batch target. Clearing the target
+        // (Whole library) clears the highlight too.
+        if self.library_batch.choice.is_none() { self.library_dir = None; }
         if let Some(action) = project_action {
             self.project_tree_action(ctx, action, &project_order);
         }

@@ -14,6 +14,8 @@ pub enum TreeAction {
     Batch(Vec<usize>),
     /// Run a library batch over every file under this folder.
     BatchDir(String),
+    /// Generate embeddings for the labeled sheets of this library.
+    Embeddings,
     /// Ctrl+click: add or remove the file from the marked set.
     Toggle(usize),
     /// Shift+click: mark the range from the anchor to this file; with Ctrl
@@ -65,6 +67,8 @@ pub struct View<'a> {
     pub selected: Option<usize>,
     /// The files in the marked group.
     pub marked: Option<&'a HashSet<usize>>,
+    /// The folder chosen as the library batch target, for its highlight.
+    pub selected_dir: Option<&'a str>,
     pub query: &'a [String],
     /// The query changed this frame: set the folders open or closed once.
     pub apply_query: bool,
@@ -178,6 +182,16 @@ impl Node {
                 let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.4);
                 ui.painter().set(band, egui::Shape::rect_filled(header.header_response.rect, 2.0, fill));
             }
+            // Ctrl+click chooses the folder as the library batch target, the
+            // way Ctrl+click marks a file.
+            if !v.menus && header.header_response.clicked() && ui.input(|i| i.modifiers.command) {
+                action = Some(TreeAction::BatchDir(rel.clone()));
+            }
+            // The chosen folder wears the solid selection colour.
+            if v.selected_dir == Some(rel.as_str()) {
+                let fill = ui.visuals().selection.bg_fill;
+                ui.painter().set(band, egui::Shape::rect_filled(header.header_response.rect, 2.0, fill));
+            }
             // A folder under lifted files is where they land.
             if v.lifting && header.header_response.contains_pointer() {
                 *hover_dir = Some(rel.clone());
@@ -189,6 +203,10 @@ impl Node {
                 if !v.menus {
                     if ui.button("Generate Tags (AI)…").clicked() {
                         action = Some(TreeAction::BatchDir(rel.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Generate Embeddings (AI)…").clicked() {
+                        action = Some(TreeAction::Embeddings);
                         ui.close();
                     }
                     ui.separator();
@@ -293,6 +311,10 @@ impl Node {
                     } else if let Some(command) = crate::labels::menu(ui) {
                         action = Some(TreeAction::Labels(*i, command));
                     }
+                    if ui.button("Generate Embeddings (AI)…").clicked() {
+                        action = Some(TreeAction::Embeddings);
+                        ui.close();
+                    }
                 }
                 // Only a tree the user owns offers the items that change files.
                 if v.menus && group {
@@ -350,6 +372,7 @@ mod tests {
                     visible: None,
                     selected: None,
                     marked: None,
+                    selected_dir: None,
                     query: &[],
                     apply_query: false,
                     menus: false,
