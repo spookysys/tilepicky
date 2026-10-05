@@ -1135,7 +1135,7 @@ impl Panel {
             ui.horizontal_wrapped(|ui| {
                 if !job.done() && mode != Mode::Cancelling {
                     let text = if mode == Mode::Paused { "Resume" }
-                        else if job.provider.kind == Kind::Gemini { "Pause uploads" } else { "Pause" };
+                        else if job.provider.kind == Kind::Gemini || job.provider.store.is_some() { "Pause uploads" } else { "Pause" };
                     if crate::stopped(ui.button(text)).clicked() { pause = Some(if mode == Mode::Paused { Mode::Running } else { Mode::Paused }); }
                     if crate::stopped(ui.button("Cancel job")).clicked() { cancel = true; }
                 }

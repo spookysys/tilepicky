@@ -170,6 +170,7 @@ Use **Whole library** to clear the choice. A folder and loose files cannot share
 The confirmation estimates the job's cost in USD before you start. **Estimate details** shows input and output token ranges and price sources.
 It reads local image sizes and fetches OpenRouter's public model prices. It does not upload sheets to calculate the estimate.
 Google estimates use a dated table of batch prices. The table expires instead of silently keeping old prices.
+With **Sheet storage**, the OpenRouter estimate uses the batch rate, about half the live catalog price.
 For `gemini-flash-latest`, the confirmation names its price assumption because the alias can change.
 Unsupported models, expired prices, or a failed price lookup show an unavailable estimate. You can still start the job.
 
@@ -195,6 +196,7 @@ Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Googl
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
 A model serves single sheets, library jobs, or both. The model editor ticks each scope, and sets how many requests or batches a library job keeps in flight.
 Library models show **OpenRouter batch**, **Several sheets at a time**, or **Google batch**, depending on the provider and its storage.
+Not every batch provider can carry an image. A Google-batched model cannot, and its sheets end with a message that names the cause. Choose a Library model whose provider can carry images, or label those sheets one at a time with the Single sheet model.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
 Repeated errors appear once, with the affected sheet count. **Error details** keeps the full explanations and affected sheet paths.
@@ -211,8 +213,8 @@ The main message distinguishes queued work, processing, and an unknown provider 
 
 **Pause uploads** stops new submissions after the current request finishes. Tilepicky still collects accepted results.
 For a provider that labels sheets one by one, the button is **Pause**. **Resume** continues the same job.
-**Cancel job** stops new submissions and asks Google to cancel accepted work.
-The job remains visible as **Cancellation pending** until Google confirms an outcome. Saved labels stay.
+**Cancel job** stops new submissions. For a Google batch it asks Google to cancel accepted work, and the job stays visible as **Cancellation pending** until Google confirms an outcome.
+An OpenRouter batch has no cancel call: Tilepicky stops waiting and releases the uploaded objects, but the batch may still finish at OpenRouter and bill. Its sheet labels are not collected. Saved labels stay.
 
 Closing pauses local uploads and result collection. Google can continue work it has accepted.
 Reopen the same library to continue. Pause and cancellation requests survive restart.
@@ -425,6 +427,8 @@ Settings are stored in `~/.config/tilepicky/settings.json`.
 ### Setting up a bucket
 
 Use any S3-compatible object store. Cloudflare R2 is a common choice: 10 GB free and no egress fees, though it asks for a payment method before it activates, even on the free tier. Backblaze B2 is an alternative.
+
+The store must be reachable from the internet, because OpenRouter fetches the signed URL. A MinIO instance on your own machine works for **Test connection** but not for a batch.
 
 1. Make an account, enable the object store, and create a bucket.
 2. Create an API token scoped to that one bucket, read and write objects. It gives an access key ID and a secret access key.
