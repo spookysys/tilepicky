@@ -44,12 +44,15 @@ fn batch_body(model: &str, requests: &[(usize, Value)]) -> Value {
 /// Uploads the next sheets and submits them as one OpenRouter batch.
 pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
     let Some(objects) = job.objects.clone() else { return Err("Object storage is not set for this provider.".into()) };
+    let book = crate::sidecar::load_book(root)?;
     let (mut requests, mut taken) = (Vec::new(), Vec::new());
     for i in 0..job.sheets.len() {
         if job.sheets[i].taken { continue; }
         if requests.len() == MAX_REQUESTS { break; }
         let bytes = std::fs::read(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))?;
         let image = image::load_from_memory(&bytes).map_err(|e| format!("Could not read the image: {e}"))?;
+        job.sheets[i].guard = Some(InputGuard { hash: { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(&bytes)) },
+            label: book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone()) });
         let png = labels::png_bytes(&image.to_rgba8())?;
         let object = object_key(&png);
         let url = match objects.upload(&object, &png) {

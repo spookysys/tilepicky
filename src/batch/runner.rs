@@ -225,7 +225,7 @@ impl Runner {
                 }
                 let batch_ready = batch_send.is_some() && coordinator.job.mode == Mode::Running
                     && !coordinator.job.pending_save();
-                if batch_ready && let Some(send) = &batch_send {
+                if batch_ready && coordinator.job.provider.kind == Kind::Gemini && let Some(send) = &batch_send {
                     dirty |= coordinator.dispatch_submissions(&mut submits, send, &log, now);
                 }
                 if submits.inflight() > 0 {
