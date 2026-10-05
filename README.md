@@ -73,9 +73,9 @@ Search matches query terms as prefixes against sheet metadata:
 
 - Entering `gra` matches `grass`.
 - Multiple terms require all words to match.
-- The filter menu beside the input toggles target fields: folder names, file names, AI captions, and AI tags.
+- The filter menu beside the input toggles target fields: folder names, file names, AI captions, AI tags, and embeddings (meaning).
 
-Search runs locally and synchronously on your machine. It makes no network requests.
+The word fields are matched locally and synchronously on your machine. The embeddings field is a sibling of them, not a mode above them: a sheet shows when any enabled field matches. It needs an embedding index; see [Search by meaning](#search-by-meaning). Until the library has one, the checkbox matches nothing, the way an empty caption field does.
 
 ## Labeling sheets with AI
 
@@ -88,8 +88,8 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 
 ### Label a single sheet
 
-1. Open a library sheet and click **AI label...** beside the source header.
-   You can also choose **Label with AI...** from the sheet or file-tree context menu.
+1. Open a library sheet and click **Tags (AI)...** beside the source header.
+   You can also choose **Generate Tags (AI)...** from the sheet or file-tree context menu.
 2. Choose the **Single sheet** model and its provider key in Settings (`Ctrl+,`).
    Both Google Gemini and OpenAI-compatible image models are supported.
 3. Click **Label this sheet**. The dialog shows progress, the result, or the error.
@@ -135,6 +135,20 @@ Existing batches keep their original prompt and context policy. The request log 
 
 GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixels are scaled down before submission.
 
+### Search by meaning
+
+**Generate Embeddings (AI)...** turns each labeled sheet into one vector, so that search can match a query by meaning rather than by prefix. The button sits in the library AI panel and beside the source header.
+
+The caption and the tags of each sheet go to the embedding model. The images stay on this machine. The confirm names the model and the number of sheets before anything is sent.
+
+The vectors live in `embeddings.json` beside the library, with the model that made them. Generating again embeds only the sheets whose label changed. A different embedding model re-embeds every labeled sheet.
+
+Choose the **Embeddings** model in Settings (`Ctrl+,`). Only labeled sheets get a vector. OpenRouter serves embeddings through an OpenAI-style endpoint.
+
+The **embeddings (meaning)** checkbox in the search filter then matches a sheet whose vector is close to the query's. It is a peer of the word fields. A sheet with no vector, or a library whose vectors came from another model, matches nothing by meaning.
+
+With that checkbox on, the query text goes to the embedding model, once per settled query, so that Tilepicky can compare it. The word fields need no network.
+
 ### Label an entire library
 
 To label multiple library sheets in bulk:
@@ -148,7 +162,7 @@ Use **Rerun all...** to label every sheet again with the current library model a
 Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
 
 To label part of a library, choose the sheets in the tree first.
-Right-click a folder and select **Label with AI...**. That target is every sheet below the folder, in its subfolders too.
+Right-click a folder and select **Generate Tags (AI)...**. That target is every sheet below the folder, in its subfolders too.
 To choose single files, Ctrl+click each one, then right-click one of them and select **Label N sheets with AI...**.
 The panel names the target and offers **Label unlabeled in selection...** and **Rerun all in selection...**.
 Use **Whole library** to clear the choice. A folder and loose files cannot share one selection.
@@ -174,7 +188,7 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends ordinary requests for the sheets in the background, several at a time. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends ordinary requests for the sheets in the background, several at a time. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Generate Tags (AI)** asks once more.
 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.

@@ -58,6 +58,7 @@ impl App {
         self.remove_label_dialog(ctx);
         self.clear_labels_dialog(ctx);
         self.label_options_dialog(ctx);
+        self.embed_confirm_dialog(ctx);
         self.prompt_dialog(ctx);
         self.library_batch.confirmation(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.has_unsaved() {
@@ -361,7 +362,8 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     options = ui.button("Edit library options...").clicked();
                     if ui.button("Current prompt...").clicked() {
-                        self.prompt_view = Some(("Next request for this sheet".into(), labels::sheet_prompt(labels::prompt(&target.tags, target.free_tags), &target.rel)));
+                        let texts = labels::sheet_prompt(labels::prompt(&target.tags, target.free_tags), &target.rel);
+                        self.prompt_view = Some(("Next request for this sheet".into(), texts));
                     }
                 });
             });
@@ -423,6 +425,36 @@ impl App {
             }
         }
         if close { self.label_options = None; }
+    }
+
+    /// Asks before label text goes to the embedding provider.
+    fn embed_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some((model, count)) = self.embed_confirm.clone() else { return };
+        let mut start = false;
+        let mut close = false;
+        egui::Modal::new(Id::new("generate embeddings")).show(ctx, |ui| {
+            ui.set_width(440.0_f32.min(ctx.content_rect().width() - 48.0));
+            ui.heading("Generate Embeddings (AI)?");
+            ui.label(self.library.index.root.display().to_string());
+            if model.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, "Choose an embedding model in Settings.");
+            } else {
+                ui.label(format!("Model: {model}"));
+                ui.label(format!("Labeled sheets that need an embedding: {count}."));
+                ui.label("The caption and the tags of each sheet go to the provider. The images stay on this machine.");
+                ui.label("Each vector is kept in embeddings.json beside the library.");
+            }
+            footer(ui, |ui| {
+                start = ui.add_enabled(!model.is_empty() && count > 0, egui::Button::new("Generate")).clicked();
+                close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+            });
+        });
+        if start {
+            self.embed_start = true;
+            self.embed_confirm = None;
+        } else if close {
+            self.embed_confirm = None;
+        }
     }
 
     /// Shows a prompt as it goes to the model. The text can be selected and copied.

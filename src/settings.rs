@@ -28,13 +28,17 @@ pub struct SearchIn {
     pub captions: bool,
     #[serde(default = "enabled")]
     pub tags: bool,
+    /// Semantic search: a sheet matches when its embedding is close to the
+    /// query's. It does nothing until embeddings exist for the library.
+    #[serde(default = "enabled")]
+    pub embeddings: bool,
 }
 
 fn enabled() -> bool { true }
 
 impl Default for SearchIn {
     fn default() -> Self {
-        SearchIn { folders: true, files: true, captions: true, tags: true }
+        SearchIn { folders: true, files: true, captions: true, tags: true, embeddings: true }
     }
 }
 
@@ -117,6 +121,15 @@ mod tests {
         assert_eq!(s.ai, crate::ai::Ai::default());
         let s: Settings = serde_json::from_str(r#"{"ai": {"providers": []}}"#).unwrap();
         assert!(s.ai.providers.is_empty());
+    }
+
+    /// An older file that lists the four text fields gets the embeddings
+    /// field, on by default like the others.
+    #[test]
+    fn an_old_search_section_gets_the_embeddings_field() {
+        let s: Settings = serde_json::from_str(r#"{"search": {"folders": true, "files": true, "captions": true, "tags": true}}"#).unwrap();
+        assert!(s.search.embeddings);
+        assert_eq!(s.search, SearchIn::default());
     }
 
     #[test]

@@ -145,6 +145,9 @@ pub struct Model {
     pub provider: String,
     /// The provider model ID, with the internal `:batch` suffix for library scope.
     pub id: String,
+    /// The model makes embeddings for semantic search, not labels.
+    #[serde(default)]
+    pub embed: bool,
 }
 
 impl Model {
@@ -169,9 +172,10 @@ impl Model {
         ModelRef { provider: self.provider.clone(), model: self.id.clone() }
     }
 
-    /// How a list names the model: its id, then its provider.
+    /// How a list names the model: its id, then its provider and scope.
     fn label(&self) -> String {
-        format!("{} ({}, {})", self.id.trim_end_matches(BATCH), self.provider, self.mode().label())
+        if self.embed { format!("{} ({}, embeddings)", self.id.trim_end_matches(BATCH), self.provider) }
+        else { format!("{} ({}, {})", self.id.trim_end_matches(BATCH), self.provider, self.mode().label()) }
     }
 }
 
@@ -194,6 +198,9 @@ pub struct Ai {
     pub instant: Option<ModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<ModelRef>,
+    /// The model that makes embeddings for semantic search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<ModelRef>,
 }
 
 /// A fresh install offers OpenRouter and Google models, without keys.
@@ -205,7 +212,7 @@ impl Default for Ai {
         openrouter.url = "https://openrouter.ai/api/v1".into();
         openrouter.key_env = vec!["OPENROUTER_API_KEY".into()];
         let google = Provider::new("Google", Kind::Gemini);
-        let on = |provider: &str, id: &str| Model { provider: provider.into(), id: id.into() };
+        let on = |provider: &str, id: &str| Model { provider: provider.into(), id: id.into(), embed: false };
         let models = vec![
             on("OpenRouter", "~deepseek/deepseek-flash-latest"),
             on("OpenRouter", "~deepseek/deepseek-flash-latest:batch"),
@@ -213,9 +220,11 @@ impl Default for Ai {
             on("OpenRouter", "z-ai/glm-5.3-flash:batch"),
             on("Google", "gemini-flash-latest:batch"),
             on("Google", "gemini-flash-latest"),
+            Model { provider: "OpenRouter".into(), id: "openai/text-embedding-3-small".into(), embed: true },
         ];
         let (instant, batch) = (Some(models[0].reference()), Some(models[1].reference()));
-        Ai { providers: vec![openrouter, google], models, instant, batch }
+        let embed = Some(models[6].reference());
+        Ai { providers: vec![openrouter, google], models, instant, batch, embed }
     }
 }
 
@@ -247,6 +256,10 @@ impl Ai {
             let mut seen = std::collections::HashSet::new();
             self.models.retain(|m| seen.insert((m.provider.clone(), m.id.clone())));
         }
+        // An embedding model carries no scope suffix.
+        for model in self.models.iter_mut().filter(|m| m.embed) {
+            model.id = model.id.trim_end_matches(BATCH).to_string();
+        }
         let before = self.models.len();
         self.models.retain(|m| !m.id.is_empty() && !RETIRED.contains(&(m.provider.as_str(), m.id.as_str())));
         let retired = self.models.len() < before;
@@ -259,7 +272,7 @@ impl Ai {
             }
         }
         if google && !self.models.iter().any(|m| m.provider == "Google" && m.id == "gemini-flash-latest") {
-            self.models.push(Model { provider: "Google".into(), id: "gemini-flash-latest".into() });
+            self.models.push(Model { provider: "Google".into(), id: "gemini-flash-latest".into(), embed: false });
         }
         for (mode, fallback) in [(Mode::Instant, shipped.instant), (Mode::Batch, shipped.batch)] {
             if self.chosen(mode).is_none() {
@@ -270,6 +283,17 @@ impl Ai {
                 }
             }
         }
+        if self.chosen_embed().is_none() {
+            self.embed = shipped.embed.filter(|r| self.models.iter().any(|m| m.is(r) && m.embed));
+        }
+    }
+
+    /// The embedding model, with its provider, while both exist.
+    pub fn chosen_embed(&self) -> Option<(&Provider, &Model)> {
+        let r = self.embed.as_ref()?;
+        let m = self.models.iter().find(|m| m.is(r) && m.embed)?;
+        let p = self.providers.iter().find(|p| p.name == m.provider)?;
+        Some((p, m))
     }
 
     /// The model chosen for a mode, with its provider, while both exist.
@@ -348,22 +372,32 @@ impl Keys {
 /// stays short. Edits land in place; the caller writes both files when the
 /// dialog closes.
 pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
-    let Ai { providers, models, instant, batch } = ai;
+    let Ai { providers, models, instant, batch, embed } = ai;
     ui.strong("Active models");
     ui.small("Used for new requests. Existing jobs keep their original models.");
     egui::Grid::new("defaults").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
         for (mode, slot) in [(Mode::Instant, &mut *instant), (Mode::Batch, &mut *batch)] {
             ui.label(mode.label());
-            let current = slot.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.mode() == mode));
+            let current = slot.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.mode() == mode && !m.embed));
             let active_name = |m: &Model| format!("{} ({})", m.id.trim_end_matches(BATCH), m.provider);
             let text = current.map_or("none".to_string(), active_name);
             egui::ComboBox::from_id_salt(("default", mode.label())).selected_text(text).show_ui(ui, |ui| {
-                for m in models.iter().filter(|m| m.mode() == mode) {
+                for m in models.iter().filter(|m| m.mode() == mode && !m.embed) {
                     ui.selectable_value(slot, Some(m.reference()), active_name(m));
                 }
             });
             ui.end_row();
         }
+        ui.label("Embeddings");
+        let current = embed.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.embed));
+        let embed_name = |m: &Model| format!("{} ({})", m.id.trim_end_matches(BATCH), m.provider);
+        let text = current.map_or("none".to_string(), embed_name);
+        egui::ComboBox::from_id_salt("default embeddings").selected_text(text).show_ui(ui, |ui| {
+            for m in models.iter().filter(|m| m.embed) {
+                ui.selectable_value(embed, Some(m.reference()), embed_name(m));
+            }
+        });
+        ui.end_row();
     });
     let mut configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
     if let Some(selected) = batch.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
@@ -405,10 +439,10 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
         ui.label("Use this section to add custom models or providers, or change their connection settings.");
         ui.small("A provider is the service you connect to. A model is the AI you choose from that service.");
         ui.strong("Providers");
-        providers_ui(ui, providers, models, instant, batch, keys);
+        providers_ui(ui, providers, models, instant, batch, embed, keys);
         ui.separator();
         ui.strong("Models");
-        if models_ui(ui, providers, models, instant, batch) {
+        if models_ui(ui, providers, models, instant, batch, embed) {
             ui.data_mut(|d| d.insert_temp(egui::Id::new("configure Gemini"), true));
             ui.ctx().request_repaint();
         }
@@ -434,7 +468,7 @@ fn gemini_setup(providers: &mut Vec<Provider>, models: &mut Vec<Model>) -> (usiz
     });
     let name = &providers[provider].name;
     let model = models.iter().position(|m| &m.provider == name && m.mode() == Mode::Batch).unwrap_or_else(|| {
-        models.push(Model { provider: name.clone(), id: "gemini-flash-latest:batch".into() }); models.len() - 1
+        models.push(Model { provider: name.clone(), id: "gemini-flash-latest:batch".into(), embed: false }); models.len() - 1
     });
     (provider, model)
 }
@@ -496,6 +530,7 @@ fn providers_ui(
     models: &mut Vec<Model>,
     instant: &mut Option<ModelRef>,
     batch: &mut Option<ModelRef>,
+    embed: &mut Option<ModelRef>,
     keys: &mut Keys,
 ) {
     // The name is what the models, the defaults, and the key hold on to, so
@@ -517,7 +552,7 @@ fn providers_ui(
                 for m in models.iter_mut().filter(|m| m.provider == old) {
                     m.provider = p.name.clone();
                 }
-                for r in [&mut *instant, &mut *batch].into_iter().flatten() {
+                for r in [&mut *instant, &mut *batch, &mut *embed].into_iter().flatten() {
                     if r.provider == old {
                         r.provider = p.name.clone();
                     }
@@ -573,7 +608,7 @@ fn providers_ui(
     if remove && sel < providers.len() {
         let gone = providers.remove(sel);
         models.retain(|m| m.provider != gone.name);
-        for r in [&mut *instant, &mut *batch] {
+        for r in [&mut *instant, &mut *batch, &mut *embed] {
             if r.as_ref().is_some_and(|r| r.provider == gone.name) {
                 *r = None;
             }
@@ -581,12 +616,14 @@ fn providers_ui(
     }
 }
 
-/// One model at a time: its provider, ID, and scope. Active selections follow edits.
-fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>, instant: &mut Option<ModelRef>, batch: &mut Option<ModelRef>) -> bool {
+/// One model at a time: its provider, ID, scope, and whether it makes
+/// embeddings. Active selections follow edits.
+fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
+    instant: &mut Option<ModelRef>, batch: &mut Option<ModelRef>, embed: &mut Option<ModelRef>) -> bool {
     let mut configure = false;
     let names = models.iter().map(Model::label).collect();
     let first = providers.first().map(|p| p.name.clone()).unwrap_or_default();
-    let (sel, remove) = selector(ui, "model", names, &mut || models.push(Model { provider: first.clone(), id: String::new() }));
+    let (sel, remove) = selector(ui, "model", names, &mut || models.push(Model { provider: first.clone(), id: String::new(), embed: false }));
     if let Some(m) = models.get_mut(sel) {
         let before = m.reference();
         egui::Grid::new("model fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -598,34 +635,42 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
             });
             ui.end_row();
             ui.label("Model ID");
-            let mut mode = m.mode();
             let mut id = m.id.trim_end_matches(BATCH).to_string();
             if ui.add(egui::TextEdit::singleline(&mut id).desired_width(f32::INFINITY)).changed() {
                 m.id = id.trim_end_matches(BATCH).to_string();
-                m.set_batch(mode == Mode::Batch);
+                if !m.embed { m.set_batch(m.mode() == Mode::Batch); }
             }
             ui.end_row();
-            ui.label("Use for");
-            egui::ComboBox::from_id_salt("model scope").selected_text(mode.label()).show_ui(ui, |ui| {
-                for scope in [Mode::Instant, Mode::Batch] { ui.selectable_value(&mut mode, scope, scope.label()); }
-            });
-            m.set_batch(mode == Mode::Batch);
+            ui.label("Embedding");
+            if ui.checkbox(&mut m.embed, "makes embeddings").changed() && m.embed {
+                // An embedding model carries no scope suffix.
+                m.id = m.id.trim_end_matches(BATCH).to_string();
+            }
             ui.end_row();
-            if mode == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider) {
-                ui.label("Processing");
-                ui.label(match provider.kind {
-                    Kind::OpenAi => "Several sheets at a time",
-                    Kind::Gemini => "Google batch",
+            if !m.embed {
+                let mut mode = m.mode();
+                ui.label("Use for");
+                egui::ComboBox::from_id_salt("model scope").selected_text(mode.label()).show_ui(ui, |ui| {
+                    for scope in [Mode::Instant, Mode::Batch] { ui.selectable_value(&mut mode, scope, scope.label()); }
                 });
+                m.set_batch(mode == Mode::Batch);
                 ui.end_row();
+                if mode == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider) {
+                    ui.label("Processing");
+                    ui.label(match provider.kind {
+                        Kind::OpenAi => "Several sheets at a time",
+                        Kind::Gemini => "Google batch",
+                    });
+                    ui.end_row();
+                }
             }
         });
-        if m.mode() == Mode::Batch && providers.iter().any(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
+        if !m.embed && m.mode() == Mode::Batch && providers.iter().any(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
             configure = endpoint_notice(ui);
         }
         let after = m.reference();
         if after != before {
-            for r in [&mut *instant, &mut *batch].into_iter().flatten() {
+            for r in [&mut *instant, &mut *batch, &mut *embed].into_iter().flatten() {
                 if *r == before {
                     *r = after.clone();
                 }
@@ -634,7 +679,7 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
     }
     if remove && sel < models.len() {
         let gone = models.remove(sel).reference();
-        for r in [&mut *instant, &mut *batch] {
+        for r in [&mut *instant, &mut *batch, &mut *embed] {
             if r.as_ref() == Some(&gone) {
                 *r = None;
             }
@@ -720,7 +765,7 @@ mod tests {
     /// come in, and the choices follow; a model the user added stays.
     #[test]
     fn retired_models_give_way_to_the_shipped_ones() {
-        let on = |id: &str| Model { provider: "OpenRouter".into(), id: id.into() };
+        let on = |id: &str| Model { provider: "OpenRouter".into(), id: id.into(), embed: false };
         let mut ai = Ai {
             models: vec![on("xiaomi/mimo-v2.5"), on("openrouter/free"), on("xiaomi/mimo-v2.5:batch"), on("mine/vision")],
             instant: Some(on("openrouter/free").reference()),
@@ -730,7 +775,8 @@ mod tests {
         ai.heal();
         let ids: Vec<_> = ai.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["mine/vision", "~deepseek/deepseek-flash-latest", "~deepseek/deepseek-flash-latest:batch",
-            "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-flash-latest:batch", "gemini-flash-latest"]);
+            "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-flash-latest:batch", "gemini-flash-latest",
+            "openai/text-embedding-3-small"]);
         assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
         assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest:batch"));
     }
@@ -739,7 +785,7 @@ mod tests {
     /// models, and choices that name nothing.
     #[test]
     fn an_old_file_heals_to_the_shipped_models() {
-        let mut ai = Ai { models: vec![Model { provider: "OpenRouter".into(), id: String::new() }], ..Ai::default() };
+        let mut ai = Ai { models: vec![Model { provider: "OpenRouter".into(), id: String::new(), embed: false }], ..Ai::default() };
         ai.batch = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash".into() });
         ai.heal();
         assert_eq!(ai.models, Ai::default().models);
@@ -751,8 +797,8 @@ mod tests {
     fn google_defaults_migrate_without_changing_custom_models_or_other_defaults() {
         let mut ai = Ai::default();
         ai.models.retain(|m| m.provider != "Google");
-        ai.models.push(Model { provider: "Google".into(), id: "gemini-3.7-flash:batch".into() });
-        ai.models.push(Model { provider: "Google".into(), id: "custom-model".into() });
+        ai.models.push(Model { provider: "Google".into(), id: "gemini-3.7-flash:batch".into(), embed: false });
+        ai.models.push(Model { provider: "Google".into(), id: "custom-model".into(), embed: false });
         ai.batch = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash:batch".into() });
         let instant = ai.instant.clone(); let providers = ai.providers.clone();
         ai.heal();
@@ -765,7 +811,7 @@ mod tests {
 
     #[test]
     fn the_batch_end_of_the_id_is_the_mode() {
-        let mut m = Model { provider: "P".into(), id: "x".into() };
+        let mut m = Model { provider: "P".into(), id: "x".into(), embed: false };
         assert_eq!(m.mode(), Mode::Instant);
         m.set_batch(true);
         m.set_batch(true);

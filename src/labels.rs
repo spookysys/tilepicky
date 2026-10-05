@@ -13,7 +13,7 @@ pub enum Action { Label, Show, Remove, Cancel }
 
 /// Both context menus open the sheet dialog without starting a request.
 pub fn menu(ui: &mut eframe::egui::Ui) -> Option<Action> {
-    if ui.button("Label with AI...").clicked() {
+    if ui.button("Generate Tags (AI)...").clicked() {
         ui.close();
         Some(Action::Show)
     } else { None }
@@ -672,7 +672,8 @@ pub mod tests {
             let log = crate::ai_log::Log::single("s.png"); let _scope = log.enter();
             let input = Input { path: "s.png".into(), dir: "".into(), rel: "s.png".into(), img: RgbaImage::new(2, 2) };
             let answers = std::sync::Mutex::new(answers);
-            let run = Run::start(input, "p".into(), "m".into(), vec![], crate::sidecar::FREE_TAGS, move |_| Ok(answers.lock().unwrap().remove(0)), || {}).unwrap();
+            let run = Run::start(input, "p".into(), "m".into(), vec![], crate::sidecar::FREE_TAGS,
+                move |_| Ok(answers.lock().unwrap().remove(0)), || {}).unwrap();
             run.result.recv_timeout(Duration::from_secs(5)).unwrap()
         };
         let prose = json!({"choices":[{"finish_reason":"stop", "message":{"content":"**Caption:** Trees"}}]});

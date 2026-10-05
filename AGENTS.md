@@ -46,7 +46,11 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
   grid, pixel origins, animations, and AI label.
 - `src/index.rs`: the scan of a folder, and the search of names, captions,
-  and tags. Search is local and synchronous.
+  tags, and embeddings. The word search is local and synchronous; a semantic
+  match uses a query vector that a worker made.
+- `src/embed.rs`: the embeddings of sheet labels for semantic search, in
+  `embeddings.json` beside the library. It holds the vectors, the request and
+  the reply checks, the cosine, and the generation over a library.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
