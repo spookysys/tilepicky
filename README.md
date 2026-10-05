@@ -193,7 +193,7 @@ With an OpenAI-compatible provider such as OpenRouter, Tilepicky labels a librar
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
-A model serves single sheets, library jobs, or both. The model editor ticks each scope, and sets how many requests or batches a library job keeps in flight.
+A model is a chat model or an embedding model. A chat model serves single sheets, library jobs, or both; the editor ticks each scope, and sets how many requests or batches a library job keeps in flight. An embedding model makes vectors for search and serves no sheet.
 Library models show **OpenRouter batch**, **Several sheets at a time**, or **Google batch**, depending on the provider and its storage.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.

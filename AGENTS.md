@@ -58,6 +58,7 @@ the person who uses the tool; this file is for an agent that works on it.
   and their settings page. OpenRouter requests use the provider skip list.
   An OpenAI-style provider may carry an S3 object store for batch uploads, and
   the matching `(S3 secret)` entry in `keys.json`.
+  A model is a chat model, with the scopes it serves, or an embedding model.
   Single-sheet labeling uses the Single sheet model, through Google Gemini or an OpenAI-compatible endpoint.
   Library jobs use the Library model through Google batches (several at once),
   OpenRouter batches when object storage is set, or several OpenAI-compatible
