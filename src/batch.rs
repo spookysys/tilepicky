@@ -110,8 +110,6 @@ struct Recovery {
     page: String,
     #[serde(default)]
     matches: Vec<String>,
-    #[serde(default)]
-    not_found: bool,
 }
 
 fn key(sheet: usize) -> String { format!("sheet-{sheet}") }
@@ -612,7 +610,9 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
     job.save(dir).and(result.map(|_| ()))
 }
 
-/// Recover by the unique reference saved before submission. Never resend an uncertain request.
+/// Recover by the unique reference saved before submission. A reply never
+/// assumed: the lookup tells whether Google made the batch. When it did not,
+/// the sheets go out again, as if the upload had never started.
 fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     let i = job.groups.iter().position(|g| g.remote == Remote::Submitting && g.recovery.is_some())
         .ok_or("No submission has a recovery reference.")?;
@@ -635,23 +635,30 @@ fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     recovery.page = value["nextPageToken"].as_str().unwrap_or_default().into();
     if !recovery.page.is_empty() { return job.save(dir); }
     let matches = std::mem::take(&mut recovery.matches);
-    recovery.not_found = matches.is_empty();
+    let reference = recovery.reference.clone();
 
-    crate::ai_log::event("batch_recovery_check", json!({"reference":recovery.reference, "matches":matches.len()}));
-    let result = match matches.as_slice() {
+    crate::ai_log::event("batch_recovery_check", json!({"reference":reference, "matches":matches.len()}));
+    match matches.as_slice() {
+        // Google never made this batch: its sheets go out again.
+        [] => {
+            crate::ai_log::event("batch_resubmit", json!({"reference":reference}));
+            job.send_again(i);
+            job.save(dir)
+        }
         [id] => {
-            crate::ai_log::event("batch_recovered", json!({"reference":recovery.reference, "id":id}));
+            crate::ai_log::event("batch_recovered", json!({"reference":reference, "id":id}));
             job.groups[i].tracking.id = id.clone();
             job.groups[i].remote = Remote::Waiting(id.clone());
-            Ok(())
+            job.groups[i].tracking.recoveries += 1;
+            job.groups.rotate_left(i + 1);
+            job.save(dir)
         }
-        [] => Ok(()),
-        _ => Err("Google returned more than one matching batch. Open Advanced recovery; nothing was resent.".into()),
-    };
-    job.groups[i].tracking.recoveries += 1;
-    // Give each unconfirmed group a turn after a complete lookup.
-    job.groups.rotate_left(i + 1);
-    job.save(dir).and(result.map(|_| ()))
+        _ => {
+            job.groups[i].tracking.recoveries += 1;
+            job.groups.rotate_left(i + 1);
+            job.save(dir).and(Err("Google returned more than one matching batch. Open Advanced recovery; nothing was resent.".into()))
+        }
+    }
 }
 
 fn poll(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
@@ -1779,22 +1786,23 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfirmed_submission_is_not_sent_twice() {
+    fn an_unconfirmed_submission_that_never_left_goes_out_again() {
         let files = Files::new();
         let (_, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Unknown("timeout".into())));
         assert!(result.is_err());
-        let mut job = files.journal();
+        let job = files.journal();
         assert!(job.uncertain());
-        let (_, result) = files.advance(job.clone(), |path, body| {
+        let (job, result) = files.advance(job, |path, body| {
             assert_eq!(path, "batches?pageSize=100");
             assert!(body.is_none(), "Recovery must never send another paid request.");
             Ok(json!({"operations":[]}))
         });
         result.unwrap();
-        job.send_again(0);
+        assert!(!job.uncertain(), "a batch Google never made is released for another try");
+        assert!(!job.sheets[0].taken);
         let (job, result) = files.advance(job, id("batches/batch-3"));
         result.unwrap();
-        assert!(!job.uncertain());
+        assert!(matches!(&job.groups[0].remote, Remote::Waiting(_)));
     }
 
     #[test]
@@ -1812,13 +1820,14 @@ mod tests {
         let (job, result) = files.advance(job, |path, body| {
             assert!(path.ends_with(":batchGenerateContent"), "Recovery blocked the queued sheets: {path}");
             let requests = body.unwrap().pointer("/batch/inputConfig/requests/requests").unwrap().as_array().unwrap();
-            assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0]["metadata"]["key"], "sheet-1");
+            assert_eq!(requests.len(), 2, "the released sheet joins the queued one");
+            assert_eq!(requests[0]["metadata"]["key"], "sheet-0");
+            assert_eq!(requests[1]["metadata"]["key"], "sheet-1");
             Ok(json!({"name":"batches/next"}))
         });
         result.unwrap();
-        assert!(job.uncertain());
-        assert_eq!(job.groups.len(), 2);
+        assert!(!job.uncertain());
+        assert_eq!(job.groups.len(), 1);
     }
 
     #[test]
@@ -1846,16 +1855,19 @@ mod tests {
         let mut second = job.groups[0].clone();
         second.recovery.as_mut().unwrap().reference = "second".into();
         job.groups.push(second);
-        let (job, result) = files.advance(job, |_, _| Ok(json!({"operations":[]})));
+        // The first lookup proves the first group absent, so it goes out again.
+        let (mut job, result) = files.advance(job, |_, _| Ok(json!({"operations":[]})));
         result.unwrap();
+        assert_eq!(job.groups.len(), 1);
         assert_eq!(job.groups[0].recovery.as_ref().unwrap().reference, "second");
-        assert!(job.groups[1].recovery.as_ref().unwrap().not_found);
+        // The next lookup turns to the second group, which Google did make.
+        job.submit_next = false;
         let (job, result) = files.advance(job, |_, _| Ok(json!({"operations":[
             {"name":"batches/second", "metadata":{"displayName":"second", "model":"models/test"}}
         ]})));
         result.unwrap();
         assert!(job.groups.iter().any(|g| g.remote == Remote::Waiting("batches/second".into())));
-        assert!(job.uncertain());
+        assert!(!job.uncertain());
     }
 
     #[test]

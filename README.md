@@ -209,7 +209,7 @@ Only one Tilepicky window can own a library job at a time.
 
 Tilepicky saves each submission's reference before sending it. A lost reply triggers an automatic lookup.
 An uncertain submission stays separate while other work can continue. Repeated uncertain uploads temporarily stop new submissions.
-Tilepicky never automatically resends uncertain sheets. **Retry unconfirmed sheets...** explains the possible duplicate charge before a resend.
+When the lookup proves Google never made the batch, Tilepicky sends its sheets again on its own, so an interrupted upload resumes. **Retry unconfirmed sheets...** remains for a submission the lookup could not resolve, and explains the possible duplicate charge before a resend.
 You do not need to find or attach a provider batch ID.
 
 Network operations retry independently, with a delay of up to eight minutes after repeated failures.
