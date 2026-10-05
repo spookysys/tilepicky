@@ -59,7 +59,7 @@ the person who uses the tool; this file is for an agent that works on it.
   Only one labeling job runs at a time. An outstanding batch blocks single-sheet requests.
 - `src/gemini.rs`: shared Gemini request conversion and response validation for both job scopes.
 - `src/labels.rs`: one labeling request per sheet, the library's tag list
-  in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
+  and free-tag count in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
   thread; to cancel, drop the `Run`. Save guards preserve newer local changes. Tests use fake responses.
 - `src/batch.rs`: library batches, one request per sheet: through the
   Gemini batch API, or one at a time to an OpenAI-style endpoint, whose

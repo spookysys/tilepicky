@@ -175,6 +175,11 @@ pub struct Book {
     /// `TAG_LIST`. It lives in the book of the library root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_list: Option<Vec<String>>,
+    /// The most tags the model is asked to add of its own per sheet. The
+    /// tags of `tag_list` do not count. Absent: `FREE_TAGS`. It lives in the
+    /// book of the library root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_tags: Option<usize>,
     /// One library job and its durable commands. Credentials stay in the app configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_batch: Option<serde_json::Value>,
@@ -185,9 +190,19 @@ pub struct Book {
 /// The tags a library looks for until someone changes its list.
 pub const TAG_LIST: [&str; 11] = ["character", "NPC", "hero", "landscape", "building", "indoor", "UI", "font", "animation", "props", "background"];
 
+/// The free tags a library asks for until someone changes the count.
+pub const FREE_TAGS: usize = 16;
+/// The most free tags a library may ask for.
+pub const FREE_TAGS_MAX: usize = 64;
+
 /// The list of a book: its own, else `TAG_LIST`.
 pub fn tag_list(book: &Book) -> Vec<String> {
     book.tag_list.clone().unwrap_or_else(|| TAG_LIST.map(String::from).to_vec())
+}
+
+/// The free-tag count of a book: its own, else `FREE_TAGS`.
+pub fn free_tags(book: &Book) -> usize {
+    book.free_tags.unwrap_or(FREE_TAGS).min(FREE_TAGS_MAX)
 }
 
 /// Writes the tag list of a library. The default list is written as absent,
@@ -195,6 +210,15 @@ pub fn tag_list(book: &Book) -> Vec<String> {
 pub fn store_tag_list(dir: &Path, list: &[String]) -> Result<(), String> {
     update_book(dir, |book| {
         book.tag_list = (list != TAG_LIST).then(|| list.to_vec());
+        Ok(())
+    })
+}
+
+/// Writes the free-tag count of a library. The default is written as absent,
+/// so that a library that never changed it follows a new default.
+pub fn store_free_tags(dir: &Path, free_tags: usize) -> Result<(), String> {
+    update_book(dir, |book| {
+        book.free_tags = (free_tags != FREE_TAGS).then_some(free_tags);
         Ok(())
     })
 }
@@ -475,5 +499,24 @@ mod tests {
         assert!(tag_list(&load_book(dir).unwrap()).is_empty(), "an empty list stays empty");
         store_tag_list(dir, &TAG_LIST.map(String::from)).unwrap();
         assert_eq!(load_book(dir).unwrap().tag_list, None);
+    }
+
+    /// A library starts with the default free-tag count, and keeps one of its
+    /// own at the root of its book. The default is written as absent.
+    #[test]
+    fn the_free_tag_count_lives_at_the_root_of_the_book() {
+        let folder = crate::storage::tests::Folder::new();
+        let dir = &folder.0;
+        assert_eq!(free_tags(&load_book(dir).unwrap()), FREE_TAGS);
+        store_free_tags(dir, 30).unwrap();
+        let text = std::fs::read_to_string(dir.join(BOOK)).unwrap();
+        assert!(text.contains(r#""free_tags": 30"#) || text.contains(r#""free_tags":30"#), "{text}");
+        assert_eq!(free_tags(&load_book(dir).unwrap()), 30);
+        store_free_tags(dir, 0).unwrap();
+        assert_eq!(free_tags(&load_book(dir).unwrap()), 0, "a count of zero stays zero");
+        store_free_tags(dir, FREE_TAGS).unwrap();
+        assert_eq!(load_book(dir).unwrap().free_tags, None);
+        store_free_tags(dir, FREE_TAGS_MAX + 1).unwrap();
+        assert_eq!(free_tags(&load_book(dir).unwrap()), FREE_TAGS_MAX, "a count above the ceiling is held to it");
     }
 }

@@ -106,6 +106,9 @@ struct Recovery {
 
 fn key(sheet: usize) -> String { format!("sheet-{sheet}") }
 
+/// A job journal from before the count existed reads as the default.
+fn default_free_tags() -> usize { crate::sidecar::FREE_TAGS }
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
     #[serde(default)]
@@ -123,6 +126,10 @@ pub struct Job {
     /// asks for it, and every label records it.
     #[serde(default)]
     pub tag_list: Vec<String>,
+    /// The free-tag count when the job started. Every request of the job asks
+    /// for it.
+    #[serde(default = "default_free_tags")]
+    pub free_tags: usize,
     #[serde(default)]
     prompt: Option<[String; 2]>,
     /// Older jobs keep their original requests without file context.
@@ -217,8 +224,8 @@ fn body(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, String> {
 }
 
 fn chat_request(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, String> {
-    let mut request = labels::request(&job.model, img, &job.tag_list)?;
-    let texts = job.prompt.clone().unwrap_or_else(|| labels::prompt(&job.tag_list));
+    let mut request = labels::request(&job.model, img, &job.tag_list, job.free_tags)?;
+    let texts = job.prompt.clone().unwrap_or_else(|| labels::prompt(&job.tag_list, job.free_tags));
     let [system, user] = if job.file_context { labels::sheet_prompt(texts, rel) } else { texts };
     request["messages"][0]["content"] = json!(system);
     request["messages"][1]["content"][0]["text"] = json!(user);
@@ -285,7 +292,8 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
     Ok(Job {
         log_id: crate::ai_log::id(),
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
-        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), prompt: Some(labels::prompt(&index.tag_list)),
+        replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), free_tags: index.free_tags,
+        prompt: Some(labels::prompt(&index.tag_list, index.free_tags)),
         file_context: true, poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
         issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0, estimate: None, usage: cost::Usage::default(),
         sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(),
@@ -1938,7 +1946,7 @@ mod tests {
 
     #[test]
     fn gemini_request_and_response_use_the_same_structured_label() {
-        let request = labels::request("test", &RgbaImage::new(2, 2), &[]).unwrap();
+        let request = labels::request("test", &RgbaImage::new(2, 2), &[], crate::sidecar::FREE_TAGS).unwrap();
         let gemini = crate::gemini::request(&request);
         assert_eq!(gemini["generationConfig"]["responseMimeType"], "application/json");
         assert!(gemini["generationConfig"]["responseJsonSchema"].is_object());

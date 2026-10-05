@@ -217,14 +217,14 @@ fn image_tokens(kind: Kind, model: &str, dimensions: Option<(u32, u32)>) -> [u64
 fn estimate(job: &Job, root: &Path, rates: Option<Rates>, price_note: String, usage: &Usage, cancel: &AtomicBool) -> Option<Estimate> {
     let mut input = [0, 0]; let mut failed_headers = 0;
     // Include the actual schema and prompt. Use a tiny image only to build the request locally.
-    let request = crate::labels::request(&job.model, &image::RgbaImage::new(1, 1), &job.tag_list).ok()?;
+    let request = crate::labels::request(&job.model, &image::RgbaImage::new(1, 1), &job.tag_list, job.free_tags).ok()?;
     let schema = request["response_format"].to_string().chars().count() as u64;
     for sheet in &job.sheets {
         if cancel.load(Ordering::Relaxed) { return None; }
         let dimensions = image::image_dimensions(root.join(&sheet.rel)).ok();
         if dimensions.is_none() { failed_headers += 1; }
         let image = image_tokens(job.provider.kind, &job.model, dimensions);
-        let prompt = job.prompt.clone().unwrap_or_else(|| crate::labels::prompt(&job.tag_list));
+        let prompt = job.prompt.clone().unwrap_or_else(|| crate::labels::prompt(&job.tag_list, job.free_tags));
         let prompt = if job.file_context { crate::labels::sheet_prompt(prompt, &sheet.rel) } else { prompt };
         let chars = prompt.iter().map(|s| s.chars().count() as u64).sum::<u64>() + schema;
         input[0] += image[0] + chars.div_ceil(4) + 32;

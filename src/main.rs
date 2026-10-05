@@ -1507,10 +1507,11 @@ impl App {
     }
 
     fn open_label_options(&mut self, root: PathBuf) {
-        let (text, error) = match sidecar::load_book(&root) {
-            Ok(book) => (sidecar::tag_list(&book).join(", "), String::new()), Err(error) => (String::new(), error),
+        let (text, free_tags, error) = match sidecar::load_book(&root) {
+            Ok(book) => (sidecar::tag_list(&book).join(", "), sidecar::free_tags(&book), String::new()),
+            Err(error) => (String::new(), sidecar::FREE_TAGS, error),
         };
-        self.label_options = Some(labels::Options { root, text, error });
+        self.label_options = Some(labels::Options { root, text, free_tags, error });
     }
 
     #[cfg(test)]
@@ -1610,10 +1611,11 @@ impl App {
             let key = provider.key(&self.keys).ok_or("Set the provider key in Settings.")?;
             let endpoint = labels::Endpoint::for_provider(provider, &model.id, key)?;
             let (input, guard) = labels::Guard::read(&target.dir, &target.rel)?;
-            let list = sidecar::tag_list(&sidecar::load_book(&target.dir)?);
+            let book = sidecar::load_book(&target.dir)?;
+            let (list, free_tags) = (sidecar::tag_list(&book), sidecar::free_tags(&book));
             let (name, id) = (provider.name.clone(), model.id.clone());
             let provider = provider.clone(); let ctx = ctx.clone();
-            let mut run = labels::Run::start(input, name, id, list,
+            let mut run = labels::Run::start(input, name, id, list, free_tags,
                 move |body| endpoint.send(&provider.route(body.clone())), move || ctx.request_repaint())?;
             run.guard = Some(guard);
             Ok::<_, String>(run)

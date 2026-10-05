@@ -361,7 +361,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     options = ui.button("Edit library options...").clicked();
                     if ui.button("Current prompt...").clicked() {
-                        self.prompt_view = Some(("Next request for this sheet".into(), labels::sheet_prompt(labels::prompt(&target.tags), &target.rel)));
+                        self.prompt_view = Some(("Next request for this sheet".into(), labels::sheet_prompt(labels::prompt(&target.tags, target.free_tags), &target.rel)));
                     }
                 });
             });
@@ -393,9 +393,13 @@ impl App {
                 if ui.button("Reset tags").clicked() { options.text = sidecar::TAG_LIST.join(", "); }
                 if ui.button("Prompt template...").clicked() {
                     self.prompt_view = Some(("New requests add each sheet's filename and relative folder".into(),
-                        labels::prompt(&labels::parse_list(&options.text))));
+                        labels::prompt(&labels::parse_list(&options.text), options.free_tags)));
                 }
             });
+            ui.add_space(4.0);
+            ui.strong("Free tags per sheet");
+            ui.label("The most tags the model may add of its own. The tags above are extra, and a reply is kept whole even when the model returns more.");
+            ui.add(egui::DragValue::new(&mut options.free_tags).range(0..=sidecar::FREE_TAGS_MAX).speed(1));
             footer(ui, |ui| {
                 save = ui.button("Save options").clicked();
                 close = ui.button("Cancel").clicked() || (self.prompt_view.is_none() && ui.input(|i| i.key_pressed(Key::Escape)));
@@ -403,10 +407,16 @@ impl App {
         });
         if save {
             let tags = labels::parse_list(&options.text);
-            match sidecar::store_tag_list(&options.root, &tags) {
+            match sidecar::store_tag_list(&options.root, &tags).and_then(|()| sidecar::store_free_tags(&options.root, options.free_tags)) {
                 Ok(()) => {
-                    if self.library.index.root == options.root { self.library.index.tag_list = tags.clone(); }
-                    if let Some(target) = &mut self.label_target && target.dir == options.root { target.tags = tags; }
+                    if self.library.index.root == options.root {
+                        self.library.index.tag_list = tags.clone();
+                        self.library.index.free_tags = options.free_tags;
+                    }
+                    if let Some(target) = &mut self.label_target && target.dir == options.root {
+                        target.tags = tags;
+                        target.free_tags = options.free_tags;
+                    }
                     close = true;
                 }
                 Err(error) => options.error = error,

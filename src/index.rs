@@ -28,6 +28,8 @@ pub struct Index {
     pub tile: [u32; 2],
     /// The tags a labeling request asks for; see `sidecar::Book::tag_list`.
     pub tag_list: Vec<String>,
+    /// The most free tags a labeling request asks for; see `sidecar::Book::free_tags`.
+    pub free_tags: usize,
 }
 
 impl Index {
@@ -42,6 +44,7 @@ impl Index {
                 dirs: Vec::new(),
                 tile: default_tile,
                 tag_list: Vec::new(),
+                free_tags: sidecar::FREE_TAGS,
             };
         }
         let mut rels: Vec<String> = Vec::new();
@@ -78,6 +81,7 @@ impl Index {
             .collect();
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
         let tag_list = sidecar::tag_list(&book);
+        let free_tags = sidecar::free_tags(&book);
         Self {
             root: root.to_path_buf(),
             error,
@@ -85,6 +89,7 @@ impl Index {
             dirs,
             tile,
             tag_list,
+            free_tags,
         }
     }
 

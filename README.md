@@ -96,7 +96,7 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 4. Use **Label again** to replace a saved label, or **Retry** after a failed request.
    Opening the dialog does not send a request.
 
-The model returns a caption, up to 12 freeform tags, and matching tags from your list.
+The model returns a caption, freeform tags, and matching tags from your list. The prompt asks for at most the library's free-tag count, 16 by default; a reply that returns more is kept whole.
 Tilepicky writes the label to `tilepicky.json`. The dialog shows the saved model separately from the next request's model.
 Closing the dialog or pressing Escape keeps the request running. Click its status-bar entry to reopen it.
 The dialog remains attached to its sheet when you select another sheet or library.
@@ -229,9 +229,11 @@ Both links open the same form for their stated library. Separate tags with comma
 Changes apply to new requests in both scopes. Existing jobs keep their original tags.
 The prompt asks the model to check each tag independently, including secondary content.
 It asks for every matching tag, with the spelling from your list, and no duplicate synonyms.
-The model can still miss visible content. These tags do not count toward the 12 the model adds of its own.
+The model can still miss visible content. These tags do not count toward the free-tag count the prompt asks for.
 
-A new library starts with `character, NPC, hero, landscape, building, indoor, UI, font, animation, props, background`. **Reset tags** brings that list back. The list belongs to the library: Tilepicky writes it at the top of the library's `tilepicky.json`.
+**Free tags per sheet** sets the most tags the model may add of its own, from 0 to 64. A new library starts at 16. The prompt only asks: a reply is kept whole even when the model returns more.
+
+A new library starts with `character, NPC, hero, landscape, building, indoor, UI, font, animation, props, background`. **Reset tags** brings that list back. The list and the free-tag count belong to the library: Tilepicky writes them at the top of the library's `tilepicky.json`.
 
 Each label records the list its request used. **Current prompt...** in the sheet dialog previews the next request.
 **Prompt template...** in library options shows the shared text before each request adds its filename context.
