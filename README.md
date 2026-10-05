@@ -422,6 +422,16 @@ Use the menu beside the search field to choose folders, files, captions, and tag
 
 Settings are stored in `~/.config/tilepicky/settings.json`.
 
+### Setting up a bucket
+
+Use any S3-compatible object store. Cloudflare R2 is a common choice: 10 GB free and no egress fees, though it asks for a payment method before it activates, even on the free tier. Backblaze B2 is an alternative.
+
+1. Make an account, enable the object store, and create a bucket.
+2. Create an API token scoped to that one bucket, read and write objects. It gives an access key ID and a secret access key.
+3. Copy the S3 endpoint. For R2 it is `https://<account id>.r2.cloudflarestorage.com`, and the region is `auto`.
+4. In **Sheet storage**, tick it and fill endpoint, region, bucket, and access key. Put the secret in the secret key field; it is kept in `keys.json`, readable by your user alone. Leave path-style off for R2 and turn it on for MinIO.
+5. Click **Test connection**. Then label a small library to prove the path, and set the bucket lifecycle rule described above.
+
 ## Provenance tracking
 
 Tilepicky tracks the origin of pixels pasted into project sheets. When you copy tiles from a library sheet, the pixel data retains the source filename. If you copy tiles between project sheets, the original source path is preserved.
