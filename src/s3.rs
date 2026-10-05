@@ -13,7 +13,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// A bucket to upload sheets to. The secret key is not here; it lives with
 /// the other secrets in `keys.json`, and is passed to each call.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Store {
     pub endpoint: String,
     pub region: String,

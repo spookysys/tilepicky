@@ -803,7 +803,7 @@ pub mod tests {
             (headers, serde_json::from_slice::<Value>(&bytes).unwrap())
         });
         let provider = crate::ai::Provider { name: "Google".into(), kind: crate::ai::Kind::Gemini,
-            url: "https://generativelanguage.googleapis.com/v1beta".into(), key_env: vec![], skip: None };
+            url: "https://generativelanguage.googleapis.com/v1beta".into(), key_env: vec![], skip: None, store: None };
         let mut endpoint = Endpoint::for_provider(&provider, "gemini-flash-latest", "test-key".into()).unwrap();
         assert!(endpoint.url.ends_with("/models/gemini-flash-latest:generateContent"));
         assert!(Endpoint::for_provider(&provider, "../other?key=x", "test".into()).is_err());

@@ -69,7 +69,15 @@ pub struct Provider {
     /// None uses the OpenRouter default. An empty list explicitly skips nobody.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip: Option<Vec<String>>,
+    /// Where to upload sheets so a batch can fetch them as public URLs. Only
+    /// OpenAI-style providers use it, and only for a library job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<crate::s3::Store>,
 }
+
+/// The `keys.json` name for a provider's object-storage secret. It is separate
+/// from the provider key, so an empty one is dropped on save.
+pub fn s3_secret_name(provider: &str) -> String { format!("{provider} (S3 secret)") }
 
 /// Where a provider's key comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +99,7 @@ impl Provider {
 
     fn new(name: &str, kind: Kind) -> Self {
         let (url, env) = kind.defaults();
-        Provider { name: name.into(), kind, skip: None, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
+        Provider { name: name.into(), kind, skip: None, store: None, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
     }
 
     pub fn is_openrouter(&self) -> bool {
@@ -121,6 +129,12 @@ impl Provider {
             KeySource::Env(name) => std::env::var(name).ok(),
             KeySource::None => None,
         }
+    }
+
+    /// The typed object-storage secret, if any. It never comes from the
+    /// provider's key or its environment variables.
+    pub fn store_secret(&self, keys: &Keys) -> Option<String> {
+        keys.get(&s3_secret_name(&self.name)).map(str::to_string)
     }
 
     pub fn key_source(&self, keys: &Keys) -> KeySource {
@@ -337,9 +351,8 @@ impl Keys {
 
     /// The key follows a provider that changes its name.
     fn rename(&mut self, old: &str, new: &str) {
-        if let Some(v) = self.0.remove(old) {
-            self.0.insert(new.to_string(), v);
-        }
+        if let Some(v) = self.0.remove(old) { self.0.insert(new.to_string(), v); }
+        if let Some(v) = self.0.remove(&s3_secret_name(old)) { self.0.insert(s3_secret_name(new), v); }
     }
 }
 
@@ -568,6 +581,33 @@ fn providers_ui(
                 KeySource::None => "no key: type one, or set the variable".to_string(),
             });
             ui.end_row();
+            if p.kind == Kind::OpenAi {
+                ui.label("Sheet storage");
+                let mut on = p.store.is_some();
+                if ui.checkbox(&mut on, "Upload sheets so a batch can fetch them").changed() {
+                    p.store = on.then(crate::s3::Store::default);
+                }
+                ui.end_row();
+                let has_secret = p.store_secret(keys).is_some();
+                if let Some(store) = &mut p.store {
+                    for (label, value) in [("Endpoint", &mut store.endpoint), ("Region", &mut store.region),
+                        ("Bucket", &mut store.bucket), ("Access key", &mut store.access_key)] {
+                        ui.label(label);
+                        ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+                        ui.end_row();
+                    }
+                    ui.label("");
+                    ui.checkbox(&mut store.path_style, "Path-style URLs (MinIO)");
+                    ui.end_row();
+                    ui.label("Secret key");
+                    ui.add(egui::TextEdit::singleline(keys.entry(&s3_secret_name(&p.name))).password(true)
+                        .hint_text("Secret access key").desired_width(f32::INFINITY));
+                    ui.end_row();
+                    ui.label("");
+                    ui.weak(if has_secret { "The secret key is set" } else { "No secret key yet" });
+                    ui.end_row();
+                }
+            }
         });
     }
     if remove && sel < providers.len() {

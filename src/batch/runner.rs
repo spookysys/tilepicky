@@ -400,7 +400,7 @@ mod tests {
             Self { folder, root, dir }
         }
         fn job(&self) -> Job {
-            let provider = Provider { name: "test".into(), kind: Kind::Gemini, skip: None, key_env: vec![],
+            let provider = Provider { name: "test".into(), kind: Kind::Gemini, skip: None, store: None, key_env: vec![],
                 url: "https://example.invalid/v1beta".into() };
             prepare(&Index::scan(&self.root, [16, 16]), provider, "test".into(), Scope::Unlabeled).unwrap()
         }

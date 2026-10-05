@@ -1352,7 +1352,7 @@ mod tests {
     }
     impl Drop for Files { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.base); } }
     pub(super) fn provider(kind: Kind) -> Provider {
-        Provider { name: "test".into(), kind, skip: None, key_env: vec![], url: match kind {
+        Provider { name: "test".into(), kind, skip: None, store: None, key_env: vec![], url: match kind {
             Kind::Gemini => "https://generativelanguage.googleapis.com/v1beta".into(),
             Kind::OpenAi => "https://openrouter.ai/api/v1".into(),
         } }
