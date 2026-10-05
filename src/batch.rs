@@ -458,6 +458,52 @@ fn outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
     Ok(Some(out))
 }
 
+/// The OpenRouter batch body for the next sheets, up to `limit`. Each request
+/// carries the same chat body that the ordinary path sends, with the base64
+/// image, or the given public URL in its place.
+#[cfg(test)]
+fn openai_batch_body(job: &Job, root: &Path, limit: usize, image_url: Option<&str>) -> Result<Value, String> {
+    let mut requests = Vec::new();
+    for (i, sheet) in job.sheets.iter().enumerate() {
+        if sheet.taken { continue; }
+        if requests.len() == limit { break; }
+        let bytes = std::fs::read(root.join(&sheet.rel)).map_err(|e| format!("Could not read the image: {e}"))?;
+        let image = image::load_from_memory(&bytes).map_err(|e| format!("Could not read the image: {e}"))?;
+        let mut body = chat_request(job, &image.to_rgba8(), &sheet.rel)?;
+        if let Some(url) = image_url { body["messages"][1]["content"][1]["image_url"]["url"] = json!(url); }
+        requests.push(json!({"custom_id": key(i), "body": body}));
+    }
+    Ok(json!({"endpoint":"/v1/chat/completions", "model": job.model, "requests": requests}))
+}
+
+/// Submits one prepared OpenRouter batch body and returns its ID.
+#[cfg(test)]
+fn openai_batch_post(body: &Value, send: Send) -> Result<String, String> {
+    let response = send("batches", Some(body)).map_err(|f| f.message())?;
+    response["id"].as_str().map(str::to_string).ok_or_else(|| format!("The batch was not accepted: {response}"))
+}
+
+/// The results of a finished OpenRouter batch, each as the chat completion
+/// that `labels::diagnosed_response` reads. None while the batch still runs.
+#[cfg(test)]
+fn openai_batch_outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, String> {
+    match value["status"].as_str().unwrap_or_default() {
+        "completed" => {
+            let results = value["results"].as_array().ok_or("The completed batch has no results.")?;
+            let mut out = Vec::new();
+            for item in results {
+                let id = item["custom_id"].as_str().ok_or("A batch result has no request ID.")?.to_string();
+                if !item["error"].is_null() { out.push((id, json!({"error":item["error"]}))); continue; }
+                out.push((id, item["response"]["body"].clone()));
+            }
+            Ok(Some(out))
+        }
+        "failed" | "expired" | "cancelled" => Err(format!("The batch is {}. {}",
+            value["status"].as_str().unwrap_or_default(), value["error"]["message"].as_str().unwrap_or_default()).trim().to_string()),
+        _ => Ok(None),
+    }
+}
+
 /// Writes what a request gave back into the sheet: a label, or the reason
 /// there is none.
 fn record(sheet: &mut Sheet, job: (&str, &str, &[String]), reply: Result<labels::Reply, String>) {
@@ -1321,6 +1367,65 @@ mod tests {
     fn id(value: &str) -> impl FnMut(&str, Option<&Value>) -> Result<Value, Failure> {
         let value = value.to_string();
         move |_, _| Ok(json!({"name":value}))
+    }
+
+    /// Submits one real OpenRouter batch with a base64 image, to settle whether
+    /// the batch API accepts base64 as the docs say it does not. Needs
+    /// OPENROUTER_API_KEY and a few cents. Run with:
+    ///   cargo test -- --ignored a_real_openrouter_batch --nocapture
+    #[test]
+    #[ignore = "Hits the real OpenRouter batch API; needs OPENROUTER_API_KEY and a few cents."]
+    fn a_real_openrouter_batch_reports_whether_base64_is_accepted() {
+        let Ok(key) = std::env::var("OPENROUTER_API_KEY") else { eprintln!("OPENROUTER_API_KEY is unset; skipping"); return };
+        let files = Files::new();
+        let job = prepare(&Index::scan(&files.root, [16, 16]), provider(Kind::OpenAi), "openai/gpt-5-nano".into(), Scope::Unlabeled).unwrap();
+        let transport = Transport::new(&job.provider, key).unwrap();
+        let mut send = |path: &str, body: Option<&Value>| transport.send(path, body);
+        let body = openai_batch_body(&job, &files.root, 1, None).unwrap();
+        let image = body["requests"][0]["body"]["messages"][1]["content"][1]["image_url"]["url"].as_str().unwrap();
+        eprintln!("base64 image part starts: {}", &image[..image.len().min(48)]);
+        let id = openai_batch_post(&body, &mut send).unwrap();
+        eprintln!("submitted batch {id}");
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let response = send(&format!("batches/{id}"), None).map_err(|f| f.message()).unwrap();
+            eprintln!("status {} counts {}", response["status"], response["request_counts"]);
+            match openai_batch_outputs(&response) {
+                Ok(None) => continue,
+                Ok(Some(values)) => { for (k, v) in values { eprintln!("result {k}: {v}"); } return; }
+                Err(error) => { eprintln!("terminal: {error}"); return; }
+            }
+        }
+        eprintln!("still running after five minutes: {id}");
+    }
+
+    /// Submits one real OpenRouter batch with a public image URL to a Google
+    /// model, to test whether the docs are right that Google's batch cannot
+    /// fetch an image URL. Needs OPENROUTER_API_KEY and a few cents.
+    #[test]
+    #[ignore = "Hits the real OpenRouter batch API; needs OPENROUTER_API_KEY and a few cents."]
+    fn a_real_openrouter_batch_url_to_google() {
+        let Ok(key) = std::env::var("OPENROUTER_API_KEY") else { eprintln!("OPENROUTER_API_KEY is unset; skipping"); return };
+        let files = Files::new();
+        let job = prepare(&Index::scan(&files.root, [16, 16]), provider(Kind::OpenAi), "google/gemini-3.8-flash".into(), Scope::Unlabeled).unwrap();
+        let transport = Transport::new(&job.provider, key).unwrap();
+        let mut send = |path: &str, body: Option<&Value>| transport.send(path, body);
+        let url = "https://httpbin.org/image/png";
+        let body = openai_batch_body(&job, &files.root, 1, Some(url)).unwrap();
+        eprintln!("submitting {url} to {}", job.model);
+        let id = openai_batch_post(&body, &mut send).unwrap();
+        eprintln!("submitted batch {id}");
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let response = send(&format!("batches/{id}"), None).map_err(|f| f.message()).unwrap();
+            eprintln!("status {} counts {}", response["status"], response["request_counts"]);
+            match openai_batch_outputs(&response) {
+                Ok(None) => continue,
+                Ok(Some(values)) => { for (k, v) in values { eprintln!("result {k}: {v}"); } return; }
+                Err(error) => { eprintln!("terminal: {error}"); return; }
+            }
+        }
+        eprintln!("still running after five minutes: {id}");
     }
 
     #[test]

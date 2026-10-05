@@ -16,6 +16,7 @@ mod detect;
 mod dialogs;
 mod index;
 mod labels;
+mod s3;
 mod batch;
 mod storage;
 mod files;
