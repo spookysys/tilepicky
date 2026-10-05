@@ -161,11 +161,11 @@ To label multiple library sheets in bulk:
 Use **Rerun all...** to label every sheet again with the current library model and tag list.
 Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
 
-To label part of a library, choose the sheets in the tree first.
-Click a folder to choose every sheet below it, in its subfolders too; the chosen folder wears the selection colour. Right-click a folder and select **Generate Tags (AI)...** does the same.
-To choose single files, Ctrl+click each one, then right-click one of them and select **Label N sheets with AI...**.
+To label part of a library, mark a group in the tree first.
+Ctrl+click folders and files to add or remove them; a marked folder brings every sheet below it, in its subfolders too, so folders and files can share one selection. Marked rows wear the selection colour.
+Right-click a marked row and select **Label selected sheets with AI...**, or right-click an unmarked folder and choose **Generate Tags (AI)...** to take that folder alone.
 The panel names the target and offers **Label unlabeled in selection...** and **Rerun all in selection...**.
-Use **Whole library** to clear the choice. A folder and loose files cannot share one selection.
+Use **Whole library** to clear the choice.
 
 The confirmation estimates the job's cost in USD before you start. **Estimate details** shows input and output token ranges and price sources.
 It reads local image sizes and fetches OpenRouter's public model prices. It does not upload sheets to calculate the estimate.

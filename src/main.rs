@@ -169,8 +169,8 @@ struct App {
     sweep: Option<usize>,
     /// Files marked with Ctrl+click in the LIBRARY tree, for a library batch.
     library_marked: HashSet<usize>,
-    /// The folder chosen as the library batch target, if any.
-    library_dir: Option<String>,
+    /// Folders marked with Ctrl+click in the LIBRARY tree.
+    library_marked_dirs: HashSet<String>,
     /// The last plainly clicked library file, for shift ranges.
     library_anchor: Option<usize>,
     /// A drag across the library files started here; it marks a group while it lasts.
@@ -433,7 +433,7 @@ impl App {
             tree_cursor: None,
             sweep: None,
             library_marked: HashSet::new(),
-            library_dir: None,
+            library_marked_dirs: HashSet::new(),
             library_anchor: None,
             library_sweep: None,
             library_order: Vec::new(),
@@ -531,6 +531,8 @@ impl App {
         let name = match panel {
             Panel::Library => {
                 self.library_marked.clear();
+                self.library_marked_dirs.clear();
+                self.library_batch.choice = None;
                 self.library_anchor = None;
                 self.library_sweep = None;
                 "library"
@@ -867,6 +869,8 @@ impl App {
 
     fn rescan_library(&mut self) {
         self.library_marked.clear();
+        self.library_marked_dirs.clear();
+        self.library_batch.choice = None;
         self.library_anchor = None;
         self.library_sweep = None;
         self.library.rescan(&self.qwords, self.settings.search);
@@ -2346,20 +2350,17 @@ impl App {
                 if !self.library_marked.remove(&i) {
                     self.library_marked.insert(i);
                 }
-                self.library_dir = None;
                 self.library_batch.choice = None;
                 self.library_anchor = Some(i);
             }
             TreeAction::Range(i, additive) => {
                 let a = self.library_anchor.unwrap_or(i);
                 self.mark_library_range(a, i, additive);
-                self.library_dir = None;
                 self.library_batch.choice = None;
             }
             TreeAction::SweepStart(i) => {
                 self.library_sweep = Some(i);
                 self.library_anchor = Some(i);
-                self.library_dir = None;
                 self.library_batch.choice = None;
                 self.library_marked.clear();
                 self.library_marked.insert(i);
@@ -2368,12 +2369,22 @@ impl App {
                 let a = self.library_sweep.unwrap_or(i);
                 self.mark_library_range(a, i, false);
             }
-            TreeAction::Batch(ids) => {
-                let rels: BTreeSet<String> = ids.iter().filter_map(|&k| self.library.index.entries.get(k)).map(|e| e.rel.clone()).collect();
+            TreeAction::ToggleDir(dir) => {
+                if !self.library_marked_dirs.remove(&dir) {
+                    self.library_marked_dirs.insert(dir);
+                }
+                self.library_batch.choice = None;
+            }
+            TreeAction::BatchMarked => {
+                let mut rels: BTreeSet<String> = self.library_marked.iter()
+                    .filter_map(|&k| self.library.index.entries.get(k)).map(|e| e.rel.clone()).collect();
+                for dir in &self.library_marked_dirs {
+                    let prefix = format!("{dir}/");
+                    rels.extend(self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()));
+                }
                 if !rels.is_empty() {
                     let count = rels.len();
                     self.library_batch.choose(rels, format!("{count} sheets"));
-                    self.library_dir = None;
                     self.ai_panel = true;
                 }
             }
@@ -2385,19 +2396,8 @@ impl App {
                     let count = rels.len();
                     self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
                     self.library_marked.clear();
-                    self.library_dir = Some(dir.clone());
+                    self.library_marked_dirs.clear();
                     self.ai_panel = true;
-                }
-            }
-            TreeAction::SelectDir(dir) => {
-                let prefix = format!("{dir}/");
-                let rels: BTreeSet<String> =
-                    self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
-                if !rels.is_empty() {
-                    let count = rels.len();
-                    self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
-                    self.library_marked.clear();
-                    self.library_dir = Some(dir.clone());
                 }
             }
             TreeAction::Embeddings => {
@@ -2428,7 +2428,7 @@ impl App {
     fn project_tree_action(&mut self, ctx: &egui::Context, action: TreeAction, project_order: &[usize]) {
         match action {
             // The project tree never offers these; only the library does.
-            TreeAction::Embeddings | TreeAction::SelectDir(_) => {}
+            TreeAction::Embeddings | TreeAction::ToggleDir(_) | TreeAction::BatchMarked => {}
             TreeAction::Open(i) => {
                 // The plainly clicked file is the start of any group.
                 self.marked.clear();
@@ -2528,7 +2528,7 @@ impl App {
                     focus: true,
                 });
             }
-            TreeAction::Labels(_, _) | TreeAction::Batch(_) | TreeAction::BatchDir(_) => {}
+            TreeAction::Labels(_, _) | TreeAction::BatchDir(_) => {}
         }
     }
 }
@@ -2728,7 +2728,7 @@ impl App {
                             visible: self.library.visible.as_deref(),
                             selected: self.library.sel,
                             marked: Some(&self.library_marked),
-                            selected_dir: self.library_dir.as_deref(),
+                            marked_dirs: Some(&self.library_marked_dirs),
                             query: &self.qwords,
                             apply_query: self.open_trees,
                             menus: false,
@@ -2810,7 +2810,7 @@ impl App {
                         visible: self.project.visible.as_deref(),
                         selected: self.project.sel,
                         marked: Some(&self.marked),
-                        selected_dir: None,
+                        marked_dirs: None,
                         query: &self.qwords,
                         apply_query: self.open_trees,
                         menus: true,
@@ -2868,9 +2868,6 @@ impl App {
         if let Some(action) = library_action {
             self.library_tree_action(ctx, action);
         }
-        // The folder highlight follows the batch target. Clearing the target
-        // (Whole library) clears the highlight too.
-        if self.library_batch.choice.is_none() { self.library_dir = None; }
         if let Some(action) = project_action {
             self.project_tree_action(ctx, action, &project_order);
         }
@@ -3691,7 +3688,8 @@ mod tests {
         assert_eq!(rels.iter().map(String::as_str).collect::<Vec<_>>(), ["pack/one.png", "pack/two.png"]);
         assert_eq!(name, "pack (2 sheets)");
         let ids: Vec<usize> = (0..b.app.library.index.entries.len()).collect();
-        b.app.library_tree_action(&b.ctx, TreeAction::Batch(ids));
+        b.app.library_marked = ids.into_iter().collect();
+        b.app.library_tree_action(&b.ctx, TreeAction::BatchMarked);
         assert_eq!(b.app.library_batch.choice.as_ref().unwrap().0.len(), 3);
     }
 
