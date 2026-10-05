@@ -1254,7 +1254,8 @@ impl Panel {
             crate::stop(&button);
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
-                let (provider, model, concurrency) = (provider.clone(), model.id.clone(), model.concurrency.max(1));
+                let (provider, model, concurrency) = (provider.clone(), model.id.clone(),
+                    model.concurrency().unwrap_or(crate::ai::DEFAULT_CONCURRENCY).max(1));
                 let set = self.choice.as_ref().map(|(rels, _)| rels.clone());
                 let job = match set.as_ref() {
                     Some(set) => prepare_of(index, provider, model, scope, Some(set)),
