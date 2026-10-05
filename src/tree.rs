@@ -14,6 +14,8 @@ pub enum TreeAction {
     BatchDir(String),
     /// Ctrl+click: add or remove the folder from the marked set.
     ToggleDir(String),
+    /// A plain click on a folder chooses it alone as the library batch target.
+    SelectDir(String),
     /// Run a library batch over the marked files and folders.
     BatchMarked,
     /// Generate embeddings for the labeled sheets of this library.
@@ -184,10 +186,11 @@ impl Node {
                 let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.4);
                 ui.painter().set(band, egui::Shape::rect_filled(header.header_response.rect, 2.0, fill));
             }
-            // Ctrl+click adds or removes the folder from the marked group,
-            // the way it marks a file.
-            if !v.menus && header.header_response.clicked() && ui.input(|i| i.modifiers.command) {
-                action = Some(TreeAction::ToggleDir(rel.clone()));
+            // A plain click chooses the folder alone; Ctrl+click adds or
+            // removes it from the marked group, the way it marks a file.
+            if !v.menus && header.header_response.clicked() {
+                action = Some(if ui.input(|i| i.modifiers.command) { TreeAction::ToggleDir(rel.clone()) }
+                    else { TreeAction::SelectDir(rel.clone()) });
             }
             // A marked folder wears the selection colour.
             if v.marked_dirs.is_some_and(|d| d.contains(&rel)) {
@@ -205,7 +208,7 @@ impl Node {
                 if !v.menus {
                     let marked = v.marked.is_some_and(|m| !m.is_empty()) || v.marked_dirs.is_some_and(|d| !d.is_empty());
                     if marked {
-                        if ui.button("Label selected sheets with AI…").clicked() {
+                        if ui.button("Generate Labels (AI)…").clicked() {
                             action = Some(TreeAction::BatchMarked);
                             ui.close();
                         }
@@ -312,7 +315,7 @@ impl Node {
                 if !v.menus {
                     let any_dirs = v.marked_dirs.is_some_and(|d| !d.is_empty());
                     if group || any_dirs {
-                        if ui.button("Label selected sheets with AI…").clicked() {
+                        if ui.button("Generate Labels (AI)…").clicked() {
                             action = Some(TreeAction::BatchMarked);
                             ui.close();
                         }
@@ -431,5 +434,29 @@ mod tests {
         let mut action = None;
         ctx.run_ui(input, |ui| { action = tree.show(ui, &view(), "", &mut Vec::new(), &mut Vec::new(), &mut None); }).textures_delta.clear();
         assert!(matches!(action, Some(TreeAction::ToggleDir(ref d)) if d == "a"), "no ToggleDir action");
+    }
+
+    /// A plain click chooses the folder alone.
+    #[test]
+    fn a_plain_click_chooses_one_folder() {
+        use egui::{Event, PointerButton, Rect, pos2, vec2};
+        fn view() -> View<'static> {
+            View {
+                visible: None, selected: None, marked: None, marked_dirs: None, query: &[], apply_query: false,
+                menus: false, scroll_to: None, cursor: None, open_dir: None, sweeping: false, lifting: false, entries: &[],
+            }
+        }
+        let ctx = egui::Context::default();
+        let tree = Node::build(&["a/one.png".to_string()], &[]);
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 200.0));
+        ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() },
+            |ui| { tree.show(ui, &view(), "", &mut Vec::new(), &mut Vec::new(), &mut None); }).textures_delta.clear();
+        let at = pos2(10.0, 8.0);
+        let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        let input = egui::RawInput { screen_rect: Some(rect),
+            events: vec![Event::PointerMoved(at), button(true), button(false)], ..Default::default() };
+        let mut action = None;
+        ctx.run_ui(input, |ui| { action = tree.show(ui, &view(), "", &mut Vec::new(), &mut Vec::new(), &mut None); }).textures_delta.clear();
+        assert!(matches!(action, Some(TreeAction::SelectDir(ref d)) if d == "a"), "no SelectDir action");
     }
 }

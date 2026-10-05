@@ -2400,6 +2400,18 @@ impl App {
                     self.ai_panel = true;
                 }
             }
+            TreeAction::SelectDir(dir) => {
+                let prefix = format!("{dir}/");
+                let rels: BTreeSet<String> =
+                    self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
+                if !rels.is_empty() {
+                    let count = rels.len();
+                    self.library_marked.clear();
+                    self.library_marked_dirs.clear();
+                    self.library_marked_dirs.insert(dir.clone());
+                    self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
+                }
+            }
             TreeAction::Embeddings => {
                 let can = self.library.is_set() && self.library.index.error.is_none()
                     && self.library.index.entries.iter().any(|e| e.side.label.is_some());
@@ -2428,7 +2440,7 @@ impl App {
     fn project_tree_action(&mut self, ctx: &egui::Context, action: TreeAction, project_order: &[usize]) {
         match action {
             // The project tree never offers these; only the library does.
-            TreeAction::Embeddings | TreeAction::ToggleDir(_) | TreeAction::BatchMarked => {}
+            TreeAction::Embeddings | TreeAction::ToggleDir(_) | TreeAction::SelectDir(_) | TreeAction::BatchMarked => {}
             TreeAction::Open(i) => {
                 // The plainly clicked file is the start of any group.
                 self.marked.clear();
