@@ -2347,17 +2347,20 @@ impl App {
                     self.library_marked.insert(i);
                 }
                 self.library_dir = None;
+                self.library_batch.choice = None;
                 self.library_anchor = Some(i);
             }
             TreeAction::Range(i, additive) => {
                 let a = self.library_anchor.unwrap_or(i);
                 self.mark_library_range(a, i, additive);
                 self.library_dir = None;
+                self.library_batch.choice = None;
             }
             TreeAction::SweepStart(i) => {
                 self.library_sweep = Some(i);
                 self.library_anchor = Some(i);
                 self.library_dir = None;
+                self.library_batch.choice = None;
                 self.library_marked.clear();
                 self.library_marked.insert(i);
             }
@@ -2384,6 +2387,17 @@ impl App {
                     self.library_marked.clear();
                     self.library_dir = Some(dir.clone());
                     self.ai_panel = true;
+                }
+            }
+            TreeAction::SelectDir(dir) => {
+                let prefix = format!("{dir}/");
+                let rels: BTreeSet<String> =
+                    self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
+                if !rels.is_empty() {
+                    let count = rels.len();
+                    self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
+                    self.library_marked.clear();
+                    self.library_dir = Some(dir.clone());
                 }
             }
             TreeAction::Embeddings => {
@@ -2413,8 +2427,8 @@ impl App {
     /// `project_order` is the files in the order the tree shows them.
     fn project_tree_action(&mut self, ctx: &egui::Context, action: TreeAction, project_order: &[usize]) {
         match action {
-            // The project tree never offers embeddings; only the library does.
-            TreeAction::Embeddings => {}
+            // The project tree never offers these; only the library does.
+            TreeAction::Embeddings | TreeAction::SelectDir(_) => {}
             TreeAction::Open(i) => {
                 // The plainly clicked file is the start of any group.
                 self.marked.clear();

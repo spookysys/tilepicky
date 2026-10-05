@@ -162,7 +162,7 @@ Use **Rerun all...** to label every sheet again with the current library model a
 Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
 
 To label part of a library, choose the sheets in the tree first.
-Ctrl+click a folder to choose every sheet below it, in its subfolders too; the chosen folder wears the selection colour. Right-click a folder and select **Generate Tags (AI)...** does the same.
+Click a folder to choose every sheet below it, in its subfolders too; the chosen folder wears the selection colour. Right-click a folder and select **Generate Tags (AI)...** does the same.
 To choose single files, Ctrl+click each one, then right-click one of them and select **Label N sheets with AI...**.
 The panel names the target and offers **Label unlabeled in selection...** and **Rerun all in selection...**.
 Use **Whole library** to clear the choice. A folder and loose files cannot share one selection.

@@ -14,6 +14,8 @@ pub enum TreeAction {
     Batch(Vec<usize>),
     /// Run a library batch over every file under this folder.
     BatchDir(String),
+    /// Clicking a folder chooses it as the library batch target.
+    SelectDir(String),
     /// Generate embeddings for the labeled sheets of this library.
     Embeddings,
     /// Ctrl+click: add or remove the file from the marked set.
@@ -182,10 +184,10 @@ impl Node {
                 let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.4);
                 ui.painter().set(band, egui::Shape::rect_filled(header.header_response.rect, 2.0, fill));
             }
-            // Ctrl+click chooses the folder as the library batch target, the
-            // way Ctrl+click marks a file.
-            if !v.menus && header.header_response.clicked() && ui.input(|i| i.modifiers.command) {
-                action = Some(TreeAction::BatchDir(rel.clone()));
+            // Clicking the folder chooses it as the library batch target, the
+            // way clicking a file selects it.
+            if !v.menus && header.header_response.clicked() {
+                action = Some(TreeAction::SelectDir(rel.clone()));
             }
             // The chosen folder wears the solid selection colour.
             if v.selected_dir == Some(rel.as_str()) {
@@ -397,5 +399,29 @@ mod tests {
     fn the_rows_hold_the_folders() {
         assert_eq!(rows_of(None), vec![Row::Dir("a".into()), Row::File(2)]);
         assert_eq!(rows_of(Some(("a", true))), vec![Row::Dir("a".into()), Row::File(0), Row::File(1), Row::File(2)]);
+    }
+
+    /// Clicking a folder header chooses it as the library batch target.
+    #[test]
+    fn clicking_a_folder_chooses_it() {
+        use egui::{Event, PointerButton, Rect, pos2, vec2};
+        fn view() -> View<'static> {
+            View {
+                visible: None, selected: None, marked: None, selected_dir: None, query: &[], apply_query: false,
+                menus: false, scroll_to: None, cursor: None, open_dir: None, sweeping: false, lifting: false, entries: &[],
+            }
+        }
+        let ctx = egui::Context::default();
+        let tree = Node::build(&["a/one.png".to_string()], &[]);
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 200.0));
+        let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+        ctx.run_ui(input, |ui| { tree.show(ui, &view(), "", &mut Vec::new(), &mut Vec::new(), &mut None); }).textures_delta.clear();
+        let at = pos2(10.0, 8.0);
+        let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        let input = egui::RawInput { screen_rect: Some(rect),
+            events: vec![Event::PointerMoved(at), button(true), button(false)], ..Default::default() };
+        let mut action = None;
+        ctx.run_ui(input, |ui| { action = tree.show(ui, &view(), "", &mut Vec::new(), &mut Vec::new(), &mut None); }).textures_delta.clear();
+        assert!(matches!(action, Some(TreeAction::SelectDir(ref d)) if d == "a"), "no SelectDir action");
     }
 }
