@@ -20,8 +20,6 @@ use std::{collections::{BTreeSet, BTreeMap}, path::{Path, PathBuf}, sync::mpsc, 
 /// The limits of one provider batch.
 const MAX_BYTES: usize = 18_000_000;
 const MAX_REQUESTS: usize = 100;
-// Limit uncertain paid work while the connection is unreliable.
-const MAX_UNCONFIRMED: usize = 3;
 /// How often the tool asks the provider about a submitted batch.
 const POLL: Duration = Duration::from_secs(30);
 
@@ -560,10 +558,11 @@ fn finish_one(job: &mut Job, dir: &Path, i: usize, reply: Result<Value, Failure>
     job.save(dir)
 }
 
-/// Reads the next sheets, and submits them as one Gemini batch. The group is saved
-/// as `Submitting` before the request goes out, so that a crash cannot send
-/// it twice.
-fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
+/// Reads the next sheets into one Gemini batch, and saves the group as
+/// `Submitting` before the request goes out, so that a crash cannot send it
+/// twice. It reads the images and sends nothing. Returns the group's
+/// reference, its path, and its body, or `None` when no sheet is left.
+fn prepare_submission(job: &mut Job, root: &Path, dir: &Path) -> Result<Option<(String, String, Value)>, String> {
     let (mut requests, mut bytes) = (Vec::new(), 0);
     for i in 0..job.sheets.len() {
         if job.sheets[i].taken { continue; }
@@ -578,7 +577,7 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
         }
         job.sheets[i].taken = true;
     }
-    if requests.is_empty() { return job.save(dir); }
+    if requests.is_empty() { job.save(dir)?; return Ok(None); }
     let sheets: Vec<_> = requests.iter().map(|(i, _)| *i).collect();
     for &i in &sheets { job.sheets[i].taken = true; }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
@@ -590,24 +589,45 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
         "sheets":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel})).collect::<Vec<_>>()}));
     let path = format!("models/{}:batchGenerateContent", job.model);
     let requests: Vec<_> = requests.into_iter().map(|(i, body)| (key(i), body)).collect();
-    let g = job.groups.len() - 1;
-    let result = match send(&path, Some(&submit_body(&requests, &reference))) {
+    Ok(Some((reference.clone(), path, submit_body(&requests, &reference))))
+}
+
+/// Reads the provider's answer to a prepared submission into its group.
+/// A submission the provider did not make sends its sheets again; one it
+/// rejected fails those sheets.
+fn finish_submission(job: &mut Job, dir: &Path, reference: &str, reply: Result<Value, Failure>) -> Result<(), String> {
+    let Some(i) = job.groups.iter().position(|g| g.remote == Remote::Submitting
+        && g.recovery.as_ref().is_some_and(|r| r.reference == reference)) else { return Ok(()); };
+    let result = match reply {
         Ok(response) => remote_id(&response).map(|id| {
-            job.groups[g].tracking.id = id.clone(); job.groups[g].remote = Remote::Waiting(id);
+            job.groups[i].tracking.id = id.clone(); job.groups[i].remote = Remote::Waiting(id);
         }),
         // The provider made no batch: the sheets wait for the next try.
         Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429 | 503, _))) => {
-            job.send_again(g);
+            job.send_again(i);
             Err(failure.message())
         }
         Err(failure @ Failure::Status(400..500, _)) => {
-            for &i in &job.groups[g].sheets { job.sheets[i].error = failure.message(); }
-            job.groups[g].remote = Remote::Done;
+            for &s in &job.groups[i].sheets { job.sheets[s].error = failure.message(); }
+            job.groups[i].remote = Remote::Done;
             Ok(())
         }
         Err(failure) => Err(failure.message()),
     };
-    job.save(dir).and(result.map(|_| ()))
+    job.save(dir).and(result)
+}
+
+/// Submits the next group of sheets as one Gemini batch, and reads the
+/// answer. The runner keeps several of these in flight instead; this path
+/// serves one step and the tests.
+fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
+    match prepare_submission(job, root, dir)? {
+        Some((reference, path, body)) => {
+            let reply = send(&path, Some(&body));
+            finish_submission(job, dir, &reference, reply)
+        }
+        None => Ok(()),
+    }
 }
 
 /// Recover by the unique reference saved before submission. A reply never
@@ -973,7 +993,7 @@ impl Panel {
             return "Uploads interrupted; retry pending".into();
         }
         if job.issues.contains_key("check") { return format!("Waiting for {}; connection interrupted", job.provider.name); }
-        if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= MAX_UNCONFIRMED {
+        if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= job.concurrency.max(1) as usize {
             return "Waiting for upload confirmations".into();
         }
         if job.untaken() {

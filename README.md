@@ -174,12 +174,12 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends ordinary requests for the sheets in the background, several at a time. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends ordinary requests for the sheets in the background, several at a time. OpenRouter's batch API accepts images only at public URLs, and your library stays on your machine. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets, and sends several batches at once. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
-A model serves single sheets, library jobs, or both. The model editor ticks each scope, and sets how many requests a library job keeps in flight.
+A model serves single sheets, library jobs, or both. The model editor ticks each scope, and sets how many requests or batches a library job keeps in flight.
 An OpenAI-compatible library model labels several sheets at a time; a Gemini one uses **Google batch**.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
@@ -208,7 +208,7 @@ The job follows the library when you move the folder. Older configuration journa
 Only one Tilepicky window can own a library job at a time.
 
 Tilepicky saves each submission's reference before sending it. A lost reply triggers an automatic lookup.
-An uncertain submission stays separate while other work can continue. Repeated uncertain uploads temporarily stop new submissions.
+An uncertain submission stays separate while other work can continue. A submission that is out or awaiting confirmation counts against the model's number, so a flaky connection cannot pile up more paid work than the model allows.
 When the lookup proves Google never made the batch, Tilepicky sends its sheets again on its own, so an interrupted upload resumes. **Retry unconfirmed sheets...** remains for a submission the lookup could not resolve, and explains the possible duplicate charge before a resend.
 You do not need to find or attach a provider batch ID.
 

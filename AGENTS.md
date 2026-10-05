@@ -62,10 +62,12 @@ the person who uses the tool; this file is for an agent that works on it.
   in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
   thread; to cancel, drop the `Run`. Save guards preserve newer local changes. Tests use fake responses.
 - `src/batch.rs`: library batches, one request per sheet: through the
-  Gemini batch API, or several at once to an OpenAI-style endpoint, whose
-  batch API (OpenRouter's) takes no local images. It also displays job snapshots and saves labels from the UI thread.
+  Gemini batch API, several batches at once, or several ordinary requests at once to an
+  OpenAI-style endpoint, whose batch API (OpenRouter's) takes no local images. It also displays job snapshots and saves labels from the UI thread.
 - `src/batch/runner.rs`: one coordinator owns the job journal under a file lock.
   It performs network operations and waits for the UI to acknowledge library writes.
+  A submission is saved with its reference before it goes out; a lookup resumes one Google never received.
+  The model's concurrency bounds requests, or batches, in flight.
   User pause and cancel requests persist in the library book before the coordinator applies them.
   Tests use fake transports and explicit times. The native UI fixture uses a loopback provider in a test build only.
 

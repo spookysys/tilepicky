@@ -33,6 +33,18 @@ impl Pump {
     fn inflight(&self) -> usize { self.busy.len() }
 }
 
+/// Batch submissions that are out, keyed by their recovery reference. The
+/// workers only send and answer; the coordinator remains the only writer.
+struct Submits {
+    tx: mpsc::Sender<(String, Result<Value, Failure>)>,
+    rx: mpsc::Receiver<(String, Result<Value, Failure>)>,
+    busy: std::collections::BTreeSet<String>,
+}
+impl Submits {
+    fn new() -> Self { let (tx, rx) = mpsc::channel(); Self { tx, rx, busy: std::collections::BTreeSet::new() } }
+    fn inflight(&self) -> usize { self.busy.len() }
+}
+
 /// What woke the idle coordinator, or that only time passed.
 enum Woke { Stop, Key(String), Retry, RetryUnconfirmed, RetryFailed, Timeout }
 
@@ -104,6 +116,9 @@ impl Runner {
             let mut pump = Pump::new();
             let mut label_send: Option<Arc<SendFn>> = None;
             let mut label_key = String::new();
+            let mut submits = Submits::new();
+            let mut batch_send: Option<Arc<SendFn>> = None;
+            let mut batch_key = String::new();
             while !stopped.load(Ordering::Relaxed) {
                 while let Ok(command) = rx.try_recv() {
                     match command {
@@ -186,6 +201,40 @@ impl Runner {
                         Woke::RetryFailed => { coordinator.retry(Command::RetryFailed); retry = true; }
                         Woke::Timeout => {}
                     }
+                    continue;
+                }
+                if !key.is_empty() && (batch_send.is_none() || batch_key != key) {
+                    match Transport::new(&coordinator.job.provider, key.clone()) {
+                        Ok(transport) => {
+                            let transport = Arc::new(transport);
+                            let send: Arc<SendFn> = Arc::new(move |path, body| transport.send(path, body));
+                            batch_send = Some(send); batch_key = key.clone();
+                        }
+                        Err(error) => { coordinator.job.issue("upload", error, now); dirty = true; batch_send = None; }
+                    }
+                }
+                let batch_ready = batch_send.is_some() && coordinator.job.mode == Mode::Running
+                    && !coordinator.job.pending_save();
+                if batch_ready && let Some(send) = &batch_send {
+                    dirty |= coordinator.dispatch_submissions(&mut submits, send, &log, now);
+                }
+                if submits.inflight() > 0 {
+                    match submits.rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok((reference, reply)) => {
+                            submits.busy.remove(&reference);
+                            coordinator.collect_submission(&reference, reply, now_ms());
+                            dirty = true;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if submits.inflight() == 0 { notify(Event::Idle); }
+                    continue;
+                }
+                if dirty { continue; }
+                if key.is_empty() && coordinator.job.untaken() && coordinator.job.due("upload", now) {
+                    coordinator.job.issue("upload", "The provider key is missing. Set it in Settings.".into(), now);
+                    dirty = true;
                     continue;
                 }
                 if let Some(operation) = coordinator.job.next_operation(now) {
@@ -295,6 +344,49 @@ impl Coordinator {
         if response { self.job.last_response_ms = now; }
         if auth { self.job.mode = Mode::Paused; }
     }
+
+    /// Prepares and sends Gemini batches, up to the model's concurrency.
+    /// A submission that is out or awaiting confirmation counts against the
+    /// same number, so a flaky connection cannot pile up unconfirmed work.
+    fn dispatch_submissions(&mut self, submits: &mut Submits, send: &Arc<SendFn>, log: &crate::ai_log::Log, now: u64) -> bool {
+        let limit = self.job.concurrency.max(1) as usize;
+        let mut worked = false;
+        while self.job.untaken() {
+            let outstanding = submits.inflight() + self.job.groups.iter()
+                .filter(|g| g.remote == Remote::Submitting)
+                .filter(|g| g.recovery.as_ref().is_some_and(|r| !submits.busy.contains(&r.reference)))
+                .count();
+            if outstanding >= limit { break; }
+            match prepare_submission(&mut self.job, &self.root, &self.dir) {
+                Ok(Some((reference, path, body))) => {
+                    submits.busy.insert(reference.clone());
+                    let (tx, send, log) = (submits.tx.clone(), send.clone(), log.clone());
+                    std::thread::spawn(move || {
+                        let _scope = log.enter();
+                        let reply = send(&path, Some(&body));
+                        let _ = tx.send((reference, reply));
+                    });
+                    worked = true;
+                }
+                Ok(None) => break,
+                Err(error) => { self.job.issue("upload", error, now); worked = true; break; }
+            }
+        }
+        worked
+    }
+
+    /// Reads one submission worker's reply into its group.
+    fn collect_submission(&mut self, reference: &str, reply: Result<Value, Failure>, now: u64) {
+        let response = reply.is_ok() || matches!(&reply, Err(Failure::Status(_, _)));
+        let auth = matches!(&reply, Err(Failure::Status(401 | 403, _)));
+        let result = finish_submission(&mut self.job, &self.dir, reference, reply);
+        if response { self.job.last_response_ms = now; }
+        if auth { self.job.mode = Mode::Paused; }
+        match result {
+            Ok(()) => { self.job.issues.remove("upload"); }
+            Err(error) => self.job.issue("upload", error, now),
+        }
+    }
     fn step(&mut self, operation: Operation, now: u64, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) {
         let polled = if operation == Operation::Poll {
             self.job.groups.iter().filter(|g| matches!(g.remote, Remote::Waiting(_)))
@@ -374,15 +466,15 @@ impl Job {
         let recoverable = self.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_some());
         let allowed = |op: Operation| self.due(op.name(), now) && match op {
             Operation::Label => self.provider.kind == Kind::OpenAi && self.mode == Mode::Running && self.untaken() && !self.pending_save(),
-            Operation::Submit => self.provider.kind == Kind::Gemini && self.mode == Mode::Running && self.untaken() && !self.pending_save()
-                && self.groups.iter().filter(|g| g.remote == Remote::Submitting).count() < MAX_UNCONFIRMED,
+            // The runner dispatches Gemini submissions on its own pool.
+            Operation::Submit => false,
             Operation::Poll => waiting && self.poll_ms <= now,
             Operation::Recover => recoverable && self.recovery_ms <= now,
             Operation::Cancel => self.mode == Mode::Cancelling
                 && self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)) && !g.tracking.cancel_sent),
         };
         let preferred = if self.mode == Mode::Cancelling { Operation::Cancel } else { self.operation() };
-        [preferred, Operation::Poll, Operation::Recover, Operation::Submit, Operation::Label].into_iter().find(|op| allowed(*op))
+        [preferred, Operation::Poll, Operation::Recover, Operation::Label].into_iter().find(|op| allowed(*op))
     }
 }
 
@@ -556,7 +648,7 @@ mod tests {
         let f = Fixture::new(); let mut c = f.coordinator();
         f.control(Mode::Paused, 1_000); c.control().unwrap();
         assert!(c.job.next_operation(2_000).is_none());
-        f.control(Mode::Running, 3_000); c.control().unwrap(); assert_eq!(c.job.next_operation(3_000), Some(Operation::Submit));
+        f.control(Mode::Running, 3_000); c.control().unwrap(); assert!(c.job.next_operation(3_000).is_none());
         c.step(Operation::Submit, 3_000, |_, _| Ok(json!({"name":"batches/accepted"})));
         f.control(Mode::Paused, 4_000); c.control().unwrap(); assert_eq!(c.job.next_operation(4_000), Some(Operation::Poll));
         c.job.save(&f.dir).unwrap(); assert!(f.reopen().job.mode == Mode::Paused);
@@ -630,16 +722,37 @@ mod tests {
         assert_eq!(c.job.next_operation(4_000), Some(Operation::Cancel));
     }
 
+    /// An unconfirmed submission counts against the model's concurrency, so
+    /// a flaky connection cannot pile up more paid work than the limit.
     #[test]
-    fn repeated_uncertain_uploads_stop_new_submissions() {
+    fn unconfirmed_submissions_fill_the_concurrency() {
         let f = Fixture::new(); let mut c = f.coordinator();
+        c.job.concurrency = 1;
         c.step(Operation::Submit, 1_000, |_, _| Err(Failure::Unknown("Lost reply".into())));
-        let uncertain = c.job.groups[0].clone();
-        c.job.groups.extend([uncertain.clone(), uncertain]);
         let mut queued = c.job.sheets[0].clone(); queued.taken = false; c.job.sheets.push(queued);
-        c.job.submit_next = true; c.job.recovery_ms = 100_000; c.job.issues.clear();
-        assert!(c.job.next_operation(5_000).is_none());
-        assert_eq!(c.job.next_operation(100_000), Some(Operation::Recover));
+        let mut submits = Submits::new();
+        let log = crate::ai_log::Log::single("test");
+        let send: Arc<SendFn> = Arc::new(|_, _| Ok(json!({"name":"batches/next"})));
+        assert!(!c.dispatch_submissions(&mut submits, &send, &log, 2_000));
+        assert_eq!(submits.inflight(), 0);
+        assert_eq!(c.job.groups.iter().filter(|g| g.remote == Remote::Submitting).count(), 1);
+    }
+
+    /// A prepared submission goes out on a worker, and its reply turns the
+    /// group into one the provider is working on.
+    #[test]
+    fn a_submission_is_sent_and_collected_on_the_pool() {
+        let f = Fixture::new(); let mut c = f.coordinator();
+        let mut submits = Submits::new();
+        let log = crate::ai_log::Log::single("test");
+        let send: Arc<SendFn> = Arc::new(|_, _| Ok(json!({"name":"batches/accepted"})));
+        assert!(c.dispatch_submissions(&mut submits, &send, &log, 1_000));
+        assert_eq!(submits.inflight(), 1);
+        let (reference, reply) = submits.rx.recv_timeout(Duration::from_secs(5)).expect("the worker answered");
+        submits.busy.remove(&reference);
+        c.collect_submission(&reference, reply, 1_000);
+        assert!(matches!(&c.job.groups[0].remote, Remote::Waiting(_)));
+        assert!(!c.job.untaken());
     }
 
     #[test]
