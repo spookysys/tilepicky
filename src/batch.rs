@@ -277,11 +277,19 @@ pub enum Scope { Unlabeled, All }
 
 /// Lists the requested sheets. It reads no image and sends nothing.
 pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -> Result<Job, String> {
+    prepare_of(index, provider, model, scope, None)
+}
+
+/// Lists the requested sheets, kept to `only` when it is given: the paths of
+/// the chosen files, below the library root. It reads no image and sends
+/// nothing.
+pub fn prepare_of(index: &Index, provider: Provider, model: String, scope: Scope, only: Option<&BTreeSet<String>>) -> Result<Job, String> {
     endpoint(&provider)?;
     if let Some(error) = &index.error { return Err(error.clone()); }
-    let labeled = index.entries.iter().filter(|e| e.side.label.is_some()).count();
+    let keep = |e: &crate::index::Entry| only.is_none_or(|set| set.contains(&e.rel));
+    let labeled = index.entries.iter().filter(|e| keep(e) && e.side.label.is_some()).count();
     let all = scope == Scope::All;
-    let open = index.entries.iter().filter(|e| all || e.side.label.is_none());
+    let open = index.entries.iter().filter(|e| keep(e) && (all || e.side.label.is_none()));
     Ok(Job {
         log_id: crate::ai_log::id(),
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
@@ -728,6 +736,10 @@ pub struct Panel {
     resend_confirm: bool,
     copied: Option<Instant>,
     pub settings_requested: bool,
+    /// The files chosen in the library tree for the next job, by their
+    /// paths below the root, and a short name for them. `None` is the
+    /// whole library.
+    pub choice: Option<(BTreeSet<String>, String)>,
 }
 
 impl Panel {
@@ -740,6 +752,8 @@ impl Panel {
         else { None }
     }
     pub fn allows_single(&self) -> bool { self.single_block_reason().is_none() }
+    /// Narrows the next job to these sheets, by their paths below the root.
+    pub fn choose(&mut self, rels: BTreeSet<String>, name: String) { self.choice = Some((rels, name)); }
     pub fn cleanup_log(&self, root: &Path) -> Result<(), String> {
         let _lock = if self.root == root && self.lock.is_some() { None } else {
             match runner::lock(root) { Ok(lock) => Some(lock), Err(_) => return Ok(()) }
@@ -1071,20 +1085,50 @@ impl Panel {
         let idle = self.lock.is_some() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
         ui.add_space(8.0);
         ui.strong("New library job");
+        let mut clear_choice = false;
+        // The counts come from the chosen sheets, when there are any. The set
+        // itself is cloned only when a job starts, not on every frame.
+        let target = self.choice.as_ref().map(|(_, name)| name.clone());
+        let labeled = |e: &&crate::index::Entry| e.side.label.as_ref().is_some_and(|l| l.status == Status::Labeled);
+        let (total, done, any_unlabeled) = match self.choice.as_ref() {
+            Some((rels, _)) => {
+                let in_scope = || index.entries.iter().filter(|e| rels.contains(&e.rel));
+                (in_scope().count(), in_scope().filter(labeled).count(), in_scope().any(|e| e.side.label.is_none()))
+            }
+            None => (
+                index.entries.len(),
+                index.entries.iter().filter(labeled).count(),
+                index.entries.iter().any(|e| e.side.label.is_none()),
+            ),
+        };
+        if let Some(name) = &target {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Target: {name}"));
+                if ui.button("Whole library").on_hover_text("Choose sheets in the library tree to narrow a job.").clicked() { clear_choice = true; }
+            });
+        }
         if let Some((provider, model)) = configured {
             ui.label(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
             ui.small(if provider.kind == Kind::Gemini { "Google batch" } else { "One sheet at a time" });
         }
-        let done = index.entries.iter().filter(|e| e.side.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
-        ui.label(format!("{done} of {} sheets have usable labels", index.entries.len()));
+        ui.label(format!("{done} of {total} sheets have usable labels"));
         if !ready { ui.label("Set a library model and its key in Settings (Ctrl+,)."); }
-        for (text, scope) in [("Label unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
-            let enabled = ready && idle && index.entries.iter().any(|e| scope == Scope::All || e.side.label.is_none());
+        for (text, scope) in [
+            (if target.is_some() { "Label unlabeled in selection..." } else { "Label unlabeled sheets..." }, Scope::Unlabeled),
+            (if target.is_some() { "Rerun all in selection..." } else { "Rerun all..." }, Scope::All),
+        ] {
+            let enabled = ready && idle && (scope == Scope::All || any_unlabeled);
             let button = ui.add_enabled(enabled, egui::Button::new(text).selected(scope == Scope::Unlabeled));
             crate::stop(&button);
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
-                match prepare(index, provider.clone(), model.id.clone(), scope) {
+                let (provider, model) = (provider.clone(), model.id.clone());
+                let set = self.choice.as_ref().map(|(rels, _)| rels.clone());
+                let job = match set.as_ref() {
+                    Some(set) => prepare_of(index, provider, model, scope, Some(set)),
+                    None => prepare(index, provider, model, scope),
+                };
+                match job {
                     Ok(job) => {
                         self.cost_error.clear();
                         self.cost_preview = match cost::Preview::start(job.clone(), index.root.clone(), self.job.as_ref(), ui.ctx().clone()) {
@@ -1096,6 +1140,7 @@ impl Panel {
                 }
             }
         }
+        if clear_choice { self.choice = None; }
         if self.job.is_none() { ui.add_enabled(false, egui::Button::new("Copy log")); }
     }
 
@@ -1143,10 +1188,11 @@ impl Panel {
         egui::Modal::new(egui::Id::new("library batch confirmation")).show(ctx, |ui| {
             ui.set_width(500.0_f32.min(ctx.content_rect().width() - 48.0));
             ui.set_max_height((ctx.content_rect().height() - 96.0).max(160.0));
-            ui.heading("Label this entire library?");
+            ui.heading(if self.choice.is_some() { "Label the chosen sheets?" } else { "Label this entire library?" });
             let height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0 - crate::dialogs::footer_height(ui)).max(80.0);
             egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
                 ui.label(self.root.display().to_string());
+                if let Some((_, name)) = &self.choice { ui.weak(format!("Target: {name}")); }
                 ui.weak(format!("{} / {} (from Settings)", job.provider.name, job.model));
                 if job.provider.kind == Kind::Gemini { ui.weak("Google batch requests require a paid API project."); }
                 if job.sheets.is_empty() {
@@ -1240,6 +1286,18 @@ mod tests {
     fn id(value: &str) -> impl FnMut(&str, Option<&Value>) -> Result<Value, Failure> {
         let value = value.to_string();
         move |_, _| Ok(json!({"name":value}))
+    }
+
+    #[test]
+    fn a_scoped_job_keeps_only_the_chosen_sheets() {
+        let files = Files::new();
+        RgbaImage::from_pixel(8, 4, Rgba([1, 2, 3, 255])).save(files.root.join("top.png")).unwrap();
+        let index = Index::scan(&files.root, [16, 16]);
+        let only: BTreeSet<String> = ["folder/sheet.png".to_string()].into_iter().collect();
+        let job = prepare_of(&index, provider(Kind::Gemini), "test:batch".into(), Scope::Unlabeled, Some(&only)).unwrap();
+        assert_eq!(job.sheets.iter().map(|s| s.rel.as_str()).collect::<Vec<_>>(), ["folder/sheet.png"]);
+        let whole = prepare(&index, provider(Kind::Gemini), "test:batch".into(), Scope::Unlabeled).unwrap();
+        assert_eq!(whole.sheets.len(), 2);
     }
 
     #[test]

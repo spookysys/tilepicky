@@ -10,6 +10,10 @@ pub enum TreeAction {
     Open(usize),
     /// A command from the AI label menu of a library file.
     Labels(usize, crate::labels::Action),
+    /// Run a library batch over these files, from a marked group.
+    Batch(Vec<usize>),
+    /// Run a library batch over every file under this folder.
+    BatchDir(String),
     /// Ctrl+click: add or remove the file from the marked set.
     Toggle(usize),
     /// Shift+click: mark the range from the anchor to this file; with Ctrl
@@ -181,6 +185,14 @@ impl Node {
                 ui.painter().rect_stroke(header.header_response.rect, 2.0, stroke, egui::StrokeKind::Inside);
             }
             header.header_response.context_menu(|ui| {
+                // The library offers its folder to a batch job.
+                if !v.menus {
+                    if ui.button("Label with AI…").clicked() {
+                        action = Some(TreeAction::BatchDir(rel.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
+                }
                 // Only a tree the user owns offers the items that change folders.
                 if v.menus {
                     if ui.button("New folder…").clicked() {
@@ -239,8 +251,9 @@ impl Node {
                     action = Some(TreeAction::SweepStart(*i));
                 } else if v.sweeping && r.contains_pointer() {
                     action = Some(TreeAction::Sweep(*i));
-                } else if r.is_pointer_button_down_on() && !r.dragged() {
+                } else if v.menus && r.is_pointer_button_down_on() && !r.dragged() {
                     // Holding still on a file lifts it, as it does on a tile.
+                    // Only the project tree moves files between folders.
                     const HOLD_S: f64 = 0.25;
                     const STILL_PX: f32 = 4.0;
                     let (t0, from, now, at) = ui.input(|inp| {
@@ -270,8 +283,16 @@ impl Node {
             let group = v.marked.is_some_and(|m| m.len() > 1 && m.contains(i));
             let count = v.marked.map_or(0, HashSet::len);
             r.context_menu(|ui| {
-                if !v.menus && let Some(command) = crate::labels::menu(ui) {
-                    action = Some(TreeAction::Labels(*i, command));
+                if !v.menus {
+                    if group {
+                        if ui.button(format!("Label {count} sheets with AI…")).clicked() {
+                            action = Some(TreeAction::Batch(v.marked.map(|m| m.iter().copied().collect()).unwrap_or_default()));
+                            ui.close();
+                        }
+                        ui.separator();
+                    } else if let Some(command) = crate::labels::menu(ui) {
+                        action = Some(TreeAction::Labels(*i, command));
+                    }
                 }
                 // Only a tree the user owns offers the items that change files.
                 if v.menus && group {

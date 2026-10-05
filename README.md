@@ -147,6 +147,12 @@ To label multiple library sheets in bulk:
 Use **Rerun all...** to label every sheet again with the current library model and tag list.
 Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
 
+To label part of a library, choose the sheets in the tree first.
+Right-click a folder and select **Label with AI...**. That target is every sheet below the folder, in its subfolders too.
+To choose single files, Ctrl+click each one, then right-click one of them and select **Label N sheets with AI...**.
+The panel names the target and offers **Label unlabeled in selection...** and **Rerun all in selection...**.
+Use **Whole library** to clear the choice. A folder and loose files cannot share one selection.
+
 The confirmation estimates the job's cost in USD before you start. **Estimate details** shows input and output token ranges and price sources.
 It reads local image sizes and fetches OpenRouter's public model prices. It does not upload sheets to calculate the estimate.
 Google estimates use a dated table of batch prices. The table expires instead of silently keeping old prices.
