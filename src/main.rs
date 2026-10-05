@@ -2412,6 +2412,7 @@ impl App {
                     self.library_marked.clear();
                     self.library_marked_dirs.clear();
                     self.library_marked_dirs.insert(dir.clone());
+                    self.library.sel = None;
                     self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
                 }
             }
@@ -3706,6 +3707,21 @@ mod tests {
         b.app.library_marked = ids.into_iter().collect();
         b.app.library_tree_action(&b.ctx, TreeAction::BatchMarked);
         assert_eq!(b.app.library_batch.choice.as_ref().unwrap().0.len(), 3);
+    }
+
+    /// A plain click on a file or a folder leaves only that item selected.
+    #[test]
+    fn a_plain_click_leaves_only_its_item_selected() {
+        let mut b = bench(&["a.png", "pack/one.png", "pack/two.png"], &[]);
+        b.app.library_marked.insert(0);
+        b.app.library_marked_dirs.insert("other".into());
+        b.app.library_tree_action(&b.ctx, TreeAction::SelectDir("pack".into()));
+        assert!(b.app.library_marked.is_empty(), "the marked file must go when a folder is chosen");
+        assert_eq!(b.app.library_marked_dirs.iter().collect::<Vec<_>>(), ["pack"]);
+        b.app.library_marked_dirs.insert("pack".into());
+        b.app.library_tree_action(&b.ctx, TreeAction::Open(1));
+        assert!(b.app.library_marked_dirs.is_empty(), "the marked folder must go when a file is clicked");
+        assert_eq!(b.app.library_marked.iter().collect::<Vec<_>>(), [&1]);
     }
 
     #[test]
