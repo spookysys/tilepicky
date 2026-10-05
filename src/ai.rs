@@ -2,7 +2,9 @@
 //! The AI providers and models the tool may call, and the settings page
 //! that edits them. A provider is an endpoint of one of two kinds: an
 //! OpenAI-style chat endpoint (OpenAI, OpenRouter), or Google's Gemini API.
-//! A model names its provider; the stored `:batch` suffix marks library scope.
+//! A model names its provider and the scopes it serves: single sheets,
+//! library jobs, or both. A library job of an OpenAI-style model sends
+//! several ordinary requests at once; a Gemini model submits one batch.
 //! API keys live in a separate file, readable by the owner alone; see `Keys`.
 
 use eframe::egui;
@@ -10,7 +12,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// The stored suffix for library scope. It does not select a provider API.
+/// How many ordinary requests a library job keeps in flight when its model
+/// does not say otherwise.
+pub const DEFAULT_CONCURRENCY: u32 = 10;
+fn default_concurrency() -> u32 { DEFAULT_CONCURRENCY }
+
+/// The suffix an older tool used to mark a library model. `heal` moves it
+/// into the model flags.
 const BATCH: &str = ":batch";
 
 /// The kind of endpoint a provider speaks.
@@ -139,33 +147,39 @@ impl Provider {
     }
 }
 
-/// A model on one of the providers.
+/// A model on one of the providers, with the scopes it serves. One model can
+/// serve single sheets and library jobs; the provider kind decides whether
+/// its library jobs run as several ordinary requests or as a Google batch.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub provider: String,
-    /// The provider model ID, with the internal `:batch` suffix for library scope.
+    /// The provider model ID, without any internal suffix.
     pub id: String,
+    /// The model answers single-sheet requests.
+    #[serde(default)]
+    pub single: bool,
+    /// The model runs library jobs.
+    #[serde(default)]
+    pub library: bool,
+    /// How many ordinary requests a library job keeps in flight. Only an
+    /// OpenAI-style provider reads it; a Gemini model submits batches.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
     /// The model makes embeddings for semantic search, not labels.
     #[serde(default)]
     pub embed: bool,
 }
 
 impl Model {
-    pub fn mode(&self) -> Mode {
-        if self.id.ends_with(BATCH) { Mode::Batch } else { Mode::Instant }
-    }
-
-    /// Writes or removes the `:batch` end of the id.
-    fn set_batch(&mut self, batch: bool) {
-        match (batch, self.mode()) {
-            (true, Mode::Instant) => self.id.push_str(BATCH),
-            (false, Mode::Batch) => self.id.truncate(self.id.len() - BATCH.len()),
-            _ => {}
-        }
-    }
-
     fn is(&self, r: &ModelRef) -> bool {
         r.provider == self.provider && r.model == self.id
+    }
+
+    fn serves(&self, mode: Mode) -> bool {
+        match mode {
+            Mode::Instant => self.single,
+            Mode::Batch => self.library,
+        }
     }
 
     fn reference(&self) -> ModelRef {
@@ -174,8 +188,8 @@ impl Model {
 
     /// How a list names the model: its id, then its provider and scope.
     fn label(&self) -> String {
-        if self.embed { format!("{} ({}, embeddings)", self.id.trim_end_matches(BATCH), self.provider) }
-        else { format!("{} ({}, {})", self.id.trim_end_matches(BATCH), self.provider, self.mode().label()) }
+        if self.embed { format!("{} ({}, embeddings)", self.id, self.provider) }
+        else { format!("{} ({})", self.id, self.provider) }
     }
 }
 
@@ -186,100 +200,109 @@ pub struct ModelRef {
     pub model: String,
 }
 
-/// The providers, the models on them, and which model answers an instant
-/// request and which runs a batch.
+/// The providers, the models on them, and which model answers a single-sheet
+/// request and which runs library jobs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Ai {
     #[serde(default)]
     pub providers: Vec<Provider>,
     #[serde(default)]
     pub models: Vec<Model>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instant: Option<ModelRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub batch: Option<ModelRef>,
+    /// The model for new single-sheet requests. Older files named it `instant`.
+    #[serde(default, alias = "instant", skip_serializing_if = "Option::is_none")]
+    pub single: Option<ModelRef>,
+    /// The model for new library jobs. Older files named it `batch`.
+    #[serde(default, alias = "batch", skip_serializing_if = "Option::is_none")]
+    pub library: Option<ModelRef>,
     /// The model that makes embeddings for semantic search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed: Option<ModelRef>,
 }
 
-/// A fresh install offers OpenRouter and Google models, without keys.
-/// Single-sheet requests use either provider format. Library jobs use several
-/// chat requests at once or Google's Gemini batch endpoint.
+/// A fresh install offers OpenRouter and Google models, without keys. Each
+/// model serves single sheets and library jobs; an OpenAI-style library job
+/// runs several requests at once, a Gemini one submits a batch.
 impl Default for Ai {
     fn default() -> Self {
         let mut openrouter = Provider::new("OpenRouter", Kind::OpenAi);
         openrouter.url = "https://openrouter.ai/api/v1".into();
         openrouter.key_env = vec!["OPENROUTER_API_KEY".into()];
         let google = Provider::new("Google", Kind::Gemini);
-        let on = |provider: &str, id: &str| Model { provider: provider.into(), id: id.into(), embed: false };
+        let on = |provider: &str, id: &str| Model {
+            provider: provider.into(), id: id.into(), single: true, library: true, concurrency: DEFAULT_CONCURRENCY, embed: false,
+        };
         let models = vec![
             on("OpenRouter", "~deepseek/deepseek-flash-latest"),
-            on("OpenRouter", "~deepseek/deepseek-flash-latest:batch"),
             on("OpenRouter", "z-ai/glm-5.3-flash"),
-            on("OpenRouter", "z-ai/glm-5.3-flash:batch"),
-            on("Google", "gemini-flash-latest:batch"),
             on("Google", "gemini-flash-latest"),
-            Model { provider: "OpenRouter".into(), id: "openai/text-embedding-3-small".into(), embed: true },
+            Model { provider: "OpenRouter".into(), id: "openai/text-embedding-3-small".into(),
+                single: false, library: false, concurrency: DEFAULT_CONCURRENCY, embed: true },
         ];
-        let (instant, batch) = (Some(models[0].reference()), Some(models[1].reference()));
-        let embed = Some(models[6].reference());
-        Ai { providers: vec![openrouter, google], models, instant, batch, embed }
+        let (single, library) = (Some(models[0].reference()), Some(models[0].reference()));
+        let embed = Some(models[3].reference());
+        Ai { providers: vec![openrouter, google], models, single, library, embed }
     }
 }
 
 /// Models an older tool shipped and this one does not: `openrouter/free`
 /// sent each request to whichever free model was up, and MiMo has no batch
 /// endpoint on OpenRouter.
-const RETIRED: [(&str, &str); 3] =
-    [("OpenRouter", "openrouter/free"), ("OpenRouter", "xiaomi/mimo-v2.5"), ("OpenRouter", "xiaomi/mimo-v2.5:batch")];
+const RETIRED: [(&str, &str); 2] =
+    [("OpenRouter", "openrouter/free"), ("OpenRouter", "xiaomi/mimo-v2.5")];
 
 impl Ai {
-    /// Fills in what a settings file from an older tool lacks. A model
-    /// without an id is dropped, and so is a model the tool once shipped
-    /// and retired; the shipped models take its place. Without any model
-    /// left, the shipped models come in, on the providers that exist; a
-    /// choice that names no model falls back to the shipped one, when that
-    /// exists.
+    /// Fills in what a settings file from an older tool lacks. An old model
+    /// carried the library scope in a `:batch` suffix; the suffix moves into
+    /// the flags, and two models of one name become one. A model with
+    /// neither flag is from an older file, where it served single sheets.
+    /// A model without an id is dropped, and so is a model the tool once
+    /// shipped and retired; the shipped models take its place. Without any
+    /// model left, the shipped models come in, on the providers that exist.
+    /// A choice that names no model falls back to the shipped one, when
+    /// that exists.
     pub fn heal(&mut self) {
+        let shipped = Ai::default();
+        for model in &mut self.models {
+            if let Some(id) = model.id.strip_suffix(BATCH).map(str::to_string) {
+                model.id = id;
+                model.library = true;
+            }
+            if model.embed { model.single = false; model.library = false; }
+            if !model.embed && !model.single && !model.library { model.single = true; }
+            if model.concurrency == 0 { model.concurrency = DEFAULT_CONCURRENCY; }
+        }
         let google = self.providers.iter().any(|p| p.name == "Google" && p.kind == Kind::Gemini
             && p.url.trim_end_matches('/') == "https://generativelanguage.googleapis.com/v1beta");
         if google {
             for model in self.models.iter_mut().filter(|m| m.provider == "Google") {
                 if model.id == "gemini-3.7-flash" { model.id = "gemini-flash-latest".into(); }
-                if model.id == "gemini-3.7-flash:batch" { model.id = "gemini-flash-latest:batch".into(); }
             }
-            for slot in [&mut self.instant, &mut self.batch].into_iter().flatten().filter(|s| s.provider == "Google") {
-                if slot.model == "gemini-3.7-flash" { slot.model = "gemini-flash-latest".into(); }
-                if slot.model == "gemini-3.7-flash:batch" { slot.model = "gemini-flash-latest:batch".into(); }
+        }
+        for slot in [&mut self.single, &mut self.library].into_iter().flatten() {
+            if let Some(id) = slot.model.strip_suffix(BATCH).map(str::to_string) { slot.model = id; }
+            if google && slot.provider == "Google" && slot.model == "gemini-3.7-flash" {
+                slot.model = "gemini-flash-latest".into();
             }
-            let mut seen = std::collections::HashSet::new();
-            self.models.retain(|m| seen.insert((m.provider.clone(), m.id.clone())));
         }
-        // An embedding model carries no scope suffix.
-        for model in self.models.iter_mut().filter(|m| m.embed) {
-            model.id = model.id.trim_end_matches(BATCH).to_string();
-        }
+        // One entry per provider and id, with the scopes of all of them.
+        let old = std::mem::take(&mut self.models);
+        for m in old { self.merge(m); }
         let before = self.models.len();
         self.models.retain(|m| !m.id.is_empty() && !RETIRED.contains(&(m.provider.as_str(), m.id.as_str())));
         let retired = self.models.len() < before;
-        let shipped = Ai::default();
         if self.models.is_empty() || retired {
-            for m in shipped.models {
-                if self.providers.iter().any(|p| p.name == m.provider) && !self.models.contains(&m) {
-                    self.models.push(m);
-                }
-            }
+            for m in shipped.models { self.merge_if_provider(m); }
         }
         if google && !self.models.iter().any(|m| m.provider == "Google" && m.id == "gemini-flash-latest") {
-            self.models.push(Model { provider: "Google".into(), id: "gemini-flash-latest".into(), embed: false });
+            self.merge(Model { provider: "Google".into(), id: "gemini-flash-latest".into(),
+                single: true, library: true, concurrency: DEFAULT_CONCURRENCY, embed: false });
         }
-        for (mode, fallback) in [(Mode::Instant, shipped.instant), (Mode::Batch, shipped.batch)] {
+        for (mode, fallback) in [(Mode::Instant, shipped.single), (Mode::Batch, shipped.library)] {
             if self.chosen(mode).is_none() {
-                let fallback = fallback.filter(|r| self.models.iter().any(|m| m.is(r) && m.mode() == mode));
+                let fallback = fallback.filter(|r| self.models.iter().any(|m| m.is(r) && m.serves(mode)));
                 match mode {
-                    Mode::Instant => self.instant = fallback,
-                    Mode::Batch => self.batch = fallback,
+                    Mode::Instant => self.single = fallback,
+                    Mode::Batch => self.library = fallback,
                 }
             }
         }
@@ -288,21 +311,38 @@ impl Ai {
         }
     }
 
-    /// The embedding model, with its provider, while both exist.
-    pub fn chosen_embed(&self) -> Option<(&Provider, &Model)> {
-        let r = self.embed.as_ref()?;
-        let m = self.models.iter().find(|m| m.is(r) && m.embed)?;
-        let p = self.providers.iter().find(|p| p.name == m.provider)?;
-        Some((p, m))
+    /// Adds a model, or adds its scopes to the model of the same name.
+    fn merge(&mut self, m: Model) {
+        if let Some(existing) = self.models.iter_mut().find(|x| x.provider == m.provider && x.id == m.id) {
+            existing.single |= m.single;
+            existing.library |= m.library;
+            existing.embed |= m.embed;
+            existing.concurrency = existing.concurrency.max(m.concurrency);
+        } else {
+            self.models.push(m);
+        }
+    }
+
+    /// Adds a shipped model only when its provider exists.
+    fn merge_if_provider(&mut self, m: Model) {
+        if self.providers.iter().any(|p| p.name == m.provider) { self.merge(m); }
     }
 
     /// The model chosen for a mode, with its provider, while both exist.
     pub fn chosen(&self, mode: Mode) -> Option<(&Provider, &Model)> {
         let r = match mode {
-            Mode::Instant => self.instant.as_ref()?,
-            Mode::Batch => self.batch.as_ref()?,
+            Mode::Instant => self.single.as_ref()?,
+            Mode::Batch => self.library.as_ref()?,
         };
-        let m = self.models.iter().find(|m| m.is(r) && m.mode() == mode)?;
+        let m = self.models.iter().find(|m| m.is(r) && m.serves(mode))?;
+        let p = self.providers.iter().find(|p| p.name == m.provider)?;
+        Some((p, m))
+    }
+
+    /// The embedding model, with its provider, while both exist.
+    pub fn chosen_embed(&self) -> Option<(&Provider, &Model)> {
+        let r = self.embed.as_ref()?;
+        let m = self.models.iter().find(|m| m.is(r) && m.embed)?;
         let p = self.providers.iter().find(|p| p.name == m.provider)?;
         Some((p, m))
     }
@@ -372,17 +412,17 @@ impl Keys {
 /// stays short. Edits land in place; the caller writes both files when the
 /// dialog closes.
 pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
-    let Ai { providers, models, instant, batch, embed } = ai;
+    let Ai { providers, models, single, library, embed } = ai;
     ui.strong("Active models");
     ui.small("Used for new requests. Existing jobs keep their original models.");
     egui::Grid::new("defaults").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        for (mode, slot) in [(Mode::Instant, &mut *instant), (Mode::Batch, &mut *batch)] {
+        for (mode, slot) in [(Mode::Instant, &mut *single), (Mode::Batch, &mut *library)] {
             ui.label(mode.label());
-            let current = slot.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.mode() == mode && !m.embed));
-            let active_name = |m: &Model| format!("{} ({})", m.id.trim_end_matches(BATCH), m.provider);
+            let current = slot.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.serves(mode) && !m.embed));
+            let active_name = |m: &Model| m.label();
             let text = current.map_or("none".to_string(), active_name);
             egui::ComboBox::from_id_salt(("default", mode.label())).selected_text(text).show_ui(ui, |ui| {
-                for m in models.iter().filter(|m| m.mode() == mode && !m.embed) {
+                for m in models.iter().filter(|m| m.serves(mode) && !m.embed) {
                     ui.selectable_value(slot, Some(m.reference()), active_name(m));
                 }
             });
@@ -390,7 +430,7 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
         }
         ui.label("Embeddings");
         let current = embed.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.embed));
-        let embed_name = |m: &Model| format!("{} ({})", m.id.trim_end_matches(BATCH), m.provider);
+        let embed_name = |m: &Model| format!("{} ({})", m.id, m.provider);
         let text = current.map_or("none".to_string(), embed_name);
         egui::ComboBox::from_id_salt("default embeddings").selected_text(text).show_ui(ui, |ui| {
             for m in models.iter().filter(|m| m.embed) {
@@ -400,10 +440,10 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
         ui.end_row();
     });
     let mut configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
-    if let Some(selected) = batch.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
+    if let Some(selected) = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
         && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
         ui.add_space(4.0);
-        if provider.kind == Kind::OpenAi { configure |= endpoint_notice(ui); }
+        if provider.kind == Kind::OpenAi { configure |= endpoint_notice(ui, selected.concurrency); }
         else {
             ui.strong("Google batch");
             ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
@@ -439,10 +479,10 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
         ui.label("Use this section to add custom models or providers, or change their connection settings.");
         ui.small("A provider is the service you connect to. A model is the AI you choose from that service.");
         ui.strong("Providers");
-        providers_ui(ui, providers, models, instant, batch, embed, keys);
+        providers_ui(ui, providers, models, single, library, embed, keys);
         ui.separator();
         ui.strong("Models");
-        if models_ui(ui, providers, models, instant, batch, embed) {
+        if models_ui(ui, providers, models, single, library, embed) {
             ui.data_mut(|d| d.insert_temp(egui::Id::new("configure Gemini"), true));
             ui.ctx().request_repaint();
         }
@@ -451,8 +491,9 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
 }
 
 /// Explain the library execution method where the user chooses it.
-fn endpoint_notice(ui: &mut egui::Ui) -> bool {
+fn endpoint_notice(ui: &mut egui::Ui, concurrency: u32) -> bool {
     ui.strong("Several sheets at a time");
+    ui.label(format!("Tilepicky keeps {concurrency} requests in flight while it labels the library."));
     ui.label("Keep Tilepicky open while it labels the library. Closing Tilepicky pauses the job.");
     ui.label("Reopen this library to continue.");
     ui.small("Want processing to continue while Tilepicky is closed? Add a Google key and choose Gemini for Library.");
@@ -467,8 +508,10 @@ fn gemini_setup(providers: &mut Vec<Provider>, models: &mut Vec<Model>) -> (usiz
         providers.push(Provider::new(&name, Kind::Gemini)); providers.len() - 1
     });
     let name = &providers[provider].name;
-    let model = models.iter().position(|m| &m.provider == name && m.mode() == Mode::Batch).unwrap_or_else(|| {
-        models.push(Model { provider: name.clone(), id: "gemini-flash-latest:batch".into(), embed: false }); models.len() - 1
+    let model = models.iter().position(|m| &m.provider == name && m.library).unwrap_or_else(|| {
+        models.push(Model { provider: name.clone(), id: "gemini-flash-latest".into(),
+            single: true, library: true, concurrency: DEFAULT_CONCURRENCY, embed: false });
+        models.len() - 1
     });
     (provider, model)
 }
@@ -528,8 +571,8 @@ fn providers_ui(
     ui: &mut egui::Ui,
     providers: &mut Vec<Provider>,
     models: &mut Vec<Model>,
-    instant: &mut Option<ModelRef>,
-    batch: &mut Option<ModelRef>,
+    single: &mut Option<ModelRef>,
+    library: &mut Option<ModelRef>,
     embed: &mut Option<ModelRef>,
     keys: &mut Keys,
 ) {
@@ -552,7 +595,7 @@ fn providers_ui(
                 for m in models.iter_mut().filter(|m| m.provider == old) {
                     m.provider = p.name.clone();
                 }
-                for r in [&mut *instant, &mut *batch, &mut *embed].into_iter().flatten() {
+                for r in [&mut *single, &mut *library, &mut *embed].into_iter().flatten() {
                     if r.provider == old {
                         r.provider = p.name.clone();
                     }
@@ -608,7 +651,7 @@ fn providers_ui(
     if remove && sel < providers.len() {
         let gone = providers.remove(sel);
         models.retain(|m| m.provider != gone.name);
-        for r in [&mut *instant, &mut *batch, &mut *embed] {
+        for r in [&mut *single, &mut *library, &mut *embed] {
             if r.as_ref().is_some_and(|r| r.provider == gone.name) {
                 *r = None;
             }
@@ -616,16 +659,19 @@ fn providers_ui(
     }
 }
 
-/// One model at a time: its provider, ID, scope, and whether it makes
-/// embeddings. Active selections follow edits.
+/// One model at a time: its provider, ID, the scopes it serves, and whether
+/// it makes embeddings. Active selections follow edits.
 fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
-    instant: &mut Option<ModelRef>, batch: &mut Option<ModelRef>, embed: &mut Option<ModelRef>) -> bool {
+    single: &mut Option<ModelRef>, library: &mut Option<ModelRef>, embed: &mut Option<ModelRef>) -> bool {
     let mut configure = false;
     let names = models.iter().map(Model::label).collect();
     let first = providers.first().map(|p| p.name.clone()).unwrap_or_default();
-    let (sel, remove) = selector(ui, "model", names, &mut || models.push(Model { provider: first.clone(), id: String::new(), embed: false }));
+    let (sel, remove) = selector(ui, "model", names, &mut || models.push(Model {
+        provider: first.clone(), id: String::new(), single: true, library: false, concurrency: DEFAULT_CONCURRENCY, embed: false,
+    }));
     if let Some(m) = models.get_mut(sel) {
         let before = m.reference();
+        let kind = providers.iter().find(|p| p.name == m.provider).map(|p| p.kind);
         egui::Grid::new("model fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("provider");
             egui::ComboBox::from_id_salt("model provider").selected_text(m.provider.clone()).show_ui(ui, |ui| {
@@ -635,51 +681,50 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
             });
             ui.end_row();
             ui.label("Model ID");
-            let mut id = m.id.trim_end_matches(BATCH).to_string();
-            if ui.add(egui::TextEdit::singleline(&mut id).desired_width(f32::INFINITY)).changed() {
-                m.id = id.trim_end_matches(BATCH).to_string();
-                if !m.embed { m.set_batch(m.mode() == Mode::Batch); }
+            ui.add(egui::TextEdit::singleline(&mut m.id).desired_width(f32::INFINITY));
+            ui.end_row();
+            ui.label("Use for");
+            if m.embed {
+                ui.label("Embeddings");
+            } else {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut m.single, "Single sheet");
+                    let library_label = if kind == Some(Kind::Gemini) { "Library (Google batch)" } else { "Library (requests at once)" };
+                    ui.checkbox(&mut m.library, library_label);
+                });
             }
             ui.end_row();
             ui.label("Embedding");
             if ui.checkbox(&mut m.embed, "makes embeddings").changed() && m.embed {
-                // An embedding model carries no scope suffix.
-                m.id = m.id.trim_end_matches(BATCH).to_string();
+                // An embedding model serves neither chat scope.
+                m.single = false;
+                m.library = false;
             }
             ui.end_row();
-            if !m.embed {
-                let mut mode = m.mode();
-                ui.label("Use for");
-                egui::ComboBox::from_id_salt("model scope").selected_text(mode.label()).show_ui(ui, |ui| {
-                    for scope in [Mode::Instant, Mode::Batch] { ui.selectable_value(&mut mode, scope, scope.label()); }
-                });
-                m.set_batch(mode == Mode::Batch);
+            if m.library && !m.embed && kind == Some(Kind::OpenAi) {
+                ui.label("Requests at once");
+                ui.add(egui::DragValue::new(&mut m.concurrency).range(1..=64))
+                    .on_hover_text("How many requests a library job of this model keeps in flight.");
                 ui.end_row();
-                if mode == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider) {
-                    ui.label("Processing");
-                    ui.label(match provider.kind {
-                        Kind::OpenAi => "Several sheets at a time",
-                        Kind::Gemini => "Google batch",
-                    });
-                    ui.end_row();
-                }
             }
         });
-        if !m.embed && m.mode() == Mode::Batch && providers.iter().any(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
-            configure = endpoint_notice(ui);
-        }
+        // A model must serve at least one scope; an empty one is useless.
+        if !m.embed && !m.single && !m.library { m.single = true; }
         let after = m.reference();
         if after != before {
-            for r in [&mut *instant, &mut *batch, &mut *embed].into_iter().flatten() {
-                if *r == before {
-                    *r = after.clone();
-                }
+            for r in [&mut *single, &mut *library, &mut *embed].into_iter().flatten() {
+                if *r == before { *r = after.clone(); }
             }
         }
+        for (mode, slot) in [(Mode::Instant, &mut *single), (Mode::Batch, &mut *library)] {
+            if !m.serves(mode) && slot.as_ref() == Some(&after) { *slot = None; }
+        }
+        if !m.embed && embed.as_ref() == Some(&after) { *embed = None; }
+        if m.library && !m.embed && kind == Some(Kind::OpenAi) { configure = endpoint_notice(ui, m.concurrency); }
     }
     if remove && sel < models.len() {
         let gone = models.remove(sel).reference();
-        for r in [&mut *instant, &mut *batch, &mut *embed] {
+        for r in [&mut *single, &mut *library, &mut *embed] {
             if r.as_ref() == Some(&gone) {
                 *r = None;
             }
@@ -694,14 +739,15 @@ mod tests {
 
     #[test]
     fn gemini_setup_reuses_configuration_and_keeps_active_models() {
-        let mut ai = Ai::default(); let instant = ai.instant.clone(); let batch = ai.batch.clone();
+        let mut ai = Ai::default(); let single = ai.single.clone(); let library = ai.library.clone();
         ai.providers.retain(|p| p.kind != Kind::Gemini); ai.models.retain(|m| m.provider != "Google");
         let (provider, model) = gemini_setup(&mut ai.providers, &mut ai.models);
         assert_eq!(ai.providers[provider].url, Kind::Gemini.defaults().0);
-        assert_eq!(ai.models[model].id, "gemini-flash-latest:batch");
+        assert_eq!(ai.models[model].id, "gemini-flash-latest");
+        assert!(ai.models[model].library);
         let configured = ai.clone();
         assert_eq!(gemini_setup(&mut ai.providers, &mut ai.models), (provider, model));
-        assert_eq!(ai, configured); assert_eq!(ai.instant, instant); assert_eq!(ai.batch, batch);
+        assert_eq!(ai, configured); assert_eq!(ai.single, single); assert_eq!(ai.library, library);
     }
 
     #[test]
@@ -753,71 +799,91 @@ mod tests {
         assert_eq!(p.route(body.clone()), body);
     }
 
+    /// A model of an older file, before the flags: it names only its
+    /// provider and id, and carries the old `:batch` suffix for library scope.
+    fn plain(provider: &str, id: &str) -> Model {
+        Model { provider: provider.into(), id: id.into(), single: false, library: false, concurrency: DEFAULT_CONCURRENCY, embed: false }
+    }
+
     #[test]
     fn the_defaults_name_a_model_for_each_mode() {
         let ai = Ai::default();
         let name = |c: Option<(&Provider, &Model)>| c.map(|(p, m)| (p.name.clone(), m.id.clone()));
         assert_eq!(name(ai.chosen(Mode::Instant)), Some(("OpenRouter".into(), "~deepseek/deepseek-flash-latest".into())));
-        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "~deepseek/deepseek-flash-latest:batch".into())));
+        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "~deepseek/deepseek-flash-latest".into())));
+    }
+
+    /// An old file lists one model twice, once per scope. The pair becomes
+    /// one model that serves both.
+    #[test]
+    fn one_model_serves_both_scopes_after_healing() {
+        let mut ai = Ai { models: vec![plain("OpenRouter", "x"), plain("OpenRouter", "x:batch")],
+            single: None, library: None, ..Ai::default() };
+        ai.heal();
+        let x = ai.models.iter().find(|m| m.id == "x").unwrap();
+        assert!(x.single && x.library);
+        assert_eq!(ai.models.iter().filter(|m| m.id == "x").count(), 1);
     }
 
     /// A file from 0.2 names the models it shipped. They go, the new ones
     /// come in, and the choices follow; a model the user added stays.
     #[test]
     fn retired_models_give_way_to_the_shipped_ones() {
-        let on = |id: &str| Model { provider: "OpenRouter".into(), id: id.into(), embed: false };
         let mut ai = Ai {
-            models: vec![on("xiaomi/mimo-v2.5"), on("openrouter/free"), on("xiaomi/mimo-v2.5:batch"), on("mine/vision")],
-            instant: Some(on("openrouter/free").reference()),
-            batch: Some(on("xiaomi/mimo-v2.5:batch").reference()),
+            models: vec![plain("OpenRouter", "xiaomi/mimo-v2.5"), plain("OpenRouter", "openrouter/free"),
+                plain("OpenRouter", "xiaomi/mimo-v2.5:batch"), plain("OpenRouter", "mine/vision")],
+            single: Some(plain("OpenRouter", "openrouter/free").reference()),
+            library: Some(plain("OpenRouter", "xiaomi/mimo-v2.5:batch").reference()),
             ..Ai::default()
         };
         ai.heal();
         let ids: Vec<_> = ai.models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["mine/vision", "~deepseek/deepseek-flash-latest", "~deepseek/deepseek-flash-latest:batch",
-            "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash:batch", "gemini-flash-latest:batch", "gemini-flash-latest",
+        assert_eq!(ids, ["mine/vision", "~deepseek/deepseek-flash-latest", "z-ai/glm-5.3-flash", "gemini-flash-latest",
             "openai/text-embedding-3-small"]);
         assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
-        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest:batch"));
+        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
     }
 
     /// A file from the tool that kept models inside the providers: no
     /// models, and choices that name nothing.
     #[test]
     fn an_old_file_heals_to_the_shipped_models() {
-        let mut ai = Ai { models: vec![Model { provider: "OpenRouter".into(), id: String::new(), embed: false }], ..Ai::default() };
-        ai.batch = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash".into() });
+        let mut ai = Ai { models: vec![Model { provider: "OpenRouter".into(), id: String::new(),
+            single: false, library: false, concurrency: DEFAULT_CONCURRENCY, embed: false }], ..Ai::default() };
+        ai.library = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash".into() });
         ai.heal();
         assert_eq!(ai.models, Ai::default().models);
         assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
-        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest:batch"));
+        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("gemini-flash-latest"));
     }
 
     #[test]
     fn google_defaults_migrate_without_changing_custom_models_or_other_defaults() {
         let mut ai = Ai::default();
         ai.models.retain(|m| m.provider != "Google");
-        ai.models.push(Model { provider: "Google".into(), id: "gemini-3.7-flash:batch".into(), embed: false });
-        ai.models.push(Model { provider: "Google".into(), id: "custom-model".into(), embed: false });
-        ai.batch = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash:batch".into() });
-        let instant = ai.instant.clone(); let providers = ai.providers.clone();
+        ai.models.push(plain("Google", "gemini-3.7-flash:batch"));
+        ai.models.push(plain("Google", "custom-model"));
+        ai.library = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash:batch".into() });
+        let single = ai.single.clone(); let providers = ai.providers.clone();
         ai.heal();
-        assert_eq!(ai.instant, instant); assert_eq!(ai.providers, providers);
-        assert_eq!(ai.batch.as_ref().unwrap().model, "gemini-flash-latest:batch");
-        assert!(ai.models.iter().any(|m| m.id == "custom-model"));
-        assert!(ai.models.iter().any(|m| m.id == "gemini-flash-latest" && m.mode() == Mode::Instant));
+        assert_eq!(ai.single, single); assert_eq!(ai.providers, providers);
+        assert_eq!(ai.library.as_ref().unwrap().model, "gemini-flash-latest");
+        assert!(ai.models.iter().any(|m| m.id == "custom-model" && m.single));
+        let gemini = ai.models.iter().find(|m| m.id == "gemini-flash-latest").unwrap();
+        assert!(gemini.library && !gemini.single);
         let healed = ai.clone(); ai.heal(); assert_eq!(ai, healed);
     }
 
+    /// Old settings name the active scopes `instant` and `batch`; they read
+    /// as `single` and `library`.
     #[test]
-    fn the_batch_end_of_the_id_is_the_mode() {
-        let mut m = Model { provider: "P".into(), id: "x".into(), embed: false };
-        assert_eq!(m.mode(), Mode::Instant);
-        m.set_batch(true);
-        m.set_batch(true);
-        assert_eq!((m.id.as_str(), m.mode()), ("x:batch", Mode::Batch));
-        m.set_batch(false);
-        assert_eq!((m.id.as_str(), m.mode()), ("x", Mode::Instant));
+    fn old_active_keys_map_to_the_new_names() {
+        let ai: Ai = serde_json::from_value(serde_json::json!({
+            "instant": {"provider": "OpenRouter", "model": "x"},
+            "batch": {"provider": "OpenRouter", "model": "y"},
+        })).unwrap();
+        assert_eq!(ai.single.as_ref().unwrap().model, "x");
+        assert_eq!(ai.library.as_ref().unwrap().model, "y");
     }
 
     #[test]
