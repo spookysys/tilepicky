@@ -12,6 +12,7 @@ use crate::{ai::{Kind, Provider}, index::Index, labels, sidecar::{Label, Status}
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod cost;
+mod openrouter;
 mod runner;
 mod store;
 
@@ -49,6 +50,9 @@ pub struct Sheet {
     cancelled: bool,
     #[serde(default)]
     guard: Option<InputGuard>,
+    /// The object key of this sheet in the batch bucket, while its batch runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stored: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -164,6 +168,10 @@ pub struct Job {
     estimate: Option<cost::Estimate>,
     #[serde(default)]
     usage: cost::Usage,
+    /// The object storage for this run. It holds the secret, so it is never
+    /// saved with the job.
+    #[serde(skip)]
+    objects: Option<std::sync::Arc<dyn openrouter::Objects>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,7 +180,7 @@ enum Operation { Label, Submit, Poll, Recover, Cancel }
 impl Job {
     fn operation(&self) -> Operation {
         let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
-        if self.provider.kind == Kind::OpenAi { Operation::Label }
+        if self.provider.kind == Kind::OpenAi && self.provider.store.is_none() { Operation::Label }
         else if waiting && (self.poll_next || (!self.untaken() && !self.uncertain())) { Operation::Poll }
         else if self.uncertain() && (!self.submit_next || !self.untaken()) { Operation::Recover }
         else if self.untaken() { Operation::Submit }
@@ -311,8 +319,9 @@ pub fn prepare_of(index: &Index, provider: Provider, model: String, scope: Scope
         prompt: Some(labels::prompt(&index.tag_list, index.free_tags)),
         file_context: true, poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
         issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0, estimate: None, usage: cost::Usage::default(),
+        objects: None,
         sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(),
-            imported: false, unknown: 0, retry_ms: 0, attempts: 0, cancelled: false, guard: None })
+            imported: false, unknown: 0, retry_ms: 0, attempts: 0, cancelled: false, guard: None, stored: None })
             .collect(),
     })
 }
@@ -542,10 +551,11 @@ pub fn advance(job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Opt
 fn advance_operation(mut job: Job, root: &Path, dir: &Path, operation: Operation, send: Send) -> (Job, Result<(), String>) {
     let result = match operation {
         Operation::Label => { job.release_groups(); one(&mut job, root, dir, send) }
-        Operation::Poll => { job.poll_next = false; poll(&mut job, dir, send) }
+        Operation::Poll => { job.poll_next = false; if job.provider.kind == Kind::OpenAi { openrouter::poll(&mut job, dir, send) } else { poll(&mut job, dir, send) } }
         Operation::Recover => { job.poll_next = true; job.submit_next = true; recover(&mut job, dir, send) }
-        Operation::Submit => { job.poll_next = true; job.submit_next = false; submit(&mut job, root, dir, send) }
-        Operation::Cancel => cancel_remote(&mut job, dir, send),
+        Operation::Submit => { job.poll_next = true; job.submit_next = false;
+            if job.provider.kind == Kind::OpenAi { openrouter::submit(&mut job, root, dir, send) } else { submit(&mut job, root, dir, send) } }
+        Operation::Cancel => if job.provider.kind == Kind::OpenAi { openrouter::cancel(&mut job, dir) } else { cancel_remote(&mut job, dir, send) },
     };
     (job, result)
 }
@@ -942,9 +952,10 @@ impl Panel {
         }
         if let Some(job) = &self.job {
             let key = job.provider.key(keys).unwrap_or_default();
+            let secret = job.provider.store_secret(keys);
             if !single_running && self.runner.is_none() && self.storage_error.is_empty() && !job.done() && let Some(lock) = &self.lock {
                 self.key = key.clone();
-                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), key, lock.clone(), ctx.clone(), self.log.clone().unwrap()));
+                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), key, secret, lock.clone(), ctx.clone(), self.log.clone().unwrap()));
             } else if key != self.key {
                 self.key = key.clone(); self.command(runner::Command::Key(key));
             }
@@ -1228,7 +1239,7 @@ impl Panel {
     fn start_retry(&mut self, command: runner::Command, ctx: &eframe::egui::Context, keys: &crate::ai::Keys) {
         if self.runner.is_none() && let (Some(job), Some(lock)) = (&self.job, &self.lock) {
             self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(),
-                job.provider.key(keys).unwrap_or_default(), lock.clone(), ctx.clone(), self.log.clone().unwrap()));
+                job.provider.key(keys).unwrap_or_default(), job.provider.store_secret(keys), lock.clone(), ctx.clone(), self.log.clone().unwrap()));
         }
         self.command(command);
     }

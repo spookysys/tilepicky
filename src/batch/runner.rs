@@ -82,7 +82,7 @@ impl Runner {
         if let Some(thread) = self.thread.take() { let _ = thread.join(); }
     }
     pub fn command(&self, command: Command) { let _ = self.commands.send(command); }
-    pub fn start(job: Job, root: PathBuf, key: String, lock: Arc<std::fs::File>, ctx: egui::Context, log: crate::ai_log::Log) -> Self {
+    pub fn start(job: Job, root: PathBuf, key: String, secret: Option<String>, lock: Arc<std::fs::File>, ctx: egui::Context, log: crate::ai_log::Log) -> Self {
         let (tx, events) = mpsc::channel();
         let (commands, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -99,6 +99,16 @@ impl Runner {
                 if let Remote::Waiting(id) = &group.remote { group.tracking.id = id.clone(); }
             }
             coordinator.job.poll_ms = coordinator.job.next_poll();
+            if coordinator.job.provider.kind == Kind::OpenAi
+                && let Some(store) = coordinator.job.provider.store.clone() {
+                match secret {
+                    Some(secret) => match crate::s3::Client::new(store, secret) {
+                        Ok(client) => coordinator.job.objects = Some(Arc::new(openrouter::Storage::new(client))),
+                        Err(error) => coordinator.job.issue("upload", error, now_ms()),
+                    },
+                    None => coordinator.job.issue("upload", "No object-storage secret key is set for this provider.".into(), now_ms()),
+                }
+            }
             let mut key = key;
             let mut retry = false;
             let mut dirty = true;
@@ -147,7 +157,7 @@ impl Runner {
                     }
                     continue;
                 }
-                if coordinator.job.provider.kind == Kind::OpenAi {
+                if coordinator.job.provider.kind == Kind::OpenAi && coordinator.job.provider.store.is_none() {
                     if !key.is_empty() && (label_send.is_none() || label_key != key) {
                         match Transport::new(&coordinator.job.provider, key.clone()) {
                             Ok(transport) => {
@@ -372,8 +382,8 @@ impl Job {
         let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
         let recoverable = self.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_some());
         let allowed = |op: Operation| self.due(op.name(), now) && match op {
-            Operation::Label => self.provider.kind == Kind::OpenAi && self.mode == Mode::Running && self.untaken() && !self.pending_save(),
-            Operation::Submit => self.provider.kind == Kind::Gemini && self.mode == Mode::Running && self.untaken() && !self.pending_save()
+            Operation::Label => self.provider.kind == Kind::OpenAi && self.provider.store.is_none() && self.mode == Mode::Running && self.untaken() && !self.pending_save(),
+            Operation::Submit => (self.provider.kind == Kind::Gemini || self.provider.store.is_some()) && self.mode == Mode::Running && self.untaken() && !self.pending_save()
                 && self.groups.iter().filter(|g| g.remote == Remote::Submitting).count() < MAX_UNCONFIRMED,
             Operation::Poll => waiting && self.poll_ms <= now,
             Operation::Recover => recoverable && self.recovery_ms <= now,
@@ -649,7 +659,7 @@ mod tests {
     #[test]
     fn the_runner_waits_for_the_library_acknowledgement() {
         let f = Fixture::new(); let mut c = f.coordinator(); receive(&mut c);
-        let runner = Runner::start(c.job, f.root.clone(), String::new(), lock(&f.dir).unwrap(), egui::Context::default(),
+        let runner = Runner::start(c.job, f.root.clone(), String::new(), None, lock(&f.dir).unwrap(), egui::Context::default(),
             crate::ai_log::Log::batch(&f.root, "test"));
         let mut reply = None;
         for _ in 0..4 {

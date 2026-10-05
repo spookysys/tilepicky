@@ -2,7 +2,6 @@
 //! A small S3-compatible client: put one object, delete it, and presign a
 //! GET that a provider can fetch. It signs with AWS Signature Version 4, in
 //! either host style (`bucket.host`) or path style (`host/bucket`).
-#![allow(dead_code)] // Wired into the batch path next.
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -25,11 +24,6 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn complete(&self) -> bool {
-        !self.endpoint.trim().is_empty() && !self.region.trim().is_empty()
-            && !self.bucket.trim().is_empty() && !self.access_key.trim().is_empty()
-    }
-
     /// The scheme and host of the endpoint, without the trailing slash.
     fn scheme_host(&self) -> Result<(String, String), String> {
         let endpoint = self.endpoint.trim().trim_end_matches('/');
@@ -56,8 +50,6 @@ impl Client {
         store.scheme_host()?;
         Ok(Self { store, secret, agent: crate::labels::agent() })
     }
-
-    pub fn store(&self) -> &Store { &self.store }
 
     fn url(&self, host: &str, uri: &str) -> Result<String, String> {
         let (scheme, _) = self.store.scheme_host()?;

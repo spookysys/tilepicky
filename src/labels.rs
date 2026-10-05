@@ -301,7 +301,7 @@ impl Run {
     }
 }
 
-fn data_url(img: &RgbaImage) -> Result<String, String> {
+pub fn png_bytes(img: &RgbaImage) -> Result<Vec<u8>, String> {
     // Bound input size while retaining nearest-neighbor pixel art edges.
     let reduced;
     let img = if img.width().max(img.height()) > 2048 {
@@ -312,7 +312,11 @@ fn data_url(img: &RgbaImage) -> Result<String, String> {
     } else { img };
     let mut png = Cursor::new(Vec::new());
     img.write_to(&mut png, image::ImageFormat::Png).map_err(|_| "Could not encode the image.")?;
-    Ok(format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner())))
+    Ok(png.into_inner())
+}
+
+fn data_url(img: &RgbaImage) -> Result<String, String> {
+    Ok(format!("data:image/png;base64,{}", STANDARD.encode(png_bytes(img)?)))
 }
 
 /// The two texts of a request: what the model is, and what it is asked.
