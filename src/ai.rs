@@ -359,6 +359,8 @@ impl Ai {
         let before = self.models.len();
         self.models.retain(|m| !m.id.is_empty() && !RETIRED.contains(&(m.provider.as_str(), m.id.as_str())));
         let retired = self.models.len() < before;
+        // The shipped embedding model, kept to add below if the file has none.
+        let shipped_embed = shipped.models.iter().find(|m| m.is_embed()).cloned();
         if self.models.is_empty() || retired {
             for m in shipped.models { self.merge_if_provider(m); }
         }
@@ -374,6 +376,11 @@ impl Ai {
                     Mode::Batch => self.library = fallback,
                 }
             }
+        }
+        // A file from before embeddings gains the default one, so search by
+        // meaning works without choosing a model by hand.
+        if !self.models.iter().any(|m| m.is_embed()) && let Some(m) = shipped_embed {
+            self.merge_if_provider(m);
         }
         if self.chosen_embed().is_none() {
             self.embed = shipped.embed.filter(|r| self.models.iter().any(|m| m.is(r) && m.is_embed()));
@@ -1070,6 +1077,17 @@ mod tests {
         assert!(!m.serves(Mode::Instant) && !m.serves(Mode::Batch));
         assert_eq!(m.concurrency(), None);
         assert!(m.label().contains("embeddings"));
+    }
+
+    /// A fresh install names an embedding model, and a file from before
+    /// embeddings gains the shipped one so search by meaning works.
+    #[test]
+    fn an_old_file_gains_the_default_embedding_model() {
+        assert!(Ai::default().chosen_embed().is_some());
+        let mut ai = Ai { models: vec![plain("OpenRouter", "mine/vision")], single: None, library: None, embed: None, ..Ai::default() };
+        ai.heal();
+        assert!(ai.models.iter().any(Model::is_embed));
+        assert_eq!(ai.chosen_embed().map(|(_, m)| m.id.as_str()), Some("openai/text-embedding-3-small"));
     }
 
     #[test]
