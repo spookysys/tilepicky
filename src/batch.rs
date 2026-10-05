@@ -25,6 +25,9 @@ const MAX_UNCONFIRMED: usize = 3;
 /// How often the tool asks the provider about a submitted batch.
 const POLL: Duration = Duration::from_secs(30);
 
+/// A loaded job that predates per-model concurrency keeps the default.
+fn default_concurrency() -> u32 { crate::ai::DEFAULT_CONCURRENCY }
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Sheet {
     pub rel: String,
@@ -119,6 +122,10 @@ pub struct Job {
     log_id: String,
     pub provider: Provider,
     pub model: String,
+    /// How many ordinary requests the job keeps in flight. Only an
+    /// OpenAI-style provider reads it; a Gemini job submits batches.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
     pub sheets: Vec<Sheet>,
     pub groups: Vec<Group>,
     /// The sheets that had a label already.
@@ -299,7 +306,8 @@ pub fn prepare_of(index: &Index, provider: Provider, model: String, scope: Scope
     let open = index.entries.iter().filter(|e| keep(e) && (all || e.side.label.is_none()));
     Ok(Job {
         log_id: crate::ai_log::id(),
-        provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
+        provider, model: model.trim_end_matches(":batch").into(), concurrency: crate::ai::DEFAULT_CONCURRENCY,
+        groups: vec![], skipped: if all { 0 } else { labeled },
         replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), prompt: Some(labels::prompt(&index.tag_list)),
         file_context: true, poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
         issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0, estimate: None, usage: cost::Usage::default(),
@@ -1149,14 +1157,15 @@ impl Panel {
             crate::stop(&button);
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
-                let (provider, model) = (provider.clone(), model.id.clone());
+                let (provider, model, concurrency) = (provider.clone(), model.id.clone(), model.concurrency.max(1));
                 let set = self.choice.as_ref().map(|(rels, _)| rels.clone());
                 let job = match set.as_ref() {
                     Some(set) => prepare_of(index, provider, model, scope, Some(set)),
                     None => prepare(index, provider, model, scope),
                 };
                 match job {
-                    Ok(job) => {
+                    Ok(mut job) => {
+                        job.concurrency = concurrency;
                         self.cost_error.clear();
                         self.cost_preview = match cost::Preview::start(job.clone(), index.root.clone(), self.job.as_ref(), ui.ctx().clone()) {
                             Ok(preview) => Some(preview), Err(error) => { self.cost_error = error; None }

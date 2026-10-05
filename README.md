@@ -179,9 +179,8 @@ With an OpenAI-compatible provider such as OpenRouter, Tilepicky sends ordinary 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
-The internal `:batch` suffix in saved settings identifies a library model; it is not part of the provider's model ID.
-The model editor uses **Use for: Single sheet / Library** and shows the provider model ID without that suffix.
-Library models show **Several sheets at a time** for OpenAI-compatible providers, including OpenRouter, or **Google batch** for Gemini.
+A model serves single sheets, library jobs, or both. The model editor ticks each scope, and sets how many requests a library job keeps in flight.
+An OpenAI-compatible library model labels several sheets at a time; a Gemini one uses **Google batch**.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
 Repeated errors appear once, with the affected sheet count. **Error details** keeps the full explanations and affected sheet paths.

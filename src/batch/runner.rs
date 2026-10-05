@@ -19,7 +19,6 @@ pub(super) enum Event {
 pub(super) struct SaveReport { pub saved: Vec<usize>, pub rejected: Vec<(usize, String)>, pub error: Option<String> }
 
 /// How many ordinary label requests an OpenAI-style job keeps in flight.
-const IN_FLIGHT: usize = 4;
 type SendFn = dyn Fn(&str, Option<&Value>) -> Result<Value, Failure> + std::marker::Send + Sync;
 
 /// Label requests that are out, and the sheets they carry. The workers only
@@ -260,12 +259,14 @@ impl Coordinator {
         else { self.job.issues.remove("save"); }
     }
 
-    /// Sends up to `IN_FLIGHT` label requests at once, each on its own worker.
-    /// The job is written here and by `collect`, never by a worker.
+    /// Sends up to the model's concurrency of label requests at once, each
+    /// on its own worker. The job is written here and by `collect`, never
+    /// by a worker.
     fn dispatch_labels(&mut self, pump: &mut Pump, send: &Arc<SendFn>, log: &crate::ai_log::Log, now: u64) -> bool {
         if self.job.groups.iter().any(|g| g.remote != Remote::Done) { self.job.release_groups(); }
+        let flight = self.job.concurrency.max(1) as usize;
         let mut worked = false;
-        while pump.inflight() < IN_FLIGHT {
+        while pump.inflight() < flight {
             let Some(i) = self.job.sheets.iter().enumerate()
                 .find(|(i, s)| !s.taken && s.retry_ms <= now && !pump.busy.contains(i)).map(|(i, _)| i) else { break };
             crate::ai_log::event("batch_sheet_start", json!({"sheet":self.job.sheets[i].rel, "provider":self.job.provider.name,
@@ -432,9 +433,11 @@ mod tests {
         for name in ["b.png", "c.png", "d.png", "e.png"] {
             RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])).save(f.root.join(name)).unwrap();
         }
-        let job = prepare(&Index::scan(&f.root, [16, 16]), super::super::tests::provider(Kind::OpenAi),
+        let mut job = prepare(&Index::scan(&f.root, [16, 16]), super::super::tests::provider(Kind::OpenAi),
             "test:batch".into(), Scope::Unlabeled).unwrap();
-        assert!(job.sheets.len() >= IN_FLIGHT);
+        job.concurrency = 4;
+        let flight = job.concurrency as usize;
+        assert!(job.sheets.len() >= flight);
         let mut c = Coordinator { job, root: f.root.clone(), dir: f.dir.clone() };
         let mut pump = Pump::new();
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -445,12 +448,12 @@ mod tests {
         });
         let log = crate::ai_log::Log::single("test");
         assert!(c.dispatch_labels(&mut pump, &send, &log, 1_000));
-        assert_eq!(pump.inflight(), IN_FLIGHT, "the pipe fills before any reply is read");
+        assert_eq!(pump.inflight(), flight, "the pipe fills before any reply is read");
         while !c.job.remote_done() {
             let reply = pump.rx.recv_timeout(Duration::from_secs(5)).expect("a worker answered");
             pump.busy.remove(&reply.0);
             c.collect(reply, 1_000);
-            if pump.inflight() < IN_FLIGHT { c.dispatch_labels(&mut pump, &send, &log, 1_000); }
+            if pump.inflight() < flight { c.dispatch_labels(&mut pump, &send, &log, 1_000); }
         }
         assert_eq!(calls.load(AtomicOrdering::Relaxed), c.job.sheets.len());
         assert!(c.job.sheets.iter().all(|s| s.taken && s.label.is_some()));
