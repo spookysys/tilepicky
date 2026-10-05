@@ -235,13 +235,14 @@ fn chat_request(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, S
     Ok(request)
 }
 
-fn image_request(job: &mut Job, root: &Path, i: usize) -> Result<Value, String> {
+/// The request for one sheet. `existing` is the label the book held when the
+/// request was built; it guards the save of the reply. The caller reads the
+/// book once for many sheets instead of once for each.
+fn image_request(job: &mut Job, root: &Path, i: usize, existing: Option<Label>) -> Result<Value, String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))?;
     let image = image::load_from_memory(&bytes).map_err(|e| format!("Could not read the image: {e}"))?;
-    let book = crate::sidecar::load_book(root)?;
-    job.sheets[i].guard = Some(InputGuard { hash: format!("{:x}", Sha256::digest(&bytes)),
-        label: book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone()) });
+    job.sheets[i].guard = Some(InputGuard { hash: format!("{:x}", Sha256::digest(&bytes)), label: existing });
     if job.provider.kind == Kind::Gemini { body(job, &image.to_rgba8(), &job.sheets[i].rel) }
     else { Ok(job.provider.route(chat_request(job, &image.to_rgba8(), &job.sheets[i].rel)?)) }
 }
@@ -508,7 +509,9 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
     let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
     crate::ai_log::event("batch_sheet_start", json!({"sheet":job.sheets[i].rel, "provider":job.provider.name,
         "model":job.model, "attempt":job.sheets[i].unknown + 1, "tags_requested":job.tag_list}));
-    let request = image_request(job, root, i);
+    let book = crate::sidecar::load_book(root)?;
+    let existing = book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone());
+    let request = image_request(job, root, i, existing);
     job.save(dir)?;
     let reply = match request {
         // The image could not be read: the sheet ends with that reason.
@@ -564,10 +567,12 @@ fn finish_one(job: &mut Job, dir: &Path, i: usize, reply: Result<Value, Failure>
 /// reference, its path, and its body, or `None` when no sheet is left.
 fn prepare_submission(job: &mut Job, root: &Path, dir: &Path) -> Result<Option<(String, String, Value)>, String> {
     let (mut requests, mut bytes) = (Vec::new(), 0);
+    let book = crate::sidecar::load_book(root)?;
     for i in 0..job.sheets.len() {
         if job.sheets[i].taken { continue; }
         if requests.len() == MAX_REQUESTS { break; }
-        let body = image_request(job, root, i);
+        let existing = book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone());
+        let body = image_request(job, root, i, existing);
         let size = body.as_ref().map_or(0, |b| serde_json::to_vec(b).unwrap().len() + 512);
         match body {
             Ok(_) if size > MAX_BYTES => job.sheets[i].error = "The image request is too large.".into(),
@@ -1367,17 +1372,17 @@ mod tests {
     fn new_jobs_send_file_context_and_old_jobs_keep_their_saved_prompt() {
         let files = Files::new();
         let mut job = files.prepare(Kind::OpenAi);
-        let request = image_request(&mut job, &files.root, 0).unwrap();
+        let request = image_request(&mut job, &files.root, 0, None).unwrap();
         let expected = labels::sheet_prompt(job.prompt.clone().unwrap(), "folder/sheet.png");
         assert_eq!(request["messages"][1]["content"][0]["text"], expected[1]);
         job.provider = provider(Kind::Gemini);
-        let google = image_request(&mut job, &files.root, 0).unwrap();
+        let google = image_request(&mut job, &files.root, 0, None).unwrap();
         assert_eq!(google, crate::gemini::request(&request));
         let mut saved = serde_json::to_value(&job).unwrap();
         saved.as_object_mut().unwrap().remove("file_context");
         saved["prompt"] = json!(["Original system", "Original user"]);
         let mut legacy: Job = serde_json::from_value(saved).unwrap();
-        let google = image_request(&mut legacy, &files.root, 0).unwrap();
+        let google = image_request(&mut legacy, &files.root, 0, None).unwrap();
         assert_eq!(google["systemInstruction"]["parts"][0]["text"], "Original system");
         assert_eq!(google["contents"][0]["parts"][0]["text"], "Original user");
     }

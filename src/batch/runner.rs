@@ -105,7 +105,7 @@ impl Runner {
             log.event("batch_resume", json!({"provider":job.provider.name,"model":job.model,"mode":job.mode}));
             let dir = root.clone();
             let notify = |event| { let _ = tx.send(event); ctx.request_repaint(); };
-            let mut coordinator = Coordinator { job, root, dir };
+            let mut coordinator = Coordinator { job, root, dir, book: None };
             for group in &mut coordinator.job.groups {
                 if let Remote::Waiting(id) = &group.remote { group.tracking.id = id.clone(); }
             }
@@ -266,8 +266,16 @@ impl Runner {
     }
 }
 
-pub(super) struct Coordinator { pub job: Job, pub root: PathBuf, pub dir: PathBuf }
+pub(super) struct Coordinator { pub job: Job, pub root: PathBuf, pub dir: PathBuf, book: Option<crate::sidecar::Book> }
 impl Coordinator {
+    /// The label the book holds for one sheet. The book is read once and
+    /// kept until labels are saved, so a library of many sheets does not
+    /// re-read it for each request.
+    fn guard_label(&mut self, i: usize) -> Option<Label> {
+        if self.book.is_none() { self.book = crate::sidecar::load_book(&self.root).ok(); }
+        let rel = &self.job.sheets[i].rel;
+        self.book.as_ref().and_then(|book| book.sheets.get(rel)).and_then(|side| side.label.clone())
+    }
     fn retry(&mut self, command: Command) {
         self.job.mode = Mode::Running;
         match command {
@@ -300,6 +308,7 @@ impl Coordinator {
         Ok(false)
     }
     fn saved(&mut self, report: SaveReport, now: u64) {
+        self.book = None;
         for i in report.saved { self.job.sheets[i].imported = true; }
         for (i, error) in report.rejected {
             self.job.sheets[i].error = error; self.job.sheets[i].label = None; self.job.sheets[i].imported = false;
@@ -320,7 +329,8 @@ impl Coordinator {
                 .find(|(i, s)| !s.taken && s.retry_ms <= now && !pump.busy.contains(i)).map(|(i, _)| i) else { break };
             crate::ai_log::event("batch_sheet_start", json!({"sheet":self.job.sheets[i].rel, "provider":self.job.provider.name,
                 "model":self.job.model, "attempt":self.job.sheets[i].unknown + 1, "tags_requested":self.job.tag_list}));
-            let request = match image_request(&mut self.job, &self.root, i) {
+            let existing = self.guard_label(i);
+            let request = match image_request(&mut self.job, &self.root, i, existing) {
                 Ok(request) => request,
                 Err(error) => { self.job.sheets[i].error = error; self.job.sheets[i].taken = true; worked = true; continue; }
             };
@@ -497,9 +507,9 @@ mod tests {
                 url: "https://example.invalid/v1beta".into() };
             prepare(&Index::scan(&self.root, [16, 16]), provider, "test".into(), Scope::Unlabeled).unwrap()
         }
-        fn coordinator(&self) -> Coordinator { Coordinator { job: self.job(), root: self.root.clone(), dir: self.dir.clone() } }
+        fn coordinator(&self) -> Coordinator { Coordinator { job: self.job(), root: self.root.clone(), dir: self.dir.clone(), book: None } }
         fn reopen(&self) -> Coordinator {
-            Coordinator { job: Job::load(&self.dir).unwrap().unwrap(), root: self.root.clone(), dir: self.dir.clone() }
+            Coordinator { job: Job::load(&self.dir).unwrap().unwrap(), root: self.root.clone(), dir: self.dir.clone(), book: None }
         }
         fn control(&self, mode: Mode, revision: u64) {
             store::set_control(&self.dir, &Control { mode, revision }).unwrap();
@@ -530,7 +540,7 @@ mod tests {
         job.concurrency = 4;
         let flight = job.concurrency as usize;
         assert!(job.sheets.len() >= flight);
-        let mut c = Coordinator { job, root: f.root.clone(), dir: f.dir.clone() };
+        let mut c = Coordinator { job, root: f.root.clone(), dir: f.dir.clone(), book: None };
         let mut pump = Pump::new();
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
@@ -753,6 +763,21 @@ mod tests {
         c.collect_submission(&reference, reply, 1_000);
         assert!(matches!(&c.job.groups[0].remote, Remote::Waiting(_)));
         assert!(!c.job.untaken());
+    }
+
+    /// The book is read once and kept, so a library of many sheets does not
+    /// re-read it for each request. A saved label refreshes the copy.
+    #[test]
+    fn the_guard_label_is_kept_and_refreshes_after_a_save() {
+        let f = Fixture::new(); let mut c = f.coordinator();
+        let label = |caption: &str| Label { provider: "test".into(), model: "test".into(), status: Status::Labeled,
+            caption: caption.into(), tags: vec![], tag_list: None };
+        crate::sidecar::store_labels(&f.root, [("sheet.png", Some(label("Old")))]).unwrap();
+        assert_eq!(c.guard_label(0).unwrap().caption, "Old");
+        crate::sidecar::store_labels(&f.root, [("sheet.png", Some(label("New")))]).unwrap();
+        assert_eq!(c.guard_label(0).unwrap().caption, "Old", "the book is kept between reads");
+        c.saved(SaveReport { saved: vec![], rejected: vec![], error: None }, 1_000);
+        assert_eq!(c.guard_label(0).unwrap().caption, "New", "a save refreshes the copy");
     }
 
     #[test]
