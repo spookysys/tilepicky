@@ -35,7 +35,7 @@ type Grid = ([u32; 2], [u32; 2], [i32; 2]);
 use index::Index;
 use sheet::{Block, Sel, Sheet};
 use sidecar::{Animation, Pair};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use dialogs::{Damaged, NameFor, NamePrompt, Pending};
@@ -150,6 +150,14 @@ struct App {
     picking: Option<(Panel, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
     /// A drag across the files started here and marks a group while it lasts.
     sweep: Option<usize>,
+    /// Files marked with Ctrl+click in the LIBRARY tree, for a library batch.
+    library_marked: HashSet<usize>,
+    /// The last plainly clicked library file, for shift ranges.
+    library_anchor: Option<usize>,
+    /// A drag across the library files started here; it marks a group while it lasts.
+    library_sweep: Option<usize>,
+    /// The visible library files, top to bottom; what a library range runs over.
+    library_order: Vec<usize>,
     /// Files held in the air, waiting for a folder to land in.
     file_drag: Option<Vec<String>>,
     /// Where the project pane sat last frame, for drops onto the empty pane.
@@ -402,6 +410,10 @@ impl App {
             tree_anchor: None,
             tree_cursor: None,
             sweep: None,
+            library_marked: HashSet::new(),
+            library_anchor: None,
+            library_sweep: None,
+            library_order: Vec::new(),
             file_drag: None,
             project_rect: Rect::NOTHING,
             confirm: None,
@@ -493,7 +505,12 @@ impl App {
     /// remembers it for the next run.
     fn set_folder(&mut self, panel: Panel, dir: PathBuf) {
         let name = match panel {
-            Panel::Library => "library",
+            Panel::Library => {
+                self.library_marked.clear();
+                self.library_anchor = None;
+                self.library_sweep = None;
+                "library"
+            }
             Panel::Project => {
                 self.marked.clear();
                 "project"
@@ -632,6 +649,20 @@ impl App {
         }
     }
 
+    /// Marks every library file from `a` to `i` in the order the tree shows
+    /// them. `additive` keeps the files that are marked already.
+    fn mark_library_range(&mut self, a: usize, i: usize, additive: bool) {
+        let (pa, pi) = (self.library_order.iter().position(|&x| x == a), self.library_order.iter().position(|&x| x == i));
+        let (Some(pa), Some(pi)) = (pa, pi) else {
+            return;
+        };
+        let range = self.library_order[pa.min(pi)..=pa.max(pi)].to_vec();
+        if !additive {
+            self.library_marked.clear();
+        }
+        self.library_marked.extend(range);
+    }
+
     fn open_library(&mut self, ctx: &egui::Context, i: usize) {
         // The keys follow the file, however it was opened. A click that
         // left the cursor behind means the next arrow starts somewhere the
@@ -694,6 +725,9 @@ impl App {
     }
 
     fn rescan_library(&mut self) {
+        self.library_marked.clear();
+        self.library_anchor = None;
+        self.library_sweep = None;
         self.library.rescan(&self.qwords, self.settings.search);
         let index = &self.library.index;
         self.status = index.error.clone().unwrap_or_else(|| format!("{} files in the library", index.entries.len()));
@@ -2144,7 +2178,50 @@ impl App {
     /// What a click or a menu in the LIBRARY tree asks for.
     fn library_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
         match action {
-            TreeAction::Open(i) => self.open_library(ctx, i),
+            TreeAction::Open(i) => {
+                self.library_marked.clear();
+                self.library_marked.insert(i);
+                self.library_anchor = Some(i);
+                self.open_library(ctx, i);
+            }
+            TreeAction::Toggle(i) => {
+                if !self.library_marked.remove(&i) {
+                    self.library_marked.insert(i);
+                }
+                self.library_anchor = Some(i);
+            }
+            TreeAction::Range(i, additive) => {
+                let a = self.library_anchor.unwrap_or(i);
+                self.mark_library_range(a, i, additive);
+            }
+            TreeAction::SweepStart(i) => {
+                self.library_sweep = Some(i);
+                self.library_anchor = Some(i);
+                self.library_marked.clear();
+                self.library_marked.insert(i);
+            }
+            TreeAction::Sweep(i) => {
+                let a = self.library_sweep.unwrap_or(i);
+                self.mark_library_range(a, i, false);
+            }
+            TreeAction::Batch(ids) => {
+                let rels: BTreeSet<String> = ids.iter().filter_map(|&k| self.library.index.entries.get(k)).map(|e| e.rel.clone()).collect();
+                if !rels.is_empty() {
+                    let count = rels.len();
+                    self.library_batch.choose(rels, format!("{count} sheets"));
+                    self.ai_panel = true;
+                }
+            }
+            TreeAction::BatchDir(dir) => {
+                let prefix = format!("{dir}/");
+                let rels: BTreeSet<String> =
+                    self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
+                if !rels.is_empty() {
+                    let count = rels.len();
+                    self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
+                    self.ai_panel = true;
+                }
+            }
             TreeAction::Labels(i, action) => {
                 let rel = self.library.index.entries[i].rel.clone();
                 if self.library.sheet.as_ref().is_none_or(|s| s.rel != rel) { self.open_library(ctx, i); }
@@ -2265,7 +2342,7 @@ impl App {
                     focus: true,
                 });
             }
-            TreeAction::Labels(_, _) => {}
+            TreeAction::Labels(_, _) | TreeAction::Batch(_) | TreeAction::BatchDir(_) => {}
         }
     }
 }
@@ -2421,7 +2498,7 @@ impl App {
                          Ctrl+F: search | +/- or Ctrl+wheel: zoom\n\
                          Ctrl+Z/Y: undo/redo | Ctrl+S: save | Ctrl+T: trim\n\
                          A: animation | M: store/remove | E: inspect{ai_key}\n\
-                         Right-click: library menu; project clear/delete\n\
+                         Right-click: library menu/batch; project clear/delete\n\
                          Ctrl+,: settings"
                     );
                     let text = egui::RichText::new(legend).weak();
@@ -2458,14 +2535,14 @@ impl App {
                         let view = tree::View {
                             visible: self.library.visible.as_deref(),
                             selected: self.library.sel,
-                            marked: None,
+                            marked: Some(&self.library_marked),
                             query: &self.qwords,
                             apply_query: self.open_trees,
                             menus: false,
                             scroll_to: self.library.scroll.as_ref(),
                             cursor: on_rows.0.then_some(self.library.at.as_ref()).flatten(),
                             open_dir: self.library.open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
-                            sweeping: false,
+                            sweeping: self.library_sweep.is_some(),
                             lifting: false,
                             entries: &self.library.index.entries,
                         };
@@ -2586,9 +2663,13 @@ impl App {
         self.project.scroll = None;
         self.library.open_dir = None;
         self.project.open_dir = None;
-        // The files of the PROJECT tree, in the order it shows them: what a
-        // marked group runs over.
-        let project_order: Vec<usize> = project_rows.iter().filter_map(|r| if let tree::Row::File(i) = r { Some(*i) } else { None }).collect();
+        // The files of each tree, in the order it shows them: what a marked
+        // group runs over.
+        let files = |rows: &[tree::Row]| -> Vec<usize> {
+            rows.iter().filter_map(|r| if let tree::Row::File(i) = r { Some(*i) } else { None }).collect()
+        };
+        let project_order = files(&project_rows);
+        self.library_order = files(&library_rows);
         self.tree_keys(ctx, &library_rows, &project_rows, &project_order);
         if let Some(action) = library_action {
             self.library_tree_action(ctx, action);
@@ -2600,6 +2681,7 @@ impl App {
         // clearing it earlier would let the last step mark one file only.
         if !ctx.input(|i| i.pointer.primary_down()) {
             self.sweep = None;
+            self.library_sweep = None;
         }
         self.drop_files(ctx, hover_dir);
         if create {
@@ -3401,6 +3483,30 @@ mod tests {
         let app = App::new(settings::Settings::default(), Some("Cannot read settings.json".into()));
         assert!(matches!(app.damaged.first(), Some(Damaged::Settings(e)) if e == "Cannot read settings.json"));
         assert!(app.dialog_open(&egui::Context::default()));
+    }
+
+    #[test]
+    fn a_folder_or_a_marked_group_narrows_the_next_library_job() {
+        let mut b = bench(&["a.png", "pack/one.png", "pack/two.png"], &[]);
+        b.app.library_tree_action(&b.ctx, TreeAction::BatchDir("pack".into()));
+        assert!(b.app.ai_panel, "The AI pane must open on the chosen target.");
+        let (rels, name) = b.app.library_batch.choice.clone().unwrap();
+        assert_eq!(rels.iter().map(String::as_str).collect::<Vec<_>>(), ["pack/one.png", "pack/two.png"]);
+        assert_eq!(name, "pack (2 sheets)");
+        let ids: Vec<usize> = (0..b.app.library.index.entries.len()).collect();
+        b.app.library_tree_action(&b.ctx, TreeAction::Batch(ids));
+        assert_eq!(b.app.library_batch.choice.as_ref().unwrap().0.len(), 3);
+    }
+
+    #[test]
+    fn a_library_range_marks_the_files_between() {
+        let mut b = bench(&["a.png", "b.png", "c.png"], &[]);
+        b.app.library_order = vec![0, 1, 2];
+        b.app.library_anchor = Some(0);
+        b.app.library_tree_action(&b.ctx, TreeAction::Range(2, false));
+        let mut marks: Vec<usize> = b.app.library_marked.iter().copied().collect();
+        marks.sort();
+        assert_eq!(marks, [0, 1, 2]);
     }
 
     #[test]

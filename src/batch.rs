@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! One library job: selected sheets, each sent as the request that
 //! Label with AI sends. Google's Gemini API takes them as a batch. An
-//! OpenAI-style endpoint takes them one at a time: OpenRouter's batch API
-//! reads only images at public URLs, and a library lies on this machine.
+//! OpenAI-style endpoint has no batch API that reads a local image, so
+//! several of its ordinary requests run at once instead.
 //!
 //! The library book holds the job state, so that a batch
 //! continues after a restart. It never holds a key. The state of a sheet:
@@ -38,6 +38,13 @@ pub struct Sheet {
     /// tool could read. See `one`.
     #[serde(default)]
     pub unknown: u32,
+    /// A transient failure of this sheet's own request waits until this time
+    /// before it goes out again.
+    #[serde(default)]
+    retry_ms: u64,
+    /// How many transient failures this sheet had, for the wait it grows.
+    #[serde(default)]
+    attempts: u32,
     #[serde(default)]
     cancelled: bool,
     #[serde(default)]
@@ -284,11 +291,19 @@ pub enum Scope { Unlabeled, All }
 
 /// Lists the requested sheets. It reads no image and sends nothing.
 pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -> Result<Job, String> {
+    prepare_of(index, provider, model, scope, None)
+}
+
+/// Lists the requested sheets, kept to `only` when it is given: the paths of
+/// the chosen files, below the library root. It reads no image and sends
+/// nothing.
+pub fn prepare_of(index: &Index, provider: Provider, model: String, scope: Scope, only: Option<&BTreeSet<String>>) -> Result<Job, String> {
     endpoint(&provider)?;
     if let Some(error) = &index.error { return Err(error.clone()); }
-    let labeled = index.entries.iter().filter(|e| e.side.label.is_some()).count();
+    let keep = |e: &crate::index::Entry| only.is_none_or(|set| set.contains(&e.rel));
+    let labeled = index.entries.iter().filter(|e| keep(e) && e.side.label.is_some()).count();
     let all = scope == Scope::All;
-    let open = index.entries.iter().filter(|e| all || e.side.label.is_none());
+    let open = index.entries.iter().filter(|e| keep(e) && (all || e.side.label.is_none()));
     Ok(Job {
         log_id: crate::ai_log::id(),
         provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
@@ -297,7 +312,7 @@ pub fn prepare(index: &Index, provider: Provider, model: String, scope: Scope) -
         file_context: true, poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
         issues: BTreeMap::new(), last_response_ms: 0, poll_ms: 0, recovery_ms: 0, estimate: None, usage: cost::Usage::default(),
         sheets: open.map(|e| Sheet { rel: e.rel.clone(), taken: false, label: None, error: String::new(),
-            imported: false, unknown: 0, cancelled: false, guard: None })
+            imported: false, unknown: 0, retry_ms: 0, attempts: 0, cancelled: false, guard: None })
             .collect(),
     })
 }
@@ -500,30 +515,47 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
     let request = image_request(job, root, i);
     job.save(dir)?;
     let reply = match request {
-        Err(error) => Err(error),
-        Ok(request) => match send("chat/completions", Some(&request)) {
-            // One provider of a model on OpenRouter may answer in prose. The
-            // next request may reach another.
-            Ok(value) => {
-                job.usage.record(&value);
-                match labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &value, &job.tag_list) {
-                Err(error) if error == labels::INVALID && job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
-                    job.sheets[i].unknown += 1;
-                    return job.save(dir);
-                }
-                reply => reply,
-                }
-            },
-            Err(Failure::Unknown(message)) if job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
+        // The image could not be read: the sheet ends with that reason.
+        Err(error) => {
+            record(&mut job.sheets[i], (&job.provider.name, &job.model, &job.tag_list), Err(error));
+            job.sheets[i].taken = true;
+            return job.save(dir);
+        }
+        Ok(request) => send("chat/completions", Some(&request)),
+    };
+    finish_one(job, dir, i, reply, now_ms())
+}
+
+/// Reads one reply into its sheet. A transient failure leaves the sheet for
+/// another try; a billed one counts against `UNKNOWN_TRIES`.
+fn finish_one(job: &mut Job, dir: &Path, i: usize, reply: Result<Value, Failure>, now: u64) -> Result<(), String> {
+    // One provider of a model on OpenRouter may answer in prose. The
+    // next request may reach another.
+    let reply = match reply {
+        Ok(value) => {
+            job.usage.record(&value);
+            match labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &value, &job.tag_list) {
+            Err(error) if error == labels::INVALID && job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
                 job.sheets[i].unknown += 1;
-                return job.save(dir).and(Err(message));
+                return job.save(dir);
             }
-            Err(Failure::Unknown(message)) => Err(format!("{message} No readable answer after {UNKNOWN_TRIES} tries.")),
-            Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429 | 500..=599, _))) => {
-                return job.save(dir).and(Err(failure.message()));
+            reply => reply,
             }
-            Err(failure @ Failure::Status(..)) => Err(failure.message()),
         },
+        Err(Failure::Unknown(message)) if job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
+            job.sheets[i].unknown += 1;
+            return job.save(dir).and(Err(message));
+        }
+        Err(Failure::Unknown(message)) => Err(format!("{message} No readable answer after {UNKNOWN_TRIES} tries.")),
+        Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429 | 500..=599, _))) => {
+            // This sheet waits a while before it goes out again; its
+            // neighbors keep their turn.
+            let sheet = &mut job.sheets[i];
+            sheet.attempts = sheet.attempts.saturating_add(1);
+            sheet.retry_ms = now + 30_000 * (1u64 << sheet.attempts.min(5).saturating_sub(1));
+            return job.save(dir).and(Err(failure.message()));
+        }
+        Err(failure @ Failure::Status(..)) => Err(failure.message()),
     };
     record(&mut job.sheets[i], (&job.provider.name, &job.model, &job.tag_list), reply);
     job.sheets[i].taken = true;
@@ -663,10 +695,10 @@ impl Job {
         self.groups.remove(group);
     }
 
-    /// Lets the sheets of an unfinished group go out one at a time. An
-    /// OpenAI-style job of 0.2 went through OpenRouter's batch API, which
-    /// read no local image: its groups never finish, and nothing asks about
-    /// them any more.
+    /// Lets the sheets of an unfinished group go out with the ordinary
+    /// requests. An OpenAI-style job of 0.2 went through OpenRouter's batch
+    /// API, which read no local image: its groups never finish, and nothing
+    /// asks about them any more.
     fn release_groups(&mut self) {
         for group in self.groups.iter().filter(|g| g.remote != Remote::Done) {
             for &i in &group.sheets {
@@ -736,6 +768,10 @@ pub struct Panel {
     resend_confirm: bool,
     copied: Option<Instant>,
     pub settings_requested: bool,
+    /// The files chosen in the library tree for the next job, by their
+    /// paths below the root, and a short name for them. `None` is the
+    /// whole library.
+    pub choice: Option<(BTreeSet<String>, String)>,
 }
 
 impl Panel {
@@ -748,6 +784,8 @@ impl Panel {
         else { None }
     }
     pub fn allows_single(&self) -> bool { self.single_block_reason().is_none() }
+    /// Narrows the next job to these sheets, by their paths below the root.
+    pub fn choose(&mut self, rels: BTreeSet<String>, name: String) { self.choice = Some((rels, name)); }
     pub fn cleanup_log(&self, root: &Path) -> Result<(), String> {
         let _lock = if self.root == root && self.lock.is_some() { None } else {
             match runner::lock(root) { Ok(lock) => Some(lock), Err(_) => return Ok(()) }
@@ -923,7 +961,10 @@ impl Panel {
         if self.mode(job) == Mode::Paused {
             return if job.provider.kind == Kind::Gemini { "Uploads paused; submitted work can continue".into() } else { "Labeling paused".into() };
         }
-        if job.issues.contains_key("upload") { return "Uploads interrupted; retry pending".into(); }
+        if job.issues.contains_key("upload")
+            || (job.provider.kind == Kind::OpenAi && job.sheets.iter().any(|s| !s.taken && s.retry_ms > now_ms())) {
+            return "Uploads interrupted; retry pending".into();
+        }
         if job.issues.contains_key("check") { return format!("Waiting for {}; connection interrupted", job.provider.name); }
         if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= MAX_UNCONFIRMED {
             return "Waiting for upload confirmations".into();
@@ -961,7 +1002,7 @@ impl Panel {
             if self.root != index.root { ui.label(format!("Active job for {}", self.root.display())); }
             ui.strong("Saved library job");
             ui.label(format!("{} / {}", job.provider.name, job.model));
-            ui.small(if job.provider.kind == Kind::Gemini { "Google batch" } else { "One sheet at a time" });
+            ui.small(if job.provider.kind == Kind::Gemini { "Google batch" } else { "Several sheets at a time" });
             if let Some((provider, model)) = configured
                 && (provider.name != job.provider.name || provider.kind != job.provider.kind || provider.url != job.provider.url
                     || model.id.trim_end_matches(":batch") != job.model.trim_end_matches(":batch")) {
@@ -1079,20 +1120,50 @@ impl Panel {
         let idle = self.lock.is_some() && !single_running && index.error.is_none() && !index.root.as_os_str().is_empty();
         ui.add_space(8.0);
         ui.strong("New library job");
+        let mut clear_choice = false;
+        // The counts come from the chosen sheets, when there are any. The set
+        // itself is cloned only when a job starts, not on every frame.
+        let target = self.choice.as_ref().map(|(_, name)| name.clone());
+        let labeled = |e: &&crate::index::Entry| e.side.label.as_ref().is_some_and(|l| l.status == Status::Labeled);
+        let (total, done, any_unlabeled) = match self.choice.as_ref() {
+            Some((rels, _)) => {
+                let in_scope = || index.entries.iter().filter(|e| rels.contains(&e.rel));
+                (in_scope().count(), in_scope().filter(labeled).count(), in_scope().any(|e| e.side.label.is_none()))
+            }
+            None => (
+                index.entries.len(),
+                index.entries.iter().filter(labeled).count(),
+                index.entries.iter().any(|e| e.side.label.is_none()),
+            ),
+        };
+        if let Some(name) = &target {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Target: {name}"));
+                if ui.button("Whole library").on_hover_text("Choose sheets in the library tree to narrow a job.").clicked() { clear_choice = true; }
+            });
+        }
         if let Some((provider, model)) = configured {
             ui.label(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
-            ui.small(if provider.kind == Kind::Gemini { "Google batch" } else { "One sheet at a time" });
+            ui.small(if provider.kind == Kind::Gemini { "Google batch" } else { "Several sheets at a time" });
         }
-        let done = index.entries.iter().filter(|e| e.side.label.as_ref().is_some_and(|l| l.status == Status::Labeled)).count();
-        ui.label(format!("{done} of {} sheets have usable labels", index.entries.len()));
+        ui.label(format!("{done} of {total} sheets have usable labels"));
         if !ready { ui.label("Set a library model and its key in Settings (Ctrl+,)."); }
-        for (text, scope) in [("Label unlabeled sheets...", Scope::Unlabeled), ("Rerun all...", Scope::All)] {
-            let enabled = ready && idle && index.entries.iter().any(|e| scope == Scope::All || e.side.label.is_none());
+        for (text, scope) in [
+            (if target.is_some() { "Label unlabeled in selection..." } else { "Label unlabeled sheets..." }, Scope::Unlabeled),
+            (if target.is_some() { "Rerun all in selection..." } else { "Rerun all..." }, Scope::All),
+        ] {
+            let enabled = ready && idle && (scope == Scope::All || any_unlabeled);
             let button = ui.add_enabled(enabled, egui::Button::new(text).selected(scope == Scope::Unlabeled));
             crate::stop(&button);
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
-                match prepare(index, provider.clone(), model.id.clone(), scope) {
+                let (provider, model) = (provider.clone(), model.id.clone());
+                let set = self.choice.as_ref().map(|(rels, _)| rels.clone());
+                let job = match set.as_ref() {
+                    Some(set) => prepare_of(index, provider, model, scope, Some(set)),
+                    None => prepare(index, provider, model, scope),
+                };
+                match job {
                     Ok(job) => {
                         self.cost_error.clear();
                         self.cost_preview = match cost::Preview::start(job.clone(), index.root.clone(), self.job.as_ref(), ui.ctx().clone()) {
@@ -1104,6 +1175,7 @@ impl Panel {
                 }
             }
         }
+        if clear_choice { self.choice = None; }
         if self.job.is_none() { ui.add_enabled(false, egui::Button::new("Copy log")); }
     }
 
@@ -1151,10 +1223,11 @@ impl Panel {
         egui::Modal::new(egui::Id::new("library batch confirmation")).show(ctx, |ui| {
             ui.set_width(500.0_f32.min(ctx.content_rect().width() - 48.0));
             ui.set_max_height((ctx.content_rect().height() - 96.0).max(160.0));
-            ui.heading("Label this entire library?");
+            ui.heading(if self.choice.is_some() { "Label the chosen sheets?" } else { "Label this entire library?" });
             let height = (ctx.content_rect().height() - ui.min_rect().height() - 96.0 - crate::dialogs::footer_height(ui)).max(80.0);
             egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
                 ui.label(self.root.display().to_string());
+                if let Some((_, name)) = &self.choice { ui.weak(format!("Target: {name}")); }
                 ui.weak(format!("{} / {} (from Settings)", job.provider.name, job.model));
                 if job.provider.kind == Kind::Gemini { ui.weak("Google batch requests require a paid API project."); }
                 if job.sheets.is_empty() {
@@ -1248,6 +1321,18 @@ mod tests {
     fn id(value: &str) -> impl FnMut(&str, Option<&Value>) -> Result<Value, Failure> {
         let value = value.to_string();
         move |_, _| Ok(json!({"name":value}))
+    }
+
+    #[test]
+    fn a_scoped_job_keeps_only_the_chosen_sheets() {
+        let files = Files::new();
+        RgbaImage::from_pixel(8, 4, Rgba([1, 2, 3, 255])).save(files.root.join("top.png")).unwrap();
+        let index = Index::scan(&files.root, [16, 16]);
+        let only: BTreeSet<String> = ["folder/sheet.png".to_string()].into_iter().collect();
+        let job = prepare_of(&index, provider(Kind::Gemini), "test:batch".into(), Scope::Unlabeled, Some(&only)).unwrap();
+        assert_eq!(job.sheets.iter().map(|s| s.rel.as_str()).collect::<Vec<_>>(), ["folder/sheet.png"]);
+        let whole = prepare(&index, provider(Kind::Gemini), "test:batch".into(), Scope::Unlabeled).unwrap();
+        assert_eq!(whole.sheets.len(), 2);
     }
 
     #[test]
