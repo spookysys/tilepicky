@@ -197,8 +197,8 @@ pub struct Ai {
 }
 
 /// A fresh install offers OpenRouter and Google models, without keys.
-/// Single-sheet requests use either provider format. Library jobs use sequential
-/// chat requests or Google's Gemini batch endpoint.
+/// Single-sheet requests use either provider format. Library jobs use several
+/// chat requests at once or Google's Gemini batch endpoint.
 impl Default for Ai {
     fn default() -> Self {
         let mut openrouter = Provider::new("OpenRouter", Kind::OpenAi);
@@ -369,7 +369,7 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
     if let Some(selected) = batch.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
         && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
         ui.add_space(4.0);
-        if provider.kind == Kind::OpenAi { configure |= serial_notice(ui); }
+        if provider.kind == Kind::OpenAi { configure |= endpoint_notice(ui); }
         else {
             ui.strong("Google batch");
             ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
@@ -417,8 +417,8 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
 }
 
 /// Explain the library execution method where the user chooses it.
-fn serial_notice(ui: &mut egui::Ui) -> bool {
-    ui.strong("One sheet at a time");
+fn endpoint_notice(ui: &mut egui::Ui) -> bool {
+    ui.strong("Several sheets at a time");
     ui.label("Keep Tilepicky open while it labels the library. Closing Tilepicky pauses the job.");
     ui.label("Reopen this library to continue.");
     ui.small("Want processing to continue while Tilepicky is closed? Add a Google key and choose Gemini for Library.");
@@ -614,14 +614,14 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
             if mode == Mode::Batch && let Some(provider) = providers.iter().find(|p| p.name == m.provider) {
                 ui.label("Processing");
                 ui.label(match provider.kind {
-                    Kind::OpenAi => "One sheet at a time",
+                    Kind::OpenAi => "Several sheets at a time",
                     Kind::Gemini => "Google batch",
                 });
                 ui.end_row();
             }
         });
         if m.mode() == Mode::Batch && providers.iter().any(|p| p.name == m.provider && p.kind == Kind::OpenAi) {
-            configure = serial_notice(ui);
+            configure = endpoint_notice(ui);
         }
         let after = m.reference();
         if after != before {

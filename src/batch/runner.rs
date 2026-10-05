@@ -18,6 +18,39 @@ pub(super) enum Event {
 }
 pub(super) struct SaveReport { pub saved: Vec<usize>, pub rejected: Vec<(usize, String)>, pub error: Option<String> }
 
+/// How many ordinary label requests an OpenAI-style job keeps in flight.
+const IN_FLIGHT: usize = 4;
+type SendFn = dyn Fn(&str, Option<&Value>) -> Result<Value, Failure> + std::marker::Send + Sync;
+
+/// Label requests that are out, and the sheets they carry. The workers only
+/// send and answer; the coordinator remains the only writer of the job.
+struct Pump {
+    tx: mpsc::Sender<(usize, Result<Value, Failure>)>,
+    rx: mpsc::Receiver<(usize, Result<Value, Failure>)>,
+    busy: std::collections::BTreeSet<usize>,
+}
+impl Pump {
+    fn new() -> Self { let (tx, rx) = mpsc::channel(); Self { tx, rx, busy: std::collections::BTreeSet::new() } }
+    fn inflight(&self) -> usize { self.busy.len() }
+}
+
+/// What woke the idle coordinator, or that only time passed.
+enum Woke { Stop, Key(String), Retry, RetryUnconfirmed, RetryFailed, Timeout }
+
+/// Waits for a command. Commands are the only thing that wakes an idle job;
+/// time alone never causes a busy loop.
+fn wait(rx: &mpsc::Receiver<Command>, stopped: &AtomicBool) -> Woke {
+    if stopped.load(Ordering::Relaxed) { return Woke::Stop; }
+    match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(Command::Key(value)) => Woke::Key(value),
+        Ok(Command::Wake) => Woke::Retry,
+        Ok(Command::RetryUnconfirmed) => Woke::RetryUnconfirmed,
+        Ok(Command::RetryFailed) => Woke::RetryFailed,
+        Err(mpsc::RecvTimeoutError::Disconnected) => Woke::Stop,
+        Err(mpsc::RecvTimeoutError::Timeout) => Woke::Timeout,
+    }
+}
+
 pub(super) struct Runner {
     pub events: mpsc::Receiver<Event>,
     commands: mpsc::Sender<Command>,
@@ -69,6 +102,9 @@ impl Runner {
             let mut key = key;
             let mut retry = false;
             let mut dirty = true;
+            let mut pump = Pump::new();
+            let mut label_send: Option<Arc<SendFn>> = None;
+            let mut label_key = String::new();
             while !stopped.load(Ordering::Relaxed) {
                 while let Ok(command) = rx.try_recv() {
                     match command {
@@ -111,6 +147,48 @@ impl Runner {
                     }
                     continue;
                 }
+                if coordinator.job.provider.kind == Kind::OpenAi {
+                    if !key.is_empty() && (label_send.is_none() || label_key != key) {
+                        match Transport::new(&coordinator.job.provider, key.clone()) {
+                            Ok(transport) => {
+                                let transport = Arc::new(transport);
+                                let send: Arc<SendFn> = Arc::new(move |path, body| transport.send(path, body));
+                                label_send = Some(send); label_key = key.clone();
+                            }
+                            Err(error) => { coordinator.job.issue("upload", error, now); dirty = true; label_send = None; }
+                        }
+                    }
+                    let ready = label_send.is_some() && coordinator.job.mode == Mode::Running
+                        && !coordinator.job.pending_save();
+                    if ready && let Some(send) = &label_send {
+                        if pump.inflight() == 0 { notify(Event::Activity(Activity::before(Operation::Label))); }
+                        dirty |= coordinator.dispatch_labels(&mut pump, send, &log, now);
+                    }
+                    if pump.inflight() > 0 {
+                        match pump.rx.recv_timeout(Duration::from_millis(200)) {
+                            Ok((i, reply)) => { pump.busy.remove(&i); coordinator.collect((i, reply), now_ms()); dirty = true; }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        if pump.inflight() == 0 { notify(Event::Idle); }
+                        continue;
+                    }
+                    if dirty { continue; }
+                    if key.is_empty() && coordinator.job.untaken() && coordinator.job.due("upload", now) {
+                        coordinator.job.issue("upload", "The provider key is missing. Set it in Settings.".into(), now);
+                        dirty = true;
+                        continue;
+                    }
+                    match wait(&rx, &stopped) {
+                        Woke::Stop => break,
+                        Woke::Key(value) => { key = value; retry = true; }
+                        Woke::Retry => retry = true,
+                        Woke::RetryUnconfirmed => { coordinator.retry(Command::RetryUnconfirmed); retry = true; }
+                        Woke::RetryFailed => { coordinator.retry(Command::RetryFailed); retry = true; }
+                        Woke::Timeout => {}
+                    }
+                    continue;
+                }
                 if let Some(operation) = coordinator.job.next_operation(now) {
                     notify(Event::Activity(Activity::before(operation)));
                     let result = if key.is_empty() { Err("The provider key is missing. Set it in Settings.".into()) }
@@ -125,21 +203,13 @@ impl Runner {
                     dirty = true;
                     notify(Event::Idle);
                 } else {
-                    // Commands wake the coordinator; time alone never causes a busy loop.
-                    match rx.recv_timeout(Duration::from_secs(1)) {
-                        Ok(Command::Key(value)) => { key = value; retry = true; }
-                        Ok(command) => {
-                            match command {
-                                Command::Wake => retry = true,
-                                Command::RetryUnconfirmed | Command::RetryFailed => {
-                                    // Handle these on the same path as commands received during network work.
-                                    coordinator.retry(command); retry = true;
-                                }
-                                Command::Key(_) => unreachable!(),
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    match wait(&rx, &stopped) {
+                        Woke::Stop => break,
+                        Woke::Key(value) => { key = value; retry = true; }
+                        Woke::Retry => retry = true,
+                        Woke::RetryUnconfirmed => { coordinator.retry(Command::RetryUnconfirmed); retry = true; }
+                        Woke::RetryFailed => { coordinator.retry(Command::RetryFailed); retry = true; }
+                        Woke::Timeout => {}
                     }
                 }
             }
@@ -188,6 +258,41 @@ impl Coordinator {
         }
         if let Some(error) = report.error { self.job.issue("save", error, now); }
         else { self.job.issues.remove("save"); }
+    }
+
+    /// Sends up to `IN_FLIGHT` label requests at once, each on its own worker.
+    /// The job is written here and by `collect`, never by a worker.
+    fn dispatch_labels(&mut self, pump: &mut Pump, send: &Arc<SendFn>, log: &crate::ai_log::Log, now: u64) -> bool {
+        if self.job.groups.iter().any(|g| g.remote != Remote::Done) { self.job.release_groups(); }
+        let mut worked = false;
+        while pump.inflight() < IN_FLIGHT {
+            let Some(i) = self.job.sheets.iter().enumerate()
+                .find(|(i, s)| !s.taken && s.retry_ms <= now && !pump.busy.contains(i)).map(|(i, _)| i) else { break };
+            crate::ai_log::event("batch_sheet_start", json!({"sheet":self.job.sheets[i].rel, "provider":self.job.provider.name,
+                "model":self.job.model, "attempt":self.job.sheets[i].unknown + 1, "tags_requested":self.job.tag_list}));
+            let request = match image_request(&mut self.job, &self.root, i) {
+                Ok(request) => request,
+                Err(error) => { self.job.sheets[i].error = error; self.job.sheets[i].taken = true; worked = true; continue; }
+            };
+            pump.busy.insert(i);
+            let (tx, send, log) = (pump.tx.clone(), send.clone(), log.clone());
+            std::thread::spawn(move || {
+                let _scope = log.enter();
+                let reply = send("chat/completions", Some(&request));
+                let _ = tx.send((i, reply));
+            });
+            worked = true;
+        }
+        worked
+    }
+
+    /// Reads one worker's reply into the job, as one ordinary request does.
+    fn collect(&mut self, (i, reply): (usize, Result<Value, Failure>), now: u64) {
+        let response = reply.is_ok() || matches!(&reply, Err(Failure::Status(_, _)));
+        let auth = matches!(&reply, Err(Failure::Status(401 | 403, _)));
+        let _ = finish_one(&mut self.job, &self.dir, i, reply, now);
+        if response { self.job.last_response_ms = now; }
+        if auth { self.job.mode = Mode::Paused; }
     }
     fn step(&mut self, operation: Operation, now: u64, mut send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) {
         let polled = if operation == Operation::Poll {
@@ -315,6 +420,40 @@ mod tests {
     fn receive(c: &mut Coordinator) {
         c.step(Operation::Submit, 1_000, |_, _| Ok(json!({"name":"batches/accepted"})));
         c.step(Operation::Poll, 2_000, |_, _| Ok(result()));
+    }
+
+    /// An OpenAI-style job fills the pipe before it reads any reply, and ends
+    /// when every sheet had its turn.
+    #[test]
+    fn an_openai_job_keeps_several_requests_in_flight() {
+        use crate::labels::tests::{completion, labeled};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let f = Fixture::new();
+        for name in ["b.png", "c.png", "d.png", "e.png"] {
+            RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])).save(f.root.join(name)).unwrap();
+        }
+        let job = prepare(&Index::scan(&f.root, [16, 16]), super::super::tests::provider(Kind::OpenAi),
+            "test:batch".into(), Scope::Unlabeled).unwrap();
+        assert!(job.sheets.len() >= IN_FLIGHT);
+        let mut c = Coordinator { job, root: f.root.clone(), dir: f.dir.clone() };
+        let mut pump = Pump::new();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let send: Arc<SendFn> = Arc::new(move |_path, _body| {
+            counted.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(completion(labeled("Forest")))
+        });
+        let log = crate::ai_log::Log::single("test");
+        assert!(c.dispatch_labels(&mut pump, &send, &log, 1_000));
+        assert_eq!(pump.inflight(), IN_FLIGHT, "the pipe fills before any reply is read");
+        while !c.job.remote_done() {
+            let reply = pump.rx.recv_timeout(Duration::from_secs(5)).expect("a worker answered");
+            pump.busy.remove(&reply.0);
+            c.collect(reply, 1_000);
+            if pump.inflight() < IN_FLIGHT { c.dispatch_labels(&mut pump, &send, &log, 1_000); }
+        }
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), c.job.sheets.len());
+        assert!(c.job.sheets.iter().all(|s| s.taken && s.label.is_some()));
     }
 
     #[test]
