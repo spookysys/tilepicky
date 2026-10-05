@@ -46,7 +46,11 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
   grid, pixel origins, animations, and AI label.
 - `src/index.rs`: the scan of a folder, and the search of names, captions,
-  and tags. Search is local and synchronous.
+  tags, and embeddings. The word search is local and synchronous; a semantic
+  match uses a query vector that a worker made.
+- `src/embed.rs`: the embeddings of sheet labels for semantic search, in
+  `embeddings.json` beside the library. It holds the vectors, the request and
+  the reply checks, the cosine, and the generation over a library.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
@@ -55,8 +59,9 @@ the person who uses the tool; this file is for an agent that works on it.
   An OpenAI-style provider may carry an S3 object store for batch uploads, and
   the matching `(S3 secret)` entry in `keys.json`.
   Single-sheet labeling uses the Single sheet model, through Google Gemini or an OpenAI-compatible endpoint.
-  Library jobs use the Library model through Google batches, OpenRouter batches
-  when object storage is set, or several OpenAI-compatible requests at once.
+  Library jobs use the Library model through Google batches (several at once),
+  OpenRouter batches when object storage is set, or several OpenAI-compatible
+  requests at once.
 - `src/s3.rs`: a small S3-compatible client for one bucket: put, delete, and a
   presigned GET, signed with AWS Signature Version 4, host style or path style.
 - `src/ai_log.rs`: diagnostics scoped to each job, with key and image redaction.
@@ -66,17 +71,19 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/labels.rs`: one labeling request per sheet, the library's tag list
   and free-tag count in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
   thread; to cancel, drop the `Run`. Save guards preserve newer local changes. Tests use fake responses.
-- `src/batch.rs`: library batches: through the Gemini batch API, or through
-  OpenRouter's batch API when the provider has object storage (each sheet is
-  uploaded and handed over as a signed URL). Without storage, it sends several
-  OpenAI-compatible requests at once. It also displays job snapshots and saves
-  labels from the UI thread.
+- `src/batch.rs`: library batches: through the Gemini batch API (several batches
+  at once), or through OpenRouter's batch API when the provider has object
+  storage (each sheet is uploaded and handed over as a signed URL). Without
+  storage, it sends several OpenAI-compatible requests at once. It also displays
+  job snapshots and saves labels from the UI thread.
 - `src/batch/openrouter.rs`: the OpenRouter batch path: upload each sheet,
   build the batch, poll it, save the labels, and delete the objects. OpenRouter
   has no client reference, so a submit whose reply is lost ends those sheets
   with an error instead of sending the batch again.
 - `src/batch/runner.rs`: one coordinator owns the job journal under a file lock.
   It performs network operations and waits for the UI to acknowledge library writes.
+  A submission is saved with its reference before it goes out; a lookup resumes one Google never received.
+  The model's concurrency bounds requests, or batches, in flight.
   User pause and cancel requests persist in the library book before the coordinator applies them.
   Tests use fake transports and explicit times. The native UI fixture uses a loopback provider in a test build only.
 

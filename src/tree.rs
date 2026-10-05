@@ -187,7 +187,7 @@ impl Node {
             header.header_response.context_menu(|ui| {
                 // The library offers its folder to a batch job.
                 if !v.menus {
-                    if ui.button("Label with AI…").clicked() {
+                    if ui.button("Generate Tags (AI)…").clicked() {
                         action = Some(TreeAction::BatchDir(rel.clone()));
                         ui.close();
                     }

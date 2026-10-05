@@ -73,9 +73,9 @@ Search matches query terms as prefixes against sheet metadata:
 
 - Entering `gra` matches `grass`.
 - Multiple terms require all words to match.
-- The filter menu beside the input toggles target fields: folder names, file names, AI captions, and AI tags.
+- The filter menu beside the input toggles target fields: folder names, file names, AI captions, AI tags, and embeddings (meaning).
 
-Search runs locally and synchronously on your machine. It makes no network requests.
+The word fields are matched locally and synchronously on your machine. The embeddings field is a sibling of them, not a mode above them: a sheet shows when any enabled field matches. It needs an embedding index; see [Search by meaning](#search-by-meaning). Until the library has one, the checkbox matches nothing, the way an empty caption field does.
 
 ## Labeling sheets with AI
 
@@ -88,8 +88,8 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 
 ### Label a single sheet
 
-1. Open a library sheet and click **AI label...** beside the source header.
-   You can also choose **Label with AI...** from the sheet or file-tree context menu.
+1. Open a library sheet and click **Tags (AI)...** beside the source header.
+   You can also choose **Generate Tags (AI)...** from the sheet or file-tree context menu.
 2. Choose the **Single sheet** model and its provider key in Settings (`Ctrl+,`).
    Both Google Gemini and OpenAI-compatible image models are supported.
 3. Click **Label this sheet**. The dialog shows progress, the result, or the error.
@@ -135,6 +135,20 @@ Existing batches keep their original prompt and context policy. The request log 
 
 GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixels are scaled down before submission.
 
+### Search by meaning
+
+**Generate Embeddings (AI)...** turns each labeled sheet into one vector, so that search can match a query by meaning rather than by prefix. The button sits in the library AI panel and beside the source header.
+
+The caption and the tags of each sheet go to the embedding model. The images stay on this machine. The confirm names the model and the number of sheets before anything is sent.
+
+The vectors live in `embeddings.json` beside the library, with the model that made them. Generating again embeds only the sheets whose label changed. A different embedding model re-embeds every labeled sheet.
+
+Choose the **Embeddings** model in Settings (`Ctrl+,`). Only labeled sheets get a vector. OpenRouter serves embeddings through an OpenAI-style endpoint.
+
+The **embeddings (meaning)** checkbox in the search filter then matches a sheet whose vector is close to the query's. It is a peer of the word fields. A sheet with no vector, or a library whose vectors came from another model, matches nothing by meaning.
+
+With that checkbox on, the query text goes to the embedding model, once per settled query, so that Tilepicky can compare it. The word fields need no network.
+
 ### Label an entire library
 
 To label multiple library sheets in bulk:
@@ -148,7 +162,7 @@ Use **Rerun all...** to label every sheet again with the current library model a
 Review the request count and confirm with **Start labeling**. Existing labels stay until new results arrive.
 
 To label part of a library, choose the sheets in the tree first.
-Right-click a folder and select **Label with AI...**. That target is every sheet below the folder, in its subfolders too.
+Right-click a folder and select **Generate Tags (AI)...**. That target is every sheet below the folder, in its subfolders too.
 To choose single files, Ctrl+click each one, then right-click one of them and select **Label N sheets with AI...**.
 The panel names the target and offers **Label unlabeled in selection...** and **Rerun all in selection...**.
 Use **Whole library** to clear the choice. A folder and loose files cannot share one selection.
@@ -174,13 +188,12 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-With an OpenAI-compatible provider such as OpenRouter, Tilepicky labels a library two ways. If the provider has **Sheet storage**, Tilepicky uploads each sheet to your bucket and submits one OpenRouter batch: it runs while Tilepicky is closed, and OpenRouter bills batch requests at about half rate. The sheets leave your machine only to that bucket, and Tilepicky deletes them when the batch finishes. Without storage, Tilepicky sends ordinary requests in the background, several at a time, and the app must stay open. OpenRouter's batch API accepts images only at public URLs, which is why storage is needed for a batch. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Label with AI** asks once more.
+With an OpenAI-compatible provider such as OpenRouter, Tilepicky labels a library two ways. If the provider has **Sheet storage**, Tilepicky uploads each sheet to your bucket and submits one OpenRouter batch: it runs while Tilepicky is closed, and OpenRouter bills batch requests at about half rate. The sheets leave your machine only to that bucket, and Tilepicky deletes them when the batch finishes. Without storage, Tilepicky sends ordinary requests in the background, several at a time, and the app must stay open. OpenRouter's batch API accepts images only at public URLs, which is why storage is needed for a batch. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets, and sends several batches at once. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Generate Tags (AI)** asks once more.
 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
-The internal `:batch` suffix in saved settings identifies a library model; it is not part of the provider's model ID.
-The model editor uses **Use for: Single sheet / Library** and shows the provider model ID without that suffix.
+A model serves single sheets, library jobs, or both. The model editor ticks each scope, and sets how many requests or batches a library job keeps in flight.
 Library models show **OpenRouter batch**, **Several sheets at a time**, or **Google batch**, depending on the provider and its storage.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
@@ -209,8 +222,8 @@ The job follows the library when you move the folder. Older configuration journa
 Only one Tilepicky window can own a library job at a time.
 
 Tilepicky saves each submission's reference before sending it. A lost reply triggers an automatic lookup.
-An uncertain submission stays separate while other work can continue. Repeated uncertain uploads temporarily stop new submissions.
-Tilepicky never automatically resends uncertain sheets. **Retry unconfirmed sheets...** explains the possible duplicate charge before a resend.
+An uncertain submission stays separate while other work can continue. A submission that is out or awaiting confirmation counts against the model's number, so a flaky connection cannot pile up more paid work than the model allows.
+When the lookup proves Google never made the batch, Tilepicky sends its sheets again on its own, so an interrupted upload resumes. **Retry unconfirmed sheets...** remains for a submission the lookup could not resolve, and explains the possible duplicate charge before a resend.
 You do not need to find or attach a provider batch ID.
 
 Network operations retry independently, with a delay of up to eight minutes after repeated failures.

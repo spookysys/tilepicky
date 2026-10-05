@@ -17,6 +17,9 @@ pub struct Half {
     pub tree: Node,
     /// Which entries the search leaves visible; `None` shows every one.
     pub visible: Option<Vec<bool>>,
+    /// The current query's embedding, when semantic search is ready. It only
+    /// applies while it was made with the library's own embedding model.
+    pub embed_query: Option<Vec<f32>>,
     pub sheet: Option<Sheet>,
     /// The entry of the open sheet. None for a sheet that has no file yet.
     pub sel: Option<usize>,
@@ -37,6 +40,7 @@ impl Half {
             tree: tree_of(&index),
             index,
             visible: None,
+            embed_query: None,
             sheet: None,
             sel: None,
             at: None,
@@ -69,7 +73,7 @@ impl Half {
 
     /// Filters the tree again after the entries or the query changed.
     pub fn refresh_visible(&mut self, query: &[String], search: SearchIn) {
-        self.visible = self.index.visible(query, search);
+        self.visible = self.index.visible(query, search, self.embed_query.as_deref());
     }
 
     /// The tile size to assume for a sheet whose entry names none: the sheet

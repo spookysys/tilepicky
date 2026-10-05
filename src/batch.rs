@@ -21,10 +21,11 @@ use std::{collections::{BTreeSet, BTreeMap}, path::{Path, PathBuf}, sync::mpsc, 
 /// The limits of one provider batch.
 const MAX_BYTES: usize = 18_000_000;
 const MAX_REQUESTS: usize = 100;
-// Limit uncertain paid work while the connection is unreliable.
-const MAX_UNCONFIRMED: usize = 3;
 /// How often the tool asks the provider about a submitted batch.
 const POLL: Duration = Duration::from_secs(30);
+
+/// A loaded job that predates per-model concurrency keeps the default.
+fn default_concurrency() -> u32 { crate::ai::DEFAULT_CONCURRENCY }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Sheet {
@@ -111,8 +112,6 @@ struct Recovery {
     page: String,
     #[serde(default)]
     matches: Vec<String>,
-    #[serde(default)]
-    not_found: bool,
 }
 
 fn key(sheet: usize) -> String { format!("sheet-{sheet}") }
@@ -126,6 +125,10 @@ pub struct Job {
     log_id: String,
     pub provider: Provider,
     pub model: String,
+    /// How many ordinary requests the job keeps in flight. Only an
+    /// OpenAI-style provider reads it; a Gemini job submits batches.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
     pub sheets: Vec<Sheet>,
     pub groups: Vec<Group>,
     /// The sheets that had a label already.
@@ -247,13 +250,14 @@ fn chat_request(job: &Job, img: &image::RgbaImage, rel: &str) -> Result<Value, S
     Ok(request)
 }
 
-fn image_request(job: &mut Job, root: &Path, i: usize) -> Result<Value, String> {
+/// The request for one sheet. `existing` is the label the book held when the
+/// request was built; it guards the save of the reply. The caller reads the
+/// book once for many sheets instead of once for each.
+fn image_request(job: &mut Job, root: &Path, i: usize, existing: Option<Label>) -> Result<Value, String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))?;
     let image = image::load_from_memory(&bytes).map_err(|e| format!("Could not read the image: {e}"))?;
-    let book = crate::sidecar::load_book(root)?;
-    job.sheets[i].guard = Some(InputGuard { hash: format!("{:x}", Sha256::digest(&bytes)),
-        label: book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone()) });
+    job.sheets[i].guard = Some(InputGuard { hash: format!("{:x}", Sha256::digest(&bytes)), label: existing });
     if job.provider.kind == Kind::Gemini { body(job, &image.to_rgba8(), &job.sheets[i].rel) }
     else { Ok(job.provider.route(chat_request(job, &image.to_rgba8(), &job.sheets[i].rel)?)) }
 }
@@ -314,7 +318,8 @@ pub fn prepare_of(index: &Index, provider: Provider, model: String, scope: Scope
     let open = index.entries.iter().filter(|e| keep(e) && (all || e.side.label.is_none()));
     Ok(Job {
         log_id: crate::ai_log::id(),
-        provider, model: model.trim_end_matches(":batch").into(), groups: vec![], skipped: if all { 0 } else { labeled },
+        provider, model: model.trim_end_matches(":batch").into(), concurrency: crate::ai::DEFAULT_CONCURRENCY,
+        groups: vec![], skipped: if all { 0 } else { labeled },
         replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), free_tags: index.free_tags,
         prompt: Some(labels::prompt(&index.tag_list, index.free_tags)),
         file_context: true, poll_next: false, submit_next: false, mode: Mode::Running, control_revision: 0,
@@ -568,7 +573,9 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
     let Some(i) = job.sheets.iter().position(|s| !s.taken) else { return Ok(()) };
     crate::ai_log::event("batch_sheet_start", json!({"sheet":job.sheets[i].rel, "provider":job.provider.name,
         "model":job.model, "attempt":job.sheets[i].unknown + 1, "tags_requested":job.tag_list}));
-    let request = image_request(job, root, i);
+    let book = crate::sidecar::load_book(root)?;
+    let existing = book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone());
+    let request = image_request(job, root, i, existing);
     job.save(dir)?;
     let reply = match request {
         // The image could not be read: the sheet ends with that reason.
@@ -618,15 +625,18 @@ fn finish_one(job: &mut Job, dir: &Path, i: usize, reply: Result<Value, Failure>
     job.save(dir)
 }
 
-/// Reads the next sheets, and submits them as one Gemini batch. The group is saved
-/// as `Submitting` before the request goes out, so that a crash cannot send
-/// it twice.
-fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
+/// Reads the next sheets into one Gemini batch, and saves the group as
+/// `Submitting` before the request goes out, so that a crash cannot send it
+/// twice. It reads the images and sends nothing. Returns the group's
+/// reference, its path, and its body, or `None` when no sheet is left.
+fn prepare_submission(job: &mut Job, root: &Path, dir: &Path) -> Result<Option<(String, String, Value)>, String> {
     let (mut requests, mut bytes) = (Vec::new(), 0);
+    let book = crate::sidecar::load_book(root)?;
     for i in 0..job.sheets.len() {
         if job.sheets[i].taken { continue; }
         if requests.len() == MAX_REQUESTS { break; }
-        let body = image_request(job, root, i);
+        let existing = book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone());
+        let body = image_request(job, root, i, existing);
         let size = body.as_ref().map_or(0, |b| serde_json::to_vec(b).unwrap().len() + 512);
         match body {
             Ok(_) if size > MAX_BYTES => job.sheets[i].error = "The image request is too large.".into(),
@@ -636,7 +646,7 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
         }
         job.sheets[i].taken = true;
     }
-    if requests.is_empty() { return job.save(dir); }
+    if requests.is_empty() { job.save(dir)?; return Ok(None); }
     let sheets: Vec<_> = requests.iter().map(|(i, _)| *i).collect();
     for &i in &sheets { job.sheets[i].taken = true; }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
@@ -648,27 +658,50 @@ fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), Stri
         "sheets":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel})).collect::<Vec<_>>()}));
     let path = format!("models/{}:batchGenerateContent", job.model);
     let requests: Vec<_> = requests.into_iter().map(|(i, body)| (key(i), body)).collect();
-    let g = job.groups.len() - 1;
-    let result = match send(&path, Some(&submit_body(&requests, &reference))) {
+    Ok(Some((reference.clone(), path, submit_body(&requests, &reference))))
+}
+
+/// Reads the provider's answer to a prepared submission into its group.
+/// A submission the provider did not make sends its sheets again; one it
+/// rejected fails those sheets.
+fn finish_submission(job: &mut Job, dir: &Path, reference: &str, reply: Result<Value, Failure>) -> Result<(), String> {
+    let Some(i) = job.groups.iter().position(|g| g.remote == Remote::Submitting
+        && g.recovery.as_ref().is_some_and(|r| r.reference == reference)) else { return Ok(()); };
+    let result = match reply {
         Ok(response) => remote_id(&response).map(|id| {
-            job.groups[g].tracking.id = id.clone(); job.groups[g].remote = Remote::Waiting(id);
+            job.groups[i].tracking.id = id.clone(); job.groups[i].remote = Remote::Waiting(id);
         }),
         // The provider made no batch: the sheets wait for the next try.
         Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429 | 503, _))) => {
-            job.send_again(g);
+            job.send_again(i);
             Err(failure.message())
         }
         Err(failure @ Failure::Status(400..500, _)) => {
-            for &i in &job.groups[g].sheets { job.sheets[i].error = failure.message(); }
-            job.groups[g].remote = Remote::Done;
+            for &s in &job.groups[i].sheets { job.sheets[s].error = failure.message(); }
+            job.groups[i].remote = Remote::Done;
             Ok(())
         }
         Err(failure) => Err(failure.message()),
     };
-    job.save(dir).and(result.map(|_| ()))
+    job.save(dir).and(result)
 }
 
-/// Recover by the unique reference saved before submission. Never resend an uncertain request.
+/// Submits the next group of sheets as one Gemini batch, and reads the
+/// answer. The runner keeps several of these in flight instead; this path
+/// serves one step and the tests.
+fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
+    match prepare_submission(job, root, dir)? {
+        Some((reference, path, body)) => {
+            let reply = send(&path, Some(&body));
+            finish_submission(job, dir, &reference, reply)
+        }
+        None => Ok(()),
+    }
+}
+
+/// Recover by the unique reference saved before submission. A reply never
+/// assumed: the lookup tells whether Google made the batch. When it did not,
+/// the sheets go out again, as if the upload had never started.
 fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     let i = job.groups.iter().position(|g| g.remote == Remote::Submitting && g.recovery.is_some())
         .ok_or("No submission has a recovery reference.")?;
@@ -691,23 +724,30 @@ fn recover(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
     recovery.page = value["nextPageToken"].as_str().unwrap_or_default().into();
     if !recovery.page.is_empty() { return job.save(dir); }
     let matches = std::mem::take(&mut recovery.matches);
-    recovery.not_found = matches.is_empty();
+    let reference = recovery.reference.clone();
 
-    crate::ai_log::event("batch_recovery_check", json!({"reference":recovery.reference, "matches":matches.len()}));
-    let result = match matches.as_slice() {
+    crate::ai_log::event("batch_recovery_check", json!({"reference":reference, "matches":matches.len()}));
+    match matches.as_slice() {
+        // Google never made this batch: its sheets go out again.
+        [] => {
+            crate::ai_log::event("batch_resubmit", json!({"reference":reference}));
+            job.send_again(i);
+            job.save(dir)
+        }
         [id] => {
-            crate::ai_log::event("batch_recovered", json!({"reference":recovery.reference, "id":id}));
+            crate::ai_log::event("batch_recovered", json!({"reference":reference, "id":id}));
             job.groups[i].tracking.id = id.clone();
             job.groups[i].remote = Remote::Waiting(id.clone());
-            Ok(())
+            job.groups[i].tracking.recoveries += 1;
+            job.groups.rotate_left(i + 1);
+            job.save(dir)
         }
-        [] => Ok(()),
-        _ => Err("Google returned more than one matching batch. Open Advanced recovery; nothing was resent.".into()),
-    };
-    job.groups[i].tracking.recoveries += 1;
-    // Give each unconfirmed group a turn after a complete lookup.
-    job.groups.rotate_left(i + 1);
-    job.save(dir).and(result.map(|_| ()))
+        _ => {
+            job.groups[i].tracking.recoveries += 1;
+            job.groups.rotate_left(i + 1);
+            job.save(dir).and(Err("Google returned more than one matching batch. Open Advanced recovery; nothing was resent.".into()))
+        }
+    }
 }
 
 fn poll(job: &mut Job, dir: &Path, send: Send) -> Result<(), String> {
@@ -1023,7 +1063,7 @@ impl Panel {
             return "Uploads interrupted; retry pending".into();
         }
         if job.issues.contains_key("check") { return format!("Waiting for {}; connection interrupted", job.provider.name); }
-        if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= MAX_UNCONFIRMED {
+        if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= job.concurrency.max(1) as usize {
             return "Waiting for upload confirmations".into();
         }
         if job.untaken() {
@@ -1214,14 +1254,15 @@ impl Panel {
             crate::stop(&button);
             if button.clicked() {
                 let (provider, model) = configured.unwrap();
-                let (provider, model) = (provider.clone(), model.id.clone());
+                let (provider, model, concurrency) = (provider.clone(), model.id.clone(), model.concurrency.max(1));
                 let set = self.choice.as_ref().map(|(rels, _)| rels.clone());
                 let job = match set.as_ref() {
                     Some(set) => prepare_of(index, provider, model, scope, Some(set)),
                     None => prepare(index, provider, model, scope),
                 };
                 match job {
-                    Ok(job) => {
+                    Ok(mut job) => {
+                        job.concurrency = concurrency;
                         self.cost_error.clear();
                         self.cost_preview = match cost::Preview::start(job.clone(), index.root.clone(), self.job.as_ref(), ui.ctx().clone()) {
                             Ok(preview) => Some(preview), Err(error) => { self.cost_error = error; None }
@@ -1455,17 +1496,17 @@ mod tests {
     fn new_jobs_send_file_context_and_old_jobs_keep_their_saved_prompt() {
         let files = Files::new();
         let mut job = files.prepare(Kind::OpenAi);
-        let request = image_request(&mut job, &files.root, 0).unwrap();
+        let request = image_request(&mut job, &files.root, 0, None).unwrap();
         let expected = labels::sheet_prompt(job.prompt.clone().unwrap(), "folder/sheet.png");
         assert_eq!(request["messages"][1]["content"][0]["text"], expected[1]);
         job.provider = provider(Kind::Gemini);
-        let google = image_request(&mut job, &files.root, 0).unwrap();
+        let google = image_request(&mut job, &files.root, 0, None).unwrap();
         assert_eq!(google, crate::gemini::request(&request));
         let mut saved = serde_json::to_value(&job).unwrap();
         saved.as_object_mut().unwrap().remove("file_context");
         saved["prompt"] = json!(["Original system", "Original user"]);
         let mut legacy: Job = serde_json::from_value(saved).unwrap();
-        let google = image_request(&mut legacy, &files.root, 0).unwrap();
+        let google = image_request(&mut legacy, &files.root, 0, None).unwrap();
         assert_eq!(google["systemInstruction"]["parts"][0]["text"], "Original system");
         assert_eq!(google["contents"][0]["parts"][0]["text"], "Original user");
     }
@@ -1894,22 +1935,23 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfirmed_submission_is_not_sent_twice() {
+    fn an_unconfirmed_submission_that_never_left_goes_out_again() {
         let files = Files::new();
         let (_, result) = files.advance(files.prepare(Kind::Gemini), |_, _| Err(Failure::Unknown("timeout".into())));
         assert!(result.is_err());
-        let mut job = files.journal();
+        let job = files.journal();
         assert!(job.uncertain());
-        let (_, result) = files.advance(job.clone(), |path, body| {
+        let (job, result) = files.advance(job, |path, body| {
             assert_eq!(path, "batches?pageSize=100");
             assert!(body.is_none(), "Recovery must never send another paid request.");
             Ok(json!({"operations":[]}))
         });
         result.unwrap();
-        job.send_again(0);
+        assert!(!job.uncertain(), "a batch Google never made is released for another try");
+        assert!(!job.sheets[0].taken);
         let (job, result) = files.advance(job, id("batches/batch-3"));
         result.unwrap();
-        assert!(!job.uncertain());
+        assert!(matches!(&job.groups[0].remote, Remote::Waiting(_)));
     }
 
     #[test]
@@ -1927,13 +1969,14 @@ mod tests {
         let (job, result) = files.advance(job, |path, body| {
             assert!(path.ends_with(":batchGenerateContent"), "Recovery blocked the queued sheets: {path}");
             let requests = body.unwrap().pointer("/batch/inputConfig/requests/requests").unwrap().as_array().unwrap();
-            assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0]["metadata"]["key"], "sheet-1");
+            assert_eq!(requests.len(), 2, "the released sheet joins the queued one");
+            assert_eq!(requests[0]["metadata"]["key"], "sheet-0");
+            assert_eq!(requests[1]["metadata"]["key"], "sheet-1");
             Ok(json!({"name":"batches/next"}))
         });
         result.unwrap();
-        assert!(job.uncertain());
-        assert_eq!(job.groups.len(), 2);
+        assert!(!job.uncertain());
+        assert_eq!(job.groups.len(), 1);
     }
 
     #[test]
@@ -1961,16 +2004,19 @@ mod tests {
         let mut second = job.groups[0].clone();
         second.recovery.as_mut().unwrap().reference = "second".into();
         job.groups.push(second);
-        let (job, result) = files.advance(job, |_, _| Ok(json!({"operations":[]})));
+        // The first lookup proves the first group absent, so it goes out again.
+        let (mut job, result) = files.advance(job, |_, _| Ok(json!({"operations":[]})));
         result.unwrap();
+        assert_eq!(job.groups.len(), 1);
         assert_eq!(job.groups[0].recovery.as_ref().unwrap().reference, "second");
-        assert!(job.groups[1].recovery.as_ref().unwrap().not_found);
+        // The next lookup turns to the second group, which Google did make.
+        job.submit_next = false;
         let (job, result) = files.advance(job, |_, _| Ok(json!({"operations":[
             {"name":"batches/second", "metadata":{"displayName":"second", "model":"models/test"}}
         ]})));
         result.unwrap();
         assert!(job.groups.iter().any(|g| g.remote == Remote::Waiting("batches/second".into())));
-        assert!(job.uncertain());
+        assert!(!job.uncertain());
     }
 
     #[test]

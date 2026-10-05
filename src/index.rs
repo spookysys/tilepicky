@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Scans a directory of sheets and searches their names, captions, and tags.
 
+use crate::embed;
 use crate::settings::SearchIn;
 use crate::sidecar::{self, Pair, Sidecar};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ pub struct Entry {
     pub name_words: Vec<String>,
     /// The book entry: grid, origins, animations, AI label.
     pub side: Sidecar,
+    /// The sheet's embedding, when the library has one; see `embed`.
+    pub embed: Option<Vec<f32>>,
 }
 
 pub struct Index {
@@ -30,6 +33,8 @@ pub struct Index {
     pub tag_list: Vec<String>,
     /// The most free tags a labeling request asks for; see `sidecar::Book::free_tags`.
     pub free_tags: usize,
+    /// The model the library's embeddings came from. Empty when there are none.
+    pub embed_model: String,
 }
 
 impl Index {
@@ -45,6 +50,7 @@ impl Index {
                 tile: default_tile,
                 tag_list: Vec::new(),
                 free_tags: sidecar::FREE_TAGS,
+                embed_model: String::new(),
             };
         }
         let mut rels: Vec<String> = Vec::new();
@@ -70,13 +76,17 @@ impl Index {
         let (mut book, error) = match sidecar::load_book(root) {
             Ok(book) => (book, None), Err(e) => (sidecar::Book::default(), Some(e)),
         };
+        // A damaged embeddings file leaves semantic search off; the book's own
+        // error is the one the panel shows.
+        let embeddings = embed::read(root).unwrap_or_default();
         let entries = rels
             .into_iter()
             .map(|rel| {
                 let side = book.sheets.remove(&rel).unwrap_or_default();
                 let (dirs, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
                 let (dir_words, name_words) = (words(dirs), path_words(name));
-                Entry { dir_words, name_words, side, rel }
+                let vector = embeddings.sheets.get(&rel).map(|v| v.vec.clone());
+                Entry { dir_words, name_words, side, rel, embed: vector }
             })
             .collect();
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
@@ -90,6 +100,7 @@ impl Index {
             tile,
             tag_list,
             free_tags,
+            embed_model: embeddings.model,
         }
     }
 
@@ -97,22 +108,26 @@ impl Index {
         self.entries.binary_search_by(|e| e.rel.as_str().cmp(rel)).ok()
     }
 
-    /// True when every query word is the prefix of a word in the fields
-    /// that `search` names.
-    pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn) -> bool {
+    /// True when every query word is the prefix of a word in the fields that
+    /// `search` names, or when the sheet's embedding is close to `embed`.
+    /// The embedding is a sibling of the text fields: either one can match.
+    pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn, embed: Option<&[f32]>) -> bool {
         let starts = |ws: &[String], q: &str| ws.iter().any(|w| w.starts_with(q));
         let label = e.side.label.as_ref();
         let caption = label.filter(|_| search.captions).map(|l| words(&l.caption)).unwrap_or_default();
         let tags = label.filter(|_| search.tags).map(|l| words(&l.tags.join(" "))).unwrap_or_default();
-        matches(query, |q| (search.folders && starts(&e.dir_words, q)) || (search.files && starts(&e.name_words, q))
-            || starts(&caption, q) || starts(&tags, q))
+        let prefix = matches(query, |q| (search.folders && starts(&e.dir_words, q)) || (search.files && starts(&e.name_words, q))
+            || starts(&caption, q) || starts(&tags, q));
+        let semantic = search.embeddings
+            && embed.is_some_and(|q| e.embed.as_deref().is_some_and(|v| embed::cosine(q, v) >= embed::FLOOR));
+        prefix || semantic
     }
 
-    pub fn visible(&self, query: &[String], search: SearchIn) -> Option<Vec<bool>> {
+    pub fn visible(&self, query: &[String], search: SearchIn, embed: Option<&[f32]>) -> Option<Vec<bool>> {
         if query.is_empty() {
             return None;
         }
-        Some(self.entries.iter().map(|e| Self::entry_matches(e, query, search)).collect())
+        Some(self.entries.iter().map(|e| Self::entry_matches(e, query, search, embed)).collect())
     }
 }
 
@@ -146,4 +161,29 @@ pub fn matches(query: &[String], has: impl Fn(&str) -> bool) -> bool {
 /// Book keys and tree paths use one separator on every platform.
 fn relative_path(path: &Path) -> String {
     path.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(rel: &str, embed: Option<Vec<f32>>) -> Entry {
+        Entry { dir_words: words("props"), name_words: path_words(rel), side: Sidecar::default(), rel: rel.into(), embed }
+    }
+
+    /// The embedding is a sibling of the text fields: a sheet can match by
+    /// meaning when no word matches, and the checkbox turns it off. With no
+    /// vector ready, nothing matches by meaning.
+    #[test]
+    fn a_sheet_matches_by_meaning_beside_the_words() {
+        let e = entry("props/tree.png", Some(vec![1.0, 0.0]));
+        let search = SearchIn::default();
+        let query = words("cozy");
+        assert!(!Index::entry_matches(&e, &query, search, None), "no prefix match, no vector");
+        assert!(Index::entry_matches(&e, &query, search, Some(&[1.0, 0.0])), "a close vector matches");
+        assert!(!Index::entry_matches(&e, &query, search, Some(&[0.0, 1.0])), "a far vector does not");
+        let off = SearchIn { embeddings: false, ..search };
+        assert!(!Index::entry_matches(&e, &query, off, Some(&[1.0, 0.0])), "the checkbox turns it off");
+        assert!(Index::entry_matches(&e, &words("tree"), search, None), "the words still match on their own");
+    }
 }

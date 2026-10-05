@@ -11,6 +11,7 @@
 
 mod ai;
 mod ai_log;
+mod embed;
 mod gemini;
 mod detect;
 mod dialogs;
@@ -33,6 +34,9 @@ const AI_VISIBLE: bool = true;
 
 /// A sheet's tile size, gap, and offset, as the header fields edit them.
 type Grid = ([u32; 2], [u32; 2], [i32; 2]);
+
+/// The answer of a query-embedding worker: one vector, or why there is none.
+type QueryEmbedding = std::sync::mpsc::Receiver<Result<Vec<f32>, String>>;
 use index::Index;
 use sheet::{Block, Sel, Sheet};
 use sidecar::{Animation, Pair};
@@ -128,6 +132,18 @@ struct App {
     label_copy_error: String,
     label_options: Option<labels::Options>,
 
+    /// The embeddings generation in flight.
+    embed_run: Option<embed::Run>,
+    /// The confirm that asks before label text goes to the provider: the
+    /// embedding model and the number of sheets it will embed.
+    embed_confirm: Option<(String, usize)>,
+    /// The confirm's Generate was pressed this frame.
+    embed_start: bool,
+    /// The library's query embedding: the query, the model, and the vector.
+    embed_query: Option<(String, String, Vec<f32>)>,
+    /// A query embedding in flight: the query, the model, and its answer.
+    query_embed: Option<(String, String, QueryEmbedding)>,
+
     /// A prompt to show: a title, and its two texts.
     prompt_view: Option<(String, [String; 2])>,
     library_batch: batch::Panel,
@@ -173,6 +189,8 @@ struct App {
     project: Half,
     query: String,
     qwords: Vec<String>,
+    /// When the query last changed, so that its embedding waits for a pause.
+    query_at: std::time::Instant,
     active: Panel,
     clip: Option<Block>,
     new_name: String,
@@ -394,6 +412,7 @@ impl App {
             label_outcome: None,
             label_view: false,
             label_target: None, label_focus: None, label_copied: None, label_copy_error: String::new(), label_options: None,
+            embed_run: None, embed_confirm: None, embed_start: false, embed_query: None, query_embed: None,
             prompt_view: None,
             library_batch: batch::Panel::default(),
             remove_label: None,
@@ -425,6 +444,7 @@ impl App {
             project: Half::new(project, false),
             query: String::new(),
             qwords: Vec::new(),
+            query_at: std::time::Instant::now(),
             active: Panel::Library,
             pane: (Panel::Library, Spot::Tree),
             stops: Vec::new(),
@@ -542,6 +562,12 @@ impl App {
     fn refresh_query(&mut self) {
         self.qwords = index::words(&self.query);
         self.open_trees = true;
+        self.query_at = std::time::Instant::now();
+        // A new query has no vector yet: the old one must not match it.
+        if self.embed_query.as_ref().is_none_or(|(q, _, _)| q != &self.query) {
+            self.library.embed_query = None;
+            self.project.embed_query = None;
+        }
         self.refresh_visible();
     }
 
@@ -550,6 +576,117 @@ impl App {
     fn refresh_visible(&mut self) {
         self.library.refresh_visible(&self.qwords, self.settings.search);
         self.project.refresh_visible(&self.qwords, self.settings.search);
+    }
+
+    /// Keeps the query embedding in step with the query and the model.
+    /// Semantic search does nothing until a vector is ready, and it applies
+    /// only where the library's own vectors came from the same model.
+    fn ensure_query_embedding(&mut self, ctx: &egui::Context) {
+        let query = self.query.trim().to_string();
+        let chosen = self.settings.ai.chosen_embed().map(|(p, m)| (p.clone(), m.id.clone()));
+        // Take the answer of a worker that finished, and put it back while it runs.
+        if let Some((q, m, rx)) = self.query_embed.take() {
+            match rx.try_recv() {
+                Ok(Ok(vec)) => self.embed_query = Some((q, m, vec)),
+                Ok(Err(error)) => self.status = error,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.query_embed = Some((q, m, rx));
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        let model = chosen.as_ref().map_or(String::new(), |(_, id)| id.clone());
+        let ready = self.embed_query.as_ref().filter(|(q, m, _)| *q == query && *m == model).map(|(_, _, v)| v.clone());
+        let enabled = self.settings.search.embeddings;
+        for half in [&mut self.library, &mut self.project] {
+            half.embed_query = ready.clone().filter(|_| enabled && half.index.embed_model == model);
+        }
+        let running = self.query_embed.as_ref().is_some_and(|(q, _, _)| *q == query);
+        // Wait for a pause in typing, so that a word in progress is not sent.
+        let settled = self.query_at.elapsed() >= Duration::from_millis(400);
+        if enabled && !query.is_empty() && !settled && ready.is_none() && !running {
+            ctx.request_repaint_after(Duration::from_millis(400));
+        }
+        let wanted = enabled && settled && !self.qwords.is_empty() && ready.is_none() && !running
+            && self.library.index.embed_model == model && chosen.as_ref().is_some_and(|(p, _)| p.key(&self.keys).is_some());
+        if wanted && let Some((provider, model)) = chosen
+            && let Some(key) = provider.key(&self.keys) {
+            match embed::Endpoint::new(&provider, key) {
+                Ok(endpoint) => {
+                    let body = provider.route(embed::request(&model, std::slice::from_ref(&query)));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let wake = ctx.clone();
+                    std::thread::spawn(move || {
+                        let out = endpoint.send(&body).and_then(|v| embed::response(&v, 1)).map(|mut vs| vs.remove(0));
+                        let _ = tx.send(out);
+                        wake.request_repaint();
+                    });
+                    self.query_embed = Some((query, model, rx));
+                }
+                Err(error) => self.status = error,
+            }
+        }
+    }
+
+    /// Takes the result of a generation, and reads the library again so the
+    /// new vectors reach the search.
+    fn receive_embeddings(&mut self, ctx: &egui::Context) {
+        let Some(run) = self.embed_run.take() else { return };
+        match run.result.try_recv() {
+            Ok(Ok(count)) => {
+                self.status = format!("Embedded {count} sheets.");
+                let (query, search) = (self.qwords.clone(), self.settings.search);
+                self.library.rescan(&query, search);
+                self.embed_query = None;
+            }
+            Ok(Err(error)) => self.status = error,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.embed_run = Some(run);
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+
+    /// Sends the labels that need a vector to the embedding model. Nothing
+    /// goes out until the user has agreed in the confirm.
+    fn start_embeddings(&mut self, ctx: &egui::Context) {
+        let root = self.library.index.root.clone();
+        let Some((provider, model)) = self.settings.ai.chosen_embed().map(|(p, m)| (p.clone(), m.id.clone())) else {
+            self.status = "Choose an embedding model in Settings.".into();
+            return;
+        };
+        let Some(key) = provider.key(&self.keys) else {
+            self.status = format!("Set the {} API key in Settings.", provider.name);
+            return;
+        };
+        let endpoint = match embed::Endpoint::new(&provider, key) { Ok(e) => e, Err(e) => { self.status = e; return; } };
+        let book = match sidecar::load_book(&root) { Ok(b) => b, Err(e) => { self.status = e; return; } };
+        let done = embed::read(&root).unwrap_or_default();
+        let jobs = embed::jobs(&book, &done, &model);
+        if jobs.is_empty() { self.status = "Every labeled sheet already has an embedding.".into(); return; }
+        let total = jobs.len();
+        let route = provider.clone();
+        let wake = ctx.clone();
+        match embed::Run::start(root, model, total, jobs, done,
+            move |body| endpoint.send(&route.route(body.clone())), move || wake.request_repaint()) {
+            Ok(run) => { self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// The model, and the labeled sheets that still need a vector.
+    fn embed_plan(&self) -> (String, usize) {
+        let model = self.settings.ai.chosen_embed().map(|(_, m)| m.id.clone()).unwrap_or_default();
+        let count = match sidecar::load_book(&self.library.index.root) {
+            Ok(book) => {
+                let done = embed::read(&self.library.index.root).unwrap_or_default();
+                embed::jobs(&book, &done, &model).len()
+            }
+            Err(_) => 0,
+        };
+        (model, count)
     }
 
     /// The arrow keys move a cursor over the folders and files of the tree
@@ -1539,6 +1676,18 @@ impl App {
         if stopped(ui.add_enabled(self.library.is_set(), egui::Button::new("Edit library options..."))).clicked() {
             self.open_label_options(self.library.index.root.clone());
         }
+        ui.add_space(6.0);
+        ui.strong("Search embeddings");
+        ui.label("Embed each labeled sheet, so that search can match by meaning.");
+        if let Some(run) = &self.embed_run {
+            ui.label(format!("Embedding {} sheets...", run.total));
+        } else {
+            let can = self.library.is_set() && self.library.index.error.is_none()
+                && self.library.index.entries.iter().any(|e| e.side.label.is_some());
+            if stopped(ui.add_enabled(can, egui::Button::new("Generate Embeddings (AI)..."))).clicked() {
+                self.embed_confirm = Some(self.embed_plan());
+            }
+        }
     }
 
     fn open_label_options(&mut self, root: PathBuf) {
@@ -2053,8 +2202,13 @@ impl App {
         Self::sheet_toolbar(ui, "source toolbar", |ui| {
             ui.horizontal(|ui| {
                 let live = keys == (Panel::Library, Spot::Sheet);
-                if stopped(ui.add_enabled(self.library.sheet.is_some(), egui::Button::new("AI label..."))).clicked() {
+                if stopped(ui.add_enabled(self.library.sheet.is_some(), egui::Button::new("Tags (AI)..."))).clicked() {
                     self.label_action(ctx, labels::Action::Show);
+                }
+                let can_embed = self.library.is_set() && self.library.index.error.is_none()
+                    && self.library.index.entries.iter().any(|e| e.side.label.is_some());
+                if stopped(ui.add_enabled(can_embed, egui::Button::new("Embeddings (AI)..."))).clicked() {
+                    self.embed_confirm = Some(self.embed_plan());
                 }
                 let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
                 let clicked;
@@ -2391,6 +2545,9 @@ impl App {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = &ui.ctx().clone();
         self.receive_label();
+        self.receive_embeddings(ctx);
+        self.ensure_query_embedding(ctx);
+        if std::mem::take(&mut self.embed_start) { self.start_embeddings(ctx); }
         let root = &self.library.index.root;
         if !root.as_os_str().is_empty() { self.log_roots.insert(root.clone()); }
         if self.library_batch.tick(ctx, &self.library.index.root, &self.keys, self.label_run.is_some()) {
@@ -2467,13 +2624,16 @@ impl App {
                     let second = ui.checkbox(&mut self.settings.search.files, "file names");
                     let third = ui.checkbox(&mut self.settings.search.captions, "captions");
                     let fourth = ui.checkbox(&mut self.settings.search.tags, "tags");
-                    let changed = [&first, &second, &third, &fourth].iter().any(|r| r.changed());
+                    let fifth = ui.checkbox(&mut self.settings.search.embeddings, "embeddings (meaning)");
+                    let changed = [&first, &second, &third, &fourth, &fifth].iter().any(|r| r.changed());
                     popup_keys(ui, &r, &first);
                     if changed {
                         self.refresh_query();
                         if let Err(e) = self.settings.save() { self.status = e; }
                     }
-                    ui.weak("Words match by prefix. All words must match.\nCaptions and tags come from Label with AI.");
+                    ui.weak("Words match by prefix. All words must match.\n\
+                        Captions and tags come from Generate Tags (AI).\n\
+                        Embeddings come from Generate Embeddings (AI).");
                 });
                 let r = egui::TextEdit::singleline(&mut self.query)
                     .id(search_id())
@@ -3513,7 +3673,7 @@ mod tests {
     #[test]
     fn labeling_from_the_menu_opens_the_result_dialog_on_setup_error() {
         let mut b = bench(&["a.png"], &[]);
-        b.app.settings.ai.instant = None;
+        b.app.settings.ai.single = None;
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Label));
         assert!(b.app.label_view, "The label action must show its progress or error immediately.");
         assert_eq!(b.app.selected_label_outcome(), Some("Choose a single-sheet model in Settings."));
@@ -3523,7 +3683,7 @@ mod tests {
     #[test]
     fn reopening_a_popup_keeps_its_outcome_without_showing_it_on_another_sheet() {
         let mut b = bench(&["a.png", "b.png"], &[]);
-        b.app.settings.ai.instant = None;
+        b.app.settings.ai.single = None;
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(0, labels::Action::Label));
         let error = b.app.selected_label_outcome().unwrap().to_string();
         b.app.label_view = false;
@@ -3550,7 +3710,7 @@ mod tests {
         let mut b = bench(&["a.png", "b.png"], &[]);
         b.app.open_library(&b.ctx, 0);
         assert!(!b.app.single_log_available());
-        b.app.settings.ai.instant = None;
+        b.app.settings.ai.single = None;
         b.app.label_action(&b.ctx, labels::Action::Label);
         assert!(b.app.single_log_available());
         let first = b.app.selected_single_log().unwrap().clone();
