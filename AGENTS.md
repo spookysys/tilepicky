@@ -32,6 +32,9 @@ the person who uses the tool; this file is for an agent that works on it.
 
 ## Where things are
 
+- `src/workspace.rs`: Library and Build navigation, the sheet inspector, search comparison, and scoped Improve search actions.
+- `src/gallery.rs`: virtual thumbnail rows and a bounded worker/cache for image previews.
+- `src/ai_catalog.rs`: provider model discovery, capability filters, shortlist, and private offline cache.
 - `src/main.rs`: the app: the panels, the headers, the keys, the popups,
   and the drag of a block between the panels. The status bar shows label progress.
 - `src/half.rs`: one half of the window, the library or the project: its
@@ -51,7 +54,8 @@ the person who uses the tool; this file is for an agent that works on it.
   match uses a query vector that a worker made.
 - `src/embed.rs`: image embeddings in `embeddings.json` and independent caption/tag embeddings in `embeddings-text.json`.
   Image input can optionally include labels. Each store records its model, provider identity, and source hashes.
-  Generation checks replies and saves completed batches. Query requests run separately with bounded concurrency and explicit retries.
+  Generation checks replies and saves completed batches. Image and label searches can use separate models.
+  Each source has a bounded query worker and explicit retry.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/quant/`: the color quantizer, a vendored port of SuperFamiconv 0.12's
   incremental tile-aware quantizer. It holds the SNES palettes, the dithers,
@@ -68,7 +72,8 @@ the person who uses the tool; this file is for an agent that works on it.
   An OpenAI-style provider may carry an S3 object store for batch uploads, and
   the matching `(S3 secret)` entry in `keys.json`.
   A model is a chat model, with the scopes it serves, or an embedding model.
-  Single-sheet labeling uses the Single sheet model, through Google Gemini or an OpenAI-compatible endpoint.
+  Captions and tags assigns one model to both scopes, with an advanced library override.
+  Single-sheet labeling uses Google Gemini or an OpenAI-compatible endpoint.
   Library jobs use the Library model through Google batches (several at once),
   OpenRouter batches when object storage is set, or several OpenAI-compatible
   requests at once.

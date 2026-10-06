@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//! Task navigation, the visual library, and scoped search tools.
+
+use crate::{App, Panel, Spot, Index, labels, embed, settings, egui, Id};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Workspace { Library, Build }
+
+impl App {
+    pub(super) fn workspace_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("workspace navigation").show(ui, |ui| {
+            crate::set_pane(ui, (Panel::Project, Spot::Status));
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Tilepicky");
+                let before = self.workspace;
+                crate::stop(&ui.selectable_value(&mut self.workspace, Workspace::Library, "Library"));
+                crate::stop(&ui.selectable_value(&mut self.workspace, Workspace::Build, "Build"));
+                if before != self.workspace {
+                    self.drag = None;
+                    self.active = Panel::Library;
+                    self.pane = (Panel::Library, Spot::Tree);
+                    ui.ctx().memory_mut(|m| m.request_focus(crate::library_tree_id()));
+                }
+                ui.separator();
+                if ui.add_enabled(self.library.is_set(), egui::Button::new("Improve search...")).clicked() {
+                    self.open_improve();
+                }
+                let running = self.label_run.is_some() || self.embed_run.is_some() || self.library_batch.busy();
+                if ui.selectable_label(self.ai_panel, if running { "Activity (running)" } else { "Activity" }).clicked() {
+                    self.ai_panel = !self.ai_panel;
+                }
+                if crate::stopped(ui.button("AI setup...")).clicked() { self.settings_request = true; }
+                ui.menu_button("Folders", |ui| {
+                    if ui.button("Open library...").clicked() { self.ask_folder(Panel::Library); ui.close(); }
+                    if ui.button("Open project...").clicked() { self.ask_folder(Panel::Project); ui.close(); }
+                    if ui.button("Refresh library").clicked() { self.rescan_library(); ui.close(); }
+                });
+                if self.workspace == Workspace::Build {
+                    if ui.add_enabled(self.project.sheet.is_some(), egui::Button::new("Save")).clicked() { self.save(); }
+                    if ui.add_enabled(self.project.sheet.is_some(), egui::Button::new("Colors and export...")).clicked() {
+                        self.quant_panel = !self.quant_panel;
+                    }
+                }
+            });
+        });
+    }
+
+    pub(super) fn open_improve(&mut self) {
+        self.improve_rels = self.marked_library_rels().into_iter().collect();
+        if self.library_marked.is_empty() && self.library_marked_dirs.is_empty() {
+            self.improve_rels = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
+        }
+        self.improve_open = true;
+    }
+
+    pub(super) fn library_workspace(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.library.sel.is_some() {
+            egui::Panel::right("sheet inspector").default_size(250.0).size_range(180.0..=400.0).resizable(true).show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let Some(i) = self.library.sel.filter(|i| *i < self.library.index.entries.len()) else { return };
+                    let entry = &self.library.index.entries[i];
+                    ui.strong(&entry.rel);
+                    ui.add_space(8.0);
+                    self.gallery.preview(ui, &self.library.index, i, egui::vec2(ui.available_width(), 210.0));
+                    if let Some(label) = &entry.side.label {
+                        ui.label(&label.caption);
+                        ui.horizontal_wrapped(|ui| { for tag in &label.tags { ui.label(egui::RichText::new(tag).strong()); } });
+                    } else { ui.weak("No captions or tags yet."); }
+                    let sources = Index::match_sources(entry, &self.qwords, self.settings.search,
+                        self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
+                    if !self.qwords.is_empty() && !sources.is_empty() { ui.small(format!("Matches: {}", sources.join(", "))); }
+                    ui.separator();
+                    if ui.button("Use in tilesheet").clicked() {
+                        self.workspace = Workspace::Build;
+                        self.active = Panel::Library;
+                        self.pane = (Panel::Library, Spot::Sheet);
+                        ctx.memory_mut(|m| m.request_focus(crate::library_id()));
+                    }
+                    if ui.button("Review / generate tags...").clicked() { self.label_action(&ctx, labels::Action::Show); }
+                    if ui.button("Improve this sheet...").clicked() {
+                        self.improve_rels = vec![self.library.index.entries[i].rel.clone()];
+                        self.improve_open = true;
+                    }
+                });
+            });
+        }
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Library");
+                ui.checkbox(&mut self.library_without_tags, "Without tags");
+                ui.checkbox(&mut self.compare_search, "Compare search");
+                if !self.library_marked.is_empty() || !self.library_marked_dirs.is_empty() {
+                    ui.label(format!("{} selected", self.marked_library_rels().len()));
+                    if ui.button("Clear selection").clicked() {
+                        self.library_marked.clear(); self.library_marked_dirs.clear(); self.library_batch.choice = None;
+                    }
+                }
+            });
+            if !self.library.is_set() {
+                ui.label("Open a folder of sprite sheets to start. Your source images stay unchanged.");
+                if ui.button("Open library...").clicked() { self.ask_folder(Panel::Library); }
+                return;
+            }
+            if self.compare_search { self.search_comparison(ui); return; }
+            let mut order = self.library.index.ranked(&self.qwords, self.settings.search,
+                self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
+            if self.library_without_tags { order.retain(|i| self.library.index.entries[*i].side.label.is_none()); }
+            ui.weak(format!("{} sheets. Click to inspect; use checkboxes to select a job scope.", order.len()));
+            if !self.qwords.is_empty() && (self.query_embed.is_some() || self.text_query.pending.is_some()) {
+                ui.weak("Meaning search is running. Word matches are available.");
+            }
+            if let Some((_, error)) = self.query_error.as_ref().or(self.text_query.error.as_ref()) {
+                ui.colored_label(ui.visuals().error_fg_color, labels::summary(error));
+                if ui.button("Retry meaning search").clicked() { self.query_error = None; self.text_query.error = None; }
+            }
+            if let Some(i) = self.gallery.show_ordered(ui, &self.library.index, &order, self.library.sel, &mut self.library_marked) {
+                self.open_library(&ctx, i);
+            }
+        });
+    }
+
+    fn search_comparison(&mut self, ui: &mut egui::Ui) {
+        if self.qwords.is_empty() { ui.label("Enter a query to compare words, image meaning, and label meaning."); return; }
+        ui.weak("Each column ranks its own source. Similarity scores from different models are not compared.");
+        let base = settings::SearchIn { folders: false, files: false, captions: false, tags: false,
+            embeddings: false, text_embeddings: false, similarity: self.settings.search.similarity };
+        let sources = [
+            ("Words", settings::SearchIn { folders: true, files: true, captions: true, tags: true, ..base }),
+            ("Image meaning", settings::SearchIn { embeddings: true, ..base }),
+            ("Label meaning", settings::SearchIn { text_embeddings: true, ..base }),
+        ];
+        let mut open = None;
+        ui.columns(3, |columns| {
+            for (column, (title, search)) in columns.iter_mut().zip(sources) {
+                column.strong(title);
+                if search.embeddings || search.text_embeddings {
+                    let (enabled, vector, count) = if search.embeddings {
+                        (self.settings.search.embeddings, self.library.embed_query.as_ref(),
+                            self.library.index.entries.iter().filter(|e| e.embed.is_some()).count())
+                    } else {
+                        (self.settings.search.text_embeddings, self.library.text_embed_query.as_ref(),
+                            self.library.index.entries.iter().filter(|e| e.text_embed.is_some()).count())
+                    };
+                    column.small(format!("{count} / {} sheets indexed", self.library.index.entries.len()));
+                    if !enabled {
+                        if column.button("Enable this source").clicked() {
+                            if search.embeddings { self.settings.search.embeddings = true; }
+                            else { self.settings.search.text_embeddings = true; }
+                            self.refresh_query();
+                            if let Err(e) = self.settings.save() { self.status = e; }
+                        }
+                        continue;
+                    }
+                    let error = if search.embeddings { self.query_error.as_ref() } else { self.text_query.error.as_ref() };
+                    if let Some((_, message)) = error {
+                        column.colored_label(column.visuals().error_fg_color, labels::summary(message));
+                        if column.button("Retry this source").clicked() {
+                            if search.embeddings { self.query_error = None; } else { self.text_query.error = None; }
+                        }
+                        continue;
+                    }
+                    if vector.is_none() { column.weak("Waiting for a compatible index and query vector."); continue; }
+                }
+                let results = self.library.index.ranked(&self.qwords, search,
+                    self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
+                column.small(format!("{} matches", results.len()));
+                egui::ScrollArea::vertical().id_salt(title).show(column, |ui| {
+                    for i in results {
+                        if ui.selectable_label(self.library.sel == Some(i), &self.library.index.entries[i].rel).clicked() { open = Some(i); }
+                    }
+                });
+            }
+        });
+        if let Some(i) = open { self.open_library(ui.ctx(), i); }
+    }
+
+    pub(super) fn workflow_windows(&mut self, ctx: &egui::Context) {
+        if self.ai_panel {
+            let mut open = true;
+            egui::Window::new("Activity").id(Id::new("activity window")).open(&mut open)
+                .default_width(540.0).default_height(500.0).vscroll(true).show(ctx, |ui| { self.assist_panel(ui); });
+            self.ai_panel &= open;
+        }
+        if !self.improve_open { return; }
+        let mut open = true;
+        let mut action = None;
+        egui::Window::new("Improve search").open(&mut open).default_width(480.0).vscroll(true).show(ctx, |ui| {
+            ui.heading(format!("{} selected sheets", self.improve_rels.len()));
+            egui::CollapsingHeader::new("Review scope").show(ui, |ui| {
+                for rel in &self.improve_rels { ui.label(rel); }
+            });
+            ui.label("Choose a task. Review the model, inputs, and replacement options before generation starts.");
+            ui.group(|ui| {
+                ui.strong("Captions and tags");
+                ui.label("Describe visible content and make its words searchable.");
+                if ui.button("Review tag generation...").clicked() { action = Some(0); }
+                if ui.add_enabled(!self.improve_rels.is_empty(), egui::Button::new("Try one sheet...")).clicked() { action = Some(3); }
+            });
+            ui.group(|ui| {
+                ui.strong("Image meaning");
+                ui.label("Find sheets from a visual description. This sends sheet images to your provider.");
+                if ui.button("Review image index...").clicked() { action = Some(1); }
+            });
+            ui.group(|ui| {
+                ui.strong("Label meaning");
+                ui.label("Find related ideas in saved captions and tags. Sheets without labels are skipped.");
+                if ui.button("Review label index...").clicked() { action = Some(2); }
+            });
+            if crate::stopped(ui.button("AI setup...")).clicked() { self.settings_request = true; }
+            ui.small("Your selection stays here while you configure AI. No generation starts from setup.");
+        });
+        self.improve_open = open;
+        if let Some(action) = action {
+            if self.improve_rels.is_empty() { self.status = "Select at least one sheet.".into(); return; }
+            match action {
+                0 if self.improve_rels.len() > 1 => {
+                    self.library_batch.choose(self.improve_rels.iter().cloned().collect(), format!("{} selected sheets", self.improve_rels.len()));
+                    self.ai_panel = true;
+                }
+                0 | 3 => {
+                    self.open_label_target(ctx, self.library.index.root.clone(), self.improve_rels[0].clone());
+                }
+                _ => {
+                    self.embed_mode = if action == 1 { embed::InputMode::Image } else { embed::InputMode::Text };
+                    self.embed_rels = Some(self.improve_rels.clone());
+                    let configured = if action == 1 { self.settings.ai.chosen_embed() } else { self.settings.ai.chosen_text_embed() };
+                    if configured.is_none() { self.settings_request = true; return; }
+                    if self.embed_run.is_some() || self.embed_preparing.is_some() {
+                        self.status = "Wait for the current search index task or cancel it in Activity.".into();
+                        return;
+                    }
+                    self.prepare_embeddings(ctx);
+                    if self.embed_preparing.is_none() { return; }
+                }
+            }
+            self.improve_open = false;
+        }
+    }
+}

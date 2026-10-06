@@ -170,19 +170,7 @@ impl Index {
     /// `search` names, or when the sheet's embedding is close to `embed`.
     /// The embedding is a sibling of the text fields: either one can match.
     pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn, embed: Option<&[f32]>, text_query: Option<&[f32]>) -> bool {
-        let starts = |ws: &[String], q: &str| ws.iter().any(|w| w.starts_with(q));
-        let label = e.side.label.as_ref();
-        let caption = label.filter(|_| search.captions).map(|l| words(&l.caption)).unwrap_or_default();
-        let tags = label.filter(|_| search.tags).map(|l| words(&l.tags.join(" "))).unwrap_or_default();
-        let prefix = matches(query, |q| (search.folders && starts(&e.dir_words, q)) || (search.files && starts(&e.name_words, q))
-            || starts(&caption, q) || starts(&tags, q));
-        let similar = |query: Option<&[f32]>, vector: Option<&[f32]>| {
-            query.zip(vector).is_some_and(|(q, v)| !q.is_empty() && q.len() == v.len()
-                && embed::cosine(q, v) >= search.similarity.clamp(0.0, 1.0))
-        };
-        let semantic = search.embeddings && similar(embed, e.embed.as_deref());
-        let text_semantic = search.text_embeddings && similar(text_query, e.text_embed.as_deref());
-        prefix || semantic || text_semantic
+        Self::match_scores(e, query, search, embed, text_query).iter().any(Option::is_some)
     }
 
     pub fn visible(&self, query: &[String], search: SearchIn, embed: Option<&[f32]>, text_query: Option<&[f32]>) -> Option<Vec<bool>> {
@@ -190,6 +178,62 @@ impl Index {
             return None;
         }
         Some(self.entries.iter().map(|e| Self::entry_matches(e, query, search, embed, text_query)).collect())
+    }
+
+    /// Orders matching sheets by reciprocal rank fusion across the three search sources.
+    /// Equal source scores share a rank. Paths settle ties without changing source relevance.
+    pub fn ranked(&self, query: &[String], search: SearchIn, image_query: Option<&[f32]>, text_query: Option<&[f32]>) -> Vec<usize> {
+        if query.is_empty() {
+            return (0..self.entries.len()).collect();
+        }
+        let mut sources: [Vec<(usize, f32)>; 3] = std::array::from_fn(|_| Vec::new());
+        for (i, entry) in self.entries.iter().enumerate() {
+            for (source, score) in sources.iter_mut().zip(Self::match_scores(entry, query, search, image_query, text_query)) {
+                if let Some(score) = score { source.push((i, score)); }
+            }
+        }
+        let mut fused = vec![0.0_f64; self.entries.len()];
+        for source in &mut sources {
+            source.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut rank = 1;
+            for (position, &(index, score)) in source.iter().enumerate() {
+                if position > 0 && score != source[position - 1].1 { rank = position + 1; }
+                // The offset limits the influence of a single source's first result.
+                fused[index] += 1.0 / (60.0 + rank as f64);
+            }
+        }
+        let mut results: Vec<usize> = (0..self.entries.len()).filter(|&i| fused[i] > 0.0).collect();
+        results.sort_by(|&a, &b| fused[b].total_cmp(&fused[a]).then_with(|| self.entries[a].rel.cmp(&self.entries[b].rel)));
+        results
+    }
+
+    /// Names the sources that include this sheet in the results.
+    pub fn match_sources(e: &Entry, query: &[String], search: SearchIn, image_query: Option<&[f32]>, text_query: Option<&[f32]>) -> Vec<&'static str> {
+        if query.is_empty() { return Vec::new(); }
+        ["Words", "Image meaning", "Label meaning"].into_iter()
+            .zip(Self::match_scores(e, query, search, image_query, text_query))
+            .filter_map(|(name, score)| score.map(|_| name)).collect()
+    }
+
+    fn match_scores(e: &Entry, query: &[String], search: SearchIn, image_query: Option<&[f32]>, text_query: Option<&[f32]>) -> [Option<f32>; 3] {
+        let mut literal = Vec::new();
+        if search.folders { literal.extend(e.dir_words.iter().cloned()); }
+        if search.files { literal.extend(e.name_words.iter().cloned()); }
+        if let Some(label) = &e.side.label {
+            if search.captions { literal.extend(words(&label.caption)); }
+            if search.tags { literal.extend(words(&label.tags.join(" "))); }
+        }
+        let prefix = matches(query, |q| literal.iter().any(|w| w.starts_with(q)));
+        let exact = query.iter().filter(|q| literal.contains(q)).count() as f32;
+        let semantic = |enabled: bool, q: Option<&[f32]>, v: Option<&[f32]>| {
+            if !enabled { return None; }
+            let (q, v) = q.zip(v)?;
+            if q.is_empty() || q.len() != v.len() { return None; }
+            let score = embed::cosine(q, v);
+            (score >= search.similarity.clamp(0.0, 1.0)).then_some(score)
+        };
+        [prefix.then_some(exact), semantic(search.embeddings, image_query, e.embed.as_deref()),
+            semantic(search.text_embeddings, text_query, e.text_embed.as_deref())]
     }
 }
 
@@ -313,6 +357,64 @@ mod tests {
         let letter = entry("a.png", None);
         assert!(Index::entry_matches(&letter, &words("a"), search, None, None));
         assert!(!Index::entry_matches(&letter, &words("b"), search, None, None));
+    }
+
+    fn search_index(entries: Vec<Entry>) -> Index {
+        let mut index = Index::scan(Path::new(""), [16, 16]);
+        index.entries = entries;
+        index
+    }
+
+    #[test]
+    fn ranked_search_preserves_visible_membership_and_empty_query_order() {
+        let mut label_match = entry("c.png", None);
+        label_match.text_embed = Some(vec![1.0, 0.0]);
+        let index = search_index(vec![entry("a.png", Some(vec![1.0, 0.0])), entry("tree.png", None),
+            label_match, entry("d.png", Some(vec![0.0, 1.0]))]);
+        for flags in 0..8 {
+            let search = SearchIn { files: flags & 1 != 0, folders: false, captions: false, tags: false,
+                embeddings: flags & 2 != 0, text_embeddings: flags & 4 != 0, similarity: 0.8 };
+            let query = words("tree");
+            let expected: Vec<usize> = index.visible(&query, search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0]))
+                .unwrap().iter().enumerate().filter_map(|(i, &visible)| visible.then_some(i)).collect();
+            let mut actual = index.ranked(&query, search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0]));
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+            assert_eq!(index.ranked(&[], search, None, None), vec![0, 1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn exact_words_precede_prefixes_and_equal_matches_use_paths() {
+        let index = search_index(vec![entry("z/tree.png", None), entry("a/trees.png", None), entry("b/tree.png", None)]);
+        let search = SearchIn { folders: false, ..SearchIn::default() };
+        assert_eq!(index.ranked(&words("tree"), search, None, None), vec![2, 0, 1]);
+        assert_eq!(Index::match_sources(&index.entries[0], &words("tree"), search, None, None), vec!["Words"]);
+    }
+
+    #[test]
+    fn fusion_uses_source_ranks_instead_of_raw_similarity() {
+        let mut a = entry("a.png", Some(vec![1.0, 0.0]));
+        a.text_embed = Some(vec![0.6, 0.8]);
+        let mut b = entry("b.png", Some(vec![0.99, 0.1]));
+        b.text_embed = Some(vec![1.0, 0.0]);
+        let mut index = search_index(vec![a, b]);
+        let search = SearchIn { files: false, folders: false, captions: false, tags: false,
+            embeddings: true, text_embeddings: true, similarity: 0.5 };
+        // Each sheet leads one source, so the path decides the tied fusion score.
+        assert_eq!(index.ranked(&words("forest"), search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0])), vec![0, 1]);
+        index.entries[0].embed = Some(vec![0.7, 0.7]);
+        index.entries[1].embed = Some(vec![0.6, 0.8]);
+        assert_eq!(index.ranked(&words("forest"), search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0])), vec![0, 1]);
+        assert_eq!(Index::match_sources(&index.entries[0], &words("forest"), search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0])),
+            vec!["Image meaning", "Label meaning"]);
+    }
+
+    #[test]
+    fn agreement_between_sources_precedes_a_single_source_match() {
+        let index = search_index(vec![entry("a.png", Some(vec![1.0, 0.0])), entry("tree.png", Some(vec![0.8, 0.6]))]);
+        let search = SearchIn { folders: false, similarity: 0.5, ..SearchIn::default() };
+        assert_eq!(index.ranked(&words("tree"), search, Some(&[1.0, 0.0]), None), vec![1, 0]);
     }
 
 }

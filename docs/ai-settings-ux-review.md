@@ -1,5 +1,8 @@
 # Settings UX review
 
+This is a historical review of the earlier settings layout.
+The current task-based setup, model discovery, and workspace behavior are documented in README.md.
+
 This review covers the AI controls in Settings. It uses both the code and native screenshots.
 The ranked findings describe the initial state. The implementation review below records the changes inspected afterward.
 The final review includes native interaction evidence supplied by the implementation agent.

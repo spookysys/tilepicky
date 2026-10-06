@@ -311,7 +311,8 @@ impl App {
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
         self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.prompt_view.is_some() || self.library_batch.open()
             || self.clear_labels.is_some() || self.label_options.is_some() || self.label_view || self.pending.is_some()
-            || self.legend_prompt || !self.damaged.is_empty() || self.settings_open || self.embed_confirm.is_some() || self.quant_conflict.is_some()
+            || self.improve_open || self.ai_panel || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
+            || self.embed_confirm.is_some() || self.quant_conflict.is_some()
             || egui::Popup::is_any_open(ctx)
     }
 
@@ -410,7 +411,7 @@ impl App {
         if close { self.close_label_view(ctx); }
         if options { self.open_label_options(target.dir); }
         if open_job { self.open_active_label_job(ctx); }
-        if settings { self.close_label_view(ctx); self.settings_request = true; }
+        if settings { self.close_label_view(ctx); self.resume_label_after_setup = true; self.settings_request = true; }
         if let Some(action) = action { self.label_target_action(ctx, action); }
     }
 

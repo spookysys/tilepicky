@@ -8,6 +8,9 @@
 //! batch. API keys live in a separate file, readable by the owner alone; see
 //! `Keys`.
 
+#[path = "ai_catalog.rs"]
+mod catalog;
+
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -63,14 +66,6 @@ pub enum Mode {
     Batch,
 }
 
-impl Mode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Instant => "Single sheet",
-            Mode::Batch => "Library",
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Provider {
@@ -294,6 +289,9 @@ pub struct Ai {
     /// The model that makes embeddings for semantic search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed: Option<ModelRef>,
+    /// An independent label-text model. None uses the image model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_embed: Option<ModelRef>,
     /// Put a sheet's caption and tags into its embedding, when it has a label.
     #[serde(default = "embed_labels_default")]
     pub embed_labels: bool,
@@ -320,7 +318,7 @@ impl Default for Ai {
         ];
         let (single, library) = (Some(models[0].reference()), Some(models[0].reference()));
         let embed = Some(models[3].reference());
-        Ai { providers: vec![openrouter, google], models, single, library, embed, embed_labels: true }
+        Ai { providers: vec![openrouter, google], models, single, library, embed, text_embed: None, embed_labels: true }
     }
 }
 
@@ -399,10 +397,16 @@ impl Ai {
         }
         // The old shipped embedding model read label text. Image embeddings
         // need a multimodal one, so swap it where it was never changed.
+        let text_choice = self.text_embed.as_ref();
         for m in &mut self.models {
-            if m.is_embed() && m.provider == "OpenRouter" && m.id == OLD_EMBED_MODEL { m.id = EMBED_MODEL.into(); }
+            if m.is_embed() && m.provider == "OpenRouter" && m.id == OLD_EMBED_MODEL && !text_choice.is_some_and(|r| m.is(r)) {
+                m.id = EMBED_MODEL.into();
+            }
         }
-        if let Some(r) = &mut self.embed && r.provider == "OpenRouter" && r.model == OLD_EMBED_MODEL { r.model = EMBED_MODEL.into(); }
+        if let Some(r) = &mut self.embed && r.provider == "OpenRouter" && r.model == OLD_EMBED_MODEL {
+            r.model = EMBED_MODEL.into();
+            self.merge_if_provider(Model { provider: "OpenRouter".into(), id: EMBED_MODEL.into(), role: Role::Embed });
+        }
     }
 
     /// Adds a model, or adds its scopes to the model of the same name.
@@ -437,6 +441,14 @@ impl Ai {
         let p = self.providers.iter().find(|p| p.name == m.provider)?;
         Some((p, m))
     }
+    /// The independent label model, or the image model when no override exists.
+    pub fn chosen_text_embed(&self) -> Option<(&Provider, &Model)> {
+        let Some(reference) = &self.text_embed else { return self.chosen_embed(); };
+        let model = self.models.iter().find(|m| m.is(reference) && m.is_embed())?;
+        let provider = self.providers.iter().find(|p| p.name == model.provider)?;
+        Some((provider, model))
+    }
+
 }
 
 /// One model of a name with the scopes of all of them. An embedding model
@@ -512,49 +524,75 @@ impl Keys {
 /// stays short. Edits land in place; the caller writes both files when the
 /// dialog closes.
 pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
-    let Ai { providers, models, single, library, embed, embed_labels } = ai;
-    ui.strong("Active models");
-    ui.small("Used for new requests. Existing jobs keep their original models.");
-    egui::Grid::new("defaults").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        for (mode, slot) in [(Mode::Instant, &mut *single), (Mode::Batch, &mut *library)] {
-            ui.label(mode.label());
-            let current = slot.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.serves(mode)));
-            let active_name = |m: &Model| m.label();
-            let text = current.map_or("none".to_string(), active_name);
-            egui::ComboBox::from_id_salt(("default", mode.label())).selected_text(text).show_ui(ui, |ui| {
-                for m in models.iter().filter(|m| m.serves(mode)) {
-                    ui.selectable_value(slot, Some(m.reference()), active_name(m));
+    let Ai { providers, models, single, library, embed, text_embed, embed_labels } = ai;
+    ui.heading("AI setup");
+    ui.label("Choose a model for each task. Connect its provider with an API key below.");
+    ui.small("Changes apply to new requests. Existing jobs keep their original models.");
+    if [single.as_ref(), library.as_ref(), embed.as_ref(), text_embed.as_ref()].into_iter().flatten()
+        .any(|reference| reference.model.contains("latest")) {
+        ui.small("A 'latest' model ID is a provider alias. Choose a versioned ID to keep the same model.");
+    }
+    egui::Grid::new("defaults").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        ui.label("Captions and tags");
+        let current = single.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.serves(Mode::Instant)));
+        let text = current.map_or("Choose a model".to_string(), Model::label);
+        egui::ComboBox::from_id_salt("tag task model").selected_text(text).show_ui(ui, |ui| {
+            for m in models.iter_mut().filter(|m| !m.is_embed()) {
+                if ui.selectable_label(single.as_ref() == Some(&m.reference()), m.label()).clicked() {
+                    if let Role::Chat { single, library, .. } = &mut m.role { *single = true; *library = true; }
+                    *single = Some(m.reference());
+                    *library = single.clone();
                 }
-            });
-            ui.end_row();
-        }
-        ui.label("Embeddings");
-        let current = embed.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.is_embed()));
-        let embed_name = |m: &Model| m.label();
-        let text = current.map_or("none".to_string(), embed_name);
-        egui::ComboBox::from_id_salt("default embeddings").selected_text(text).show_ui(ui, |ui| {
-            for m in models.iter().filter(|m| m.is_embed()) {
-                ui.selectable_value(embed, Some(m.reference()), embed_name(m));
             }
         });
         ui.end_row();
-        ui.label("");
-        ui.checkbox(embed_labels, "Include captions and tags")
-            .on_hover_text("Add a sheet's caption and tags to its embedding, so a query can match the words as well as the picture. Only labeled sheets have them.");
+        ui.label("Image meaning");
+        let current = embed.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.is_embed()));
+        let text = current.map_or("Choose a model".to_string(), Model::label);
+        egui::ComboBox::from_id_salt("default embeddings").selected_text(text).show_ui(ui, |ui| {
+            for m in models.iter().filter(|m| m.is_embed()) {
+                ui.selectable_value(embed, Some(m.reference()), m.label());
+            }
+        });
         ui.end_row();
     });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Label meaning");
+        let name = text_embed.as_ref().map_or("Use image model".to_owned(), |r| format!("{} ({})", r.model, r.provider));
+        egui::ComboBox::from_id_salt("label meaning model").selected_text(name).show_ui(ui, |ui| {
+            ui.selectable_value(text_embed, None, "Use image model");
+            for model in models.iter().filter(|m| m.is_embed()) {
+                ui.selectable_value(text_embed, Some(model.reference()), model.label());
+            }
+        });
+    });
+    ui.small("Image and label indexes stay separate. Label meaning can use a text-only embedding model.");
+    ui.small("A different search model needs new indexes before it can search existing sheets.");
+    egui::CollapsingHeader::new("Advanced task options").show(ui, |ui| {
+        ui.checkbox(embed_labels, "Include captions and tags in image embeddings");
+        ui.small("Use this to compare combined image and text input with the separate indexes.");
+        ui.label("Library tagging override");
+        let current = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.serves(Mode::Batch)));
+        egui::ComboBox::from_id_salt("library task override")
+            .selected_text(current.map_or("Choose a model".to_string(), Model::label)).show_ui(ui, |ui| {
+                for m in models.iter().filter(|m| m.serves(Mode::Batch)) {
+                    ui.selectable_value(library, Some(m.reference()), m.label());
+                }
+            });
+    });
+    if single != library { ui.small("Library tagging uses a separate model. See Advanced task options."); }
     let mut configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
     if let Some(selected) = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
         && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
-        ui.add_space(4.0);
-        if provider.kind == Kind::OpenAi {
-            configure |= endpoint_notice(ui, selected.concurrency().unwrap_or(DEFAULT_CONCURRENCY), provider.uses_batch_storage());
-        }
-        else {
-            ui.strong("Google batch");
-            ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
-            ui.label("Reopen this library to collect the labels. Sheets not yet uploaded wait until you return.");
-        }
+        egui::CollapsingHeader::new("How library jobs run").show(ui, |ui| {
+            if provider.kind == Kind::OpenAi {
+                configure |= endpoint_notice(ui, selected.concurrency().unwrap_or(DEFAULT_CONCURRENCY), provider.uses_batch_storage());
+            } else {
+                ui.strong("Google batch");
+                ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
+                ui.label("Reopen this library to collect the labels. Sheets not yet uploaded wait until you return.");
+            }
+        });
     }
     let focus = if configure {
         let (provider, model) = gemini_setup(providers, models);
@@ -581,18 +619,20 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
         }
     });
     ui.add_space(6.0);
-    egui::CollapsingHeader::new("Provider and model setup").show(ui, |ui| {
+    egui::CollapsingHeader::new("Advanced connections and models").show(ui, |ui| {
         ui.label("Use this section to add custom models or providers, or change their connection settings.");
         ui.small("A provider is the service you connect to. A model is the AI you choose from that service.");
         ui.strong("Providers");
-        providers_ui(ui, providers, models, single, library, embed, keys);
+        providers_ui(ui, providers, models, single, library, embed, text_embed, keys);
         ui.separator();
         ui.strong("Models");
-        if models_ui(ui, providers, models, single, library, embed) {
+        if models_ui(ui, providers, models, single, library, embed, text_embed) {
             ui.data_mut(|d| d.insert_temp(egui::Id::new("configure Gemini"), true));
             ui.ctx().request_repaint();
         }
     });
+    ui.separator();
+    catalog::ui(ui, ai, keys);
 
 }
 
@@ -679,6 +719,7 @@ fn selector(ui: &mut egui::Ui, what: &str, names: Vec<String>, add: &mut dyn FnM
 
 /// One provider at a time: its endpoint and its key. A removed provider
 /// takes its models with it.
+#[allow(clippy::too_many_arguments)]
 fn providers_ui(
     ui: &mut egui::Ui,
     providers: &mut Vec<Provider>,
@@ -686,6 +727,7 @@ fn providers_ui(
     single: &mut Option<ModelRef>,
     library: &mut Option<ModelRef>,
     embed: &mut Option<ModelRef>,
+    text_embed: &mut Option<ModelRef>,
     keys: &mut Keys,
 ) {
     // The name is what the models, the defaults, and the key hold on to, so
@@ -707,7 +749,7 @@ fn providers_ui(
                 for m in models.iter_mut().filter(|m| m.provider == old) {
                     m.provider = p.name.clone();
                 }
-                for r in [&mut *single, &mut *library, &mut *embed].into_iter().flatten() {
+                for r in [&mut *single, &mut *library, &mut *embed, &mut *text_embed].into_iter().flatten() {
                     if r.provider == old {
                         r.provider = p.name.clone();
                     }
@@ -826,7 +868,7 @@ fn providers_ui(
     if remove && sel < providers.len() {
         let gone = providers.remove(sel);
         models.retain(|m| m.provider != gone.name);
-        for r in [&mut *single, &mut *library, &mut *embed] {
+        for r in [&mut *single, &mut *library, &mut *embed, &mut *text_embed] {
             if r.as_ref().is_some_and(|r| r.provider == gone.name) {
                 *r = None;
             }
@@ -837,7 +879,7 @@ fn providers_ui(
 /// One model at a time: its provider, ID, the scopes it serves, and whether
 /// it makes embeddings. Active selections follow edits.
 fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
-    single: &mut Option<ModelRef>, library: &mut Option<ModelRef>, embed: &mut Option<ModelRef>) -> bool {
+    single: &mut Option<ModelRef>, library: &mut Option<ModelRef>, embed: &mut Option<ModelRef>, text_embed: &mut Option<ModelRef>) -> bool {
     let mut configure = false;
     let names = models.iter().map(Model::label).collect();
     let first = providers.first().map(|p| p.name.clone()).unwrap_or_default();
@@ -898,21 +940,23 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
         });
         let after = m.reference();
         if after != before {
-            for r in [&mut *single, &mut *library, &mut *embed].into_iter().flatten() {
+            for r in [&mut *single, &mut *library, &mut *embed, &mut *text_embed].into_iter().flatten() {
                 if *r == before { *r = after.clone(); }
             }
         }
         for (mode, slot) in [(Mode::Instant, &mut *single), (Mode::Batch, &mut *library)] {
             if !m.serves(mode) && slot.as_ref() == Some(&after) { *slot = None; }
         }
-        if !m.is_embed() && embed.as_ref() == Some(&after) { *embed = None; }
+        if !m.is_embed() {
+            for slot in [&mut *embed, &mut *text_embed] { if slot.as_ref() == Some(&after) { *slot = None; } }
+        }
         if let Role::Chat { library: true, concurrency, .. } = m.role && kind == Some(Kind::OpenAi) {
             configure = endpoint_notice(ui, concurrency, store);
         }
     }
     if remove && sel < models.len() {
         let gone = models.remove(sel).reference();
-        for r in [&mut *single, &mut *library, &mut *embed] {
+        for r in [&mut *single, &mut *library, &mut *embed, &mut *text_embed] {
             if r.as_ref() == Some(&gone) {
                 *r = None;
             }
@@ -924,6 +968,24 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_model_is_independent_and_survives_migration() {
+        let mut ai = Ai::default();
+        assert_eq!(ai.chosen_text_embed(), ai.chosen_embed());
+        let model = Model { provider: "OpenRouter".into(), id: OLD_EMBED_MODEL.into(), role: Role::Embed };
+        ai.text_embed = Some(model.reference());
+        ai.models.push(model);
+        ai.heal();
+        assert_eq!(ai.chosen_text_embed().unwrap().1.id, OLD_EMBED_MODEL);
+        assert_eq!(ai.chosen_embed().unwrap().1.id, EMBED_MODEL);
+        let saved = serde_json::to_vec(&ai).unwrap();
+        let mut restored: Ai = serde_json::from_slice(&saved).unwrap();
+        restored.heal();
+        assert_eq!(restored.chosen_text_embed().unwrap().1.id, OLD_EMBED_MODEL);
+        restored.text_embed.as_mut().unwrap().model = "removed-model".into();
+        assert!(restored.chosen_text_embed().is_none());
+    }
 
     #[test]
     fn gemini_setup_reuses_configuration_and_keeps_active_models() {

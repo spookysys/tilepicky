@@ -15,7 +15,7 @@ Tilepicky organizes your work into two directories:
 - **Library**: Holds your collected sprite sheets. Tilepicky treats this directory as read-only. It creates only a `tilepicky.json` metadata file to record grids, animations, and labels.
 - **Project**: Holds the tilesheets you create and edit. Tilepicky writes output image files here, along with a project-specific `tilepicky.json`.
 
-If you start Tilepicky without directory arguments, both panels prompt you to select a folder. You can change folders through the context menu in either file tree. Both paths are stored in `~/.config/tilepicky/settings.json`.
+Use **Folders** to open or change the library and project folders. Both paths are stored in `~/.config/tilepicky/settings.json`.
 
 You can also pass paths as command line arguments:
 
@@ -47,14 +47,25 @@ To compile and install from source, run:
 
 ## Layout
 
-The window splits into two main columns:
+Use the top bar to switch between two workspaces:
 
-- **Left column**: File trees. The library tree sits above, and the project tree sits below.
-- **Right column**: Sheet viewports. The source sheet from the library sits above, and your project canvas sits below.
+- **Library** shows sheet thumbnails, a folder tree, search, and a selected-sheet inspector.
+  Click a thumbnail to inspect it. Use its checkbox to select it for an AI task.
+  **Without tags** shows sheets that have no saved label.
+- **Build** places the source sheet beside the project canvas. Narrow windows stack the canvases.
+  The file trees remain available beside the canvases. **Use in tilesheet** opens Build with the inspected source.
 
-![The left column with both trees, the source sheet above, and the tilesheet being built below](media/screenshot.png)
+Switching workspaces keeps open sheets, selections, zoom, and unsaved project changes.
+Project edit shortcuts operate only in Build. Saving remains available in both workspaces.
+**Colors and export...** opens the existing palette, preview, and export tools for the project.
 
-Each sheet viewport includes a header toolbar. The toolbar displays grid parameters (tile size, gap, offset), current zoom level, selection coordinates, sheet filename, and hover tile coordinates. Buttons on the right edge open side panels.
+**Improve search...** captures the selected files and folders. With no selection, it targets the whole library.
+Review the scope, choose a task, and review its confirmation before any generation starts.
+**Activity** holds library tagging jobs and search index progress. You can close it and keep browsing.
+**AI setup...** opens a resizable settings window.
+
+Each Build canvas has a header with grid parameters, zoom, and selection details.
+The recordings in this README show the earlier layout. Their tile operations still apply in Build.
 
 ### Inspector mode (Eye)
 
@@ -77,6 +88,10 @@ Search matches query terms as prefixes against sheet metadata:
 
 Word search runs locally. Every query word must match an enabled word field. Either meaning source can add matching sheets.
 Meaning search needs saved embeddings; see [Search by meaning](#search-by-meaning).
+The gallery combines separate source rankings. It does not compare raw similarities from different models.
+The inspector names the matching sources. The folder tree keeps its folder order.
+**Compare search** shows separate result lists for words, image meaning, and label meaning.
+Each meaning column shows index coverage and offers recovery after a failed query.
 
 ## Labeling sheets with AI
 
@@ -89,9 +104,9 @@ The search finds the dungeon sheet through its tags. The recording sends no requ
 
 ### Label a single sheet
 
-1. Open a library sheet and click **Tags (AI)...** beside the source header.
+1. Inspect a library sheet and click **Review / generate tags...**.
    You can also choose **Generate Tags (AI)...** from the sheet or file-tree context menu.
-2. Choose the **Single sheet** model and its provider key in Settings (`Ctrl+,`).
+2. Choose the **Captions and tags** model and its provider key in **AI setup...** (`Ctrl+,`).
    Both Google Gemini and OpenAI-compatible image models are supported.
 3. Click **Label this sheet**. The dialog shows progress, the result, or the error.
 4. Use **Label again** to replace a saved label, or **Retry** after a failed request.
@@ -103,7 +118,7 @@ Closing the dialog or pressing Escape keeps the request running. Click its statu
 The dialog remains attached to its sheet when you select another sheet or library.
 A failed or unlabelable replacement keeps an existing usable label. Results cannot overwrite an image or label changed during the request.
 
-The sheet dialog and the library panel each have a **Copy log** button for their own job.
+The sheet dialog and Activity each have a **Copy log** button for their own job.
 Copying shows **Copied** beside that button. A button stays disabled when the matching job has no log.
 A saved label alone does not provide a request log.
 
@@ -127,7 +142,7 @@ To delete a label, select **Remove label...** in the sheet dialog and confirm.
 **Current prompt...** shows what a new request for this sheet would send, including its current library tags and filename context.
 
 OpenRouter settings have a **skip** field for provider slugs, separated by commas. It defaults to `phala`, including for older settings.
-Clear the field to allow all providers. Single requests and library batches use this list.
+Clear the field to allow all providers. Ordinary requests use this list. OpenRouter batches use the account routing settings.
 A batch keeps the provider settings it started with.
 
 New requests include the filename and library-relative folder as optional clues. They never include the absolute path.
@@ -138,8 +153,8 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 
 ### Search by meaning
 
-Open **Search embeddings** in the library AI panel. Choose **Images** or **Captions and tags**, then select **Generate search embeddings (AI)...**.
-A file or folder context menu selects that target. The panel also lets you return to the whole library.
+Open **Improve search...** and choose **Review image index...** or **Review label index...**.
+The dialog captures the selected sheets. File and folder context menus also provide scoped index actions.
 
 - **Images** embeds each sheet's image. Labels are optional.
 - **Captions and tags** embeds saved label text without the image. It skips sheets without labels.
@@ -152,19 +167,20 @@ Image vectors live in `embeddings.json`. Label vectors live independently in `em
 Each file records its model and provider identity. Changed sources need new vectors. Changed models or providers require regeneration.
 Old vectors without a provider identity also need regeneration. Damaged files produce an error and remain unchanged.
 
-Choose the **Embeddings** model in Settings (`Ctrl+,`). Image search requires a model that accepts both images and text.
+Choose **Image meaning** and **Label meaning** models in **AI setup...**. Image search requires a model that accepts images and text.
+Label meaning can use a separate text-only model. **Use image model** preserves the shared-model option.
 The shipped default is `voyageai/voyage-multimodal-3.5` through an OpenAI-compatible endpoint.
 
-**Include captions and tags**, beside the model setting, combines label text with the image input.
+**Include captions and tags in image embeddings**, under **Advanced task options**, combines label text with the image input.
 Leave it off to compare image embeddings against independent label embeddings. Changing this option requires regenerating the image vectors.
 Label edits invalidate the affected label vectors and combined image vectors.
 
 Use **image meaning** and **caption and tag meaning** in the search filter to compare the saved sources.
 Disable the other fields to test one source alone. **Minimum similarity** controls how close a vector must be.
-Results stay in folder order; the score does not rank them.
+The gallery ranks matches. The folder tree keeps its folder order.
 
 Meaning search sends your query to the selected embedding provider after a short pause in typing.
-One query vector can search both sources when their model and provider match. Word search needs no network.
+Each source uses its configured model and provider. Compatible sources can reuse a query vector. Word search needs no network.
 Failed queries show an error and a **Retry meaning search** button. They do not retry on every frame.
 
 ### Label an entire library
@@ -172,8 +188,8 @@ Failed queries show an error and a **Retry meaning search** button. They do not 
 To label multiple library sheets in bulk:
 
 1. Open the library folder.
-2. Open **Library AI labels** (`I`) and select **Label unlabeled sheets...**.
-3. Choose the **Library** model under **Active models** and set its provider key in Settings. The initial selection is `~deepseek/deepseek-flash-latest` on OpenRouter.
+2. Select sheets, open **Improve search...**, and choose **Review tag generation...**. Then choose the unlabeled-sheets action.
+3. Choose **Captions and tags** in **AI setup...** and enter its provider key. **Try one sheet...** previews a small job first.
 4. Review the unlabeled sheet count and the tags to look for, then click **Start labeling**.
 
 Use **Rerun all...** to label every sheet again with the current library model and tag list.
@@ -216,7 +232,7 @@ The excluded-host list applies to ordinary requests. OpenRouter batch routing us
 
 Other OpenAI-compatible endpoints use concurrent ordinary requests, even when storage is configured. The app must remain open for these jobs.
 Google Gemini uses batches of up to 100 sheets. Both batch methods count accepted, unfinished batches against the configured concurrency limit.
-The library panel shows progress and saves completed labels into `tilepicky.json`.
+Activity shows progress and saves completed labels into `tilepicky.json`.
 Invalid label replies can retry up to three times. Cancelling a job stops new requests and discards late label results.
 
 
@@ -225,13 +241,13 @@ Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Googl
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
 A model is a chat model or an embedding model. A chat model serves single sheets, library jobs, or both; the editor ticks each scope, and sets how many requests or batches a library job keeps in flight. An embedding model makes vectors for search and serves no sheet.
 Library models show **OpenRouter batch**, **Several sheets at a time**, or **Google batch**, depending on the provider and its storage.
-Not every batch provider can carry an image. A Google-batched model cannot, and its sheets end with a message that names the cause. Choose a Library model whose provider can carry images, or label those sheets one at a time with the Single sheet model.
+Choose a model that accepts images. Google Gemini supports image requests through its native batch API.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
 Repeated errors appear once, with the affected sheet count. **Error details** keeps the full explanations and affected sheet paths.
 
 When no newer message is visible, the status bar shows the outstanding batch's progress and state.
-Click the batch status to open the AI pane and its controls.
+Click the batch status to open **Activity** and its controls.
 A library failure keeps a status-bar notice, including after the job finishes. Click it to open the recovery actions.
 A failed single-sheet request keeps a clickable notice while its current request log remains available.
 
@@ -263,7 +279,7 @@ A successful status check does not discard an upload or cancellation error. **Re
 A failed library write retries from stored results without another model request.
 New jobs record the image and existing label before submission, so delayed results cannot silently replace newer work.
 
-Single-sheet actions live in the sheet dialog. Library jobs live in the side panel.
+Single-sheet actions live in the sheet dialog. Library jobs live in **Activity**.
 The panel identifies its execution method as **Google batch**, **OpenRouter batch**, or **Several sheets at a time**.
 A running job keeps its original provider, model, prompt, and tags.
 Resume and retry also use the saved model. Changing Settings selects the model for new jobs.
@@ -272,9 +288,27 @@ To use the selected model, cancel the saved job or let it finish. Then choose **
 Saved labels stay. **Rerun all...** also replaces existing labels.
 **Copy log** includes the current job summary and recent diagnostics, without keys or image data.
 
+### Model discovery
+
+**AI setup...** assigns models to tasks. Choosing **Captions and tags** sets the model for single-sheet and library requests.
+**Advanced task options** retains a separate library override.
+
+The provider catalogue refreshes when you open setup, and after an hour while it remains open.
+**Refresh available models** requests an immediate update. A private local cache keeps the last catalogue available after a failed refresh.
+Refreshing the catalogue never changes a selected model and never uploads sheets.
+
+The shortlist shows up to three compatible models, ordered by their listed input price.
+These are starting points, not measured quality recommendations. Output prices, routing, and image charges can change the total cost.
+**Choose another model** searches the compatible catalogue. **Use a custom model ID** accepts an exact provider ID.
+
+Some providers do not report input capabilities. Those models appear only when you enable unverified capabilities.
+Gemini reports generation methods but does not establish image support in its model list.
+Try one sheet before you start a large job with an unverified model.
+An ID containing `latest` can change at the provider. Use a versioned ID when you need a fixed model.
+
 ### Tags to look for
 
-Open **Edit library options...** from the sheet dialog or the library panel.
+Open **Edit library options...** from the sheet dialog or Activity.
 Both links open the same form for their stated library. Separate tags with commas, then select **Save options**.
 Changes apply to new requests in both scopes. Existing jobs keep their original tags.
 The prompt asks the model to check each tag independently, including secondary content.
@@ -294,11 +328,13 @@ API keys are stored separately in `~/.config/tilepicky/keys.json` with restricte
 
 ## Keyboard navigation
 
-Tilepicky supports complete operation using the keyboard.
+Build retains the canvas and file-tree keyboard controls. Library uses Tab to reach its gallery controls.
 
 ![A house and two trees go from the Tiny Town pack into a new tilesheet without the mouse: the arrows open the pack, Ctrl+Tab moves between panes, Shift and the arrows select, Ctrl+C and Ctrl+V copy, Ctrl+T trims, and Ctrl+S saves](media/keyboard.gif)
 
 In the recording, the arrows walk the library tree and open the Tiny Town pack. `Ctrl+Tab` moves to the source sheet, and `Shift` with the arrows selects a house. `Ctrl+C` copies it, and `Ctrl+Tab` into the empty canvas starts a new tilesheet, where `Ctrl+V` pastes it. Two trees follow the same way. `Ctrl+T` trims the canvas to what it holds, and `Ctrl+S` names and saves it.
+
+The following canvas navigation applies in **Build**. Library excludes hidden canvases from pane navigation.
 
 ### Pane and widget navigation
 
@@ -474,9 +510,8 @@ Library files are read-only and cannot be moved, renamed, or deleted within Tile
 
 Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
 
-**Active models** selects the models for new single-sheet requests and library jobs. Existing jobs keep their saved configuration.
-The OpenRouter library notice explains its execution method. **Set up Gemini...** opens its key field without changing the active model.
-Select a Gemini **Library** model to use Google's batch processing.
+**Captions and tags**, **Image meaning**, and **Label meaning** select the models for new requests. Existing jobs keep their saved configuration.
+**How library jobs run** explains the execution method. **Set up Gemini...** opens its key field without changing the selected model.
 
 Give an OpenAI-compatible provider **Sheet storage** to use OpenRouter batch processing. The fields are the S3 endpoint (host only, no path), region, bucket, access key, and a path-style switch for MinIO. The secret key sits with the API keys, readable by your user alone. The bucket may stay private: Tilepicky hands OpenRouter a signed URL for each sheet. Any S3-compatible store works, for example Cloudflare R2, Backblaze B2, or MinIO. **Test connection** uploads one small object, fetches it through its signed URL, and deletes it, so a setup mistake shows here rather than mid-job.
 
@@ -485,13 +520,13 @@ Tilepicky deletes each object as soon as its batch ends. Add a bucket lifecycle 
 If the reply to a batch submission is lost, Tilepicky does not send that batch again, because OpenRouter offers no client reference to find it. Those sheets end with an error. Retrying them can bill twice.
 
 **API keys** shows one field per configured provider. The built-in providers and models are ready for their keys.
-Open **Provider and model setup** to add custom models or change connections. It starts collapsed.
+Open **Advanced connections and models** to add custom models or change connections. It starts collapsed.
 Removing a provider or model asks for confirmation and explains which active selections it clears.
 
-Click **Done** at the bottom right to save and close Settings. Escape or an outside click also saves.
-Closing Tilepicky also saves edits from an open Settings popup. A save error keeps the app open.
+Click **Done**, press Escape, or close the Settings window to save. An outside click leaves Settings open.
+Closing Tilepicky also saves edits from an open Settings window. A save error keeps the app open.
 If saving fails, Settings stays open with the error and a **Retry save** button.
-The keyboard-shortcut checkbox controls the legend below the file trees.
+The keyboard-shortcut checkbox controls the legend below the file trees in Build.
 
 Use the menu beside the search field to choose folders, files, captions, and tags for search matching.
 

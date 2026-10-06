@@ -10,6 +10,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod gallery;
+mod workspace;
+#[cfg(test)]
+mod workspace_tests;
 mod ai_log;
 mod embed;
 mod gemini;
@@ -52,6 +56,13 @@ struct QueryKey {
 struct PreparedEmbeddings {
     provider: ai::Provider,
     plan: embed::Plan,
+}
+
+#[derive(Default)]
+struct QueryState {
+    cached: Option<(QueryKey, Vec<f32>)>,
+    error: Option<(QueryKey, String)>,
+    pending: Option<(QueryKey, QueryEmbedding)>,
 }
 
 type EmbeddingPreparation = std::sync::mpsc::Receiver<Result<PreparedEmbeddings, String>>;
@@ -145,6 +156,12 @@ fn drop_action(from: Panel, ctrl: bool, alt: bool, shift: bool) -> DropAction {
 }
 
 struct App {
+    workspace: workspace::Workspace,
+    gallery: gallery::Gallery,
+    compare_search: bool,
+    improve_open: bool,
+    improve_rels: Vec<String>,
+    library_without_tags: bool,
     /// Configuration files that could not be read, waiting for the user
     /// to agree that they are written over.
     damaged: Vec<Damaged>,
@@ -182,6 +199,7 @@ struct App {
     /// embedding model and the number of sheets it will embed.
     embed_confirm: Option<PreparedEmbeddings>,
     embed_preparing: Option<EmbeddingPreparation>,
+    embed_outcome: Option<String>,
     embed_mode: embed::InputMode,
     embed_rels: Option<Vec<String>>,
     /// The confirm's Generate was pressed this frame.
@@ -191,6 +209,7 @@ struct App {
     query_error: Option<(QueryKey, String)>,
     /// A query embedding in flight: the query, the model, and its answer.
     query_embed: Option<(QueryKey, QueryEmbedding)>,
+    text_query: QueryState,
 
     /// A prompt to show: a title, and its two texts.
     prompt_view: Option<(String, [String; 2])>,
@@ -206,6 +225,7 @@ struct App {
     settings_open: bool,
     /// Something outside the gear asked for the settings.
     settings_request: bool,
+    resume_label_after_setup: bool,
     /// The legend asks whether to hide itself.
     legend_prompt: bool,
     /// The eye of the project panel: tooltips and islands, no editing. Off
@@ -473,6 +493,12 @@ impl App {
             settings,
             keys,
             ai_panel: false,
+            workspace: workspace::Workspace::Library,
+            gallery: gallery::Gallery::default(),
+            compare_search: false,
+            improve_open: false,
+            improve_rels: Vec::new(),
+            library_without_tags: false,
             label_run: None,
             single_log: None,
             log_roots: Default::default(),
@@ -480,8 +506,8 @@ impl App {
             label_outcome: None,
             label_view: false,
             label_target: None, label_focus: None, label_copied: None, label_copy_error: String::new(), label_options: None,
-            embed_run: None, embed_confirm: None, embed_start: false, embed_query: None, query_embed: None,
-            embed_preparing: None, embed_mode: embed::InputMode::Image, embed_rels: None, query_error: None,
+            embed_run: None, embed_confirm: None, embed_start: false, embed_query: None, query_embed: None, text_query: QueryState::default(),
+            embed_preparing: None, embed_outcome: None, embed_mode: embed::InputMode::Image, embed_rels: None, query_error: None,
             prompt_view: None,
             library_batch: batch::Panel::default(),
             remove_label: None,
@@ -489,7 +515,7 @@ impl App {
             config_open: false,
             settings_error: String::new(),
             settings_open: false,
-            settings_request: false,
+            settings_request: false, resume_label_after_setup: false,
             legend_prompt: false,
             project_eye: false,
             quant_panel: false,
@@ -611,6 +637,8 @@ impl App {
     fn set_folder(&mut self, panel: Panel, dir: PathBuf) {
         let name = match panel {
             Panel::Library => {
+                self.improve_open = false;
+                self.improve_rels.clear();
                 self.library_marked.clear();
                 self.library_marked_dirs.clear();
                 self.library_batch.choice = None;
@@ -654,10 +682,13 @@ impl App {
         self.open_trees = true;
         self.query_at = std::time::Instant::now();
         self.query_error = None;
+        self.text_query.error = None;
         // A new query has no vector yet: the old one must not match it.
         if self.embed_query.as_ref().is_none_or(|(q, _)| q.text != self.query.trim()) {
             self.library.embed_query = None;
             self.project.embed_query = None;
+        }
+        if self.text_query.cached.as_ref().is_none_or(|(q, _)| q.text != self.query.trim()) {
             self.library.text_embed_query = None;
             self.project.text_embed_query = None;
         }
@@ -671,52 +702,73 @@ impl App {
         self.project.refresh_visible(&self.qwords, self.settings.search);
     }
 
-    /// Runs at most one query request and refreshes results when it completes.
+    /// Each search source owns one bounded request and keeps its model identity.
     fn ensure_query_embedding(&mut self, ctx: &egui::Context) {
-        let chosen = self.settings.ai.chosen_embed().map(|(p, m)| (p.clone(), m.id.clone()));
+        let mut image = QueryState { cached: self.embed_query.take(), error: self.query_error.take(), pending: self.query_embed.take() };
+        self.ensure_query_mode(ctx, false, &mut image, true);
+        self.embed_query = image.cached; self.query_error = image.error; self.query_embed = image.pending;
+        let mut text = std::mem::take(&mut self.text_query);
+        if let Some((key, vector)) = &self.embed_query
+            && self.settings.ai.chosen_text_embed().is_some_and(|(p, m)| m.id == key.model && embed::identity(p) == key.provider) {
+            text.cached = Some((key.clone(), vector.clone()));
+        }
+        let shared_pending = self.query_embed.as_ref().is_some_and(|(key, _)| {
+            self.settings.ai.chosen_text_embed().is_some_and(|(p, m)| key.model == m.id && key.provider == embed::identity(p))
+        });
+        self.ensure_query_mode(ctx, true, &mut text, !shared_pending);
+        self.text_query = text;
+    }
+
+    fn ensure_query_mode(&mut self, ctx: &egui::Context, text: bool, state: &mut QueryState, allow_request: bool) {
+        let chosen = if text { self.settings.ai.chosen_text_embed() } else { self.settings.ai.chosen_embed() }
+            .map(|(p, m)| (p.clone(), m.id.clone()));
         let wanted_key = chosen.as_ref().map(|(provider, model)| QueryKey {
             text: self.query.trim().to_string(), model: model.clone(), provider: embed::identity(provider),
         });
-        if let Some((key, rx)) = self.query_embed.take() {
+        if let Some((key, rx)) = state.pending.take() {
             match rx.try_recv() {
                 Ok(result) if wanted_key.as_ref() == Some(&key) => match result {
-                    Ok(vector) => { self.embed_query = Some((key, vector)); self.query_error = None; }
-                    Err(error) => { self.status = error.clone(); self.query_error = Some((key, error)); }
+                    Ok(vector) => { state.cached = Some((key, vector)); state.error = None; }
+                    Err(error) => { self.status = error.clone(); state.error = Some((key, error)); }
                 },
                 Ok(_) => {},
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.query_embed = Some((key, rx));
+                    state.pending = Some((key, rx));
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     if wanted_key.as_ref() == Some(&key) {
-                        self.query_error = Some((key, "The search request stopped. Retry the search.".into()));
+                        state.error = Some((key, "The search request stopped. Retry the search.".into()));
                     }
                 }
             }
         }
-        let ready = self.embed_query.as_ref().filter(|(key, _)| wanted_key.as_ref() == Some(key));
+        let ready = state.cached.as_ref().filter(|(key, _)| wanted_key.as_ref() == Some(key));
         let mut changed = false;
         for half in [&mut self.library, &mut self.project] {
-            let image = ready.filter(|(key, _)| self.settings.search.embeddings
-                && half.index.embed_model == key.model && half.index.embed_provider == key.provider).map(|(_, v)| v.clone());
-            let text = ready.filter(|(key, _)| self.settings.search.text_embeddings
-                && half.index.text_embed_model == key.model && half.index.text_embed_provider == key.provider).map(|(_, v)| v.clone());
-            changed |= half.embed_query != image || half.text_embed_query != text;
-            half.embed_query = image;
-            half.text_embed_query = text;
+            let (enabled, model, provider, current) = if text {
+                (self.settings.search.text_embeddings, &half.index.text_embed_model, &half.index.text_embed_provider, &mut half.text_embed_query)
+            } else {
+                (self.settings.search.embeddings, &half.index.embed_model, &half.index.embed_provider, &mut half.embed_query)
+            };
+            let vector = ready.filter(|(key, _)| enabled && *model == key.model && *provider == key.provider).map(|(_, v)| v.clone());
+            changed |= *current != vector;
+            *current = vector;
         }
         if changed { self.refresh_visible(); self.open_trees = true; }
         let Some(key) = wanted_key else { return };
         let enabled = [&self.library, &self.project].iter().any(|half| {
-            (self.settings.search.embeddings && half.index.embed_model == key.model && half.index.embed_provider == key.provider
-                && half.index.entries.iter().any(|entry| entry.embed.is_some()))
-                || (self.settings.search.text_embeddings && half.index.text_embed_model == key.model
-                    && half.index.text_embed_provider == key.provider && half.index.entries.iter().any(|entry| entry.text_embed.is_some()))
+            if text {
+                self.settings.search.text_embeddings && half.index.text_embed_model == key.model
+                    && half.index.text_embed_provider == key.provider && half.index.entries.iter().any(|entry| entry.text_embed.is_some())
+            } else {
+                self.settings.search.embeddings && half.index.embed_model == key.model
+                    && half.index.embed_provider == key.provider && half.index.entries.iter().any(|entry| entry.embed.is_some())
+            }
         });
-        if !enabled || self.qwords.is_empty() || self.query_embed.is_some()
-            || self.embed_query.as_ref().is_some_and(|(k, _)| k == &key)
-            || self.query_error.as_ref().is_some_and(|(k, _)| k == &key) { return; }
+        if !allow_request || !enabled || self.qwords.is_empty() || state.pending.is_some()
+            || state.cached.as_ref().is_some_and(|(k, _)| k == &key)
+            || state.error.as_ref().is_some_and(|(k, _)| k == &key) { return; }
         let delay = Duration::from_millis(400);
         if self.query_at.elapsed() < delay {
             ctx.request_repaint_after(delay.saturating_sub(self.query_at.elapsed()));
@@ -724,12 +776,12 @@ impl App {
         }
         let Some((provider, _)) = chosen else { return };
         let Some(secret) = provider.key(&self.keys) else {
-            self.query_error = Some((key, format!("Set the {} API key in Settings to search by meaning.", provider.name)));
+            state.error = Some((key, format!("Set the {} API key in Settings to search by meaning.", provider.name)));
             return;
         };
         let endpoint = match embed::Endpoint::new(&provider, secret) {
             Ok(endpoint) => endpoint,
-            Err(error) => { self.query_error = Some((key, error)); return; }
+            Err(error) => { state.error = Some((key, error)); return; }
         };
         let body = provider.route(embed::request(&key.model, &[serde_json::json!(key.text)]));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -739,8 +791,8 @@ impl App {
             let _ = tx.send(result);
             wake.request_repaint();
         }) {
-            Ok(_) => self.query_embed = Some((key, rx)),
-            Err(error) => self.query_error = Some((key, format!("Cannot start the search: {error}"))),
+            Ok(_) => state.pending = Some((key, rx)),
+            Err(error) => state.error = Some((key, format!("Cannot start the search: {error}"))),
         }
     }
 
@@ -766,9 +818,12 @@ impl App {
                 };
                 if self.library.index.root == run.root { self.rescan_library(); }
                 if self.project.index.root == run.root { self.rescan_project(); }
+                self.embed_outcome = Some(message.clone());
                 self.status = message;
                 self.embed_query = None;
                 self.query_error = None;
+                self.text_query.cached = None;
+                self.text_query.error = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.embed_run = Some(run);
@@ -791,7 +846,7 @@ impl App {
         let wake = ctx.clone();
         match embed::Run::start(plan,
             move |body| endpoint.send(&provider.route(body.clone())), move || wake.request_repaint()) {
-            Ok(run) => { self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
+            Ok(run) => { self.embed_outcome = None; self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
             Err(error) => self.status = error,
         }
     }
@@ -799,7 +854,9 @@ impl App {
     /// Reads and hashes the selected sources on a worker before confirmation.
     fn prepare_embeddings(&mut self, ctx: &egui::Context) {
         if self.embed_run.is_some() || self.embed_preparing.is_some() { return; }
-        let Some((provider, model)) = self.settings.ai.chosen_embed().map(|(p, m)| (p.clone(), m.id.clone())) else {
+        let chosen = if self.embed_mode == embed::InputMode::Text { self.settings.ai.chosen_text_embed() }
+            else { self.settings.ai.chosen_embed() };
+        let Some((provider, model)) = chosen.map(|(p, m)| (p.clone(), m.id.clone())) else {
             self.status = "Choose an embedding model in Settings.".into(); return;
         };
         let root = self.library.index.root.clone();
@@ -1337,63 +1394,31 @@ impl App {
         });
     }
 
-    /// The settings, in a popup above the gear, opening up and to the left:
-    /// the legend, active models, and provider settings. Both files
-    /// are written when the popup closes.
+    /// Settings stay open while the user checks a model or changes providers.
     fn settings_popup(&mut self, gear: &egui::Response, ui: &egui::Ui) {
-        let id = Id::new("settings popup");
-        // egui holds one open popup at a time, and a combo box in the
-        // settings takes it. So the settings keep their own open state, and
-        // close here: on Escape, or on a click outside them. A click that
-        // closes a combo box leaves them open.
-        let ctx = ui.ctx().clone();
-        let combo = egui::Popup::is_any_open(&ctx);
-        let last = ctx.read_response(id).map(|r| r.rect);
-        let (click, escape) = ctx.input(|i| (i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten(),
-            i.key_pressed(Key::Escape)));
-        let outside = click.is_some_and(|p| !gear.rect.contains(p) && last.is_none_or(|r| !r.contains(p)));
-        if std::mem::take(&mut self.settings_request) {
-            self.settings_open = true;
-        } else if gear.clicked() {
-            self.settings_open = !self.settings_open;
-        } else if self.settings_open && !combo && (escape || outside) {
-            self.settings_open = false;
-        }
-        egui::Popup::new(id, ctx.clone(), gear, ui.layer_id())
-            .open(self.settings_open)
-            .align(egui::RectAlign::TOP_END)
-            .show(|ui| {
-                // A maximum, not a fixed width: the popup shrinks to its
-                // content, and wraps a long line instead of growing wide
-                // enough to keep it on one.
-                ui.set_max_width(480.0);
-                ui.strong("Settings");
-                ui.small("Changes are saved when you close Settings.");
+        if std::mem::take(&mut self.settings_request) || gear.clicked() { self.settings_open = true; }
+        let mut open = self.settings_open;
+        let mut done = false;
+        egui::Window::new("AI setup and settings").id(Id::new("settings window"))
+            .open(&mut open).default_width(580.0).default_height(560.0).vscroll(true).show(ui.ctx(), |ui| {
+                ui.small("Changes are saved when you close Settings. Existing jobs keep their models.");
                 if !self.settings_error.is_empty() {
                     ui.colored_label(ui.visuals().error_fg_color, labels::summary(&self.settings_error)).on_hover_text(&self.settings_error);
                 }
                 let mut legend = !self.settings.hide_legend;
-                let first = ui.checkbox(&mut legend, "Show keyboard shortcuts");
-                if first.changed() {
-                    self.settings.hide_legend = !legend;
-                }
-                popup_keys(ui, gear, &first);
-                if AI_VISIBLE {
-                    ui.add_space(8.0);
-                    egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 160.0 - dialogs::footer_height(ui)).max(100.0)).show(ui, |ui| {
-                        ai::settings_ui(ui, &mut self.settings.ai, &mut self.keys);
-                    });
-                }
-                dialogs::footer(ui, |ui| {
-                    let label = if self.settings_error.is_empty() { "Done" } else { "Retry save" };
-                    if ui.button(label).clicked() { self.settings_open = false; }
-                });
+                let shortcuts = ui.checkbox(&mut legend, "Show Build keyboard shortcuts");
+                ui.data_mut(|d| d.insert_temp(Id::new("shortcut setting response"), shortcuts.id));
+                if shortcuts.changed() { self.settings.hide_legend = !legend; }
+                ui.separator();
+                ai::settings_ui(ui, &mut self.settings.ai, &mut self.keys);
+                ui.separator();
+                done = ui.button(if self.settings_error.is_empty() { "Done" } else { "Retry save" }).clicked();
             });
-        let open = self.settings_open;
-        if self.config_open && !open {
-            self.settings_save_result(self.settings.save(), self.keys.save());
-        }
+        if ui.input(|i| i.key_pressed(Key::Escape)) && !egui::Popup::is_any_open(ui.ctx()) { open = false; }
+        self.settings_open = open && !done;
+        if self.config_open && !self.settings_open { self.settings_save_result(self.settings.save(), self.keys.save()); }
         self.config_open = self.settings_open;
+        if !self.settings_open && std::mem::take(&mut self.resume_label_after_setup) { self.label_view = true; }
     }
 
     fn settings_save_result(&mut self, settings: Result<(), String>, keys: Result<(), String>) {
@@ -1453,9 +1478,9 @@ impl App {
             self.press_pane(ctx, -1);
         } else if key(cmd, Key::Tab) {
             self.press_pane(ctx, 1);
-        } else if key(Modifiers::SHIFT, Key::Tab) {
+        } else if self.workspace == workspace::Workspace::Build && key(Modifiers::SHIFT, Key::Tab) {
             self.press_tab(ctx, -1);
-        } else if key(Modifiers::NONE, Key::Tab) {
+        } else if self.workspace == workspace::Workspace::Build && key(Modifiers::NONE, Key::Tab) {
             self.press_tab(ctx, 1);
         }
         // Typing beats every shortcut below.
@@ -1466,6 +1491,10 @@ impl App {
         // which a text field lets go of them, fires no command.
         let focus = ctx.memory(|m| m.focused());
         if focus.is_none_or(|id| self.pane_of(id).is_none()) {
+            return;
+        }
+        if self.workspace == workspace::Workspace::Library {
+            if key(Modifiers::NONE, Key::I) { self.ai_panel = !self.ai_panel; }
             return;
         }
         // The status bar lies in neither half. A command that asks which
@@ -1777,19 +1806,26 @@ impl App {
                     ui.weak("nothing open");
                     return None;
                 };
-                ui.weak(format!("{cols}x{rows} tiles"));
-                ui.label("tile");
-                let mut new_grid = tile_field(library).ui(ui, tile).map(|t| (t, gap, offset));
-                if library {
-                    // Sheets drawn with gaps between the tiles, and a border
-                    // before the first one.
-                    ui.label("gap");
-                    if let Some(g) = gap_field(library).ui(ui, gap) { new_grid = Some((tile, g, offset)); }
-                    ui.label("offset");
-                    if let Some(o) = offset_field(library).ui(ui, offset) { new_grid = Some((tile, gap, o)); }
-                }
-                ui.weak(format!("{zoom}x"));
-                if let Some(sel) = sel { ui.weak(sel); }
+                let mut new_grid = None;
+                let grid_button = ui.menu_button("Grid...", |ui| {
+                    ui.label(format!("{cols} x {rows} tiles"));
+                    ui.horizontal(|ui| {
+                        ui.label("Tile size");
+                        if let Some(t) = tile_field(library).ui(ui, tile) { new_grid = Some((t, gap, offset)); }
+                    });
+                    if library {
+                        ui.horizontal(|ui| {
+                            ui.label("Gap");
+                            if let Some(g) = gap_field(library).ui(ui, gap) { new_grid = Some((tile, g, offset)); }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Offset");
+                            if let Some(o) = offset_field(library).ui(ui, offset) { new_grid = Some((tile, gap, o)); }
+                        });
+                    }
+                });
+                stop(&grid_button.response);
+                ui.weak(format!("{zoom}x")).on_hover_text(sel.unwrap_or_else(|| "No tile selection".into()));
                 new_grid
             },
             |ui| Self::header_tail(ui, sheet, ai, eye, quant, name, cell),
@@ -1861,7 +1897,7 @@ impl App {
 
     /// Library jobs and shared options have one home outside the sheet panes.
     fn assist_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Library AI labels");
+        ui.heading("Tags and search indexes");
         let root = &self.library.index.root;
         if !root.as_os_str().is_empty() {
             ui.label(root.file_name().unwrap_or_default().to_string_lossy()).on_hover_text(root.display().to_string());
@@ -1887,7 +1923,8 @@ impl App {
             self.open_label_options(self.library.index.root.clone());
         }
         ui.add_space(6.0);
-        ui.strong("Search embeddings");
+        ui.strong("Search indexes");
+        if let Some(outcome) = &self.embed_outcome { ui.label(outcome); }
         ui.label("Compare image meaning, label meaning, and word search.");
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.embed_mode, embed::InputMode::Image, "Images");
@@ -1914,6 +1951,7 @@ impl App {
                 self.embed_run = None;
                 self.rescan_library();
                 self.status = "Generation cancelled. Saved batches remain available. An active request may still incur a charge.".into();
+                self.embed_outcome = Some(self.status.clone());
             }
         } else if self.embed_preparing.is_some() {
             ui.label("Checking source files...");
@@ -2184,6 +2222,8 @@ impl App {
     /// Where the keys land in a pane: the rows of a tree, the grid of a
     /// sheet, else the first stop of the pane.
     fn body(&self, pane: (Panel, Spot)) -> Option<Id> {
+        if self.workspace == workspace::Workspace::Library
+            && pane != (Panel::Library, Spot::Tree) && pane.1 != Spot::Status { return None; }
         match pane.1 {
             Spot::Tree => return Some(tree_id(pane.0)),
             Spot::Sheet if self.half(pane.0).sheet.is_some() => return Some(sheet_id(pane.0)),
@@ -2249,7 +2289,8 @@ impl App {
         // The canvas is the one pane you can make on the way. A step down
         // from the source sheet starts a tilesheet there, as a dropped block
         // does, at the tile size of the sheet you come from.
-        if step > 0 && self.pane == (Panel::Library, Spot::Sheet) && self.project.sheet.is_none() && self.project.is_set() {
+        if self.workspace == workspace::Workspace::Build && step > 0 && self.pane == (Panel::Library, Spot::Sheet)
+            && self.project.sheet.is_none() && self.project.is_set() {
             let tile = self.library.inherited_tile();
             self.start_canvas(ctx, tile);
         }
@@ -2439,17 +2480,8 @@ impl App {
         Self::sheet_toolbar(ui, "source toolbar", |ui| {
             ui.horizontal(|ui| {
                 let live = keys == (Panel::Library, Spot::Sheet);
-                if stopped(ui.add_enabled(self.library.sheet.is_some(), egui::Button::new("Tags (AI)..."))).clicked() {
-                    self.label_action(ctx, labels::Action::Show);
-                }
-                let can_embed = self.library.is_set() && self.library.index.error.is_none()
-                    && !self.library.index.entries.is_empty();
-                if stopped(ui.add_enabled(can_embed, egui::Button::new("Embeddings (AI)..."))).clicked() {
-                    self.select_embedding_sources(None);
-                }
-                let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
                 let clicked;
-                (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), ai, None, None);
+                (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), None, None, None);
                 // A header button does not keep the keys: they go to the grid.
                 if clicked {
                     self.active = Panel::Library;
@@ -2853,10 +2885,14 @@ impl eframe::App for App {
             return;
         }
         let typing = ctx.text_edit_focused();
+        let library = self.workspace == workspace::Workspace::Library;
+        let tree_focused = ctx.memory(|m| m.has_focus(library_tree_id()));
         let mut nav = Vec::new();
         raw_input.events.retain(|e| {
             let egui::Event::Key { key, modifiers, .. } = e else { return true };
             match key {
+                Key::Tab if library && !modifiers.command => return true,
+                Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight if library && !tree_focused => return true,
                 Key::Tab => nav.push(e.clone()),
                 Key::ArrowUp | Key::ArrowDown if typing && modifiers.is_none() => {}
                 Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Escape if !typing => nav.push(e.clone()),
@@ -2936,11 +2972,12 @@ impl App {
         let mut project_rows: Vec<tree::Row> = Vec::new();
         let mut create = false;
         // Keep the layout fixed for this frame. Settings can change it while the status bar draws.
-        let hide_legend = self.settings.hide_legend;
+        self.workspace_bar(ui);
+        let hide_legend = self.settings.hide_legend || self.workspace == workspace::Workspace::Library;
         if hide_legend {
             self.status_bar(ctx, ui);
         }
-        egui::Panel::left("left").resizable(true).default_size(340.0).size_range(240.0..=800.0).show(ui, |ui| {
+        egui::Panel::left("left").resizable(true).default_size(260.0).size_range(200.0..=500.0).show(ui, |ui| {
             ui.add_space(4.0);
             // One row: the filter button at the left, the box in the rest.
             set_pane(ui, (Panel::Library, Spot::Tree));
@@ -3010,9 +3047,9 @@ impl App {
                     }
                 });
             }
-            egui::Panel::top("library tree")
+            egui::Panel::top(if self.workspace == workspace::Workspace::Library { "library folders" } else { "build folders" })
                 .resizable(true)
-                .default_size(ui.available_height() * if project_set { 0.6 } else { 0.45 })
+                .default_size(ui.available_height() * if self.workspace == workspace::Workspace::Library { 0.98 } else { 0.45 })
                 .size_range(80.0..=f32::INFINITY)
                 .show(ui, |ui| {
                     ui.label(title_text("LIBRARY", keys == (Panel::Library, Spot::Tree)));
@@ -3065,6 +3102,7 @@ impl App {
                         });
                     });
                 });
+            if self.workspace == workspace::Workspace::Build {
             egui::CentralPanel::default().show(ui, |ui| {
                 set_pane(ui, (Panel::Project, Spot::Tree));
                 let title = title_text("PROJECT", keys == (Panel::Project, Spot::Tree));
@@ -3159,6 +3197,7 @@ impl App {
                     });
                 });
             });
+            }
         });
         if !hide_legend {
             self.status_bar(ctx, ui);
@@ -3198,25 +3237,26 @@ impl App {
         }
         self.dialogs(ctx);
 
-        if self.ai_panel {
-            egui::Panel::right("library assist full height").resizable(true).default_size(330.0).size_range(280.0..=480.0).show(ui, |ui| {
-                set_pane(ui, (Panel::Library, Spot::Side));
-                self.assist_panel(ui);
-            });
-        }
+        self.workflow_windows(ctx);
         let dragging = self.drag.is_some();
-        // The split is kept as a fraction of the height, so that it stays in
-        // place when the window changes size. The panel state is written from
-        // it each frame and read back after the user drags the divider.
-        let total = ui.available_height();
-        let panel_id = Id::new("library panel");
-        let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
-        ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
-        let library_out = egui::Panel::top("library panel").resizable(true).show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner;
-        if let Some(state) = egui::PanelState::load(ctx, panel_id) && total > 0.0 {
-            self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
-        }
-        let project_out = egui::CentralPanel::default().show(ui, |ui| self.project_panel(ctx, ui, keys, dragging)).inner;
+        let (library_out, project_out) = if self.workspace == workspace::Workspace::Library {
+            self.project_rect = Rect::NOTHING;
+            if let Some(sheet) = &mut self.project.sheet { sheet.clip = Rect::NOTHING; }
+            if let Some(sheet) = &mut self.library.sheet { sheet.clip = Rect::NOTHING; }
+            self.library_workspace(ui);
+            (PanelOut::default(), PanelOut::default())
+        } else {
+            let width = ui.available_width();
+            let library_out = if width >= 700.0 {
+                egui::Panel::left("build source").resizable(true).default_size(width * 0.48)
+                    .size_range(220.0..=width * 0.75).show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner
+            } else {
+                egui::Panel::top("build source stacked").resizable(true).default_size(ui.available_height() * self.split)
+                    .show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner
+            };
+            let project_out = egui::CentralPanel::default().show(ui, |ui| self.project_panel(ctx, ui, keys, dragging)).inner;
+            (library_out, project_out)
+        };
         for (panel, out) in [(Panel::Library, &library_out), (Panel::Project, &project_out)] {
             if out.ask {
                 ask = Some(panel);
@@ -4062,6 +4102,8 @@ mod tests {
         b.app.library_tree_action(&b.ctx, TreeAction::SelectDir("empty".into()));
         assert!(b.app.library_marked.is_empty());
         assert!(b.app.library_batch.choice.as_ref().unwrap().0.is_empty());
+        b.app.open_improve();
+        assert!(b.app.improve_rels.is_empty());
     }
 
     #[test]
@@ -4107,13 +4149,13 @@ mod tests {
                 ..Default::default()
             }, |ui| b.app.draw(ui));
             out.textures_delta.clear();
-            let rect = b.ctx.memory(|m| m.focused()).and_then(|id| b.ctx.read_response(id)).map(|r| r.rect);
+            let rect = b.ctx.data(|d| d.get_temp::<Id>(Id::new("shortcut setting response"))).and_then(|id| b.ctx.read_response(id)).map(|r| r.rect);
             stable = if rect.is_some() && rect == previous { stable + 1 } else { 0 };
             previous = rect;
             if stable >= 2 { break; }
         }
         assert!(stable >= 2, "Settings must settle before the click.");
-        let checkbox = b.ctx.memory(|m| m.focused()).and_then(|id| b.ctx.read_response(id)).unwrap();
+        let checkbox = b.ctx.data(|d| d.get_temp::<Id>(Id::new("shortcut setting response"))).and_then(|id| b.ctx.read_response(id)).unwrap();
         let at = checkbox.rect.center();
         for pressed in [true, false] {
             let mut out = b.ctx.run_ui(egui::RawInput {
