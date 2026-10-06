@@ -45,5 +45,32 @@ caption and the tags are then empty.
 Books from before this format kept island regions under `labels`. The tool
 ignores that key and leaves it out the next time it writes the book.
 
+## Color quantization
+
+The project book may hold a `quantize` list. Each group shares one setting
+across the sheets it covers, so a scene shares its palettes. The `target` is
+a folder or a list of sheets, and `pins` holds one flag per tile of a member
+sheet: a pinned tile is 8bpp.
+
+    "quantize": [
+      {
+        "target": { "dir": "props" },
+        "setting": {
+          "mode": "snes",
+          "snes": { "depth": "bpp4_plus8", "palettes": 8, "colors": 15, "dither": "checker", "auto_pct": 25, "extra_8bpp": 8 }
+        },
+        "pins": { "props/tree.png": [false, true, false] }
+      },
+      {
+        "target": { "files": ["village.png"] },
+        "setting": { "mode": "general", "general": { "kind": "indexed", "format": "rgb565", "colors": 256, "key": true, "dither": "none" } }
+      }
+    ]
+
+A sheet belongs to at most one group. The panel refuses a second setting over
+a sheet that already has one, unless you delete the old setting first. The
+groups are a preview: the tool reads them, it does not build the game assets
+from them.
+
 Writes replace the complete book through a temporary file. A malformed or unreadable
 book blocks writes until you fix it. Keep backups of your project images and books.

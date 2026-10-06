@@ -163,6 +163,137 @@ impl Sidecar {
     }
 }
 
+/// The sheets a quantization group covers: a folder, or a named set.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizeTarget {
+    /// A folder, by its path below the project root.
+    Dir(String),
+    /// Sheets, by their path below the project root.
+    Files(Vec<String>),
+}
+
+/// The two kinds of quantization a group can hold.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizeMode {
+    General,
+    Snes,
+}
+
+/// How the general result is stored.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneralKind {
+    /// Reduce each pixel, no palette.
+    Downsample,
+    /// Build a palette and an index per pixel.
+    Indexed,
+}
+
+/// The channel format of a general result.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneralFormat {
+    Rgb565,
+    Rgba5658,
+    Rgb233,
+    Rgb888,
+    Rgba8888,
+}
+
+impl GeneralFormat {
+    /// Whether the format carries an alpha channel.
+    pub fn has_alpha(self) -> bool {
+        matches!(self, GeneralFormat::Rgba5658 | GeneralFormat::Rgba8888)
+    }
+}
+
+/// The depth of the tiles a SNES group quantizes.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnesDepth {
+    Bpp2,
+    Bpp4,
+    Bpp8,
+    /// 4bpp tiles, with some tiles promoted to 8bpp.
+    Bpp4Plus8,
+}
+
+/// The dither patterns, shared by both modes.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizeDither {
+    None,
+    Bayer2,
+    Checker,
+    StippleV,
+    StippleH,
+    LineV,
+    LineH,
+    FloydSteinberg,
+}
+
+/// The general settings of a group.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct General {
+    pub kind: GeneralKind,
+    pub format: GeneralFormat,
+    /// Palette entries for the indexed kind, including a key when `key` is set.
+    #[serde(default = "default_colors")]
+    pub colors: usize,
+    /// Reserve index 0, or the zero color, as transparency.
+    #[serde(default)]
+    pub key: bool,
+    #[serde(default = "no_dither")]
+    pub dither: QuantizeDither,
+}
+
+/// The SNES settings of a group.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Snes {
+    pub depth: SnesDepth,
+    /// Subpalettes, 1..=8. They are views into one 256-entry CGRAM.
+    #[serde(default = "default_palettes")]
+    pub palettes: usize,
+    /// Colors per subpalette, excluding the reserved index 0.
+    #[serde(default = "default_colors")]
+    pub colors: usize,
+    #[serde(default = "no_dither")]
+    pub dither: QuantizeDither,
+    /// The most tiles the auto step may make 8bpp, in percent of all tiles.
+    /// Pinned tiles count against this number.
+    #[serde(default)]
+    pub auto_pct: u32,
+    /// Extra CGRAM entries that only 8bpp pixels may use.
+    #[serde(default)]
+    pub extra_8bpp: usize,
+}
+
+fn default_colors() -> usize { 256 }
+fn default_palettes() -> usize { 8 }
+fn no_dither() -> QuantizeDither { QuantizeDither::None }
+
+/// One group's settings, for one mode.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Quantize {
+    pub mode: QuantizeMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub general: Option<General>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snes: Option<Snes>,
+}
+
+/// A setting shared by a group of sheets, and the per-sheet tile pins.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct QuantizeGroup {
+    pub target: QuantizeTarget,
+    pub setting: Quantize,
+    /// One flag per tile of a member sheet: true pins the tile to 8bpp.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pins: BTreeMap<String, Vec<bool>>,
+}
+
 /// The book of one directory: the tile size the directory used last, and
 /// one entry per sheet in it.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -183,6 +314,10 @@ pub struct Book {
     /// One library job and its durable commands. Credentials stay in the app configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_batch: Option<serde_json::Value>,
+    /// The color quantization groups of this project. One group shares a
+    /// setting across the sheets it covers, and holds their tile pins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quantize: Vec<QuantizeGroup>,
     #[serde(default)]
     pub sheets: BTreeMap<String, Sidecar>,
 }
@@ -341,9 +476,16 @@ pub fn store_labels<'a>(dir: &Path, labels: impl IntoIterator<Item = (&'a str, O
     })
 }
 
-/// Clears all labels in the book, including entries for missing files.
-pub fn clear_labels(dir: &Path) -> Result<Vec<String>, String> {
+/// Replaces the quantization groups of a project in one write.
+pub fn store_quantize(dir: &Path, groups: &[QuantizeGroup]) -> Result<(), String> {
     update_book(dir, |book| {
+        book.quantize = groups.to_vec();
+        Ok(())
+    })
+}
+
+/// Clears all labels in the book, including entries for missing files.
+pub fn clear_labels(dir: &Path) -> Result<Vec<String>, String> {    update_book(dir, |book| {
         let mut cleared = Vec::new();
         for (rel, side) in &mut book.sheets {
             if side.label.take().is_some() { cleared.push(rel.clone()); }
@@ -518,5 +660,32 @@ mod tests {
         assert_eq!(load_book(dir).unwrap().free_tags, None);
         store_free_tags(dir, FREE_TAGS_MAX + 1).unwrap();
         assert_eq!(free_tags(&load_book(dir).unwrap()), FREE_TAGS_MAX, "a count above the ceiling is held to it");
+    }
+
+    /// A group keeps its target, its setting, and its per-sheet tile pins.
+    #[test]
+    fn quantization_groups_roundtrip() {
+        let folder = crate::storage::tests::Folder::new();
+        let dir = &folder.0;
+        let group = QuantizeGroup {
+            target: QuantizeTarget::Dir("props".into()),
+            setting: Quantize {
+                mode: QuantizeMode::Snes,
+                general: None,
+                snes: Some(Snes {
+                    depth: SnesDepth::Bpp4Plus8,
+                    palettes: 8,
+                    colors: 15,
+                    dither: QuantizeDither::Checker,
+                    auto_pct: 25,
+                    extra_8bpp: 8,
+                }),
+            },
+            pins: [("props/tree.png".to_string(), vec![false, true, false])].into_iter().collect(),
+        };
+        store_quantize(dir, std::slice::from_ref(&group)).unwrap();
+        assert_eq!(load_book(dir).unwrap().quantize, vec![group]);
+        store_quantize(dir, &[]).unwrap();
+        assert!(load_book(dir).unwrap().quantize.is_empty());
     }
 }

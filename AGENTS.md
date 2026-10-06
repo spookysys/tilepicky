@@ -44,7 +44,8 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/files.rs`: project file operations, separate from the UI.
 - `src/storage.rs`: strict JSON reads and complete-file replacement.
 - `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
-  grid, pixel origins, animations, and AI label.
+  grid, pixel origins, animations, and AI label, plus the color quantization
+  groups of a project.
 - `src/index.rs`: the scan of a folder, and the search of names, captions,
   tags, and embeddings. The word search is local and synchronous; a semantic
   match uses a query vector that a worker made.
@@ -52,6 +53,13 @@ the person who uses the tool; this file is for an agent that works on it.
   `embeddings.json` beside the library. It holds the vectors, the request and
   the reply checks, the cosine, and the generation over a library.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
+- `src/quant/`: the color quantizer, a vendored port of SuperFamiconv 0.12's
+  incremental tile-aware quantizer. It holds the SNES palettes, the dithers,
+  the mixed 4bpp/8bpp depth, and the indexed-PNG export. `quantette` builds
+  the general palettes.
+- `src/quant_panel.rs`: the Color quantization side panel of the project. It
+  holds the working setting, the group cache, the preview, the tile-depth
+  paint tool, and the export. The setting itself lives in the project book.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),

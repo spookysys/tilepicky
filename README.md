@@ -343,6 +343,42 @@ Tilepicky analyzes new sheets automatically to detect repeating pixel pitch. Ima
 
 Auto-detected grids are saved immediately to `tilepicky.json`. Manual grid adjustments override detected values and clear the auto-detected flag.
 
+## Color quantization preview
+
+The paintbrush button in the tilesheet header opens the **Color quantization**
+panel. It previews how a sheet looks once its colors are reduced. It changes
+nothing on disk; it is a look ahead, not a conversion.
+
+Choose what the setting applies to:
+
+- The open sheet.
+- A marked group of files.
+- A folder, chosen with Ctrl+click in the project tree, like the library batch.
+
+The panel shows the target, and a **paths** button lists the sheets it covers.
+A group shares one palette, so a whole scene is quantized together. A sheet
+can hold only one setting; the panel asks before it replaces an older one.
+
+Two modes:
+
+- **General** reduces each pixel, with no palette (downsample), or builds a
+  palette and an index per pixel (indexed). The formats are `rgb565`,
+  `rgba5658`, `rgb233`, `rgb888`, and `rgba8888`. The formats without alpha
+  can reserve color 0 as transparent. A palette has up to 256 colors.
+- **SNES** is tile-aware. Pick the tile depth (`2bpp`, `4bpp`, `8bpp`, or
+  `4bpp + 8bpp`), the number of palettes, and the colors per palette. Index 0
+  of every palette is transparent. With `4bpp + 8bpp`, the **auto** slider
+  promotes a share of the tiles to 8bpp, and the **paint** and **erase**
+  tools pin or unpin a tile by hand.
+
+Dithering is offered in both modes.
+
+**Save Quantized...** writes the preview as an indexed PNG, with the palette
+inside it. It opens a save dialog, so you choose where the file goes. The
+file keeps the palette order and the index of every pixel, but a PNG has no
+tiles and the target engine may want a different palette order, so treat it
+as a preview.
+
 ## Shortcuts
 
 ### Sheet operations

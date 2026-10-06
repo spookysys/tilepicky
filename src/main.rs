@@ -17,6 +17,10 @@ mod detect;
 mod dialogs;
 mod index;
 mod labels;
+// The vendored quantizer offers more than this tool calls.
+#[allow(dead_code)]
+mod quant;
+mod quant_panel;
 mod s3;
 mod batch;
 mod storage;
@@ -78,11 +82,13 @@ struct PanelOut {
     resized: bool,
     /// A right click deleted the content of the selection.
     deleted: bool,
+    /// A click or drag with the quantization paint tool, on this cell.
+    quant_cell: Option<(u32, u32)>,
 }
 
 impl Default for PanelOut {
     fn default() -> Self {
-        Self { grid: None, anim: Ok(false), drag: None, ask: false, resized: false, deleted: false }
+        Self { grid: None, anim: Ok(false), drag: None, ask: false, resized: false, deleted: false, quant_cell: None }
     }
 }
 
@@ -163,6 +169,22 @@ struct App {
     /// The eye of the project panel: tooltips and islands, no editing. Off
     /// at each start; a thing to switch on for a moment.
     project_eye: bool,
+    /// The color quantization panel: its working setting, target, and the
+    /// per-tile pins, plus the cached preview and the paint tool.
+    quant_panel: bool,
+    quant_open_rel: Option<String>,
+    quant: sidecar::Quantize,
+    quant_target: Option<sidecar::QuantizeTarget>,
+    quant_pins: Vec<bool>,
+    /// The member images of the current target, loaded once for the shared run.
+    quant_members: Vec<(String, image::RgbaImage)>,
+    quant_preview: Option<quant_panel::Outcome>,
+    quant_dirty: bool,
+    quant_error: String,
+    quant_paths: bool,
+    quant_tool: Option<quant_panel::Tool>,
+    quant_conflict: Option<quant_panel::Conflict>,
+    quant_picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
     /// A folder dialog is open for this side; the answer arrives on the channel.
     picking: Option<(Panel, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
     /// A drag across the files started here and marks a group while it lasts.
@@ -427,6 +449,19 @@ impl App {
             settings_request: false,
             legend_prompt: false,
             project_eye: false,
+            quant_panel: false,
+            quant_open_rel: None,
+            quant: quant_panel::default_setting(),
+            quant_target: None,
+            quant_pins: Vec::new(),
+            quant_members: Vec::new(),
+            quant_preview: None,
+            quant_dirty: false,
+            quant_error: String::new(),
+            quant_paths: false,
+            quant_tool: None,
+            quant_conflict: None,
+            quant_picking: None,
             picking: None,
             drag: None,
             prompt: None,
@@ -1583,6 +1618,7 @@ impl App {
     /// (tile, gap, offset), and whether a header button was clicked: the
     /// caller makes this panel active on a click, so a key like `A` or `E`
     /// next acts on the panel whose button was just pressed.
+    #[allow(clippy::too_many_arguments)]
     fn sheet_header(
         ui: &mut egui::Ui,
         title: &str,
@@ -1591,6 +1627,7 @@ impl App {
         sheet: Option<&mut Sheet>,
         ai: Option<&mut bool>,
         eye: Option<&mut bool>,
+        quant: Option<&mut bool>,
     ) -> (Option<Grid>, bool) {
         // The fields read the sheet and the tail takes it, so the numbers
         // the fields show are read here, before the tail borrows it.
@@ -1632,7 +1669,7 @@ impl App {
                 if let Some(sel) = sel { ui.weak(sel); }
                 new_grid
             },
-            |ui| Self::header_tail(ui, sheet, ai, eye, name, cell),
+            |ui| Self::header_tail(ui, sheet, ai, eye, quant, name, cell),
         )
     }
 
@@ -1640,7 +1677,7 @@ impl App {
     /// then the name of the sheet and the cell under the pointer. The two
     /// texts are truncated: a long name can never push the fields off screen.
     /// Returns whether one of the three buttons was clicked.
-    fn header_tail(ui: &mut egui::Ui, sheet: Option<&mut Sheet>, ai: Option<&mut bool>, eye: Option<&mut bool>, name: String, cell: Option<String>) -> bool {
+    fn header_tail(ui: &mut egui::Ui, mut sheet: Option<&mut Sheet>, ai: Option<&mut bool>, eye: Option<&mut bool>, quant: Option<&mut bool>, name: String, cell: Option<String>) -> bool {
         let mut clicked = false;
         // The buttons draw from the right, so they are kept here and become
         // stops from the left, in the order you read them.
@@ -1660,7 +1697,7 @@ impl App {
             let r = ui.add_enabled(open, egui::Button::new("🎬").small().selected(anim)).on_hover_text("animation panel (A)");
             if r.clicked() {
                 clicked = true;
-                if let Some(s) = sheet {
+                if let Some(s) = &mut sheet {
                     if s.anim_panel {
                         s.anim_panel = false;
                     } else {
@@ -1669,6 +1706,14 @@ impl App {
                 }
             }
             here.push(r);
+            if let Some(quant) = quant {
+                let r = ui.add_enabled(open, egui::Button::new("🎨").small().selected(*quant)).on_hover_text("color quantization");
+                if r.clicked() {
+                    *quant = !*quant;
+                    clicked = true;
+                }
+                here.push(r);
+            }
             if let Some(eye) = eye {
                 let r = ui.add_enabled(open, egui::Button::new("👁").small().selected(*eye))
                     .on_hover_text("view information about the sheet, no editing (E)");
@@ -2254,7 +2299,7 @@ impl App {
                 }
                 let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
                 let clicked;
-                (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), ai, None);
+                (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), ai, None, None);
                 // A header button does not keep the keys: they go to the grid.
                 if clicked {
                     self.active = Panel::Library;
@@ -2303,12 +2348,32 @@ impl App {
         set_pane(ui, (Panel::Project, Spot::Sheet));
         let live = keys == (Panel::Project, Spot::Sheet);
         let clicked = Self::sheet_toolbar(ui, "canvas toolbar", |ui| {
-            let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye));
+            let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye), Some(&mut self.quant_panel));
             out.grid = grid; clicked
         });
         if clicked {
             self.active = Panel::Project;
             if self.project.sheet.is_some() { ctx.memory_mut(|m| m.request_focus(project_id())); }
+        }
+        // The color quantization panel. Its target follows the open sheet
+        // until a folder or a marked group is chosen from the tree.
+        let open_rel = self.project.sheet.as_ref().map(|s| s.rel.clone());
+        if self.quant_panel && self.quant_open_rel != open_rel {
+            self.quant_open_sheet();
+            self.quant_open_rel = open_rel;
+        }
+        if !self.quant_panel {
+            self.quant_open_rel = None;
+            if let Some(s) = self.project.sheet.as_mut() {
+                s.clear_quant_preview();
+                s.quant_tool = None;
+            }
+        }
+        if self.quant_panel {
+            egui::Panel::right("color quantization").resizable(true).default_size(300.0).show(ui, |ui| {
+                set_pane(ui, (Panel::Project, Spot::Side));
+                self.quant_side_panel(ui, keys == (Panel::Project, Spot::Side));
+            });
         }
         let eye = self.project_eye;
         if let Some(s) = &mut self.project.sheet {
@@ -2326,6 +2391,7 @@ impl App {
             }
             out.resized = ev.resized;
             out.drag = ev.drag_block;
+            out.quant_cell = ev.quant_cell;
             if ev.delete {
                 s.clear_selection();
                 out.deleted = true;
@@ -2352,6 +2418,9 @@ impl App {
     fn after_panel(&mut self, ctx: &egui::Context, panel: Panel, out: PanelOut) {
         if let Some(g) = out.grid {
             self.change_grid(ctx, panel, g);
+        }
+        if let Some(cell) = out.quant_cell {
+            self.quant_paint(cell);
         }
         if out.deleted {
             self.after_edit();
@@ -2480,6 +2549,17 @@ impl App {
         match action {
             // The project tree never offers these; only the library does.
             TreeAction::Embeddings | TreeAction::ToggleDir(_) | TreeAction::SelectDir(_) | TreeAction::BatchMarked => {}
+            TreeAction::QuantizeDir(dir) => self.quant_set_target(sidecar::QuantizeTarget::Dir(dir)),
+            TreeAction::QuantizeFile(i) => {
+                let rel = self.project.index.entries[i].rel.clone();
+                self.quant_set_target(sidecar::QuantizeTarget::Files(vec![rel]));
+            }
+            TreeAction::QuantizeFiles(ids) => {
+                let mut rels: Vec<String> = ids.iter().map(|&i| self.project.index.entries[i].rel.clone()).collect();
+                rels.sort();
+                rels.dedup();
+                self.quant_set_target(sidecar::QuantizeTarget::Files(rels));
+            }
             TreeAction::Open(i) => {
                 // The plainly clicked file is the start of any group.
                 self.marked.clear();

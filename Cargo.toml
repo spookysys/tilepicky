@@ -23,6 +23,10 @@ hmac = "0.12.1"
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp", "tga"] }
 png = "0.18.1"
+# The color quantizer under `src/quant` is a port of SuperFamiconv 0.12 (MIT).
+# It builds its palettes and its Oklab math on quantette, so the same colors
+# come out as the reference. `kmeans` is the general palette method.
+quantette = { version = "0.6", default-features = false, features = ["std", "kmeans"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

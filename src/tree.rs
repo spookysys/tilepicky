@@ -12,6 +12,12 @@ pub enum TreeAction {
     Labels(usize, crate::labels::Action),
     /// Run a library batch over every file under this folder.
     BatchDir(String),
+    /// Choose this folder as the color quantization target.
+    QuantizeDir(String),
+    /// Choose this file as the color quantization target.
+    QuantizeFile(usize),
+    /// Choose a marked group as the color quantization target.
+    QuantizeFiles(Vec<usize>),
     /// Ctrl+click: add or remove the folder from the marked set.
     ToggleDir(String),
     /// A plain click on a folder chooses it alone as the library batch target.
@@ -192,6 +198,11 @@ impl Node {
                 action = Some(if ui.input(|i| i.modifiers.command) { TreeAction::ToggleDir(rel.clone()) }
                     else { TreeAction::SelectDir(rel.clone()) });
             }
+            // Ctrl+click a folder of the project chooses it as the color
+            // quantization target.
+            if v.menus && header.header_response.clicked() && ui.input(|i| i.modifiers.command) {
+                action = Some(TreeAction::QuantizeDir(rel.clone()));
+            }
             // A marked folder wears the selection colour.
             if v.marked_dirs.is_some_and(|d| d.contains(&rel)) {
                 let fill = ui.visuals().selection.bg_fill;
@@ -224,6 +235,11 @@ impl Node {
                 }
                 // Only a tree the user owns offers the items that change folders.
                 if v.menus {
+                    if ui.button("Color quantization…").clicked() {
+                        action = Some(TreeAction::QuantizeDir(rel.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("New folder…").clicked() {
                         action = Some(TreeAction::NewFolder(rel.clone()));
                         ui.close();
@@ -330,12 +346,22 @@ impl Node {
                 }
                 // Only a tree the user owns offers the items that change files.
                 if v.menus && group {
+                    if ui.button("Color quantization for these files…").clicked() {
+                        action = Some(TreeAction::QuantizeFiles(v.marked.map(|m| m.iter().copied().collect()).unwrap_or_default()));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button(format!("Delete {count} files…")).clicked() {
                         action = Some(TreeAction::DeleteMarked);
                         ui.close();
                     }
                     ui.separator();
                 } else if v.menus {
+                    if ui.button("Color quantization…").clicked() {
+                        action = Some(TreeAction::QuantizeFile(*i));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Rename…").clicked() {
                         action = Some(TreeAction::RenameFile(*i));
                         ui.close();

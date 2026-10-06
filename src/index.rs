@@ -3,7 +3,7 @@
 
 use crate::embed;
 use crate::settings::SearchIn;
-use crate::sidecar::{self, Pair, Sidecar};
+use crate::sidecar::{self, Pair, QuantizeGroup, QuantizeTarget, Sidecar};
 use std::path::{Path, PathBuf};
 
 /// The formats the tool reads. It always writes 32 bit RGBA PNG.
@@ -35,6 +35,8 @@ pub struct Index {
     pub free_tags: usize,
     /// The model the library's embeddings came from. Empty when there are none.
     pub embed_model: String,
+    /// The color quantization groups of this project.
+    pub quantize: Vec<QuantizeGroup>,
 }
 
 impl Index {
@@ -51,6 +53,7 @@ impl Index {
                 tag_list: Vec::new(),
                 free_tags: sidecar::FREE_TAGS,
                 embed_model: String::new(),
+                quantize: Vec::new(),
             };
         }
         let mut rels: Vec<String> = Vec::new();
@@ -92,6 +95,7 @@ impl Index {
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
         let tag_list = sidecar::tag_list(&book);
         let free_tags = sidecar::free_tags(&book);
+        let quantize = book.quantize;
         Self {
             root: root.to_path_buf(),
             error,
@@ -101,11 +105,42 @@ impl Index {
             tag_list,
             free_tags,
             embed_model: embeddings.model,
+            quantize,
         }
     }
 
     pub fn position(&self, rel: &str) -> Option<usize> {
         self.entries.binary_search_by(|e| e.rel.as_str().cmp(rel)).ok()
+    }
+
+    /// The sheets a quantization target covers, in tree order. A folder
+    /// covers every sheet below it, the root folder included.
+    pub fn quantize_members(&self, target: &QuantizeTarget) -> Vec<String> {
+        match target {
+            QuantizeTarget::Files(rels) => {
+                let mut out: Vec<String> = rels.iter().filter(|r| self.position(r).is_some()).cloned().collect();
+                out.sort();
+                out.dedup();
+                out
+            }
+            QuantizeTarget::Dir(dir) => self
+                .entries
+                .iter()
+                .filter(|e| dir.is_empty() || e.rel.starts_with(&format!("{dir}/")))
+                .map(|e| e.rel.clone())
+                .collect(),
+        }
+    }
+
+    /// A short name for a target, for the panel: the file, `N files`, or
+    /// `dir/*`.
+    pub fn target_name(&self, target: &QuantizeTarget) -> String {
+        match target {
+            QuantizeTarget::Files(rels) if rels.len() == 1 => rels[0].clone(),
+            QuantizeTarget::Files(rels) => format!("{} files", rels.len()),
+            QuantizeTarget::Dir(dir) if dir.is_empty() => "*".to_string(),
+            QuantizeTarget::Dir(dir) => format!("{dir}/*"),
+        }
     }
 
     /// True when every query word is the prefix of a word in the fields that
@@ -175,8 +210,7 @@ mod tests {
     /// meaning when no word matches, and the checkbox turns it off. With no
     /// vector ready, nothing matches by meaning.
     #[test]
-    fn a_sheet_matches_by_meaning_beside_the_words() {
-        let e = entry("props/tree.png", Some(vec![1.0, 0.0]));
+    fn a_sheet_matches_by_meaning_beside_the_words() {        let e = entry("props/tree.png", Some(vec![1.0, 0.0]));
         let search = SearchIn::default();
         let query = words("cozy");
         assert!(!Index::entry_matches(&e, &query, search, None), "no prefix match, no vector");
@@ -185,5 +219,37 @@ mod tests {
         let off = SearchIn { embeddings: false, ..search };
         assert!(!Index::entry_matches(&e, &query, off, Some(&[1.0, 0.0])), "the checkbox turns it off");
         assert!(Index::entry_matches(&e, &words("tree"), search, None), "the words still match on their own");
+    }
+
+    /// A folder target covers the sheets below it; a file target names them.
+    #[test]
+    fn a_quantize_target_resolves_to_its_members() {
+        let entry = |rel: &str| Entry {
+            rel: rel.into(),
+            dir_words: Vec::new(),
+            name_words: Vec::new(),
+            side: Sidecar::default(),
+            embed: None,
+        };
+        let index = Index {
+            root: PathBuf::new(),
+            error: None,
+            entries: vec![entry("props/tree.png"), entry("props/rock.png"), entry("village.png")],
+            dirs: vec!["props".into()],
+            tile: [8, 8],
+            tag_list: Vec::new(),
+            free_tags: sidecar::FREE_TAGS,
+            embed_model: String::new(),
+            quantize: Vec::new(),
+        };
+        assert_eq!(index.quantize_members(&QuantizeTarget::Dir("props".into())), ["props/tree.png", "props/rock.png"]);
+        assert_eq!(index.quantize_members(&QuantizeTarget::Dir(String::new())), ["props/tree.png", "props/rock.png", "village.png"]);
+        assert_eq!(
+            index.quantize_members(&QuantizeTarget::Files(vec!["village.png".into(), "gone.png".into()])),
+            ["village.png"]
+        );
+        assert_eq!(index.target_name(&QuantizeTarget::Dir("props".into())), "props/*");
+        assert_eq!(index.target_name(&QuantizeTarget::Files(vec!["a.png".into()])), "a.png");
+        assert_eq!(index.target_name(&QuantizeTarget::Files(vec!["a.png".into(), "b.png".into()])), "2 files");
     }
 }

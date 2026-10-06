@@ -60,6 +60,7 @@ impl App {
         self.label_options_dialog(ctx);
         self.embed_confirm_dialog(ctx);
         self.prompt_dialog(ctx);
+        self.quant_conflict_dialog(ctx);
         self.library_batch.confirmation(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.has_unsaved() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -68,6 +69,39 @@ impl App {
         self.save_dialog(ctx);
         self.legend_dialog(ctx);
         self.damaged_dialog(ctx);
+    }
+
+    /// The sheets a new quantization target would cover already carry a
+    /// setting. The user chooses to delete those, or to abort.
+    fn quant_conflict_dialog(&mut self, ctx: &egui::Context) {
+        let Some(conflict) = &self.quant_conflict else { return };
+        let covered = conflict.covered.clone();
+        let mut choice: Option<bool> = None;
+        egui::Modal::new(Id::new("quant conflict")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("These sheets already have a color quantization");
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                for rel in &covered {
+                    ui.weak(rel);
+                }
+            });
+            ui.add_space(4.0);
+            ui.label("Delete the settings those sheets have and apply the new one, or abort?");
+            ui.add_space(8.0);
+            footer(ui, |ui| {
+                if ui.button("Delete and continue").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Abort").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        match choice {
+            Some(true) => self.quant_apply(true),
+            Some(false) => self.quant_conflict = None,
+            None => {}
+        }
     }
 
     /// A settings file that could not be read is written over with the

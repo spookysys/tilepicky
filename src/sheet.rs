@@ -370,6 +370,8 @@ pub struct ViewEvent {
     pub resized: bool,
     /// Right click inside the selection: delete its content, keep the selection.
     pub delete: bool,
+    /// A click or drag with the quantization paint tool, on this cell.
+    pub quant_cell: Option<(u32, u32)>,
 }
 
 /// Which source file each pixel came from: an index into `sources`, or -1.
@@ -591,6 +593,10 @@ pub struct Sheet {
     pub ppp: f32,
     /// The pointer was over the animation preview last frame.
     pub preview_hovered: bool,
+    /// The paint tool of that panel: pin a tile to 8bpp, or erase the pin.
+    pub quant_tool: Option<crate::quant_panel::Tool>,
+    /// The quantized pixels, shown in place of the sheet while it previews.
+    quant_preview: Option<Vec<(Rect, TextureHandle)>>,
     /// Which source file each pixel came from, in image coordinates.
     pub prov: ProvMap,
     /// The frames of an animated GIF; empty for still images.
@@ -755,6 +761,8 @@ impl Sheet {
             preview_zoom: Zoom::new(2.0),
             ppp: 1.0,
             preview_hovered: false,
+            quant_tool: None,
+            quant_preview: None,
             prov,
             frames: Vec::new(),
             frame_ms: 0,
@@ -831,6 +839,35 @@ impl Sheet {
             }
             y += ch;
         }
+    }
+
+    /// Uploads the quantized pixels, to draw in place of the sheet while the
+    /// color quantization panel previews it.
+    pub fn set_quant_preview(&mut self, ctx: &egui::Context, image: &RgbaImage) {
+        let (w, h) = image.dimensions();
+        let side = CHUNK.min(ctx.input(|i| i.max_texture_side) as u32).max(64);
+        let mut chunks = Vec::new();
+        let mut y = 0;
+        while y < h {
+            let ch = side.min(h - y);
+            let mut x = 0;
+            while x < w {
+                let cw = side.min(w - x);
+                let sub = image::imageops::crop_imm(image, x, y, cw, ch).to_image();
+                let color = egui::ColorImage::from_rgba_unmultiplied([cw as usize, ch as usize], sub.as_raw());
+                let tex = ctx.load_texture(format!("{}@q{x},{y}", self.rel), color, TextureOptions::NEAREST);
+                let rect = Rect::from_min_size(Pos2::new(x as f32, y as f32), Vec2::new(cw as f32, ch as f32));
+                chunks.push((rect, tex));
+                x += cw;
+            }
+            y += ch;
+        }
+        self.quant_preview = Some(chunks);
+    }
+
+    /// Drops the preview, so the sheet draws its own pixels again.
+    pub fn clear_quant_preview(&mut self) {
+        self.quant_preview = None;
     }
 
     /// What a tooltip says about the whole sheet: its name, its size, its
@@ -967,7 +1004,7 @@ impl Sheet {
     pub fn view(&mut self, ui: &mut Ui, id: Id, dragging: bool, editable: bool, eye: bool, live: bool) -> ViewEvent {
         let mut event = ViewEvent::default();
         let library = !editable;
-        let editable = editable && !eye;
+        let editable = editable && !eye && self.quant_tool.is_none();
         if !eye {
             self.eye_islands = None;
         }
@@ -1029,9 +1066,13 @@ impl Sheet {
             }
             self.screen = rect;
             self.clip = ui.clip_rect();
+            if self.quant_tool.is_some() && (resp.clicked() || resp.dragged()) && let Some(pos) = resp.interact_pointer_pos() {
+                event.quant_cell = self.cell_at(pos);
+            }
             let painter = ui.painter_at(rect);
             checkerboard(&painter, rect);
-            for (px, tex) in &self.chunks {
+            let chunks = self.quant_preview.as_ref().unwrap_or(&self.chunks);
+            for (px, tex) in chunks {
                 let r = Rect::from_min_size(rect.min + px.min.to_vec2() * zoom, px.size() * zoom);
                 painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             }
