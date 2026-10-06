@@ -2499,6 +2499,23 @@ mod prov_tests {
         assert_eq!(*grass.img.get_pixel(2, 0), Rgba([0, 200, 0, 255]));
         assert_eq!(grass.prov.get(2, 0), Some("grass.png"));
     }
+
+    /// The overlay composites straight alpha, the way the loader and the
+    /// exporter keep it: a partial source over a partial destination mixes
+    /// the two and raises the alpha.
+    #[test]
+    fn an_overlay_composites_straight_alpha() {
+        let red = Rgba([255, 0, 0, 128]);
+        let green = Rgba([0, 200, 0, 128]);
+        // Opaque wins, whatever is beneath it.
+        assert_eq!(over(Rgba([255, 0, 0, 255]), Rgba([0, 200, 0, 255])), Rgba([255, 0, 0, 255]));
+        // A transparent source changes nothing.
+        assert_eq!(over(Rgba([0, 0, 0, 0]), Rgba([0, 200, 0, 255])), Rgba([0, 200, 0, 255]));
+        // Over nothing, the source keeps its color and its alpha.
+        assert_eq!(over(red, Rgba([0, 0, 0, 0])), red);
+        // Half over half: the colors mix and the alpha is 1 - (1/2)(1/2).
+        assert_eq!(over(red, green), Rgba([170, 66, 0, 192]));
+    }
 }
 
 /// The frames of a GIF, composited to full canvas, and the first delay in ms.

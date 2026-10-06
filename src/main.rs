@@ -1650,17 +1650,18 @@ impl App {
         );
         painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, Color32::from_rgb(80, 160, 255)), egui::StrokeKind::Inside);
         // What the drop will do, from the keys held. Shift lays the block over
-        // what is already there; Ctrl copies and Alt swaps. A block from the
-        // library can only be copied; Shift yields to Ctrl and Alt.
+        // what is already there, and it works with or without Ctrl, because a
+        // blend is already a copy. Alt swaps, and it wins over Shift. A block
+        // from the library can only be copied, or laid over with Shift.
         let ctrl = ctx.input(|i| i.modifiers.command);
         let alt = ctx.input(|i| i.modifiers.alt);
         let shift = ctx.input(|i| i.modifiers.shift);
-        let action = if shift && !ctrl && !alt {
+        let action = if alt && !ctrl && drag.from == Panel::Project {
+            DropAction::Swap
+        } else if shift {
             DropAction::Blend
         } else if drag.from == Panel::Library || ctrl {
             DropAction::Copy
-        } else if alt {
-            DropAction::Swap
         } else {
             DropAction::Move
         };
@@ -2988,7 +2989,7 @@ impl App {
                     let ai_key = if AI_VISIBLE { " | I: library AI labels" } else { "" };
                     let legend = format!(
                         "Drag: select | hold and drag: move | Ctrl+drag: copy\n\
-                         Alt+drag: swap | Shift+drag: overlay on what is there\n\
+                         Alt+drag: swap | Shift+drag (or Ctrl+Shift): overlay\n\
                          Ctrl+C/X/V: copy/cut/paste | Delete: clear tiles\n\
                          Arrows: move | Shift+arrows: extend\n\
                          Ctrl+Tab: next pane | Tab: next control\n\
