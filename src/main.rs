@@ -121,7 +121,7 @@ struct Drag {
 }
 
 /// What the keys held during a drag make the drop do.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DropAction {
     Move,
     Copy,
@@ -129,6 +129,19 @@ enum DropAction {
     /// Lay the block over what is already there, keeping its transparent
     /// pixels.
     Blend,
+}
+
+/// Alt overrides Shift. The library always keeps its source pixels.
+fn drop_action(from: Panel, ctrl: bool, alt: bool, shift: bool) -> DropAction {
+    if alt {
+        if from == Panel::Project { DropAction::Swap } else { DropAction::Copy }
+    } else if shift {
+        DropAction::Blend
+    } else if from == Panel::Library || ctrl {
+        DropAction::Copy
+    } else {
+        DropAction::Move
+    }
 }
 
 struct App {
@@ -1656,15 +1669,7 @@ impl App {
         let ctrl = ctx.input(|i| i.modifiers.command);
         let alt = ctx.input(|i| i.modifiers.alt);
         let shift = ctx.input(|i| i.modifiers.shift);
-        let action = if alt && !ctrl && drag.from == Panel::Project {
-            DropAction::Swap
-        } else if shift {
-            DropAction::Blend
-        } else if drag.from == Panel::Library || ctrl {
-            DropAction::Copy
-        } else {
-            DropAction::Move
-        };
+        let action = drop_action(drag.from, ctrl, alt, shift);
         // The sign sits on the block itself, so that only one thing follows
         // the pointer. A plain move, and the library's copy, need none.
         let sign = match action {
@@ -3860,6 +3865,26 @@ mod tests {
             let mut app = App::new(settings, damaged); app.ai_panel = true;
             Ok(Box::new(app))
         })).unwrap();
+    }
+
+    #[test]
+    fn drag_modifiers_have_consistent_precedence() {
+        for from in [Panel::Library, Panel::Project] {
+            for ctrl in [false, true] {
+                for alt in [false, true] {
+                    for shift in [false, true] {
+                        let expected = match (from, ctrl, alt, shift) {
+                            (Panel::Project, _, true, _) => DropAction::Swap,
+                            (Panel::Library, _, true, _) => DropAction::Copy,
+                            (_, _, false, true) => DropAction::Blend,
+                            (Panel::Library, _, false, false) | (_, true, false, false) => DropAction::Copy,
+                            _ => DropAction::Move,
+                        };
+                        assert_eq!(drop_action(from, ctrl, alt, shift), expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

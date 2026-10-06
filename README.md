@@ -443,7 +443,7 @@ While dragging tiles:
 - Hold `Shift` to lay the tiles over what is already there: transparent
   pixels of the dragged block leave the sheet beneath them visible. It
   works alone or with `Ctrl`, since a blend is already a copy.
-- A cursor badge indicates the active mode. `Shift` yields to `Alt`; a
+- A cursor badge indicates the active mode. `Alt` overrides `Ctrl` and `Shift`; a
   library tile is otherwise duplicated, and with `Shift` it is laid over
   instead.
 
