@@ -705,13 +705,16 @@ impl App {
             return;
         };
         let endpoint = match embed::Endpoint::new(&provider, key) { Ok(e) => e, Err(e) => { self.status = e; return; } };
+        let book = match sidecar::load_book(&root) { Ok(b) => b, Err(e) => { self.status = e; return; } };
         let rels: Vec<String> = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
         let done = embed::read(&root).unwrap_or_default();
-        let total = embed::pending(&root, &rels, &done, &model);
+        let labels = self.settings.ai.embed_labels;
+        let total = embed::pending(&root, &book, &rels, &done, &model, labels);
         if total == 0 { self.status = "Every sheet already has an embedding.".into(); return; }
         let route = provider.clone();
         let wake = ctx.clone();
-        match embed::Run::start(root, model, total, rels, done,
+        let plan = embed::Plan { root, model, total, book, rels, labels, done };
+        match embed::Run::start(plan,
             move |body| endpoint.send(&route.route(body.clone())), move || wake.request_repaint()) {
             Ok(run) => { self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
             Err(error) => self.status = error,
@@ -723,7 +726,9 @@ impl App {
         let model = self.settings.ai.chosen_embed().map(|(_, m)| m.id.clone()).unwrap_or_default();
         let rels: Vec<String> = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
         let done = embed::read(&self.library.index.root).unwrap_or_default();
-        let count = embed::pending(&self.library.index.root, &rels, &done, &model);
+        let book = sidecar::load_book(&self.library.index.root).unwrap_or_default();
+        let labels = self.settings.ai.embed_labels;
+        let count = embed::pending(&self.library.index.root, &book, &rels, &done, &model, labels);
         (model, count)
     }
 

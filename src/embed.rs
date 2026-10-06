@@ -5,6 +5,7 @@
 //! by the same model, so both share one space.
 
 use crate::ai::{Kind, Provider};
+use crate::sidecar::Book;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -32,12 +33,6 @@ pub struct Embeddings {
 pub struct Vector {
     pub hash: String,
     pub vec: Vec<f32>,
-}
-
-/// The hash of the image bytes, so that a changed image is embedded again.
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Reads the vectors of a library. A missing file is an empty set.
@@ -68,39 +63,65 @@ pub struct Job {
     pub hash: String,
 }
 
-/// The sheets to embed: every sheet whose image changed or whose vector is
-/// missing, when the model matches. A new model re-embeds all of them.
-pub fn jobs(root: &Path, rels: &[String], done: &Embeddings, model: &str) -> Vec<Job> {
+/// The caption and tags of a sheet's label, when it has one.
+fn label_text(book: &Book, rel: &str) -> Option<String> {
+    let label = book.sheets.get(rel)?.label.as_ref()?;
+    let mut text = label.caption.trim().to_string();
+    for tag in &label.tags {
+        text.push(' ');
+        text.push_str(tag);
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// The hash of what a vector is made from: the image, and the label text when
+/// it is included, so that either change re-embeds the sheet.
+fn content_hash(bytes: &[u8], text: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    if let Some(text) = text { hasher.update(text.as_bytes()); }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The sheets to embed: every sheet whose image, or its included label, changed,
+/// or whose vector is missing, when the model matches. A new model re-embeds all.
+pub fn jobs(root: &Path, book: &Book, rels: &[String], done: &Embeddings, model: &str, labels: bool) -> Vec<Job> {
     let same = done.model == model;
     rels.iter()
         .filter_map(|rel| {
             let bytes = std::fs::read(root.join(rel)).ok()?;
-            let hash = hash_bytes(&bytes);
+            let text = if labels { label_text(book, rel) } else { None };
+            let hash = content_hash(&bytes, text.as_deref());
             if same && done.sheets.get(rel).is_some_and(|v| v.hash == hash) {
                 return None;
             }
             let url = crate::labels::embed_image(&bytes).ok()?;
-            let input = json!({"content":[{"type":"image_url", "image_url":{"url":url}}]});
-            Some(Job { rel: rel.clone(), input, hash })
+            let mut content = Vec::new();
+            if let Some(text) = text { content.push(json!({"type":"text", "text":text})); }
+            content.push(json!({"type":"image_url", "image_url":{"url":url}}));
+            Some(Job { rel: rel.clone(), input: json!({"content":content}), hash })
         })
         .collect()
 }
 
 /// The request body for one batch of inputs. A text query is a plain string;
-/// a sheet is a content part that carries its image URL.
+/// a sheet is a content part that carries its image, and its label when asked.
 pub fn request(model: &str, inputs: &[Value]) -> Value {
     json!({"model": model, "input": inputs, "encoding_format": "float"})
 }
 
 /// How many sheets still need a vector. It reads the images but does not
 /// decode them, so a plan can be counted without the work of a run.
-pub fn pending(root: &Path, rels: &[String], done: &Embeddings, model: &str) -> usize {
+pub fn pending(root: &Path, book: &Book, rels: &[String], done: &Embeddings, model: &str, labels: bool) -> usize {
     let same = done.model == model;
     rels.iter()
         .filter(|rel| {
             let Ok(bytes) = std::fs::read(root.join(rel)) else { return false };
             if image::guess_format(&bytes).is_err() { return false; }
-            !(same && done.sheets.get(*rel).is_some_and(|v| v.hash == hash_bytes(&bytes)))
+            let text = if labels { label_text(book, rel) } else { None };
+            let hash = content_hash(&bytes, text.as_deref());
+            !(same && done.sheets.get(*rel).is_some_and(|v| v.hash == hash))
         })
         .count()
 }
@@ -173,16 +194,29 @@ pub struct Run {
     pub total: usize,
 }
 
+/// What a run needs: the library, the model, and what to embed.
+pub struct Plan {
+    pub root: PathBuf,
+    pub model: String,
+    /// How many sheets the run will embed, for the message before it starts.
+    pub total: usize,
+    pub book: Book,
+    pub rels: Vec<String>,
+    pub labels: bool,
+    pub done: Embeddings,
+}
+
 impl Run {
     pub fn start(
-        root: PathBuf, model: String, total: usize, rels: Vec<String>, done: Embeddings,
+        plan: Plan,
         send: impl Fn(&Value) -> Result<Value, String> + Send + 'static,
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
+        let Plan { root, model, total, book, rels, labels, done } = plan;
         let (tx, result) = std::sync::mpsc::channel();
         std::thread::Builder::new().name("generate embeddings".into()).spawn(move || {
             // The images are read and decoded here, off the UI thread.
-            let jobs = jobs(&root, &rels, &done, &model);
+            let jobs = jobs(&root, &book, &rels, &done, &model, labels);
             let mut done = done;
             done.model = model.clone();
             let outcome = embed_all(&root, &model, &jobs, &mut done, &send);
@@ -235,21 +269,28 @@ mod tests {
     }
 
     /// A sheet with an unchanged image is not embedded again; a new model
-    /// re-embeds every sheet; an unreadable file is skipped.
+    /// re-embeds every sheet; an unreadable file is skipped; including a label
+    /// changes the hash and so re-embeds the sheet.
     #[test]
     fn jobs_skip_what_is_already_embedded() {
+        use crate::sidecar::{Label, Sidecar, Status};
         let folder = folder_with(&["a.png", "b.png"]);
         std::fs::write(folder.0.join("broken.png"), b"nope").unwrap();
         let rels: Vec<String> = ["a.png", "b.png", "broken.png"].iter().map(|s| s.to_string()).collect();
-        let all = jobs(&folder.0, &rels, &Embeddings::default(), "m");
+        let empty = Book::default();
+        let all = jobs(&folder.0, &empty, &rels, &Embeddings::default(), "m", false);
         assert_eq!(all.len(), 2, "the unreadable file is skipped");
-        assert_eq!(pending(&folder.0, &rels, &Embeddings::default(), "m"), 2, "the plan counts the same");
+        assert_eq!(pending(&folder.0, &empty, &rels, &Embeddings::default(), "m", false), 2, "the plan counts the same");
         let hash = all[0].hash.clone();
         let mut done = Embeddings { model: "m".into(), ..Default::default() };
         done.sheets.insert("a.png".into(), Vector { hash, vec: vec![1.0, 0.0] });
-        assert_eq!(jobs(&folder.0, &rels, &done, "m").len(), 1, "the unchanged sheet stays");
-        assert_eq!(pending(&folder.0, &rels, &done, "m"), 1);
-        assert_eq!(jobs(&folder.0, &rels, &done, "other").len(), 2, "a new model re-embeds all");
+        assert_eq!(jobs(&folder.0, &empty, &rels, &done, "m", false).len(), 1, "the unchanged sheet stays");
+        assert_eq!(pending(&folder.0, &empty, &rels, &done, "m", false), 1);
+        assert_eq!(jobs(&folder.0, &empty, &rels, &done, "other", false).len(), 2, "a new model re-embeds all");
+        let mut book = Book::default();
+        book.sheets.insert("a.png".into(), Sidecar { label: Some(Label { provider: "p".into(), model: "m".into(),
+            status: Status::Labeled, caption: "Tree".into(), tags: vec!["green".into()], tag_list: None }), ..Default::default() });
+        assert_eq!(pending(&folder.0, &book, &rels, &done, "m", true), 2, "including the label re-embeds a.png");
     }
 
     #[test]
@@ -264,8 +305,10 @@ mod tests {
     fn a_run_embeds_writes_and_reports() {
         let folder = folder_with(&["a.png", "b.png"]);
         let rels: Vec<String> = ["a.png", "b.png"].iter().map(|s| s.to_string()).collect();
-        let total = pending(&folder.0, &rels, &Embeddings::default(), "m");
-        let run = Run::start(folder.0.clone(), "m".into(), total, rels, Embeddings::default(),
+        let total = pending(&folder.0, &Book::default(), &rels, &Embeddings::default(), "m", false);
+        let plan = Plan { root: folder.0.clone(), model: "m".into(), total, book: Book::default(),
+            rels, labels: false, done: Embeddings::default() };
+        let run = Run::start(plan,
             |body| {
                 let n = body["input"].as_array().unwrap().len();
                 Ok(reply(&(0..n).map(|i| vec![1.0, i as f32]).collect::<Vec<_>>()))

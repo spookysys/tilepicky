@@ -145,6 +145,8 @@ The vectors live in `embeddings.json` beside the library, with the model that ma
 
 Choose the **Embeddings** model in Settings (`Ctrl+,`). It must read images as well as text, so that a text query can match a picture. The shipped default is `voyageai/voyage-multimodal-3.5`. OpenRouter serves embeddings through an OpenAI-style endpoint.
 
+**Include captions and tags** (in Settings, beside the embeddings model) adds a labeled sheet's caption and tags to its embedding, so a query can match those words as well as the picture. Unlabeled sheets are embedded from their image alone. Turning it on or off, or editing a label, re-embeds the sheets it affects.
+
 The **embeddings (meaning)** checkbox in the search filter then matches a sheet whose vector is close to the query's. It is a peer of the word fields. A sheet with no vector, or a library whose vectors came from another model, matches nothing by meaning.
 
 With that checkbox on, the query text goes to the embedding model, once per settled query, so that Tilepicky can compare it. The word fields need no network.

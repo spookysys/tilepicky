@@ -293,7 +293,12 @@ pub struct Ai {
     /// The model that makes embeddings for semantic search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed: Option<ModelRef>,
+    /// Put a sheet's caption and tags into its embedding, when it has a label.
+    #[serde(default = "embed_labels_default")]
+    pub embed_labels: bool,
 }
+
+fn embed_labels_default() -> bool { true }
 
 /// A fresh install offers OpenRouter and Google models, without keys. Each
 /// model serves single sheets and library jobs; an OpenAI-style library job
@@ -314,7 +319,7 @@ impl Default for Ai {
         ];
         let (single, library) = (Some(models[0].reference()), Some(models[0].reference()));
         let embed = Some(models[3].reference());
-        Ai { providers: vec![openrouter, google], models, single, library, embed }
+        Ai { providers: vec![openrouter, google], models, single, library, embed, embed_labels: true }
     }
 }
 
@@ -506,7 +511,7 @@ impl Keys {
 /// stays short. Edits land in place; the caller writes both files when the
 /// dialog closes.
 pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
-    let Ai { providers, models, single, library, embed } = ai;
+    let Ai { providers, models, single, library, embed, embed_labels } = ai;
     ui.strong("Active models");
     ui.small("Used for new requests. Existing jobs keep their original models.");
     egui::Grid::new("defaults").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -531,6 +536,10 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
                 ui.selectable_value(embed, Some(m.reference()), embed_name(m));
             }
         });
+        ui.end_row();
+        ui.label("");
+        ui.checkbox(embed_labels, "Include captions and tags")
+            .on_hover_text("Add a sheet's caption and tags to its embedding, so a query can match the words as well as the picture. Only labeled sheets have them.");
         ui.end_row();
     });
     let mut configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
