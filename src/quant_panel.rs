@@ -113,13 +113,29 @@ pub fn run_general(setting: &General, img: &RgbaImage) -> Outcome {
 /// Reduces each pixel to the chosen channel format, with no palette.
 fn run_downsample(setting: &General, img: &RgbaImage) -> Outcome {
     let (w, h) = img.dimensions();
+    let raw = img.as_raw();
+    let n = (w * h) as usize;
+    let ordered = pattern(setting.dither);
+    let fs = is_floyd(setting.dither);
+    let mut buf: Vec<[f32; 3]> =
+        (0..n).map(|i| [raw[i * 4] as f32, raw[i * 4 + 1] as f32, raw[i * 4 + 2] as f32]).collect();
     let mut preview = RgbaImage::new(w, h);
-    for (i, p) in preview.pixels_mut().enumerate() {
-        let s = img.as_raw();
-        let (r, g, b, a) = (s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]);
-        let [r, g, b] = reduce(setting.format, [r, g, b]);
-        let (a, keyed) = alpha(setting, a);
-        *p = if keyed { image::Rgba([0, 0, 0, 0]) } else { image::Rgba([r, g, b, a]) };
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let (alpha, keyed) = alpha(setting, raw[i * 4 + 3]);
+            if keyed {
+                preview.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+                continue;
+            }
+            let src = if fs { buf[i] } else { [raw[i * 4] as f32, raw[i * 4 + 1] as f32, raw[i * 4 + 2] as f32] };
+            let rank = ordered.map(|(m, c)| (m[(x & 1) as usize][(y & 1) as usize], c));
+            let [r, g, b] = reduce_float(setting.format, src, rank);
+            preview.put_pixel(x, y, image::Rgba([r, g, b, alpha]));
+            if fs {
+                diffuse(&mut buf, w, h, x, y, src, [r as f32, g as f32, b as f32]);
+            }
+        }
     }
     Outcome { preview, export: Export::Image, deep_tiles: 0 }
 }
@@ -156,14 +172,39 @@ fn run_indexed_with(setting: &General, train: &[quantette::deps::palette::Srgb<u
         .collect();
     let oklab: Vec<Oklab> = formatted.iter().map(|&c| quant::srgb_to_oklab(c)).collect();
     let start = usize::from(setting.key);
+    let ordered = pattern(setting.dither);
+    let fs = is_floyd(setting.dither);
+    let mut buf: Vec<[f32; 3]> =
+        (0..(w * h) as usize).map(|i| [raw[i * 4] as f32, raw[i * 4 + 1] as f32, raw[i * 4 + 2] as f32]).collect();
     let mut indices = vec![0u8; (w * h) as usize];
-    for i in 0..(w * h) as usize {
-        let a = raw[i * 4 + 3];
-        if setting.key && a < OPAQUE {
-            continue;
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let a = raw[i * 4 + 3];
+            if setting.key && a < OPAQUE {
+                continue;
+            }
+            let src = if fs { buf[i] } else { [raw[i * 4] as f32, raw[i * 4 + 1] as f32, raw[i * 4 + 2] as f32] };
+            let source = Rgb::new(
+                src[0].clamp(0.0, 255.0) as u8,
+                src[1].clamp(0.0, 255.0) as u8,
+                src[2].clamp(0.0, 255.0) as u8,
+            );
+            let pick = match ordered {
+                Some((m, c)) => {
+                    let (n0, n1, d0, d1) = nearest_two(&oklab, start, source);
+                    let t = if d0 + d1 > 0.0 { d0 / (d0 + d1) } else { 0.0 };
+                    let threshold = (m[(x & 1) as usize][(y & 1) as usize] as f32 + 0.5) / c as f32;
+                    if t <= threshold { n0 } else { n1 }
+                }
+                None => nearest(&oklab, start, source),
+            };
+            indices[i] = pick as u8;
+            if fs {
+                let pal = formatted[pick];
+                diffuse(&mut buf, w, h, x, y, src, [pal.r as f32, pal.g as f32, pal.b as f32]);
+            }
         }
-        let source = Rgb::new(raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2]);
-        indices[i] = nearest(&oklab, start, source) as u8;
     }
     let mut preview = RgbaImage::new(w, h);
     for (i, p) in preview.pixels_mut().enumerate() {
@@ -217,6 +258,82 @@ fn reduce(format: GeneralFormat, [r, g, b]: [u8; 3]) -> [u8; 3] {
         GeneralFormat::Rgb888 | GeneralFormat::Rgba8888 => [r, g, b],
         GeneralFormat::Rgb233 => [bits(r, 2), bits(g, 3), bits(b, 3)],
     }
+}
+
+/// The ordered dither matrices, with the number of candidates per pixel.
+fn pattern(which: QuantizeDither) -> Option<([[usize; 2]; 2], usize)> {
+    Some(match which {
+        QuantizeDither::None | QuantizeDither::FloydSteinberg => return None,
+        QuantizeDither::Bayer2 => ([[0, 2], [3, 1]], 4),
+        QuantizeDither::Checker => ([[0, 1], [1, 0]], 2),
+        QuantizeDither::StippleV => ([[0, 1], [3, 2]], 4),
+        QuantizeDither::StippleH => ([[0, 3], [1, 2]], 4),
+        QuantizeDither::LineV => ([[0, 0], [1, 1]], 2),
+        QuantizeDither::LineH => ([[0, 1], [0, 1]], 2),
+    })
+}
+
+fn is_floyd(which: QuantizeDither) -> bool {
+    matches!(which, QuantizeDither::FloydSteinberg)
+}
+
+/// The bits per channel of a format.
+fn format_bits(format: GeneralFormat) -> (u32, u32, u32) {
+    match format {
+        GeneralFormat::Rgb565 | GeneralFormat::Rgba5658 => (5, 6, 5),
+        GeneralFormat::Rgb233 => (2, 3, 3),
+        GeneralFormat::Rgb888 | GeneralFormat::Rgba8888 => (8, 8, 8),
+    }
+}
+
+/// Reduces one channel, with the ordered bias added first.
+fn reduce_channel(v: f32, bits: u32, rank: Option<(usize, usize)>) -> u8 {
+    let v = match rank {
+        Some((r, c)) => v + ((r as f32 + 0.5) / c as f32 - 0.5) * (256u32 >> bits) as f32,
+        None => v,
+    };
+    let v = v.clamp(0.0, 255.0) as u32;
+    ((v >> (8 - bits)) << (8 - bits)) as u8
+}
+
+/// Reduces a float color to the format.
+fn reduce_float(format: GeneralFormat, [r, g, b]: [f32; 3], rank: Option<(usize, usize)>) -> [u8; 3] {
+    let (br, bg, bb) = format_bits(format);
+    [reduce_channel(r, br, rank), reduce_channel(g, bg, rank), reduce_channel(b, bb, rank)]
+}
+
+/// The two nearest palette entries at or after `start`, with their distances.
+fn nearest_two(palette: &[Oklab], start: usize, color: Rgb) -> (usize, usize, f32, f32) {
+    let c = quant::srgb_to_oklab(color);
+    let (mut best, mut second) = ((0usize, f32::INFINITY), (0usize, f32::INFINITY));
+    for (i, p) in palette.iter().enumerate().skip(start) {
+        let d = quant::oklab_sqdist(c, *p);
+        if d < best.1 {
+            second = best;
+            best = (i, d);
+        } else if d < second.1 {
+            second = (i, d);
+        }
+    }
+    (best.0, second.0, best.1, second.1)
+}
+
+/// Spreads the Floyd-Steinberg error of one pixel to its neighbors.
+fn diffuse(buf: &mut [[f32; 3]], w: u32, h: u32, x: u32, y: u32, src: [f32; 3], quant: [f32; 3]) {
+    let e = [src[0] - quant[0], src[1] - quant[1], src[2] - quant[2]];
+    let mut add = |dx: i64, dy: i64, f: f32| {
+        let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+        if nx >= 0 && ny >= 0 && (nx as u32) < w && (ny as u32) < h {
+            let j = (ny as u32 * w + nx as u32) as usize;
+            for c in 0..3 {
+                buf[j][c] += e[c] * f;
+            }
+        }
+    };
+    add(1, 0, 7.0 / 16.0);
+    add(-1, 1, 3.0 / 16.0);
+    add(0, 1, 5.0 / 16.0);
+    add(1, 1, 1.0 / 16.0);
 }
 
 /// The alpha to write, and whether the pixel is keyed out.
@@ -982,5 +1099,21 @@ mod tests {
             }
             Export::Image => panic!(),
         }
+    }
+
+    /// A dither changes the general index image.
+    #[test]
+    fn a_general_dither_changes_the_indices() {
+        let mut img = RgbaImage::new(8, 8);
+        for (x, _, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 30) as u8, (x * 30) as u8, (x * 30) as u8, 255]);
+        }
+        let base = General { kind: GeneralKind::Indexed, format: GeneralFormat::Rgb888, colors: 2, key: false, dither: QuantizeDither::None };
+        let dithered = General { dither: QuantizeDither::Checker, ..base.clone() };
+        let indices = |g: &General| match run_general(g, &img).export {
+            Export::Indexed { indices, .. } => indices,
+            Export::Image => panic!(),
+        };
+        assert_ne!(indices(&base), indices(&dithered), "checker dither changes the index image");
     }
 }
