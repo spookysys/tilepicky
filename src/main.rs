@@ -120,6 +120,17 @@ struct Drag {
     ghost: TextureHandle,
 }
 
+/// What the keys held during a drag make the drop do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropAction {
+    Move,
+    Copy,
+    Swap,
+    /// Lay the block over what is already there, keeping its transparent
+    /// pixels.
+    Blend,
+}
+
 struct App {
     /// Configuration files that could not be read, waiting for the user
     /// to agree that they are written over.
@@ -1638,15 +1649,30 @@ impl App {
             Color32::from_white_alpha(160),
         );
         painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, Color32::from_rgb(80, 160, 255)), egui::StrokeKind::Inside);
-        // What the drop will do, when a key changes it: a plus for a copy,
-        // two arrows for a swap. The sign sits on the block itself, so that
-        // only one thing follows the pointer. A block from the library can
-        // only be copied, so it needs no sign.
-        if drag.from == Panel::Project {
-            let (ctrl, alt) = ctx.input(|i| (i.modifiers.command, i.modifiers.alt));
-            if ctrl || alt {
-                drop_sign(&painter, rect.min + Vec2::splat(3.0), ctrl);
-            }
+        // What the drop will do, from the keys held. Shift lays the block over
+        // what is already there; Ctrl copies and Alt swaps. A block from the
+        // library can only be copied; Shift yields to Ctrl and Alt.
+        let ctrl = ctx.input(|i| i.modifiers.command);
+        let alt = ctx.input(|i| i.modifiers.alt);
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let action = if shift && !ctrl && !alt {
+            DropAction::Blend
+        } else if drag.from == Panel::Library || ctrl {
+            DropAction::Copy
+        } else if alt {
+            DropAction::Swap
+        } else {
+            DropAction::Move
+        };
+        // The sign sits on the block itself, so that only one thing follows
+        // the pointer. A plain move, and the library's copy, need none.
+        let sign = match action {
+            DropAction::Copy => drag.from == Panel::Project,
+            DropAction::Swap | DropAction::Blend => true,
+            DropAction::Move => false,
+        };
+        if sign {
+            drop_sign(&painter, rect.min + Vec2::splat(3.0), action);
         }
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -1671,21 +1697,15 @@ impl App {
         let (Some(at), Some(sheet)) = (target, &mut self.project.sheet) else {
             return;
         };
-        let copy = drag.from == Panel::Library || ctx.input(|i| i.modifiers.command);
-        // Alt exchanges the two places. A library sheet never changes, so a
-        // block from there can only be copied.
-        let swap = !copy && ctx.input(|i| i.modifiers.alt);
         // A lone lifted tile leaves the selections as they were; only a
         // dragged selection keeps following its block.
         let keep = (!drag.from_selection || drag.from == Panel::Library).then(|| sheet.sel.clone());
-        if copy {
-            sheet.paste(ctx, at, &drag.block);
-        } else if Some(at) == drag.origin.origin() {
-            return;
-        } else if swap {
-            sheet.swap_block(ctx, &drag.origin, at, &drag.block);
-        } else {
-            sheet.move_block(ctx, &drag.origin, at, &drag.block);
+        match action {
+            DropAction::Blend => sheet.paste_overlay(ctx, at, &drag.block),
+            DropAction::Copy => sheet.paste(ctx, at, &drag.block),
+            DropAction::Swap | DropAction::Move if Some(at) == drag.origin.origin() => return,
+            DropAction::Swap => sheet.swap_block(ctx, &drag.origin, at, &drag.block),
+            DropAction::Move => sheet.move_block(ctx, &drag.origin, at, &drag.block),
         }
         if let Some(prev) = keep {
             sheet.sel = prev;
@@ -2968,6 +2988,7 @@ impl App {
                     let ai_key = if AI_VISIBLE { " | I: library AI labels" } else { "" };
                     let legend = format!(
                         "Drag: select | hold and drag: move | Ctrl+drag: copy\n\
+                         Alt+drag: swap | Shift+drag: overlay on what is there\n\
                          Ctrl+C/X/V: copy/cut/paste | Delete: clear tiles\n\
                          Arrows: move | Shift+arrows: extend\n\
                          Ctrl+Tab: next pane | Tab: next control\n\
@@ -3255,31 +3276,44 @@ fn migrate_sidecars(project: &mut Index) {
     }
 }
 
-/// Height steps asked for by the wheel over a field this frame. Scrolling
-/// down grows the number.
 /// A small sign in the corner of the dragged block that tells what the drop
-/// will do: a plus for a copy, two arrows for a swap.
-fn drop_sign(painter: &egui::Painter, at: Pos2, copy: bool) {
+/// will do: a plus for a copy, two arrows for a swap, an arrow onto a bar for
+/// a blend that lays the block over what is already there.
+fn drop_sign(painter: &egui::Painter, at: Pos2, action: DropAction) {
     const SIDE: f32 = 18.0;
     let r = Rect::from_min_size(at, Vec2::splat(SIDE));
     painter.rect_filled(r, 3.0, Color32::from_black_alpha(200));
     painter.rect_stroke(r, 3.0, egui::Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
     let stroke = egui::Stroke::new(1.6, Color32::WHITE);
     let c = r.center();
-    if copy {
-        let arm = SIDE * 0.28;
-        painter.line_segment([c - Vec2::new(arm, 0.0), c + Vec2::new(arm, 0.0)], stroke);
-        painter.line_segment([c - Vec2::new(0.0, arm), c + Vec2::new(0.0, arm)], stroke);
-        return;
-    }
-    // Two arrows, one over the other, pointing opposite ways.
-    let (half, gap, head) = (SIDE * 0.28, SIDE * 0.16, SIDE * 0.13);
-    for (dy, dir) in [(-gap, 1.0), (gap, -1.0)] {
-        let y = c.y + dy;
-        let (a, b) = (Pos2::new(c.x - half * dir, y), Pos2::new(c.x + half * dir, y));
-        painter.line_segment([a, b], stroke);
-        painter.line_segment([b, b + Vec2::new(-head * dir, -head)], stroke);
-        painter.line_segment([b, b + Vec2::new(-head * dir, head)], stroke);
+    match action {
+        DropAction::Move => {}
+        DropAction::Copy => {
+            let arm = SIDE * 0.28;
+            painter.line_segment([c - Vec2::new(arm, 0.0), c + Vec2::new(arm, 0.0)], stroke);
+            painter.line_segment([c - Vec2::new(0.0, arm), c + Vec2::new(0.0, arm)], stroke);
+        }
+        DropAction::Swap => {
+            // Two arrows, one over the other, pointing opposite ways.
+            let (half, gap, head) = (SIDE * 0.28, SIDE * 0.16, SIDE * 0.13);
+            for (dy, dir) in [(-gap, 1.0), (gap, -1.0)] {
+                let y = c.y + dy;
+                let (a, b) = (Pos2::new(c.x - half * dir, y), Pos2::new(c.x + half * dir, y));
+                painter.line_segment([a, b], stroke);
+                painter.line_segment([b, b + Vec2::new(-head * dir, -head)], stroke);
+                painter.line_segment([b, b + Vec2::new(-head * dir, head)], stroke);
+            }
+        }
+        DropAction::Blend => {
+            // An arrow coming down onto a bar: the block lands on what is
+            // already there.
+            let (bar, head) = (c.y + SIDE * 0.26, SIDE * 0.13);
+            let tip = Pos2::new(c.x, bar - SIDE * 0.03);
+            painter.line_segment([Pos2::new(c.x, c.y - SIDE * 0.28), tip - Vec2::new(0.0, head * 0.6)], stroke);
+            painter.line_segment([Pos2::new(c.x - SIDE * 0.26, bar), Pos2::new(c.x + SIDE * 0.26, bar)], stroke);
+            painter.line_segment([tip, tip + Vec2::new(-head, -head)], stroke);
+            painter.line_segment([tip, tip + Vec2::new(head, -head)], stroke);
+        }
     }
 }
 

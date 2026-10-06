@@ -40,6 +40,21 @@ fn even_pos(p: Pos2, ppp: f32) -> Pos2 {
     Pos2::new((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
 }
 
+/// `src` over `dst`: the source pixel, whole or partial, laid on top of the
+/// pixel already there. A source pixel that is not fully transparent takes
+/// part; a fully transparent one is not drawn. Both are straight alpha, as
+/// the loader and the exporter keep them.
+fn over(src: Rgba<u8>, dst: Rgba<u8>) -> Rgba<u8> {
+    let sa = src.0[3] as f32 / 255.0;
+    if sa <= 0.0 {
+        return dst;
+    }
+    let da = dst.0[3] as f32 / 255.0;
+    let a = sa + da * (1.0 - sa);
+    let ch = |s: u8, d: u8| ((s as f32 * sa + d as f32 * da * (1.0 - sa)) / a).round().clamp(0.0, 255.0) as u8;
+    Rgba([ch(src.0[0], dst.0[0]), ch(src.0[1], dst.0[1]), ch(src.0[2], dst.0[2]), (a * 255.0).round() as u8])
+}
+
 /// A zoom level that steps through fixed values. Every view has its own.
 #[derive(Clone, Copy, Debug)]
 pub struct Zoom {
@@ -1642,8 +1657,10 @@ impl Sheet {
     /// Writes the block, pixel for pixel, onto this sheet's grid. The block
     /// may come from a sheet with another tile size; it lands with its
     /// top-left on the target cell and is padded with transparent pixels to
-    /// whole cells. Unmasked source cells stay holes.
-    fn put(&mut self, at: (u32, u32), block: &Block) {
+    /// whole cells. Unmasked source cells stay holes. With `blend`, a source
+    /// pixel is laid over the pixel already there and a transparent one
+    /// leaves it; without it, the block replaces what it covers.
+    fn put(&mut self, at: (u32, u32), block: &Block, blend: bool) {
         let ([dw, dh], [sw, sh]) = (self.tile, block.tile);
         let (bw, bh) = block.img.dimensions();
         let (dcols, drows) = (bw.div_ceil(dw), bh.div_ceil(dh));
@@ -1656,7 +1673,12 @@ impl Sheet {
         let mut sel = Sel::default();
         for j in 0..drows {
             for i in 0..dcols {
-                let any = (0..dh).any(|py| (0..dw).any(|px| src_masked(i * dw + px, j * dh + py)));
+                let any = (0..dh).any(|py| {
+                    (0..dw).any(|px| {
+                        let (bxp, byp) = (i * dw + px, j * dh + py);
+                        src_masked(bxp, byp) && (!blend || block.img.get_pixel(bxp, byp).0[3] > 0)
+                    })
+                });
                 if !any {
                     continue;
                 }
@@ -1665,14 +1687,16 @@ impl Sheet {
                 for py in 0..dh {
                     for px in 0..dw {
                         let (bxp, byp) = (i * dw + px, j * dh + py);
-                        let (v, p) = if src_masked(bxp, byp) {
-                            let idx = block.prov.index_at(bxp, byp).map_or(-1, |k| mapped[k]);
-                            (*block.img.get_pixel(bxp, byp), idx)
-                        } else {
-                            (Rgba([0; 4]), -1)
-                        };
-                        self.img.put_pixel(ix0 + px, iy0 + py, v);
-                        self.prov.set(ix0 + px, iy0 + py, p);
+                        let masked = src_masked(bxp, byp);
+                        let src = if masked { *block.img.get_pixel(bxp, byp) } else { Rgba([0; 4]) };
+                        if blend && src.0[3] == 0 {
+                            continue;
+                        }
+                        let idx = if masked { block.prov.index_at(bxp, byp).map_or(-1, |k| mapped[k]) } else { -1 };
+                        let (ix, iy) = (ix0 + px, iy0 + py);
+                        let v = if blend { over(src, *self.img.get_pixel(ix, iy)) } else { src };
+                        self.img.put_pixel(ix, iy, v);
+                        self.prov.set(ix, iy, idx);
                     }
                 }
                 sel.toggle((x, y));
@@ -1708,9 +1732,20 @@ impl Sheet {
     }
 
     pub fn paste(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) {
+        self.paste_mode(ctx, at, block, false);
+    }
+
+    /// Pastes the block over what is already there: each source pixel that is
+    /// not fully transparent is laid on the pixel beneath it, and a
+    /// transparent one lets the sheet show through. One undo step.
+    pub fn paste_overlay(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) {
+        self.paste_mode(ctx, at, block, true);
+    }
+
+    fn paste_mode(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block, blend: bool) {
         self.snapshot();
         let before = self.img.dimensions();
-        self.put(at, block);
+        self.put(at, block, blend);
         if self.img.dimensions() != before {
             self.upload(ctx);
         } else {
@@ -1725,7 +1760,7 @@ impl Sheet {
         self.snapshot();
         let before = self.img.dimensions();
         self.clear_cells(from);
-        self.put(at, block);
+        self.put(at, block, false);
         if self.img.dimensions() != before {
             self.upload(ctx);
         } else {
@@ -1755,7 +1790,7 @@ impl Sheet {
         }
         let Some(other) = self.copy_sel(&there) else { return };
         self.move_block(ctx, from, at, block);
-        self.put((b.x0, b.y0), &other);
+        self.put((b.x0, b.y0), &other, false);
         let (x0, y0, _, _) = self.cell_img_rect(b.x0, b.y0);
         let (_, _, x1, y1) = self.cell_img_rect(b.x1, b.y1);
         self.upload_region(x0, y0, x1, y1);
@@ -2437,6 +2472,32 @@ mod prov_tests {
         sheet.library = true;
         let from_library = sheet.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
         assert_eq!(from_library.prov.get(0, 0), Some("mine.png"));
+    }
+
+    /// An overlay lays the opaque pixels of the block over the sheet and lets
+    /// the transparent ones show it through, untouched.
+    #[test]
+    fn an_overlay_keeps_transparent_pixels_and_covers_the_rest() {
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut grass = Sheet::new_empty(&ctx, &dir.0, "grass.png", [4, 4], 2, 1);
+        for p in grass.img.pixels_mut() {
+            *p = Rgba([0, 200, 0, 255]);
+        }
+        let leaf = grass.prov.intern("grass.png");
+        grass.prov.fill(2, 0, 1, 1, leaf);
+
+        let mut sprite = Sheet::new_empty(&ctx, &dir.0, "flowers.png", [4, 4], 1, 1);
+        sprite.img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        sprite.img.put_pixel(1, 0, Rgba([255, 0, 0, 128]));
+        let block = sprite.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
+
+        grass.paste_overlay(&ctx, (0, 0), &block);
+        assert_eq!(*grass.img.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
+        assert_eq!(*grass.img.get_pixel(1, 0), Rgba([128, 100, 0, 255]));
+        // A transparent source pixel leaves the pixel and its source alone.
+        assert_eq!(*grass.img.get_pixel(2, 0), Rgba([0, 200, 0, 255]));
+        assert_eq!(grass.prov.get(2, 0), Some("grass.png"));
     }
 }
 

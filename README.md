@@ -440,7 +440,11 @@ While dragging tiles:
 
 - Hold `Ctrl` to duplicate tiles instead of moving them.
 - Hold `Alt` to swap tiles between source and destination positions.
-- A cursor badge indicates the active mode. Library tiles can only be duplicated.
+- Hold `Shift` to lay the tiles over what is already there: transparent
+  pixels of the dragged block leave the sheet beneath them visible.
+- A cursor badge indicates the active mode. `Shift` yields to `Ctrl` and
+  `Alt`; a library tile is otherwise duplicated, and with `Shift` it is
+  laid over instead.
 
 Dragging tiles onto an empty project canvas creates a new tilesheet matching the source tile dimensions.
 
