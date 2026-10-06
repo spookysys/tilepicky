@@ -322,6 +322,13 @@ fn data_url(img: &RgbaImage) -> Result<String, String> {
     Ok(format!("data:image/png;base64,{}", STANDARD.encode(png_bytes(img)?)))
 }
 
+/// A data URL of image bytes, for an embedding request. A GIF sends its
+/// first frame, and a large image is scaled down.
+pub fn embed_image(bytes: &[u8]) -> Result<String, String> {
+    let image = image::load_from_memory(bytes).map_err(|e| format!("Could not read the image: {e}"))?;
+    data_url(&image.to_rgba8())
+}
+
 /// The two texts of a request: what the model is, and what it is asked.
 /// The tags of `list` go into the first, and `free_tags` is the most the
 /// model is asked to add of its own.

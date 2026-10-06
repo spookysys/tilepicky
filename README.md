@@ -137,13 +137,13 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 
 ### Search by meaning
 
-**Generate Embeddings (AI)...** turns each labeled sheet into one vector, so that search can match a query by meaning rather than by prefix. The button sits in the library AI panel and beside the source header, and also in the right-click menu of a library file or folder.
+**Generate Embeddings (AI)...** turns each sheet's image into one vector, so that search can match a query by meaning rather than by prefix. Labels are not needed. The button sits in the library AI panel and beside the source header, and also in the right-click menu of a library file or folder.
 
-The caption and the tags of each sheet go to the embedding model. The images stay on this machine. The confirm names the model and the number of sheets before anything is sent.
+Each sheet's image goes to the embedding model, and the vector comes back. The confirm names the model and the number of sheets before anything is sent.
 
-The vectors live in `embeddings.json` beside the library, with the model that made them. Generating again embeds only the sheets whose label changed. A different embedding model re-embeds every labeled sheet.
+The vectors live in `embeddings.json` beside the library, with the model that made them. Generating again embeds only the sheets whose image changed. A different embedding model re-embeds every sheet.
 
-Choose the **Embeddings** model in Settings (`Ctrl+,`). Only labeled sheets get a vector. OpenRouter serves embeddings through an OpenAI-style endpoint.
+Choose the **Embeddings** model in Settings (`Ctrl+,`). It must read images as well as text, so that a text query can match a picture. The shipped default is `voyageai/voyage-multimodal-3.5`. OpenRouter serves embeddings through an OpenAI-style endpoint.
 
 The **embeddings (meaning)** checkbox in the search filter then matches a sheet whose vector is close to the query's. It is a peer of the word fields. A sheet with no vector, or a library whose vectors came from another model, matches nothing by meaning.
 

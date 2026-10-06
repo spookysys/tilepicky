@@ -22,6 +22,12 @@ fn default_concurrency() -> u32 { DEFAULT_CONCURRENCY }
 /// into the model flags.
 const BATCH: &str = ":batch";
 
+/// The shipped embedding model. It must read images as well as text, so that
+/// a text query can match a sheet's picture.
+pub const EMBED_MODEL: &str = "voyageai/voyage-multimodal-3.5";
+/// The embedding model older tools shipped. It read only text.
+const OLD_EMBED_MODEL: &str = "openai/text-embedding-3-small";
+
 /// The kind of endpoint a provider speaks.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -172,7 +178,7 @@ pub fn method(provider: &Provider) -> &'static str {
 }
 
 /// What a model is for. A chat model labels sheets and carries the scopes it
-/// serves; an embedding model turns text into vectors and serves no sheet.
+/// serves; an embedding model turns a sheet's image into a vector and serves no sheet.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Role {
@@ -304,7 +310,7 @@ impl Default for Ai {
             on("OpenRouter", "~deepseek/deepseek-flash-latest"),
             on("OpenRouter", "z-ai/glm-5.3-flash"),
             on("Google", "gemini-flash-latest"),
-            Model { provider: "OpenRouter".into(), id: "openai/text-embedding-3-small".into(), role: Role::Embed },
+            Model { provider: "OpenRouter".into(), id: EMBED_MODEL.into(), role: Role::Embed },
         ];
         let (single, library) = (Some(models[0].reference()), Some(models[0].reference()));
         let embed = Some(models[3].reference());
@@ -385,6 +391,12 @@ impl Ai {
         if self.chosen_embed().is_none() {
             self.embed = shipped.embed.filter(|r| self.models.iter().any(|m| m.is(r) && m.is_embed()));
         }
+        // The old shipped embedding model read label text. Image embeddings
+        // need a multimodal one, so swap it where it was never changed.
+        for m in &mut self.models {
+            if m.is_embed() && m.id == OLD_EMBED_MODEL { m.id = EMBED_MODEL.into(); }
+        }
+        if let Some(r) = &mut self.embed && r.model == OLD_EMBED_MODEL { r.model = EMBED_MODEL.into(); }
     }
 
     /// Adds a model, or adds its scopes to the model of the same name.
@@ -1006,7 +1018,7 @@ mod tests {
         ai.heal();
         let ids: Vec<_> = ai.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["mine/vision", "~deepseek/deepseek-flash-latest", "z-ai/glm-5.3-flash", "gemini-flash-latest",
-            "openai/text-embedding-3-small"]);
+            EMBED_MODEL]);
         assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
         assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
     }
@@ -1087,7 +1099,7 @@ mod tests {
         let mut ai = Ai { models: vec![plain("OpenRouter", "mine/vision")], single: None, library: None, embed: None, ..Ai::default() };
         ai.heal();
         assert!(ai.models.iter().any(Model::is_embed));
-        assert_eq!(ai.chosen_embed().map(|(_, m)| m.id.as_str()), Some("openai/text-embedding-3-small"));
+        assert_eq!(ai.chosen_embed().map(|(_, m)| m.id.as_str()), Some(EMBED_MODEL));
     }
 
     #[test]

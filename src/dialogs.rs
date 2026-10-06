@@ -440,8 +440,8 @@ impl App {
                 ui.colored_label(ui.visuals().error_fg_color, "Choose an embedding model in Settings.");
             } else {
                 ui.label(format!("Model: {model}"));
-                ui.label(format!("Labeled sheets that need an embedding: {count}."));
-                ui.label("The caption and the tags of each sheet go to the provider. The images stay on this machine.");
+                ui.label(format!("Sheets that need an embedding: {count}."));
+                ui.label("Each sheet's image goes to the embedding provider. The images are not added to your library.");
                 ui.label("Each vector is kept in embeddings.json beside the library.");
             }
             footer(ui, |ui| {
