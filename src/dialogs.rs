@@ -11,6 +11,7 @@ use eframe::egui::{self, Id, Key};
 #[derive(Clone, PartialEq)]
 pub enum Pending {
     Open(String),
+    Quantize(sidecar::QuantizeTarget, String),
     Create,
     Close,
 }
@@ -310,7 +311,7 @@ impl App {
     pub fn dialog_open(&self, ctx: &egui::Context) -> bool {
         self.prompt.is_some() || self.confirm.is_some() || self.remove_label.is_some() || self.prompt_view.is_some() || self.library_batch.open()
             || self.clear_labels.is_some() || self.label_options.is_some() || self.label_view || self.pending.is_some()
-            || self.legend_prompt || !self.damaged.is_empty() || self.settings_open
+            || self.legend_prompt || !self.damaged.is_empty() || self.settings_open || self.embed_confirm.is_some() || self.quant_conflict.is_some()
             || egui::Popup::is_any_open(ctx)
     }
 
@@ -461,34 +462,40 @@ impl App {
         if close { self.label_options = None; }
     }
 
-    /// Asks before label text goes to the embedding provider.
+    /// Shows the exact sources and provider before generation starts.
     fn embed_confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some((model, count)) = self.embed_confirm.clone() else { return };
+        let Some(prepared) = &self.embed_confirm else { return };
+        let plan = &prepared.plan;
         let mut start = false;
         let mut close = false;
         egui::Modal::new(Id::new("generate embeddings")).show(ctx, |ui| {
             ui.set_width(440.0_f32.min(ctx.content_rect().width() - 48.0));
-            ui.heading("Generate Embeddings (AI)?");
-            ui.label(self.library.index.root.display().to_string());
-            if model.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, "Choose an embedding model in Settings.");
-            } else {
-                ui.label(format!("Model: {model}"));
-                ui.label(format!("Sheets that need an embedding: {count}."));
-                ui.label("Each sheet's image goes to the embedding provider. The images are not added to your library.");
-                ui.label("Each vector is kept in embeddings.json beside the library.");
+            ui.heading("Generate search embeddings (AI)?");
+            ui.label(plan.root.display().to_string());
+            ui.label(format!("Provider: {}", prepared.provider.name));
+            ui.label(format!("Model: {}", plan.model));
+            ui.label(format!("Sheets that need an embedding: {}.", plan.total));
+            ui.label(match (plan.mode, plan.labels) {
+                (crate::embed::InputMode::Text, _) => "The provider receives the saved captions and tags. It receives no images.",
+                (_, true) => "The provider receives each image with its saved caption and tags.",
+                (_, false) => "The provider receives each image without its caption or tags.",
+            });
+            if !plan.done.sheets.is_empty() && (plan.done.model != plan.model || plan.done.provider != plan.provider
+                || plan.done.labels != plan.labels) {
+                ui.colored_label(ui.visuals().warn_fg_color,
+                    "This changes the model, provider, or input type. The first saved batch replaces this source's existing index.");
+                ui.label("Choose the whole library if you want vectors for every sheet in the new index.");
             }
+            ui.label("The provider may charge for these requests. This tool has no embedding cost estimate.");
+            ui.label("Completed batches stay saved if a later batch fails or you cancel.");
+            if plan.total == 0 { ui.label("No selected sheets need embeddings for this source and model."); }
             footer(ui, |ui| {
-                start = ui.add_enabled(!model.is_empty() && count > 0, egui::Button::new("Generate")).clicked();
+                start = ui.add_enabled(plan.total > 0, egui::Button::new("Generate")).clicked();
                 close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
             });
         });
-        if start {
-            self.embed_start = true;
-            self.embed_confirm = None;
-        } else if close {
-            self.embed_confirm = None;
-        }
+        if start { self.embed_start = true; }
+        else if close { self.embed_confirm = None; }
     }
 
     /// Shows a prompt as it goes to the model. The text can be selected and copied.

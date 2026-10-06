@@ -18,6 +18,7 @@ pub enum Tool {
 }
 
 /// What an export writes.
+#[derive(Clone)]
 pub enum Export {
     /// An indexed PNG: a palette, one index per pixel, and index 0 transparent.
     Indexed { palette: Vec<Rgb>, indices: Vec<u8>, key: bool },
@@ -26,10 +27,67 @@ pub enum Export {
 }
 
 /// The result of one run, ready for the preview and the export.
+#[derive(Clone)]
 pub struct Outcome {
     pub preview: RgbaImage,
     pub export: Export,
     pub deep_tiles: usize,
+}
+
+#[derive(Clone, PartialEq)]
+struct Identity {
+    root: std::path::PathBuf,
+    rel: String,
+    revision: u64,
+    tile: [u32; 2],
+    gap: [u32; 2],
+    offset: [i32; 2],
+    target: QuantizeTarget,
+    setting: Quantize,
+    pins: Vec<bool>,
+}
+
+/// One preview run. Its identity also describes the last completed preview.
+pub struct Worker {
+    identity: Identity,
+    receiver: Option<std::sync::mpsc::Receiver<Result<Outcome, String>>>,
+}
+
+fn build_preview(
+    request: &Identity,
+    image: RgbaImage,
+    inputs: Vec<(String, crate::sidecar::Sidecar)>,
+    group_pins: std::collections::BTreeMap<String, Vec<bool>>,
+) -> Result<Outcome, String> {
+    let mut images = Vec::new();
+    for (rel, side) in inputs {
+        let open = rel == request.rel;
+        let img = if open { image.clone() } else {
+            image::open(request.root.join(&rel)).map_err(|e| format!("Cannot read {rel}: {e}"))?.to_rgba8()
+        };
+        if request.setting.mode == QuantizeMode::Snes {
+            let (tile, gap, offset) = if open { (request.tile, request.gap, request.offset) } else {
+                let detected = side.tile.is_none().then(|| crate::detect::grid(&img));
+                let tile = side.tile.map(crate::sidecar::Pair::xy)
+                    .unwrap_or_else(|| detected.map_or(request.tile, |(x, y)| [x.tile, y.tile]));
+                let gap = side.gap.map(crate::sidecar::Pair::xy)
+                    .unwrap_or_else(|| detected.map_or([0, 0], |(x, y)| [x.gap, y.gap]));
+                let offset = side.offset.map(crate::sidecar::Pair::xy)
+                    .unwrap_or_else(|| detected.map_or([0, 0], |(x, y)| [x.offset, y.offset]));
+                (tile, gap, offset)
+            };
+            if tile != request.tile || gap != [0, 0] || offset != [0, 0] {
+                return Err(format!("SNES groups need matching tile sizes and no grid gaps or offsets. Check {rel}."));
+            }
+        }
+        images.push((rel, img));
+    }
+    let members: Vec<_> = images.iter().map(|(rel, img)| Member {
+        image: img,
+        open: rel == &request.rel,
+        pins: if rel == &request.rel { request.pins.clone() } else { group_pins.get(rel).cloned().unwrap_or_default() },
+    }).collect();
+    run_group(&request.setting, &members, request.tile)
 }
 
 /// A pending conflict: the sheets that already carry a setting.
@@ -61,14 +119,14 @@ fn dither(which: QuantizeDither) -> Option<Dither> {
 /// it is empty when the depth is not `4bpp+8bpp`.
 pub fn run_snes(setting: &Snes, img: &RgbaImage, tile: [u32; 2], pins: &[bool], seed: u64) -> Outcome {
     let (w, h) = img.dimensions();
-    let (tw, th) = (tile[0].max(1), tile[1].max(1));
+    let (tw, th) = (tile[0].clamp(1, w.max(1)), tile[1].clamp(1, h.max(1)));
     let bpp = match setting.depth {
         SnesDepth::Bpp2 => 2,
         SnesDepth::Bpp4 | SnesDepth::Bpp4Plus8 => 4,
         SnesDepth::Bpp8 => 8,
     };
     let stride = 1u32 << bpp;
-    let palettes = setting.palettes.clamp(1, (256 / stride) as usize);
+    let palettes = setting.palettes.clamp(1, ((256 / stride) as usize).min(8));
     let colors = setting.colors.clamp(1, stride as usize - 1);
 
     let pixels: Vec<Rgb> = img
@@ -81,6 +139,7 @@ pub fn run_snes(setting: &Snes, img: &RgbaImage, tile: [u32; 2], pins: &[bool], 
     job.tile_height = th;
     job.dither = dither(setting.dither);
     job.color_zero = Some(KEY);
+    job.transparent_pixels = Some(img.pixels().map(|p| p[3] < OPAQUE).collect());
     job.seed = seed;
 
     if matches!(setting.depth, SnesDepth::Bpp4Plus8) {
@@ -89,9 +148,10 @@ pub fn run_snes(setting: &Snes, img: &RgbaImage, tile: [u32; 2], pins: &[bool], 
         let start = palettes as u32 * stride;
         let extra = setting.extra_8bpp.min((256u32.saturating_sub(start)) as usize);
         job.deep_entries = (0..extra as u32).map(|i| (start + i) as u8).collect();
-        let want = (setting.auto_pct as usize * count + 50) / 100;
+        let want = (setting.auto_pct.min(100) as usize * count + 50) / 100;
         let have = pinned.iter().filter(|&&d| d).count();
-        job.deep_tiles = if want > have { quant::choose_deep_tiles(&pixels, w, h, &job, want - have) } else { pinned };
+        job.deep_tiles = pinned;
+        if want > have { job.deep_tiles = quant::choose_deep_tiles(&pixels, w, h, &job, want - have); }
     }
 
     let result = quant::quantize(&pixels, w, h, &job);
@@ -230,7 +290,7 @@ fn train_pixels(setting: &General, img: &RgbaImage) -> Vec<quantette::deps::pale
     let raw = img.as_raw();
     let n = (img.width() * img.height()) as usize;
     (0..n)
-        .filter(|&i| !setting.key || raw[i * 4 + 3] >= OPAQUE)
+        .filter(|&i| if setting.format.has_alpha() { raw[i * 4 + 3] != 0 } else { !setting.key || raw[i * 4 + 3] >= OPAQUE })
         .map(|i| quantette::deps::palette::Srgb::new(raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2]))
         .collect()
 }
@@ -251,13 +311,7 @@ fn nearest(palette: &[Oklab], start: usize, color: Rgb) -> usize {
 
 /// Reduces a color to the channel format.
 fn reduce(format: GeneralFormat, [r, g, b]: [u8; 3]) -> [u8; 3] {
-    let bits = |v: u8, n: u32| -> u8 { let step = 8 - n; ((v as u32 >> step) << step) as u8 };
-    match format {
-        GeneralFormat::Rgb565 => [bits(r, 5), bits(g, 6), bits(b, 5)],
-        GeneralFormat::Rgba5658 => [bits(r, 5), bits(g, 6), bits(b, 5)],
-        GeneralFormat::Rgb888 | GeneralFormat::Rgba8888 => [r, g, b],
-        GeneralFormat::Rgb233 => [bits(r, 2), bits(g, 3), bits(b, 3)],
-    }
+    reduce_float(format, [r as f32, g as f32, b as f32], None)
 }
 
 /// The ordered dither matrices, with the number of candidates per pixel.
@@ -288,12 +342,10 @@ fn format_bits(format: GeneralFormat) -> (u32, u32, u32) {
 
 /// Reduces one channel, with the ordered bias added first.
 fn reduce_channel(v: f32, bits: u32, rank: Option<(usize, usize)>) -> u8 {
-    let v = match rank {
-        Some((r, c)) => v + ((r as f32 + 0.5) / c as f32 - 0.5) * (256u32 >> bits) as f32,
-        None => v,
-    };
-    let v = v.clamp(0.0, 255.0) as u32;
-    ((v >> (8 - bits)) << (8 - bits)) as u8
+    let levels = ((1u32 << bits) - 1) as f32;
+    let bias = rank.map_or(0.0, |(r, c)| (r as f32 + 0.5) / c as f32 - 0.5);
+    let code = (v.clamp(0.0, 255.0) * levels / 255.0 + bias).round().clamp(0.0, levels);
+    (code * 255.0 / levels).round() as u8
 }
 
 /// Reduces a float color to the format.
@@ -315,6 +367,7 @@ fn nearest_two(palette: &[Oklab], start: usize, color: Rgb) -> (usize, usize, f3
             second = (i, d);
         }
     }
+    if !second.1.is_finite() { second = best; }
     (best.0, second.0, best.1, second.1)
 }
 
@@ -376,6 +429,9 @@ pub fn run_group(setting: &Quantize, members: &[Member], tile: [u32; 2]) -> Resu
     if members.is_empty() {
         return Err("the group covers no sheets".into());
     }
+    if members.iter().filter(|m| m.open).count() != 1 {
+        return Err("Open one sheet from the selected target to preview it.".into());
+    }
     if members.len() == 1 {
         let m = &members[0];
         return run(setting, m.image, tile, &m.pins);
@@ -403,7 +459,9 @@ pub fn run_group(setting: &Quantize, members: &[Member], tile: [u32; 2]) -> Resu
 /// Stacks the members into one image and quantizes it once, so they share
 /// the palettes and the CGRAM.
 fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64) -> Outcome {
-    let (tw, th) = (tile[0].max(1), tile[1].max(1));
+    let max_width = members.iter().map(|m| m.image.width()).max().unwrap_or(1).max(1);
+    let max_height = members.iter().map(|m| m.image.height()).max().unwrap_or(1).max(1);
+    let (tw, th) = (tile[0].clamp(1, max_width), tile[1].clamp(1, max_height));
     let width = members.iter().map(|m| m.image.width().div_ceil(tw) * tw).max().unwrap_or(tw);
     let bpp = match setting.depth {
         SnesDepth::Bpp2 => 2,
@@ -411,10 +469,12 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
         SnesDepth::Bpp8 => 8,
     };
     let stride = 1u32 << bpp;
-    let palettes = setting.palettes.clamp(1, (256 / stride) as usize);
+    let palettes = setting.palettes.clamp(1, ((256 / stride) as usize).min(8));
     let colors = setting.colors.clamp(1, stride as usize - 1);
 
     let mut pixels: Vec<Rgb> = Vec::new();
+    let mut transparent = Vec::new();
+    let mut real_tiles = 0usize;
     let mut pins: Vec<bool> = Vec::new();
     let mut open_at = (0u32, 0u32, 0u32, 0u32);
     let mut y = 0u32;
@@ -425,15 +485,18 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
             for px in 0..width {
                 if px < w && py < h {
                     let p = m.image.get_pixel(px, py).0;
-                    pixels.push(if p[3] < OPAQUE { KEY } else { Rgb::new(p[0], p[1], p[2]) });
+                    pixels.push(Rgb::new(p[0], p[1], p[2]));
+                    transparent.push(p[3] < OPAQUE);
                 } else {
                     pixels.push(KEY);
+                    transparent.push(true);
                 }
             }
         }
         let across = width / tw;
         let mcols = w.div_ceil(tw);
         let mrows = h.div_ceil(th);
+        real_tiles += (mcols * mrows) as usize;
         for ty in 0..(ph / th) {
             for tx in 0..across {
                 let inside = tx < mcols && ty < mrows;
@@ -452,14 +515,16 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
     job.tile_height = th;
     job.dither = dither(setting.dither);
     job.color_zero = Some(KEY);
+    job.transparent_pixels = Some(transparent);
     job.seed = seed;
     if matches!(setting.depth, SnesDepth::Bpp4Plus8) {
         let start = palettes as u32 * stride;
         let extra = setting.extra_8bpp.min((256u32.saturating_sub(start)) as usize);
         job.deep_entries = (0..extra as u32).map(|i| (start + i) as u8).collect();
-        let want = (setting.auto_pct as usize * pins.len() + 50) / 100;
+        let want = (setting.auto_pct.min(100) as usize * real_tiles + 50) / 100;
         let have = pins.iter().filter(|&&d| d).count();
-        job.deep_tiles = if want > have { quant::choose_deep_tiles(&pixels, width, height, &job, want - have) } else { pins.clone() };
+        job.deep_tiles = pins;
+        if want > have { job.deep_tiles = quant::choose_deep_tiles(&pixels, width, height, &job, want - have); }
     }
     let result = quant::quantize(&pixels, width, height, &job);
     let table = quant::cgram(&result, &job);
@@ -511,9 +576,15 @@ pub fn run(setting: &Quantize, img: &RgbaImage, tile: [u32; 2], pins: &[bool]) -
 
 /// Writes an outcome to `path`.
 pub fn write(outcome: &Outcome, path: &std::path::Path, width: u32, height: u32) -> Result<(), String> {
+    if outcome.preview.dimensions() != (width, height) {
+        return Err("The export dimensions do not match the preview.".into());
+    }
     match &outcome.export {
         Export::Indexed { palette, indices, key } => quant::export_indexed_png(path, palette, indices, width, height, *key),
-        Export::Image => outcome.preview.save(path).map_err(|e| e.to_string()),
+        Export::Image => crate::storage::replace(path, false, |file| {
+            image::DynamicImage::ImageRgba8(outcome.preview.clone()).write_to(file, image::ImageFormat::Png)
+                .map_err(std::io::Error::other)
+        }).map_err(|e| e.to_string()),
     }
 }
 
@@ -555,10 +626,11 @@ fn dither_name(which: QuantizeDither) -> &'static str {
     DITHERS.iter().find(|(d, _)| *d == which).map_or("none", |(_, n)| n)
 }
 
-fn dither_combo(ui: &mut egui::Ui, which: &mut QuantizeDither) -> bool {
+fn dither_combo(ui: &mut egui::Ui, which: &mut QuantizeDither, general: bool) -> bool {
     let mut changed = false;
     egui::ComboBox::from_label("dither").selected_text(dither_name(*which)).show_ui(ui, |ui| {
         for (value, name) in DITHERS {
+            if !general && value == QuantizeDither::FloydSteinberg { continue; }
             if ui.selectable_value(which, value, name).changed() {
                 changed = true;
             }
@@ -595,15 +667,16 @@ fn snes_ui(ui: &mut egui::Ui, s: &mut Snes) -> bool {
     };
     let stride = 1usize << bpp;
     if bpp != 8 {
-        changed |= ui.add(egui::Slider::new(&mut s.palettes, 1..=(256 / stride)).text("palettes")).changed();
+        changed |= ui.add(egui::Slider::new(&mut s.palettes, 1..=(256 / stride).min(8)).text("palettes")).changed();
     } else {
         s.palettes = 1;
     }
     changed |= ui.add(egui::Slider::new(&mut s.colors, 1..=(stride - 1)).text("colors per palette")).changed();
-    changed |= dither_combo(ui, &mut s.dither);
+    if s.dither == QuantizeDither::FloydSteinberg { s.dither = QuantizeDither::None; changed = true; }
+    changed |= dither_combo(ui, &mut s.dither, false);
     if matches!(s.depth, SnesDepth::Bpp4Plus8) {
         changed |= ui.add(egui::Slider::new(&mut s.auto_pct, 0..=100).text("auto 8bpp %")).changed();
-        changed |= ui.add(egui::Slider::new(&mut s.extra_8bpp, 0..=128).text("extra 8bpp colors")).changed();
+        changed |= ui.add(egui::Slider::new(&mut s.extra_8bpp, 0..=(256usize.saturating_sub(s.palettes * stride))).text("extra 8bpp colors")).changed();
     }
     ui.weak("index 0 of every palette is transparent");
     changed
@@ -649,13 +722,17 @@ fn general_ui(ui: &mut egui::Ui, g: &mut General) -> bool {
     }
     if matches!(g.kind, GeneralKind::Indexed) {
         changed |= ui.add(egui::Slider::new(&mut g.colors, 2..=256).text("palette colors")).changed();
-        if !g.format.has_alpha() {
-            changed |= ui.checkbox(&mut g.key, "color 0 is transparent").changed();
-        } else {
-            g.key = false;
-        }
     }
-    changed |= dither_combo(ui, &mut g.dither);
+    if !g.format.has_alpha() {
+        changed |= ui.checkbox(&mut g.key, "preserve transparency").changed();
+    } else if g.key {
+        g.key = false;
+        changed = true;
+    }
+    if g.format.has_alpha() && g.kind == GeneralKind::Indexed {
+        ui.weak("PNG keeps per-pixel alpha. Colors use the palette; the file is RGBA.");
+    }
+    changed |= dither_combo(ui, &mut g.dither, true);
     changed
 }
 
@@ -668,6 +745,7 @@ impl App {
         if index >= count {
             return;
         }
+        if cell.0 >= sheet.cols() || cell.1 >= sheet.rows() { return; }
         let set = self.quant_tool == Some(Tool::Paint);
         if self.quant_pins.len() != count {
             self.quant_pins.resize(count, false);
@@ -686,15 +764,12 @@ impl App {
             .index
             .quantize
             .iter()
-            .find(|g| self.project.index.quantize_members(&g.target).iter().any(|r| members.contains(r)))
+            .find(|g| g.target == target || self.project.index.quantize_members(&g.target) == members)
             .cloned();
         match group {
             Some(g) => {
                 self.quant = g.setting;
-                self.quant_pins = match (&target, members.first()) {
-                    (QuantizeTarget::Files(rels), Some(rel)) if rels.len() == 1 => g.pins.get(rel).cloned().unwrap_or_default(),
-                    _ => Vec::new(),
-                };
+                self.quant_pins = self.project.sheet.as_ref().and_then(|sheet| g.pins.get(&sheet.rel)).cloned().unwrap_or_default();
             }
             None => {
                 self.quant = default_setting();
@@ -734,71 +809,88 @@ impl App {
         self.quant_dirty = true;
     }
 
-    /// Loads the images of the current target, once, for the shared run.
+    /// Invalidates the current preview when its target changes.
     pub fn quant_load_members(&mut self) {
-        let Some(target) = self.quant_target.clone() else {
-            self.quant_members.clear();
-            return;
-        };
-        let open_rel = self.project.sheet.as_ref().map(|s| s.rel.clone());
-        let root = self.project.index.root.clone();
-        let rels = self.project.index.quantize_members(&target);
-        let mut members = Vec::new();
-        for rel in rels {
-            if Some(&rel) == open_rel.as_ref()
-                && let Some(sheet) = self.project.sheet.as_ref()
-            {
-                members.push((rel, sheet.img.clone()));
-                continue;
-            }
-            if let Ok(img) = image::open(root.join(&rel)) {
-                members.push((rel, img.to_rgba8()));
-            }
-        }
-        self.quant_members = members;
+        self.quant_preview = None;
+        self.quant_error.clear();
+        self.quant_tool = None;
+        if let Some(sheet) = self.project.sheet.as_mut() { sheet.clear_quant_preview(); }
     }
 
-    /// Recomputes the preview from the whole target and the working setting.
-    pub fn quant_rebuild(&mut self) {
-        if self.quant_members.is_empty() {
-            self.quant_load_members();
+    fn quant_identity(&self) -> Option<Identity> {
+        let sheet = self.project.sheet.as_ref()?;
+        Some(Identity {
+            root: self.project.index.root.clone(),
+            rel: sheet.rel.clone(),
+            revision: sheet.quant_revision,
+            tile: sheet.tile,
+            gap: sheet.gap,
+            offset: sheet.offset,
+            target: self.quant_target.clone()?,
+            setting: self.quant.clone(),
+            pins: self.quant_pins.clone(),
+        })
+    }
+
+    /// Keeps one background run active and rejects results for older inputs.
+    fn quant_update_preview(&mut self, ctx: &egui::Context) {
+        let Some(identity) = self.quant_identity() else { return };
+        if self.quant_worker.as_ref().is_none_or(|worker| worker.identity != identity) {
+            self.quant_dirty = true;
         }
-        let Some(tile) = self.project.sheet.as_ref().map(|s| s.tile) else { return };
-        let outcome = {
-            let open_rel = self.project.sheet.as_ref().map(|s| s.rel.clone());
-            let pins = self.quant_pins.clone();
-            let group_pins = self
-                .project
-                .index
-                .quantize
-                .iter()
-                .find(|g| {
-                    let target = self.quant_target.as_ref();
-                    target.is_some_and(|t| self.project.index.quantize_members(&g.target) == self.project.index.quantize_members(t))
-                })
-                .map(|g| g.pins.clone())
-                .unwrap_or_default();
-            let members: Vec<Member> = self
-                .quant_members
-                .iter()
-                .map(|(rel, img)| Member {
-                    image: img,
-                    pins: if Some(rel) == open_rel.as_ref() { pins.clone() } else { group_pins.get(rel).cloned().unwrap_or_default() },
-                    open: Some(rel) == open_rel.as_ref(),
-                })
-                .collect();
-            run_group(&self.quant, &members, tile)
-        };
-        match outcome {
-            Ok(o) => {
-                self.quant_preview = Some(o);
-                self.quant_error.clear();
-            }
-            Err(e) => {
-                self.quant_error = e;
-                self.quant_preview = None;
+        if self.quant_dirty {
+            self.quant_preview = None;
+            if let Some(sheet) = self.project.sheet.as_mut() { sheet.clear_quant_preview(); }
+        }
+        if let Some(worker) = self.quant_worker.as_mut()
+            && let Some(receiver) = worker.receiver.as_ref()
+        {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    worker.receiver = None;
+                    if worker.identity == identity {
+                        self.quant_dirty = false;
+                        match result {
+                            Ok(outcome) => {
+                                if let Some(sheet) = self.project.sheet.as_mut() { sheet.set_quant_preview(ctx, &outcome.preview); }
+                                self.quant_preview = Some(outcome);
+                                self.quant_error.clear();
+                            }
+                            Err(error) => { self.status = error.clone(); self.quant_error = error; },
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    worker.receiver = None;
+                    self.quant_error = "The quantization worker stopped before it returned a result.".into();
+                    self.quant_dirty = worker.identity != identity;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
+        if self.quant_worker.as_ref().is_some_and(|worker| worker.receiver.is_some()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
+            return;
+        }
+        if !self.quant_dirty { return; }
+        self.quant_dirty = false;
+        self.quant_error.clear();
+        let sheet = self.project.sheet.as_ref().expect("the identity has a sheet");
+        let image = sheet.img.clone();
+        let rels = self.project.index.quantize_members(&identity.target);
+        let group_pins = self.project.index.quantize.iter().flat_map(|g| g.pins.clone()).collect();
+        let inputs: Vec<_> = rels.iter().filter_map(|rel| self.project.index.entries.iter().find(|e| &e.rel == rel))
+            .map(|e| (e.rel.clone(), e.side.clone())).collect();
+        let request = identity.clone();
+        let repaint = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = build_preview(&request, image, inputs, group_pins);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+        self.quant_worker = Some(Worker { identity, receiver: Some(rx) });
+        ctx.request_repaint_after(std::time::Duration::from_millis(40));
     }
 
     /// Writes the working setting as a group. With `delete_existing`, the
@@ -815,6 +907,7 @@ impl App {
             .index
             .quantize
             .iter()
+            .filter(|g| g.target != target && self.project.index.quantize_members(&g.target) != members)
             .flat_map(|g| self.project.index.quantize_members(&g.target))
             .filter(|r| members.contains(r))
             .collect();
@@ -836,16 +929,15 @@ impl App {
             QuantizeTarget::Files(rels) => !rels.is_empty(),
             QuantizeTarget::Dir(_) => true,
         });
-        let pins: std::collections::BTreeMap<String, Vec<bool>> = {
-            let rel = self.project.sheet.as_ref().map(|s| s.rel.clone()).unwrap_or_default();
-            if matches!(self.quant.mode, QuantizeMode::Snes) && !self.quant_pins.is_empty() && members.contains(&rel) {
-                [(rel, self.quant_pins.clone())].into_iter().collect()
-            } else {
-                Default::default()
-            }
-        };
+        let mut pins: std::collections::BTreeMap<String, Vec<bool>> = self.project.index.quantize.iter()
+            .flat_map(|g| g.pins.iter()).filter(|(rel, _)| members.contains(rel)).map(|(rel, pins)| (rel.clone(), pins.clone())).collect();
+        if let Some(sheet) = &self.project.sheet
+            && members.contains(&sheet.rel)
+        {
+            pins.insert(sheet.rel.clone(), self.quant_pins.clone());
+        }
         groups.push(QuantizeGroup { target: target.clone(), setting: self.quant.clone(), pins });
-        match crate::sidecar::store_quantize(&self.project.index.root.clone(), &groups) {
+        match crate::sidecar::replace_quantize(&self.project.index.root, &self.project.index.quantize, &groups) {
             Ok(()) => {
                 self.project.index.quantize = groups;
                 self.quant_conflict = None;
@@ -872,11 +964,13 @@ impl App {
             QuantizeTarget::Files(rels) => !rels.is_empty(),
             QuantizeTarget::Dir(_) => true,
         });
-        match crate::sidecar::store_quantize(&self.project.index.root.clone(), &groups) {
+        match crate::sidecar::replace_quantize(&self.project.index.root, &self.project.index.quantize, &groups) {
             Ok(()) => {
                 self.project.index.quantize = groups;
                 self.quant_preview = None;
                 self.quant_dirty = false;
+                self.quant_panel = false;
+                self.quant_tool = None;
                 if let Some(sheet) = self.project.sheet.as_mut() {
                     sheet.clear_quant_preview();
                 }
@@ -886,36 +980,40 @@ impl App {
         }
     }
 
-    /// Asks where to save the quantized PNG, then writes it.
+    /// Saves the preview that was visible when the dialog opened.
     pub fn quant_save(&mut self) {
-        let name = self
-            .project
-            .sheet
-            .as_ref()
-            .map(|s| {
-                let stem = std::path::Path::new(&s.rel).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| "sheet".into());
-                format!("{stem}-quantized.png")
-            })
-            .unwrap_or_else(|| "sheet-quantized.png".into());
+        let (Some(outcome), Some(sheet)) = (&self.quant_preview, &self.project.sheet) else { return };
+        let outcome = outcome.clone();
+        let source = self.project.index.root.join(&sheet.rel);
+        let stem = std::path::Path::new(&sheet.rel).file_stem().unwrap_or_default().to_string_lossy();
+        let name = format!("{stem}-quantized.png");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let path = rfd::FileDialog::new().set_file_name(name).save_file();
-            let _ = tx.send(path);
+            let result = (|| {
+                let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name(name).save_file() else {
+                    return Ok(None);
+                };
+                if path == source || path.canonicalize().ok().zip(source.canonicalize().ok()).is_some_and(|(a, b)| a == b) {
+                    return Err("Choose a different file. The source sheet must stay available for further edits.".into());
+                }
+                let (width, height) = outcome.preview.dimensions();
+                write(&outcome, &path, width, height)?;
+                Ok(Some(path))
+            })();
+            let _ = tx.send(result);
         });
         self.quant_picking = Some(rx);
     }
 
-    fn quant_poll_save(&mut self) {
+    pub fn quant_poll_save(&mut self) {
         let Some(rx) = &self.quant_picking else { return };
         match rx.try_recv() {
             Ok(answer) => {
                 self.quant_picking = None;
-                if let (Some(path), Some(outcome), Some(sheet)) = (answer, &self.quant_preview, self.project.sheet.as_ref()) {
-                    let (w, h) = sheet.img.dimensions();
-                    match write(outcome, &path, w, h) {
-                        Ok(()) => self.status = format!("saved {}", path.display()),
-                        Err(e) => self.quant_error = e,
-                    }
+                match answer {
+                    Ok(Some(path)) => self.status = format!("saved {}", path.display()),
+                    Ok(None) => {},
+                    Err(error) => { self.status = error.clone(); self.quant_error = error; },
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.quant_picking = None,
@@ -952,6 +1050,9 @@ impl App {
             changed |= ui.selectable_value(&mut self.quant.mode, QuantizeMode::Snes, "SNES").changed();
             changed |= ui.selectable_value(&mut self.quant.mode, QuantizeMode::General, "general").changed();
         });
+        let defaults = default_setting();
+        if self.quant.snes.is_none() { self.quant.snes = defaults.snes; }
+        if self.quant.general.is_none() { self.quant.general = defaults.general; }
         match self.quant.mode {
             QuantizeMode::Snes => {
                 if let Some(s) = self.quant.snes.as_mut() {
@@ -969,6 +1070,7 @@ impl App {
             && self.quant.snes.as_ref().is_some_and(|s| matches!(s.depth, SnesDepth::Bpp4Plus8))
         {
             ui.label("draw on tiles");
+            ui.weak("Yellow outlines mark manual 8bpp pins. Erase removes a pin; auto can still select the tile.");
             ui.horizontal(|ui| {
                 let tool = self.quant_tool;
                 if ui.selectable_label(tool == Some(Tool::Paint), "paint 8bpp").clicked() {
@@ -981,7 +1083,9 @@ impl App {
         } else {
             self.quant_tool = None;
         }
-        if let Some(o) = &self.quant_preview {
+        if self.quant.mode == QuantizeMode::Snes
+            && self.quant.snes.as_ref().is_some_and(|s| s.depth == SnesDepth::Bpp4Plus8)
+            && let Some(o) = &self.quant_preview {
             ui.weak(format!("{} tiles are 8bpp", o.deep_tiles));
         }
         if !self.quant_error.is_empty() {
@@ -995,22 +1099,21 @@ impl App {
             if ui.button("Clear").clicked() {
                 self.quant_clear();
             }
-            if ui.add_enabled(self.quant_preview.is_some(), egui::Button::new("Save Quantized...")).clicked() {
+            if ui.add_enabled(self.quant_preview.is_some() && self.quant_picking.is_none(), egui::Button::new("Save Quantized...")).clicked() {
                 self.quant_save();
             }
         });
         if changed {
             self.quant_dirty = true;
         }
-        if self.quant_dirty {
-            self.quant_dirty = false;
-            self.quant_rebuild();
-            if let (Some(sheet), Some(o)) = (self.project.sheet.as_mut(), &self.quant_preview) {
-                sheet.set_quant_preview(ui.ctx(), &o.preview);
-            }
+        self.quant_update_preview(ui.ctx());
+        if self.quant_worker.as_ref().is_some_and(|worker| worker.receiver.is_some()) {
+            ui.horizontal(|ui| { ui.spinner(); ui.label("Computing preview..."); });
         }
+        if self.quant_picking.is_some() { ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)); }
         if let Some(sheet) = self.project.sheet.as_mut() {
             sheet.quant_tool = self.quant_tool;
+            sheet.quant_pins.clone_from(&self.quant_pins);
         }
     }
 }
@@ -1099,6 +1202,67 @@ mod tests {
             }
             Export::Image => panic!(),
         }
+    }
+
+    #[test]
+    fn opaque_black_and_magenta_never_become_transparent() {
+        let img = RgbaImage::from_fn(16, 8, |x, y| match (x / 8, y % 3) {
+            (_, 0) => image::Rgba([255, 0, 255, 255]),
+            (_, 1) => image::Rgba([0, 0, 0, 255]),
+            _ => image::Rgba([50, 80, 120, 0]),
+        });
+        for depth in [SnesDepth::Bpp2, SnesDepth::Bpp4Plus8] {
+            let setting = Snes { depth, palettes: 2, colors: 3, dither: QuantizeDither::None, auto_pct: 0, extra_8bpp: 8 };
+            let out = run_snes(&setting, &img, [8, 8], &[false, true], 0);
+            let dir = crate::storage::tests::Folder::new();
+            let path = dir.0.join("preview.png");
+            write(&out, &path, 16, 8).unwrap();
+            let decoded = image::open(path).unwrap().to_rgba8();
+            for (preview, exported) in out.preview.pixels().zip(decoded.pixels()) {
+                assert_eq!(preview[3], exported[3]);
+                if preview[3] != 0 { assert_eq!(preview, exported); }
+            }
+            for (original, actual) in img.pixels().zip(decoded.pixels()) {
+                assert_eq!(actual[3], original[3]);
+                if original[3] != 0 { assert_eq!(actual, original); }
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_depth_keeps_manual_pins() {
+        let img = RgbaImage::from_fn(32, 8, |x, y| image::Rgba([(x * 31) as u8, (y * 43) as u8, (x * y * 19) as u8, 255]));
+        let setting = Snes { depth: SnesDepth::Bpp4Plus8, palettes: 2, colors: 2,
+            dither: QuantizeDither::None, auto_pct: 100, extra_8bpp: 4 };
+        let out = run_snes(&setting, &img, [8, 8], &[true, true, true, false], 0);
+        assert!(out.deep_tiles >= 3, "automatic selection must keep all three manual pins");
+    }
+
+    #[test]
+    fn a_target_without_the_open_sheet_cannot_supply_its_preview() {
+        let img = sheet();
+        let members = [Member { image: &img, pins: vec![], open: false }];
+        assert!(run_group(&default_setting(), &members, [8, 8]).is_err());
+    }
+
+    #[test]
+    fn reduced_formats_keep_black_and_white_endpoints() {
+        for format in [GeneralFormat::Rgb565, GeneralFormat::Rgb233, GeneralFormat::Rgba5658] {
+            assert_eq!(reduce(format, [255; 3]), [255; 3]);
+            assert_eq!(reduce(format, [0; 3]), [0; 3]);
+        }
+    }
+
+    #[test]
+    fn invalid_export_preserves_the_existing_file() {
+        let dir = crate::storage::tests::Folder::new();
+        let path = dir.0.join("image.png");
+        std::fs::write(&path, b"original").unwrap();
+        assert!(quant::export_indexed_png(&path, &[Rgb::new(0, 0, 0)], &[2], 1, 1, true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        let out = run_general(default_setting().general.as_ref().unwrap(), &sheet());
+        assert!(write(&out, &path, 1, 1).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
     }
 
     /// A dither changes the general index image.

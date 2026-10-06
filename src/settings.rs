@@ -20,7 +20,7 @@ pub struct Side {
 }
 
 /// Which text fields the search matches.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct SearchIn {
     pub folders: bool,
     pub files: bool,
@@ -32,13 +32,19 @@ pub struct SearchIn {
     /// query's. It does nothing until embeddings exist for the library.
     #[serde(default = "enabled")]
     pub embeddings: bool,
+    #[serde(default)]
+    pub text_embeddings: bool,
+    #[serde(default = "similarity_floor")]
+    pub similarity: f32,
 }
+
+fn similarity_floor() -> f32 { crate::embed::FLOOR }
 
 fn enabled() -> bool { true }
 
 impl Default for SearchIn {
     fn default() -> Self {
-        SearchIn { folders: true, files: true, captions: true, tags: true, embeddings: true }
+        SearchIn { folders: true, files: true, captions: true, tags: true, embeddings: true, text_embeddings: false, similarity: similarity_floor() }
     }
 }
 

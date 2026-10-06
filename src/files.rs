@@ -23,7 +23,21 @@ pub fn relocate(root: &Path, old: &str, new: &str, copy: bool) -> Result<(), Str
     if let Some(parent) = root.join(new).parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
     if copy { std::fs::copy(root.join(old), root.join(new)).map_err(|e| e.to_string())?; }
     else { std::fs::rename(root.join(old), root.join(new)).map_err(|e| e.to_string())?; }
-    if directory { sidecar::move_prefix(root, old, new) } else { sidecar::move_entry(root, old, new, copy) }
+    let result = if directory { sidecar::move_prefix(root, old, new) } else { sidecar::move_entry(root, old, new, copy) };
+    if let Err(error) = result {
+        let rollback = if copy {
+            std::fs::remove_file(root.join(new))
+        } else if root.join(old).try_exists().unwrap_or(true) {
+            Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "the original path exists; both paths were kept"))
+        } else {
+            std::fs::rename(root.join(new), root.join(old))
+        };
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(format!("{error}. Cannot restore {old}: {rollback}")),
+        };
+    }
+    Ok(())
 }
 
 /// Deletes files and folders. The book forgets what went, even when a later
@@ -35,6 +49,7 @@ pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
             let path = root.join(rel);
             if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }.map_err(|e| format!("{rel}: {e}"))?;
             book.sheets.retain(|key, _| key != rel && !key.starts_with(&format!("{rel}/")));
+            sidecar::forget_quantize(&mut book.quantize, rel);
             Ok(())
         }))
     })?
@@ -139,6 +154,102 @@ mod tests {
             assert_eq!(drop_own_sources(&project.0, gone), Ok(1));
             assert_eq!(sidecar::load_book(&project.0).unwrap().sheets["mine.png"].provenance.len(), 3);
         }
+    }
+
+    fn quant_group(target: sidecar::QuantizeTarget, rel: &str, colors: usize) -> sidecar::QuantizeGroup {
+        let mut setting = crate::quant_panel::default_setting();
+        setting.snes.as_mut().unwrap().colors = colors;
+        sidecar::QuantizeGroup { target, setting, pins: [(rel.into(), vec![true, false])].into() }
+    }
+
+    fn create_image_file(root: &Path, rel: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"fixture").unwrap();
+    }
+
+    #[test]
+    fn quantization_file_groups_follow_rename_copy_and_partial_deletion() {
+        use sidecar::QuantizeTarget::Files;
+        let dir = Folder::new();
+        create_image_file(&dir.0, "a.png");
+        let group = quant_group(Files(vec!["a.png".into()]), "a.png", 7);
+        sidecar::store_quantize(&dir.0, &[group]).unwrap();
+        relocate(&dir.0, "a.png", "pack/b.png", false).unwrap();
+        let book = sidecar::load_book(&dir.0).unwrap();
+        assert_eq!(book.quantize[0].target, Files(vec!["pack/b.png".into()]));
+        assert_eq!(book.quantize[0].pins["pack/b.png"], [true, false]);
+        assert!(!book.quantize[0].pins.contains_key("a.png"));
+        relocate(&dir.0, "pack/b.png", "pack/c.png", true).unwrap();
+        let book = sidecar::load_book(&dir.0).unwrap();
+        assert_eq!(book.quantize[0].target, Files(vec!["pack/b.png".into(), "pack/c.png".into()]));
+        assert_eq!(book.quantize[0].pins["pack/c.png"], [true, false]);
+        assert!(remove(&dir.0, &["pack/b.png".into(), "absent.png".into()]).is_err());
+        let book = sidecar::load_book(&dir.0).unwrap();
+        assert_eq!(book.quantize[0].target, Files(vec!["pack/c.png".into()]));
+        assert!(!book.quantize[0].pins.contains_key("pack/b.png"));
+        remove(&dir.0, &["pack".into()]).unwrap();
+        assert!(sidecar::load_book(&dir.0).unwrap().quantize.is_empty());
+    }
+
+    #[test]
+    fn quantization_folder_targets_and_pins_follow_folder_renames() {
+        use sidecar::QuantizeTarget::{Dir, Files};
+        let dir = Folder::new();
+        create_image_file(&dir.0, "pack/a.png");
+        create_image_file(&dir.0, "pack/sub/b.png");
+        let groups = vec![
+            quant_group(Dir("pack/sub".into()), "pack/sub/b.png", 7),
+            quant_group(Files(vec!["pack/a.png".into()]), "pack/a.png", 3),
+        ];
+        sidecar::store_quantize(&dir.0, &groups).unwrap();
+        relocate(&dir.0, "pack", "renamed", false).unwrap();
+        let book = sidecar::load_book(&dir.0).unwrap();
+        assert_eq!(book.quantize[0].target, Dir("renamed/sub".into()));
+        assert_eq!(book.quantize[0].pins["renamed/sub/b.png"], [true, false]);
+        assert_eq!(book.quantize[1].target, Files(vec!["renamed/a.png".into()]));
+        remove(&dir.0, &["renamed".into()]).unwrap();
+        assert!(sidecar::load_book(&dir.0).unwrap().quantize.is_empty());
+    }
+
+    #[test]
+    fn a_sheet_keeps_its_source_setting_when_moved_into_another_group() {
+        use sidecar::QuantizeTarget::{Dir, Files};
+        for copy in [false, true] {
+            let dir = Folder::new();
+            create_image_file(&dir.0, "source/a.png");
+            create_image_file(&dir.0, "destination/b.png");
+            let groups = vec![
+                quant_group(Dir("source".into()), "source/a.png", 7),
+                quant_group(Dir("destination".into()), "destination/b.png", 3),
+            ];
+            sidecar::store_quantize(&dir.0, &groups).unwrap();
+            relocate(&dir.0, "source/a.png", "destination/a.png", copy).unwrap();
+            let book = sidecar::load_book(&dir.0).unwrap();
+            assert_eq!(book.quantize[0].target, Dir("source".into()));
+            assert_eq!(book.quantize[0].pins.contains_key("source/a.png"), copy);
+            assert_eq!(book.quantize[1].target, Files(vec!["destination/b.png".into()]));
+            assert_eq!(book.quantize[2].target, Files(vec!["destination/a.png".into()]));
+            assert_eq!(book.quantize[2].setting, groups[0].setting);
+            assert_eq!(book.quantize[2].pins["destination/a.png"], [true, false]);
+            assert_eq!(book.quantize[1].pins["destination/b.png"], [true, false]);
+        }
+    }
+
+    #[test]
+    fn moving_a_subfolder_out_of_a_group_keeps_its_setting() {
+        use sidecar::QuantizeTarget::{Dir, Files};
+        let dir = Folder::new();
+        create_image_file(&dir.0, "source/sub/a.png");
+        create_image_file(&dir.0, "source/stay.png");
+        let group = quant_group(Dir("source".into()), "source/sub/a.png", 7);
+        sidecar::store_quantize(&dir.0, &[group]).unwrap();
+        relocate(&dir.0, "source/sub", "moved", false).unwrap();
+        let book = sidecar::load_book(&dir.0).unwrap();
+        assert_eq!(book.quantize[0].target, Dir("source".into()));
+        assert!(book.quantize[0].pins.is_empty());
+        assert_eq!(book.quantize[1].target, Files(vec!["moved/a.png".into()]));
+        assert_eq!(book.quantize[1].pins["moved/a.png"], [true, false]);
     }
 
     #[test]

@@ -109,8 +109,9 @@ impl Runner {
             for group in &mut coordinator.job.groups {
                 if let Remote::Waiting(id) = &group.remote { group.tracking.id = id.clone(); }
             }
+            if coordinator.job.provider.uses_batch_storage() { openrouter::close_unconfirmed(&mut coordinator.job); }
             coordinator.job.poll_ms = coordinator.job.next_poll();
-            if coordinator.job.provider.kind == Kind::OpenAi
+            if coordinator.job.provider.uses_batch_storage()
                 && let Some(store) = coordinator.job.provider.store.clone() {
                 match secret {
                     Some(secret) => match crate::s3::Client::new(store, secret) {
@@ -171,7 +172,7 @@ impl Runner {
                     }
                     continue;
                 }
-                if coordinator.job.provider.kind == Kind::OpenAi && coordinator.job.provider.store.is_none() {
+                if coordinator.job.provider.kind == Kind::OpenAi && !coordinator.job.provider.uses_batch_storage() {
                     if !key.is_empty() && (label_send.is_none() || label_key != key) {
                         match Transport::new(&coordinator.job.provider, key.clone()) {
                             Ok(transport) => {
@@ -182,7 +183,7 @@ impl Runner {
                             Err(error) => { coordinator.job.issue("upload", error, now); dirty = true; label_send = None; }
                         }
                     }
-                    let ready = label_send.is_some() && coordinator.job.mode == Mode::Running
+                    let ready = !key.is_empty() && label_send.is_some() && coordinator.job.mode == Mode::Running
                         && !coordinator.job.pending_save();
                     if ready && let Some(send) = &label_send {
                         if pump.inflight() == 0 { notify(Event::Activity(Activity::before(Operation::Label))); }
@@ -223,7 +224,7 @@ impl Runner {
                         Err(error) => { coordinator.job.issue("upload", error, now); dirty = true; batch_send = None; }
                     }
                 }
-                let batch_ready = batch_send.is_some() && coordinator.job.mode == Mode::Running
+                let batch_ready = !key.is_empty() && batch_send.is_some() && coordinator.job.mode == Mode::Running
                     && !coordinator.job.pending_save();
                 if batch_ready && coordinator.job.provider.kind == Kind::Gemini && let Some(send) = &batch_send {
                     dirty |= coordinator.dispatch_submissions(&mut submits, send, &log, now);
@@ -298,6 +299,7 @@ impl Coordinator {
                 for sheet in &mut self.job.sheets {
                     if !sheet.error.is_empty() && !sheet.cancelled {
                         sheet.taken = false; sheet.error.clear(); sheet.label = None; sheet.imported = false; sheet.guard = None; sheet.unknown = 0;
+                        sheet.retry_ms = 0; sheet.attempts = 0;
                     }
                 }
                 self.job.groups.retain(|g| g.remote != Remote::Done);
@@ -360,7 +362,10 @@ impl Coordinator {
     fn collect(&mut self, (i, reply): (usize, Result<Value, Failure>), now: u64) {
         let response = reply.is_ok() || matches!(&reply, Err(Failure::Status(_, _)));
         let auth = matches!(&reply, Err(Failure::Status(401 | 403, _)));
-        let _ = finish_one(&mut self.job, &self.dir, i, reply, now);
+        if self.job.sheets[i].cancelled { return; }
+        if let Err(error) = finish_one(&mut self.job, &self.dir, i, reply, now) {
+            self.job.sheets[i].error = error;
+        }
         if response { self.job.last_response_ms = now; }
         if auth { self.job.mode = Mode::Paused; }
     }
@@ -369,13 +374,11 @@ impl Coordinator {
     /// A submission that is out or awaiting confirmation counts against the
     /// same number, so a flaky connection cannot pile up unconfirmed work.
     fn dispatch_submissions(&mut self, submits: &mut Submits, send: &Arc<SendFn>, log: &crate::ai_log::Log, now: u64) -> bool {
+        if !self.job.due("upload", now) { return false; }
         let limit = self.job.concurrency.max(1) as usize;
         let mut worked = false;
         while self.job.untaken() {
-            let outstanding = submits.inflight() + self.job.groups.iter()
-                .filter(|g| g.remote == Remote::Submitting)
-                .filter(|g| g.recovery.as_ref().is_some_and(|r| !submits.busy.contains(&r.reference)))
-                .count();
+            let outstanding = self.job.groups.iter().filter(|g| g.remote != Remote::Done).count();
             if outstanding >= limit { break; }
             match prepare_submission(&mut self.job, &self.root, &self.dir) {
                 Ok(Some((reference, path, body))) => {
@@ -388,7 +391,7 @@ impl Coordinator {
                     });
                     worked = true;
                 }
-                Ok(None) => break,
+                Ok(None) => { worked = true; break; },
                 Err(error) => { self.job.issue("upload", error, now); worked = true; break; }
             }
         }
@@ -485,11 +488,12 @@ impl Job {
         let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
         let recoverable = self.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_some());
         let allowed = |op: Operation| self.due(op.name(), now) && match op {
-            Operation::Label => self.provider.kind == Kind::OpenAi && self.provider.store.is_none() && self.mode == Mode::Running && self.untaken() && !self.pending_save(),
+            Operation::Label => self.provider.kind == Kind::OpenAi && !self.provider.uses_batch_storage()
+                && self.mode == Mode::Running && self.untaken() && !self.pending_save(),
             // Gemini submissions run on the dispatcher's own pool. An OpenRouter
             // batch submission runs through this ordinary operation path.
-            Operation::Submit => self.provider.store.is_some() && self.mode == Mode::Running && self.untaken() && !self.pending_save()
-                && !self.groups.iter().any(|g| g.remote == Remote::Submitting),
+            Operation::Submit => self.provider.uses_batch_storage() && self.mode == Mode::Running && self.untaken() && !self.pending_save()
+                && self.groups.iter().filter(|g| g.remote != Remote::Done).count() < self.concurrency.max(1) as usize,
             Operation::Poll => waiting && self.poll_ms <= now,
             Operation::Recover => recoverable && self.recovery_ms <= now,
             Operation::Cancel => self.mode == Mode::Cancelling
@@ -758,6 +762,48 @@ mod tests {
         assert!(!c.dispatch_submissions(&mut submits, &send, &log, 2_000));
         assert_eq!(submits.inflight(), 0);
         assert_eq!(c.job.groups.iter().filter(|g| g.remote == Remote::Submitting).count(), 1);
+    }
+
+    #[test]
+    fn accepted_batches_fill_the_concurrency() {
+        let f = Fixture::new(); let mut c = f.coordinator();
+        c.job.concurrency = 1;
+        c.step(Operation::Submit, 1_000, |_, _| Ok(json!({"name":"batches/running"})));
+        let mut queued = c.job.sheets[0].clone(); queued.taken = false; c.job.sheets.push(queued);
+        let mut submits = Submits::new();
+        let send: Arc<SendFn> = Arc::new(|_, _| panic!("the running batch occupies the slot"));
+        assert!(!c.dispatch_submissions(&mut submits, &send, &crate::ai_log::Log::single("test"), 2_000));
+        assert_eq!(submits.inflight(), 0);
+    }
+
+    #[test]
+    fn submission_backoff_prevents_an_immediate_retry() {
+        let f = Fixture::new(); let mut c = f.coordinator();
+        c.step(Operation::Submit, 1_000, |_, _| Err(Failure::Status(429, "Wait".into())));
+        let mut submits = Submits::new();
+        let send: Arc<SendFn> = Arc::new(|_, _| panic!("the retry time has not arrived"));
+        assert!(!c.dispatch_submissions(&mut submits, &send, &crate::ai_log::Log::single("test"), 2_000));
+        assert!(c.job.untaken());
+    }
+
+    #[test]
+    fn cancelled_requests_do_not_save_late_results() {
+        let f = Fixture::new(); let mut c = f.coordinator();
+        f.control(Mode::Cancelling, 1_000); c.control().unwrap();
+        c.collect((0, Ok(crate::labels::tests::completion(crate::labels::tests::labeled("Late")))), 2_000);
+        assert!(c.job.sheets[0].cancelled);
+        assert!(!c.job.pending_save());
+    }
+
+    #[test]
+    fn unreadable_sheets_publish_the_finished_state() {
+        let f = Fixture::new(); let mut c = f.coordinator();
+        std::fs::remove_file(f.root.join("sheet.png")).unwrap();
+        let mut submits = Submits::new();
+        let send: Arc<SendFn> = Arc::new(|_, _| panic!("no readable image"));
+        assert!(c.dispatch_submissions(&mut submits, &send, &crate::ai_log::Log::single("test"), 1_000));
+        assert!(c.job.done());
+        assert!(!c.job.sheets[0].error.is_empty());
     }
 
     /// A prepared submission goes out on a worker, and its reply turns the

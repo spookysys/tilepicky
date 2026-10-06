@@ -47,7 +47,9 @@ pub fn index_image(result: &Quantized, job: &Job, width: u32, height: u32) -> Ve
             }
             let shallow = job.shallow_pixels.get((y * width + x) as usize).copied().unwrap_or(false);
             let value = match shallow_part {
+                Some(part) if shallow && part[i] == 0 => 0,
                 Some(part) if shallow => palette * stride + u32::from(part[i]),
+                _ if index == 0 => 0,
                 _ if deep => u32::from(index),
                 _ => palette * stride + u32::from(index),
             };
@@ -101,28 +103,49 @@ pub fn export_indexed_png(
     height: u32,
     key: bool,
 ) -> Result<(), String> {
-    let depth = index_depth(palette.len());
-    let bits = depth as u8;
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-    encoder.set_color(png::ColorType::Indexed);
-    encoder.set_depth(depth);
-    let rgb: Vec<u8> = palette.iter().flat_map(|c| [c.r, c.g, c.b]).collect();
-    encoder.set_palette(rgb);
-    if key && !palette.is_empty() {
-        let mut trns = vec![255u8; palette.len()];
-        trns[0] = 0;
-        encoder.set_trns(trns);
+    let count = (width as usize).checked_mul(height as usize).ok_or("The PNG dimensions are too large.")?;
+    if width == 0 || height == 0 || palette.is_empty() || palette.len() > 256 || indices.len() != count {
+        return Err("The indexed PNG dimensions, palette, or pixel count are invalid.".into());
     }
-    let packed = pack_rows(indices, width, height, bits);
-    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-    writer.write_image_data(&packed).map_err(|e| e.to_string())?;
-    Ok(())
+    if indices.iter().any(|&i| i as usize >= palette.len()) {
+        return Err("A PNG pixel refers to a missing palette entry.".into());
+    }
+    let depth = index_depth(palette.len());
+    let packed = pack_rows(indices, width, height, depth as u8);
+    crate::storage::replace(path, false, |file| {
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(depth);
+        encoder.set_palette(palette.iter().flat_map(|c| [c.r, c.g, c.b]).collect::<Vec<_>>());
+        if key {
+            let mut trns = vec![255u8; palette.len()];
+            trns[0] = 0;
+            encoder.set_trns(trns);
+        }
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&packed)?;
+        writer.finish()?;
+        Ok(())
+    }).map_err(|e| e.to_string())
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_pixels_of_later_subpalettes_use_global_zero() {
+        let result = Quantized {
+            palettes: vec![vec![Rgb::new(0, 0, 0); 2]; 2], tile_palette: vec![1], tile_deep: vec![false],
+            tiles: vec![vec![0, 1]], shallow_parts: vec![None], deep_colors: vec![],
+            error: 0.0, pixel_error: 0.0, block_error: 0.0,
+        };
+        let mut job = Job::new(4, 2, 1);
+        job.tile_width = 2;
+        job.tile_height = 1;
+        assert_eq!(index_image(&result, &job, 2, 1), vec![0, 17]);
+    }
 
     #[test]
     fn rows_pack_from_the_high_bit() {

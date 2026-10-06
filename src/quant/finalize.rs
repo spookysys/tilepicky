@@ -31,7 +31,7 @@ fn dedup_reduced(colors: &[Oklab]) -> Vec<Rgb> {
     let mut reduced: Vec<Rgb> = Vec::new();
     for &color in colors {
         let rgb = oklab_to_rgb8(color).reduce();
-        if rgb != Rgb::new(0, 0, 0) && !reduced.contains(&rgb) {
+        if !reduced.contains(&rgb) {
             reduced.push(rgb);
         }
     }
@@ -128,6 +128,7 @@ pub(crate) fn finalize(
     tile_colors: &[Vec<Oklab>],
     capacity: usize,
     color_zero: Option<Rgb>,
+    explicit_transparency: bool,
 ) -> Vec<Vec<Rgb>> {
     let zero = color_zero.map_or(Rgb::new(0, 0, 0), |c| c.reduce());
     subpalettes
@@ -146,7 +147,7 @@ pub(crate) fn finalize(
                 reduced = grow_to_capacity(reduced, &assigned, capacity);
             }
             // Index 0 is the shared color zero.
-            reduced.retain(|&c| c != zero);
+            if !explicit_transparency { reduced.retain(|&c| c != zero); }
             reduced.insert(0, zero);
             let zero_entry = reduced[0];
             let mut rest: Vec<Rgb> = reduced[1..].to_vec();

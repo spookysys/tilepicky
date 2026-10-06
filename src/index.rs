@@ -18,6 +18,7 @@ pub struct Entry {
     pub side: Sidecar,
     /// The sheet's embedding, when the library has one; see `embed`.
     pub embed: Option<Vec<f32>>,
+    pub text_embed: Option<Vec<f32>>,
 }
 
 pub struct Index {
@@ -35,6 +36,12 @@ pub struct Index {
     pub free_tags: usize,
     /// The model the library's embeddings came from. Empty when there are none.
     pub embed_model: String,
+    pub embed_provider: String,
+    pub embed_labels: bool,
+    pub embed_error: Option<String>,
+    pub text_embed_model: String,
+    pub text_embed_provider: String,
+    pub text_embed_error: Option<String>,
     /// The color quantization groups of this project.
     pub quantize: Vec<QuantizeGroup>,
 }
@@ -53,6 +60,12 @@ impl Index {
                 tag_list: Vec::new(),
                 free_tags: sidecar::FREE_TAGS,
                 embed_model: String::new(),
+                embed_provider: String::new(),
+                embed_labels: false,
+                embed_error: None,
+                text_embed_model: String::new(),
+                text_embed_provider: String::new(),
+                text_embed_error: None,
                 quantize: Vec::new(),
             };
         }
@@ -79,17 +92,21 @@ impl Index {
         let (mut book, error) = match sidecar::load_book(root) {
             Ok(book) => (book, None), Err(e) => (sidecar::Book::default(), Some(e)),
         };
-        // A damaged embeddings file leaves semantic search off; the book's own
-        // error is the one the panel shows.
-        let embeddings = embed::read(root).unwrap_or_default();
+        let (embeddings, embed_error) = match embed::read(root) {
+            Ok(data) => (data, None), Err(error) => (Default::default(), Some(error)),
+        };
+        let (text_embeddings, text_embed_error) = match embed::read_mode(root, embed::InputMode::Text) {
+            Ok(data) => (data, None), Err(error) => (Default::default(), Some(error)),
+        };
         let entries = rels
             .into_iter()
             .map(|rel| {
                 let side = book.sheets.remove(&rel).unwrap_or_default();
                 let (dirs, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
                 let (dir_words, name_words) = (words(dirs), path_words(name));
-                let vector = embeddings.sheets.get(&rel).map(|v| v.vec.clone());
-                Entry { dir_words, name_words, side, rel, embed: vector }
+                let vector = embed::current_vector(root, &rel, &side, &embeddings, embed::InputMode::Image);
+                let text_embed = embed::current_vector(root, &rel, &side, &text_embeddings, embed::InputMode::Text);
+                Entry { dir_words, name_words, side, rel, embed: vector, text_embed }
             })
             .collect();
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
@@ -105,6 +122,12 @@ impl Index {
             tag_list,
             free_tags,
             embed_model: embeddings.model,
+            embed_provider: embeddings.provider,
+            embed_labels: embeddings.labels,
+            embed_error,
+            text_embed_model: text_embeddings.model,
+            text_embed_provider: text_embeddings.provider,
+            text_embed_error,
             quantize,
         }
     }
@@ -146,35 +169,39 @@ impl Index {
     /// True when every query word is the prefix of a word in the fields that
     /// `search` names, or when the sheet's embedding is close to `embed`.
     /// The embedding is a sibling of the text fields: either one can match.
-    pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn, embed: Option<&[f32]>) -> bool {
+    pub fn entry_matches(e: &Entry, query: &[String], search: SearchIn, embed: Option<&[f32]>, text_query: Option<&[f32]>) -> bool {
         let starts = |ws: &[String], q: &str| ws.iter().any(|w| w.starts_with(q));
         let label = e.side.label.as_ref();
         let caption = label.filter(|_| search.captions).map(|l| words(&l.caption)).unwrap_or_default();
         let tags = label.filter(|_| search.tags).map(|l| words(&l.tags.join(" "))).unwrap_or_default();
         let prefix = matches(query, |q| (search.folders && starts(&e.dir_words, q)) || (search.files && starts(&e.name_words, q))
             || starts(&caption, q) || starts(&tags, q));
-        let semantic = search.embeddings
-            && embed.is_some_and(|q| e.embed.as_deref().is_some_and(|v| embed::cosine(q, v) >= embed::FLOOR));
-        prefix || semantic
+        let similar = |query: Option<&[f32]>, vector: Option<&[f32]>| {
+            query.zip(vector).is_some_and(|(q, v)| !q.is_empty() && q.len() == v.len()
+                && embed::cosine(q, v) >= search.similarity.clamp(0.0, 1.0))
+        };
+        let semantic = search.embeddings && similar(embed, e.embed.as_deref());
+        let text_semantic = search.text_embeddings && similar(text_query, e.text_embed.as_deref());
+        prefix || semantic || text_semantic
     }
 
-    pub fn visible(&self, query: &[String], search: SearchIn, embed: Option<&[f32]>) -> Option<Vec<bool>> {
+    pub fn visible(&self, query: &[String], search: SearchIn, embed: Option<&[f32]>, text_query: Option<&[f32]>) -> Option<Vec<bool>> {
         if query.is_empty() {
             return None;
         }
-        Some(self.entries.iter().map(|e| Self::entry_matches(e, query, search, embed)).collect())
+        Some(self.entries.iter().map(|e| Self::entry_matches(e, query, search, embed, text_query)).collect())
     }
 }
 
-/// Lower-case letter runs, at least two letters long, without duplicates.
+/// Lower-case runs of letters and digits, without duplicates.
 pub fn words(s: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     for ch in s.chars().chain(std::iter::once(' ')) {
-        if ch.is_alphabetic() {
+        if ch.is_alphanumeric() {
             cur.extend(ch.to_lowercase());
         } else if !cur.is_empty() {
-            if cur.chars().count() >= 2 && !out.contains(&cur) {
+            if !out.contains(&cur) {
                 out.push(cur.clone());
             }
             cur.clear();
@@ -203,22 +230,23 @@ mod tests {
     use super::*;
 
     fn entry(rel: &str, embed: Option<Vec<f32>>) -> Entry {
-        Entry { dir_words: words("props"), name_words: path_words(rel), side: Sidecar::default(), rel: rel.into(), embed }
+        Entry { dir_words: words("props"), name_words: path_words(rel), side: Sidecar::default(), rel: rel.into(), embed, text_embed: None }
     }
 
     /// The embedding is a sibling of the text fields: a sheet can match by
     /// meaning when no word matches, and the checkbox turns it off. With no
     /// vector ready, nothing matches by meaning.
     #[test]
-    fn a_sheet_matches_by_meaning_beside_the_words() {        let e = entry("props/tree.png", Some(vec![1.0, 0.0]));
+    fn a_sheet_matches_by_meaning_beside_the_words() {
+        let e = entry("props/tree.png", Some(vec![1.0, 0.0]));
         let search = SearchIn::default();
         let query = words("cozy");
-        assert!(!Index::entry_matches(&e, &query, search, None), "no prefix match, no vector");
-        assert!(Index::entry_matches(&e, &query, search, Some(&[1.0, 0.0])), "a close vector matches");
-        assert!(!Index::entry_matches(&e, &query, search, Some(&[0.0, 1.0])), "a far vector does not");
+        assert!(!Index::entry_matches(&e, &query, search, None, None), "no prefix match, no vector");
+        assert!(Index::entry_matches(&e, &query, search, Some(&[1.0, 0.0]), None), "a close vector matches");
+        assert!(!Index::entry_matches(&e, &query, search, Some(&[0.0, 1.0]), None), "a far vector does not");
         let off = SearchIn { embeddings: false, ..search };
-        assert!(!Index::entry_matches(&e, &query, off, Some(&[1.0, 0.0])), "the checkbox turns it off");
-        assert!(Index::entry_matches(&e, &words("tree"), search, None), "the words still match on their own");
+        assert!(!Index::entry_matches(&e, &query, off, Some(&[1.0, 0.0]), None), "the checkbox turns it off");
+        assert!(Index::entry_matches(&e, &words("tree"), search, None, None), "the words still match on their own");
     }
 
     /// A folder target covers the sheets below it; a file target names them.
@@ -230,6 +258,7 @@ mod tests {
             name_words: Vec::new(),
             side: Sidecar::default(),
             embed: None,
+            text_embed: None,
         };
         let index = Index {
             root: PathBuf::new(),
@@ -240,6 +269,12 @@ mod tests {
             tag_list: Vec::new(),
             free_tags: sidecar::FREE_TAGS,
             embed_model: String::new(),
+            embed_provider: String::new(),
+            embed_labels: false,
+            embed_error: None,
+            text_embed_model: String::new(),
+            text_embed_provider: String::new(),
+            text_embed_error: None,
             quantize: Vec::new(),
         };
         assert_eq!(index.quantize_members(&QuantizeTarget::Dir("props".into())), ["props/tree.png", "props/rock.png"]);
@@ -252,4 +287,32 @@ mod tests {
         assert_eq!(index.target_name(&QuantizeTarget::Files(vec!["a.png".into()])), "a.png");
         assert_eq!(index.target_name(&QuantizeTarget::Files(vec!["a.png".into(), "b.png".into()])), "2 files");
     }
+    #[test]
+    fn text_and_image_search_have_independent_switches() {
+        let mut e = entry("tree.png", Some(vec![1.0, 0.0]));
+        e.text_embed = Some(vec![0.0, 1.0]);
+        let mut search = SearchIn { files: false, folders: false, captions: false, tags: false, ..SearchIn::default() };
+        let query = words("forest");
+        assert!(!Index::entry_matches(&e, &query, search, Some(&[0.0, 1.0]), Some(&[0.0, 1.0])));
+        search.embeddings = false;
+        search.text_embeddings = true;
+        assert!(Index::entry_matches(&e, &query, search, Some(&[0.0, 1.0]), Some(&[0.0, 1.0])));
+        search.similarity = 0.0;
+        assert!(!Index::entry_matches(&e, &query, search, None, Some(&[1.0])));
+        search.similarity = 0.9;
+        assert!(!Index::entry_matches(&e, &query, search, None, Some(&[1.0, 1.0])));
+    }
+
+    #[test]
+    fn file_search_keeps_dimensions_numbers_and_single_letters() {
+        assert_eq!(words("8x8 16 A a Ø 16"), ["8x8", "16", "a", "ø"]);
+        let search = SearchIn { folders: false, embeddings: false, ..SearchIn::default() };
+        let tiles = entry("terrain_16x16_02.png", None);
+        assert!(Index::entry_matches(&tiles, &words("16x16 02"), search, None, None));
+        assert!(!Index::entry_matches(&tiles, &words("8x8"), search, None, None));
+        let letter = entry("a.png", None);
+        assert!(Index::entry_matches(&letter, &words("a"), search, None, None));
+        assert!(!Index::entry_matches(&letter, &words("b"), search, None, None));
+    }
+
 }

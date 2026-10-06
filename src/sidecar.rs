@@ -416,6 +416,7 @@ pub fn move_entry(dir: &Path, old: &str, new: &str, keep_old: bool) -> Result<()
             }
             book.sheets.insert(new.to_string(), e);
         }
+        relocate_quantize(dir, &mut book.quantize, old, new, keep_old, false)?;
         Ok(())
     })
 }
@@ -430,8 +431,117 @@ pub fn move_prefix(dir: &Path, old: &str, new: &str) -> Result<(), String> {
                 None => (k, v),
             })
             .collect();
+        relocate_quantize(dir, &mut book.quantize, old, new, false, true)?;
         Ok(())
     })
+}
+
+fn path_under(path: &str, prefix: &str) -> bool {
+    prefix.is_empty() || path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn quantize_covers(target: &QuantizeTarget, rel: &str) -> bool {
+    match target {
+        QuantizeTarget::Dir(dir) => path_under(rel, dir),
+        QuantizeTarget::Files(files) => files.iter().any(|file| file == rel),
+    }
+}
+
+/// Source settings follow a move or copy. A conflicting folder group becomes an explicit file group.
+fn relocate_quantize(
+    root: &Path, groups: &mut Vec<QuantizeGroup>, old: &str, new: &str, copy: bool, folder: bool,
+) -> Result<(), String> {
+    if groups.is_empty() { return Ok(()); }
+    let map = |path: &str| -> Option<String> {
+        if path == old { Some(new.into()) }
+        else if folder { path.strip_prefix(&format!("{old}/")).map(|tail| format!("{new}/{tail}")) }
+        else { None }
+    };
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.map_err(|e| format!("Cannot update quantization paths: {e}"))?;
+        if !entry.file_type().is_file() { continue; }
+        let ext = entry.path().extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+        if crate::index::IMAGE_EXTS.contains(&ext.as_str()) {
+            let rel = entry.path().strip_prefix(root).map_err(|e| e.to_string())?;
+            files.push(rel.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"));
+        }
+    }
+    files.sort();
+    let mut moved = BTreeMap::new();
+    if folder {
+        for rel in &files {
+            if let Some(tail) = rel.strip_prefix(&format!("{new}/")) { moved.insert(format!("{old}/{tail}"), rel.clone()); }
+        }
+        for group in groups.iter() {
+            if let QuantizeTarget::Files(rels) = &group.target {
+                for rel in rels {
+                    if let Some(destination) = map(rel) { moved.insert(rel.clone(), destination); }
+                }
+            }
+        }
+    } else {
+        moved.insert(old.into(), new.into());
+    }
+    let owners: BTreeMap<_, _> = moved.iter().filter_map(|(source, destination)| {
+        groups.iter().position(|g| quantize_covers(&g.target, source)).map(|owner| (destination.clone(), owner))
+    }).collect();
+    let mut additions = Vec::new();
+    for (index, group) in groups.iter_mut().enumerate() {
+        let previous = group.clone();
+        match &mut group.target {
+            QuantizeTarget::Dir(dir) if folder => {
+                if let Some(destination) = map(dir) { *dir = destination; }
+            }
+            QuantizeTarget::Files(rels) => {
+                let replacements: Vec<_> = rels.iter().filter_map(|rel| map(rel)).collect();
+                if !copy { rels.retain(|rel| map(rel).is_none()); }
+                rels.extend(replacements);
+                rels.sort();
+                rels.dedup();
+            }
+            _ => {}
+        }
+        // Remove stale destination pins before assigning pins from the source.
+        group.pins.retain(|rel, _| !moved.values().any(|destination| destination == rel));
+        for (rel, pins) in &previous.pins {
+            if let Some(destination) = map(rel) {
+                if !copy { group.pins.remove(rel); }
+                group.pins.insert(destination, pins.clone());
+            }
+        }
+        let excluded: Vec<_> = owners.iter().filter(|(_, owner)| **owner != index).map(|(rel, _)| rel.clone()).collect();
+        if excluded.iter().any(|rel| quantize_covers(&group.target, rel)) {
+            let members = match &group.target {
+                QuantizeTarget::Files(rels) => rels.clone(),
+                QuantizeTarget::Dir(_) => files.iter().filter(|rel| quantize_covers(&group.target, rel)).cloned().collect(),
+            };
+            group.target = QuantizeTarget::Files(members.into_iter().filter(|rel| !excluded.contains(rel)).collect());
+            group.pins.retain(|rel, _| !excluded.contains(rel));
+        }
+        let extra: Vec<_> = owners.iter().filter(|(rel, owner)| **owner == index && !quantize_covers(&group.target, rel))
+            .map(|(rel, _)| rel.clone()).collect();
+        if !extra.is_empty() {
+            let pins = group.pins.iter().filter(|(rel, _)| extra.contains(rel)).map(|(rel, pins)| (rel.clone(), pins.clone())).collect();
+            group.pins.retain(|rel, _| !extra.contains(rel));
+            additions.push(QuantizeGroup { target: QuantizeTarget::Files(extra), setting: group.setting.clone(), pins });
+        }
+    }
+    groups.extend(additions);
+    groups.retain(|group| !matches!(&group.target, QuantizeTarget::Files(rels) if rels.is_empty()));
+    Ok(())
+}
+
+/// Removes the deleted path and its descendants from group targets and tile pins.
+pub fn forget_quantize(groups: &mut Vec<QuantizeGroup>, removed: &str) {
+    for group in groups.iter_mut() {
+        group.pins.retain(|rel, _| !path_under(rel, removed));
+        if let QuantizeTarget::Files(rels) = &mut group.target { rels.retain(|rel| !path_under(rel, removed)); }
+    }
+    groups.retain(|group| match &group.target {
+        QuantizeTarget::Files(rels) => !rels.is_empty(),
+        QuantizeTarget::Dir(dir) => !path_under(dir, removed),
+    });
 }
 
 fn not(b: &bool) -> bool {
@@ -477,8 +587,20 @@ pub fn store_labels<'a>(dir: &Path, labels: impl IntoIterator<Item = (&'a str, O
 }
 
 /// Replaces the quantization groups of a project in one write.
+#[cfg(test)]
 pub fn store_quantize(dir: &Path, groups: &[QuantizeGroup]) -> Result<(), String> {
     update_book(dir, |book| {
+        book.quantize = groups.to_vec();
+        Ok(())
+    })
+}
+
+/// Saves groups only if another process has not changed them since the scan.
+pub fn replace_quantize(dir: &Path, expected: &[QuantizeGroup], groups: &[QuantizeGroup]) -> Result<(), String> {
+    update_book(dir, |book| {
+        if book.quantize != expected {
+            return Err("The quantization settings changed on disk. Reload the project before you save them.".into());
+        }
         book.quantize = groups.to_vec();
         Ok(())
     })
@@ -663,6 +785,16 @@ mod tests {
     }
 
     /// A group keeps its target, its setting, and its per-sheet tile pins.
+    #[test]
+    fn quantization_save_does_not_replace_a_concurrent_change() {
+        let dir = crate::storage::tests::Folder::new();
+        let group = QuantizeGroup { target: QuantizeTarget::Files(vec!["a.png".into()]),
+            setting: crate::quant_panel::default_setting(), pins: Default::default() };
+        store_quantize(&dir.0, std::slice::from_ref(&group)).unwrap();
+        assert!(replace_quantize(&dir.0, &[], &[]).is_err());
+        assert_eq!(load_book(&dir.0).unwrap().quantize, vec![group]);
+    }
+
     #[test]
     fn quantization_groups_roundtrip() {
         let folder = crate::storage::tests::Folder::new();

@@ -147,6 +147,7 @@ pub(crate) fn extract(
         width,
         height,
         zero: reduced_color_of(job.color_zero),
+        transparent: job.transparent_pixels.as_deref(),
     };
 
     let shallow = |x: u32, y: u32| {
@@ -190,6 +191,7 @@ struct Region<'a> {
     width: u32,
     height: u32,
     zero: Rgb,
+    transparent: Option<&'a [bool]>,
 }
 
 impl Region<'_> {
@@ -223,7 +225,7 @@ impl Region<'_> {
                 }
                 let source = self.image[(py * self.width + px) as usize];
                 let reduced_color = source.reduce();
-                if reduced_color == self.zero {
+                if self.transparent.map_or(reduced_color == self.zero, |mask| mask[(py * self.width + px) as usize]) {
                     slots.push(None);
                     continue;
                 }
@@ -371,8 +373,8 @@ impl Choices {
     /// One subpalette. Entry 0 is the color-zero slot.
     pub(crate) fn subpalette(palette: &[Rgb]) -> Self {
         Choices {
-            colors: palette.iter().map(|&c| srgb_to_oklab(c)).collect(),
-            indices: (0..palette.len()).map(|i| i as u8).collect(),
+            colors: palette.iter().skip(1).map(|&c| srgb_to_oklab(c)).collect(),
+            indices: (1..palette.len()).map(|i| i as u8).collect(),
         }
     }
 
@@ -401,8 +403,7 @@ pub(crate) fn render_tile(tile: &TileData, choices: &Choices, settings: Settings
             continue;
         };
         let color = tile.colors[*color_index];
-        // Entry 0 is a candidate too, so a dark pixel can match the
-        // color-zero slot, as the reference's output pass allows.
+        // Opaque pixels cannot select the transparent entry.
         let index = if let Some(pattern) = settings.dither {
             let x = tile.origin.0 + (p as u32 % across);
             let y = tile.origin.1 + (p as u32 / across);

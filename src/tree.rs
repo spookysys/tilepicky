@@ -24,8 +24,12 @@ pub enum TreeAction {
     SelectDir(String),
     /// Run a library batch over the marked files and folders.
     BatchMarked,
-    /// Generate embeddings for the labeled sheets of this library.
-    Embeddings,
+    /// Generate embeddings for these library files.
+    Embeddings(Vec<usize>),
+    /// Generate embeddings for this library folder.
+    EmbeddingsDir(String),
+    /// Generate embeddings for the marked files and folders.
+    EmbeddingsMarked,
     /// Ctrl+click: add or remove the file from the marked set.
     Toggle(usize),
     /// Shift+click: mark the range from the anchor to this file; with Ctrl
@@ -198,11 +202,6 @@ impl Node {
                 action = Some(if ui.input(|i| i.modifiers.command) { TreeAction::ToggleDir(rel.clone()) }
                     else { TreeAction::SelectDir(rel.clone()) });
             }
-            // Ctrl+click a folder of the project chooses it as the color
-            // quantization target.
-            if v.menus && header.header_response.clicked() && ui.input(|i| i.modifiers.command) {
-                action = Some(TreeAction::QuantizeDir(rel.clone()));
-            }
             // A marked folder wears the selection colour.
             if v.marked_dirs.is_some_and(|d| d.contains(&rel)) {
                 let fill = ui.visuals().selection.bg_fill;
@@ -217,18 +216,18 @@ impl Node {
             header.header_response.context_menu(|ui| {
                 // The library offers its folder to a batch job.
                 if !v.menus {
-                    let marked = v.marked.is_some_and(|m| !m.is_empty()) || v.marked_dirs.is_some_and(|d| !d.is_empty());
+                    let marked = v.marked_dirs.is_some_and(|d| d.contains(&rel));
                     if marked {
-                        if ui.button("Generate Labels (AI)…").clicked() {
+                        if ui.button("Generate labels for selection (AI)...").clicked() {
                             action = Some(TreeAction::BatchMarked);
                             ui.close();
                         }
-                    } else if ui.button("Generate Tags (AI)…").clicked() {
+                    } else if ui.button("Generate labels for folder (AI)...").clicked() {
                         action = Some(TreeAction::BatchDir(rel.clone()));
                         ui.close();
                     }
-                    if ui.button("Generate Embeddings (AI)…").clicked() {
-                        action = Some(TreeAction::Embeddings);
+                    if ui.button("Generate search embeddings (AI)...").clicked() {
+                        action = Some(if marked { TreeAction::EmbeddingsMarked } else { TreeAction::EmbeddingsDir(rel.clone()) });
                         ui.close();
                     }
                     ui.separator();
@@ -329,9 +328,9 @@ impl Node {
             let count = v.marked.map_or(0, HashSet::len);
             r.context_menu(|ui| {
                 if !v.menus {
-                    let any_dirs = v.marked_dirs.is_some_and(|d| !d.is_empty());
-                    if group || any_dirs {
-                        if ui.button("Generate Labels (AI)…").clicked() {
+                    let marked = is_marked && (group || v.marked_dirs.is_some_and(|d| !d.is_empty()));
+                    if marked {
+                        if ui.button("Generate labels for selection (AI)...").clicked() {
                             action = Some(TreeAction::BatchMarked);
                             ui.close();
                         }
@@ -339,8 +338,8 @@ impl Node {
                     } else if let Some(command) = crate::labels::menu(ui) {
                         action = Some(TreeAction::Labels(*i, command));
                     }
-                    if ui.button("Generate Embeddings (AI)…").clicked() {
-                        action = Some(TreeAction::Embeddings);
+                    if ui.button("Generate search embeddings (AI)...").clicked() {
+                        action = Some(if marked { TreeAction::EmbeddingsMarked } else { TreeAction::Embeddings(vec![*i]) });
                         ui.close();
                     }
                 }

@@ -125,8 +125,7 @@ pub struct Job {
     log_id: String,
     pub provider: Provider,
     pub model: String,
-    /// How many ordinary requests the job keeps in flight. Only an
-    /// OpenAI-style provider reads it; a Gemini job submits batches.
+    /// Maximum active requests, or active batches when the provider uses batches.
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
     pub sheets: Vec<Sheet>,
@@ -183,7 +182,7 @@ enum Operation { Label, Submit, Poll, Recover, Cancel }
 impl Job {
     fn operation(&self) -> Operation {
         let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
-        if self.provider.kind == Kind::OpenAi && self.provider.store.is_none() { Operation::Label }
+        if self.provider.kind == Kind::OpenAi && !self.provider.uses_batch_storage() { Operation::Label }
         else if waiting && (self.poll_next || (!self.untaken() && !self.uncertain())) { Operation::Poll }
         else if self.uncertain() && (!self.submit_next || !self.untaken()) { Operation::Recover }
         else if self.untaken() { Operation::Submit }
@@ -523,6 +522,7 @@ fn openai_batch_outputs(value: &Value) -> Result<Option<Vec<(String, Value)>>, S
 fn record(sheet: &mut Sheet, job: (&str, &str, &[String]), reply: Result<labels::Reply, String>) {
     match reply {
         Ok(reply) => {
+            sheet.error.clear();
             let label = reply.into_label(job.0, job.1, job.2);
             if label.status == Status::Unlabelable { sheet.error = "The model could not label the sheet.".into(); }
             sheet.label = Some(label);
@@ -1045,6 +1045,7 @@ impl Panel {
     fn state(&self, job: &Job) -> String {
         if !self.storage_error.is_empty() { return "Job needs attention".into(); }
         if job.done() {
+            if job.issues.contains_key("cleanup") { return "Job finished; uploaded objects need cleanup".into(); }
             if job.mode == Mode::Cancelling { return "Cancelled; saved labels kept".into(); }
             let failed = job.sheets.iter().filter(|s| !s.error.is_empty() && s.label.is_none()).count();
             return if failed == 0 { "Finished".into() }
@@ -1056,7 +1057,9 @@ impl Panel {
             return if job.issues.contains_key("save") { "Could not save labels; retry pending".into() } else { "Saving received labels".into() };
         }
         if self.mode(job) == Mode::Paused {
-            return if job.provider.kind == Kind::Gemini || job.provider.store.is_some() { "Uploads paused; submitted work can continue".into() } else { "Labeling paused".into() };
+            return if job.provider.kind == Kind::Gemini || job.provider.uses_batch_storage() {
+                "Uploads paused; submitted work can continue".into()
+            } else { "Labeling paused".into() };
         }
         if job.issues.contains_key("upload")
             || (job.provider.kind == Kind::OpenAi && job.sheets.iter().any(|s| !s.taken && s.retry_ms > now_ms())) {
@@ -1066,8 +1069,13 @@ impl Panel {
         if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= job.concurrency.max(1) as usize {
             return "Waiting for upload confirmations".into();
         }
+        if job.untaken() && job.groups.iter().filter(|g| g.remote != Remote::Done).count() >= job.concurrency.max(1) as usize {
+            return "Waiting for submitted batches to finish".into();
+        }
         if job.untaken() {
-            return if job.provider.kind == Kind::Gemini || job.provider.store.is_some() { "Uploading remaining sheets".into() } else { "Labeling sheets".into() };
+            return if job.provider.kind == Kind::Gemini || job.provider.uses_batch_storage() {
+                "Uploading remaining sheets".into()
+            } else { "Labeling sheets".into() };
         }
         if job.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_))) {
             let states: Vec<_> = job.groups.iter().filter(|g| matches!(g.remote, Remote::Waiting(_)))
@@ -1135,11 +1143,12 @@ impl Panel {
             ui.horizontal_wrapped(|ui| {
                 if !job.done() && mode != Mode::Cancelling {
                     let text = if mode == Mode::Paused { "Resume" }
-                        else if job.provider.kind == Kind::Gemini || job.provider.store.is_some() { "Pause uploads" } else { "Pause" };
+                        else if job.provider.kind == Kind::Gemini || job.provider.uses_batch_storage() { "Pause uploads" } else { "Pause" };
                     if crate::stopped(ui.button(text)).clicked() { pause = Some(if mode == Mode::Paused { Mode::Running } else { Mode::Paused }); }
                     if crate::stopped(ui.button("Cancel job")).clicked() { cancel = true; }
                 }
-                if !job.issues.is_empty() && crate::stopped(ui.button("Retry now")).clicked() { retry = true; }
+                if job.issues.keys().any(|operation| operation != "cleanup")
+                    && crate::stopped(ui.button("Retry now")).clicked() { retry = true; }
                 if job.done() && failed > 0
                     && crate::stopped(ui.add_enabled(!single_running, egui::Button::new("Retry failed sheets"))).clicked() { retry_failed = true; }
                 copy = crate::stopped(ui.add_enabled(self.log_available(), egui::Button::new("Copy log")))
@@ -1155,7 +1164,8 @@ impl Panel {
             ui.label(format!("{queued} not sent, {waiting} at {}, {uncertain} unconfirmed", job.provider.name));
             if job.last_response_ms > 0 { ui.small(format!("Last provider response: {} s ago", now.saturating_sub(job.last_response_ms) / 1000)); }
             if waiting > 0 && job.poll_ms > now { ui.small(format!("Next results check in {} s", (job.poll_ms - now).div_ceil(1000))); }
-            if mode != Mode::Paused && let Some(issue) = job.issues.values().min_by_key(|issue| issue.retry_ms) {
+            if mode != Mode::Paused && let Some(issue) = job.issues.iter().filter(|(operation, _)| operation.as_str() != "cleanup")
+                .map(|(_, issue)| issue).min_by_key(|issue| issue.retry_ms) {
                 ui.label(format!("Automatic retry in {} s.", issue.retry_ms.saturating_sub(now).div_ceil(1000)));
             }
             egui::ScrollArea::vertical().id_salt("library job details").max_height((ui.available_height() - 180.0).max(60.0)).show(ui, |ui| {
@@ -1249,7 +1259,7 @@ impl Panel {
             (if target.is_some() { "Label unlabeled in selection..." } else { "Label unlabeled sheets..." }, Scope::Unlabeled),
             (if target.is_some() { "Rerun all in selection..." } else { "Rerun all..." }, Scope::All),
         ] {
-            let enabled = ready && idle && (scope == Scope::All || any_unlabeled);
+            let enabled = ready && idle && total > 0 && (scope == Scope::All || any_unlabeled);
             let button = ui.add_enabled(enabled, egui::Button::new(text).selected(scope == Scope::Unlabeled));
             crate::stop(&button);
             if button.clicked() {

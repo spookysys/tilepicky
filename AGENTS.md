@@ -49,10 +49,9 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/index.rs`: the scan of a folder, and the search of names, captions,
   tags, and embeddings. The word search is local and synchronous; a semantic
   match uses a query vector that a worker made.
-- `src/embed.rs`: the embeddings of sheet images for semantic search, in
-  `embeddings.json` beside the library. A multimodal model embeds each sheet's
-  image, and the query as text, into one space. It holds the vectors, the
-  request and the reply checks, the cosine, and the generation over a library.
+- `src/embed.rs`: image embeddings in `embeddings.json` and independent caption/tag embeddings in `embeddings-text.json`.
+  Image input can optionally include labels. Each store records its model, provider identity, and source hashes.
+  Generation checks replies and saves completed batches. Query requests run separately with bounded concurrency and explicit retries.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/quant/`: the color quantizer, a vendored port of SuperFamiconv 0.12's
   incremental tile-aware quantizer. It holds the SNES palettes, the dithers,
@@ -60,7 +59,8 @@ the person who uses the tool; this file is for an agent that works on it.
   the general palettes.
 - `src/quant_panel.rs`: the Color quantization side panel of the project. It
   holds the working setting, the group cache, the preview, the tile-depth
-  paint tool, and the export. The setting itself lives in the project book.
+  paint tool, and the export. Workers compute previews and save captured export results.
+  The setting itself lives in the project book. SNES groups require matching grids without gaps or offsets.
 - `src/tree.rs`: the file trees of the left column.
 - `src/settings.rs`: `~/.config/tilepicky/settings.json`.
 - `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),

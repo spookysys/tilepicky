@@ -41,6 +41,20 @@ type Grid = ([u32; 2], [u32; 2], [i32; 2]);
 
 /// The answer of a query-embedding worker: one vector, or why there is none.
 type QueryEmbedding = std::sync::mpsc::Receiver<Result<Vec<f32>, String>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueryKey {
+    text: String,
+    model: String,
+    provider: String,
+}
+
+struct PreparedEmbeddings {
+    provider: ai::Provider,
+    plan: embed::Plan,
+}
+
+type EmbeddingPreparation = std::sync::mpsc::Receiver<Result<PreparedEmbeddings, String>>;
 use index::Index;
 use sheet::{Block, Sel, Sheet};
 use sidecar::{Animation, Pair};
@@ -142,13 +156,17 @@ struct App {
     embed_run: Option<embed::Run>,
     /// The confirm that asks before label text goes to the provider: the
     /// embedding model and the number of sheets it will embed.
-    embed_confirm: Option<(String, usize)>,
+    embed_confirm: Option<PreparedEmbeddings>,
+    embed_preparing: Option<EmbeddingPreparation>,
+    embed_mode: embed::InputMode,
+    embed_rels: Option<Vec<String>>,
     /// The confirm's Generate was pressed this frame.
     embed_start: bool,
     /// The library's query embedding: the query, the model, and the vector.
-    embed_query: Option<(String, String, Vec<f32>)>,
+    embed_query: Option<(QueryKey, Vec<f32>)>,
+    query_error: Option<(QueryKey, String)>,
     /// A query embedding in flight: the query, the model, and its answer.
-    query_embed: Option<(String, String, QueryEmbedding)>,
+    query_embed: Option<(QueryKey, QueryEmbedding)>,
 
     /// A prompt to show: a title, and its two texts.
     prompt_view: Option<(String, [String; 2])>,
@@ -177,14 +195,14 @@ struct App {
     quant_target: Option<sidecar::QuantizeTarget>,
     quant_pins: Vec<bool>,
     /// The member images of the current target, loaded once for the shared run.
-    quant_members: Vec<(String, image::RgbaImage)>,
     quant_preview: Option<quant_panel::Outcome>,
+    quant_worker: Option<quant_panel::Worker>,
     quant_dirty: bool,
     quant_error: String,
     quant_paths: bool,
     quant_tool: Option<quant_panel::Tool>,
     quant_conflict: Option<quant_panel::Conflict>,
-    quant_picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    quant_picking: Option<std::sync::mpsc::Receiver<Result<Option<PathBuf>, String>>>,
     /// A folder dialog is open for this side; the answer arrives on the channel.
     picking: Option<(Panel, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
     /// A drag across the files started here and marks a group while it lasts.
@@ -439,6 +457,7 @@ impl App {
             label_view: false,
             label_target: None, label_focus: None, label_copied: None, label_copy_error: String::new(), label_options: None,
             embed_run: None, embed_confirm: None, embed_start: false, embed_query: None, query_embed: None,
+            embed_preparing: None, embed_mode: embed::InputMode::Image, embed_rels: None, query_error: None,
             prompt_view: None,
             library_batch: batch::Panel::default(),
             remove_label: None,
@@ -454,8 +473,8 @@ impl App {
             quant: quant_panel::default_setting(),
             quant_target: None,
             quant_pins: Vec::new(),
-            quant_members: Vec::new(),
             quant_preview: None,
+            quant_worker: None,
             quant_dirty: false,
             quant_error: String::new(),
             quant_paths: false,
@@ -571,8 +590,12 @@ impl App {
                 self.library_marked.clear();
                 self.library_marked_dirs.clear();
                 self.library_batch.choice = None;
+                self.embed_rels = None;
+                self.embed_preparing = None;
+                self.embed_confirm = None;
                 self.library_anchor = None;
                 self.library_sweep = None;
+                self.library_shift_anchor = None;
                 "library"
             }
             Panel::Project => {
@@ -606,10 +629,13 @@ impl App {
         self.qwords = index::words(&self.query);
         self.open_trees = true;
         self.query_at = std::time::Instant::now();
+        self.query_error = None;
         // A new query has no vector yet: the old one must not match it.
-        if self.embed_query.as_ref().is_none_or(|(q, _, _)| q != &self.query) {
+        if self.embed_query.as_ref().is_none_or(|(q, _)| q.text != self.query.trim()) {
             self.library.embed_query = None;
             self.project.embed_query = None;
+            self.library.text_embed_query = None;
+            self.project.text_embed_query = None;
         }
         self.refresh_visible();
     }
@@ -621,115 +647,176 @@ impl App {
         self.project.refresh_visible(&self.qwords, self.settings.search);
     }
 
-    /// Keeps the query embedding in step with the query and the model.
-    /// Semantic search does nothing until a vector is ready, and it applies
-    /// only where the library's own vectors came from the same model.
+    /// Runs at most one query request and refreshes results when it completes.
     fn ensure_query_embedding(&mut self, ctx: &egui::Context) {
-        let query = self.query.trim().to_string();
         let chosen = self.settings.ai.chosen_embed().map(|(p, m)| (p.clone(), m.id.clone()));
-        // Take the answer of a worker that finished, and put it back while it runs.
-        if let Some((q, m, rx)) = self.query_embed.take() {
+        let wanted_key = chosen.as_ref().map(|(provider, model)| QueryKey {
+            text: self.query.trim().to_string(), model: model.clone(), provider: embed::identity(provider),
+        });
+        if let Some((key, rx)) = self.query_embed.take() {
             match rx.try_recv() {
-                Ok(Ok(vec)) => self.embed_query = Some((q, m, vec)),
-                Ok(Err(error)) => self.status = error,
+                Ok(result) if wanted_key.as_ref() == Some(&key) => match result {
+                    Ok(vector) => { self.embed_query = Some((key, vector)); self.query_error = None; }
+                    Err(error) => { self.status = error.clone(); self.query_error = Some((key, error)); }
+                },
+                Ok(_) => {},
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.query_embed = Some((q, m, rx));
+                    self.query_embed = Some((key, rx));
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
-            }
-        }
-        let model = chosen.as_ref().map_or(String::new(), |(_, id)| id.clone());
-        let ready = self.embed_query.as_ref().filter(|(q, m, _)| *q == query && *m == model).map(|(_, _, v)| v.clone());
-        let enabled = self.settings.search.embeddings;
-        for half in [&mut self.library, &mut self.project] {
-            half.embed_query = ready.clone().filter(|_| enabled && half.index.embed_model == model);
-        }
-        let running = self.query_embed.as_ref().is_some_and(|(q, _, _)| *q == query);
-        // Wait for a pause in typing, so that a word in progress is not sent.
-        let settled = self.query_at.elapsed() >= Duration::from_millis(400);
-        if enabled && !query.is_empty() && !settled && ready.is_none() && !running {
-            ctx.request_repaint_after(Duration::from_millis(400));
-        }
-        let wanted = enabled && settled && !self.qwords.is_empty() && ready.is_none() && !running
-            && self.library.index.embed_model == model && chosen.as_ref().is_some_and(|(p, _)| p.key(&self.keys).is_some());
-        if wanted && let Some((provider, model)) = chosen
-            && let Some(key) = provider.key(&self.keys) {
-            match embed::Endpoint::new(&provider, key) {
-                Ok(endpoint) => {
-                    let body = provider.route(embed::request(&model, &[serde_json::json!(query.clone())]));
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let wake = ctx.clone();
-                    std::thread::spawn(move || {
-                        let out = endpoint.send(&body).and_then(|v| embed::response(&v, 1)).map(|mut vs| vs.remove(0));
-                        let _ = tx.send(out);
-                        wake.request_repaint();
-                    });
-                    self.query_embed = Some((query, model, rx));
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if wanted_key.as_ref() == Some(&key) {
+                        self.query_error = Some((key, "The search request stopped. Retry the search.".into()));
+                    }
                 }
-                Err(error) => self.status = error,
             }
+        }
+        let ready = self.embed_query.as_ref().filter(|(key, _)| wanted_key.as_ref() == Some(key));
+        let mut changed = false;
+        for half in [&mut self.library, &mut self.project] {
+            let image = ready.filter(|(key, _)| self.settings.search.embeddings
+                && half.index.embed_model == key.model && half.index.embed_provider == key.provider).map(|(_, v)| v.clone());
+            let text = ready.filter(|(key, _)| self.settings.search.text_embeddings
+                && half.index.text_embed_model == key.model && half.index.text_embed_provider == key.provider).map(|(_, v)| v.clone());
+            changed |= half.embed_query != image || half.text_embed_query != text;
+            half.embed_query = image;
+            half.text_embed_query = text;
+        }
+        if changed { self.refresh_visible(); self.open_trees = true; }
+        let Some(key) = wanted_key else { return };
+        let enabled = [&self.library, &self.project].iter().any(|half| {
+            (self.settings.search.embeddings && half.index.embed_model == key.model && half.index.embed_provider == key.provider
+                && half.index.entries.iter().any(|entry| entry.embed.is_some()))
+                || (self.settings.search.text_embeddings && half.index.text_embed_model == key.model
+                    && half.index.text_embed_provider == key.provider && half.index.entries.iter().any(|entry| entry.text_embed.is_some()))
+        });
+        if !enabled || self.qwords.is_empty() || self.query_embed.is_some()
+            || self.embed_query.as_ref().is_some_and(|(k, _)| k == &key)
+            || self.query_error.as_ref().is_some_and(|(k, _)| k == &key) { return; }
+        let delay = Duration::from_millis(400);
+        if self.query_at.elapsed() < delay {
+            ctx.request_repaint_after(delay.saturating_sub(self.query_at.elapsed()));
+            return;
+        }
+        let Some((provider, _)) = chosen else { return };
+        let Some(secret) = provider.key(&self.keys) else {
+            self.query_error = Some((key, format!("Set the {} API key in Settings to search by meaning.", provider.name)));
+            return;
+        };
+        let endpoint = match embed::Endpoint::new(&provider, secret) {
+            Ok(endpoint) => endpoint,
+            Err(error) => { self.query_error = Some((key, error)); return; }
+        };
+        let body = provider.route(embed::request(&key.model, &[serde_json::json!(key.text)]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = ctx.clone();
+        match std::thread::Builder::new().name("search embeddings".into()).spawn(move || {
+            let result = endpoint.send(&body).and_then(|v| embed::response(&v, 1)).map(|mut vectors| vectors.remove(0));
+            let _ = tx.send(result);
+            wake.request_repaint();
+        }) {
+            Ok(_) => self.query_embed = Some((key, rx)),
+            Err(error) => self.query_error = Some((key, format!("Cannot start the search: {error}"))),
         }
     }
 
-    /// Takes the result of a generation, and reads the library again so the
-    /// new vectors reach the search.
+    /// Receives preparation and generation results without blocking the UI.
     fn receive_embeddings(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.embed_preparing.take() {
+            match rx.try_recv() {
+                Ok(Ok(prepared)) => self.embed_confirm = Some(prepared),
+                Ok(Err(error)) => self.status = error,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.embed_preparing = Some(rx);
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.status = "Embedding preparation stopped.".into(),
+            }
+        }
         let Some(run) = self.embed_run.take() else { return };
         match run.result.try_recv() {
-            Ok(Ok(count)) => {
-                self.status = format!("Embedded {count} sheets.");
-                let (query, search) = (self.qwords.clone(), self.settings.search);
-                self.library.rescan(&query, search);
+            Ok(result) => {
+                let message = match result {
+                    Ok(count) => format!("Saved embeddings for {count} sheets."),
+                    Err(error) => error,
+                };
+                if self.library.index.root == run.root { self.rescan_library(); }
+                if self.project.index.root == run.root { self.rescan_project(); }
+                self.status = message;
                 self.embed_query = None;
+                self.query_error = None;
             }
-            Ok(Err(error)) => self.status = error,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.embed_run = Some(run);
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.status = "Embedding generation stopped.".into(),
         }
     }
 
-    /// Sends the labels that need a vector to the embedding model. Nothing
-    /// goes out until the user has agreed in the confirm.
+    /// Starts the exact operation shown in the confirmation.
     fn start_embeddings(&mut self, ctx: &egui::Context) {
-        let root = self.library.index.root.clone();
-        let Some((provider, model)) = self.settings.ai.chosen_embed().map(|(p, m)| (p.clone(), m.id.clone())) else {
-            self.status = "Choose an embedding model in Settings.".into();
-            return;
-        };
+        if self.embed_run.is_some() { return; }
+        let Some(PreparedEmbeddings { provider, plan }) = self.embed_confirm.take() else { return };
         let Some(key) = provider.key(&self.keys) else {
             self.status = format!("Set the {} API key in Settings.", provider.name);
             return;
         };
         let endpoint = match embed::Endpoint::new(&provider, key) { Ok(e) => e, Err(e) => { self.status = e; return; } };
-        let book = match sidecar::load_book(&root) { Ok(b) => b, Err(e) => { self.status = e; return; } };
-        let rels: Vec<String> = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
-        let done = embed::read(&root).unwrap_or_default();
-        let labels = self.settings.ai.embed_labels;
-        let total = embed::pending(&root, &book, &rels, &done, &model, labels);
-        if total == 0 { self.status = "Every sheet already has an embedding.".into(); return; }
-        let route = provider.clone();
+        let total = plan.total;
         let wake = ctx.clone();
-        let plan = embed::Plan { root, model, total, book, rels, labels, done };
         match embed::Run::start(plan,
-            move |body| endpoint.send(&route.route(body.clone())), move || wake.request_repaint()) {
+            move |body| endpoint.send(&provider.route(body.clone())), move || wake.request_repaint()) {
             Ok(run) => { self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
             Err(error) => self.status = error,
         }
     }
 
-    /// The model, and the sheets that still need a vector.
-    fn embed_plan(&self) -> (String, usize) {
-        let model = self.settings.ai.chosen_embed().map(|(_, m)| m.id.clone()).unwrap_or_default();
-        let rels: Vec<String> = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
-        let done = embed::read(&self.library.index.root).unwrap_or_default();
-        let book = sidecar::load_book(&self.library.index.root).unwrap_or_default();
-        let labels = self.settings.ai.embed_labels;
-        let count = embed::pending(&self.library.index.root, &book, &rels, &done, &model, labels);
-        (model, count)
+    /// Reads and hashes the selected sources on a worker before confirmation.
+    fn prepare_embeddings(&mut self, ctx: &egui::Context) {
+        if self.embed_run.is_some() || self.embed_preparing.is_some() { return; }
+        let Some((provider, model)) = self.settings.ai.chosen_embed().map(|(p, m)| (p.clone(), m.id.clone())) else {
+            self.status = "Choose an embedding model in Settings.".into(); return;
+        };
+        let root = self.library.index.root.clone();
+        let rels = self.embed_rels.clone().unwrap_or_else(|| self.library.index.entries.iter().map(|e| e.rel.clone()).collect());
+        let mode = self.embed_mode;
+        let labels = mode == embed::InputMode::Image && self.settings.ai.embed_labels;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = ctx.clone();
+        let result = std::thread::Builder::new().name("prepare embeddings".into()).spawn(move || {
+            let result = (|| {
+                let book = sidecar::load_book(&root)?;
+                let done = embed::read_mode(&root, mode)?;
+                let identity = embed::identity(&provider);
+                let empty = embed::Embeddings::default();
+                let comparison = if done.provider == identity { &done } else { &empty };
+                let total = embed::pending(&root, &book, &rels, comparison, &model, labels, mode)?;
+                let plan = embed::Plan { root, model, provider: identity, total, book, rels, labels, done, mode };
+                Ok(PreparedEmbeddings { provider, plan })
+            })();
+            let _ = tx.send(result);
+            wake.request_repaint();
+        });
+        match result {
+            Ok(_) => { self.embed_preparing = Some(rx); self.status = "Checking embedding sources...".into(); }
+            Err(error) => self.status = format!("Cannot prepare embeddings: {error}"),
+        }
+    }
+
+    fn select_embedding_sources(&mut self, rels: Option<Vec<String>>) {
+        self.embed_rels = rels;
+        self.ai_panel = true;
+    }
+
+    fn marked_library_rels(&self) -> BTreeSet<String> {
+        let mut rels: BTreeSet<String> = self.library_marked.iter()
+            .filter_map(|&k| self.library.index.entries.get(k)).map(|e| e.rel.clone()).collect();
+        for dir in &self.library_marked_dirs {
+            let prefix = format!("{dir}/");
+            rels.extend(self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()));
+        }
+        rels
     }
 
     /// The arrow keys move a cursor over the folders and files of the tree
@@ -856,6 +943,7 @@ impl App {
         let range = self.library_order[pa.min(pi)..=pa.max(pi)].to_vec();
         if !additive {
             self.library_marked.clear();
+            self.library_marked_dirs.clear();
         }
         self.library_marked.extend(range);
     }
@@ -873,7 +961,9 @@ impl App {
                 tree::Row::Dir(d) => { self.library_marked_dirs.insert(d.clone()); }
             }
         }
-        self.library_batch.choice = None;
+        let rels = self.marked_library_rels();
+        let count = rels.len();
+        self.library_batch.choose(rels, format!("{count} selected sheets"));
     }
 
     fn open_library(&mut self, ctx: &egui::Context, i: usize) {
@@ -943,6 +1033,7 @@ impl App {
         self.library_batch.choice = None;
         self.library_anchor = None;
         self.library_sweep = None;
+        self.library_shift_anchor = None;
         self.library.rescan(&self.qwords, self.settings.search);
         let index = &self.library.index;
         self.status = index.error.clone().unwrap_or_else(|| format!("{} files in the library", index.entries.len()));
@@ -1152,6 +1243,12 @@ impl App {
             Pending::Open(rel) => {
                 if let Some(i) = self.project.index.position(&rel) {
                     self.open_project(ctx, i);
+                }
+            }
+            Pending::Quantize(target, rel) => {
+                if let Some(i) = self.project.index.position(&rel) {
+                    self.open_project(ctx, i);
+                    if self.project.sheet.as_ref().is_some_and(|sheet| sheet.rel == rel) { self.quant_set_target(target); }
                 }
             }
             Pending::Create => self.create_project(ctx),
@@ -1765,14 +1862,41 @@ impl App {
         }
         ui.add_space(6.0);
         ui.strong("Search embeddings");
-        ui.label("Embed each sheet's image, so that search can match by meaning.");
+        ui.label("Compare image meaning, label meaning, and word search.");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.embed_mode, embed::InputMode::Image, "Images");
+            ui.selectable_value(&mut self.embed_mode, embed::InputMode::Text, "Captions and tags");
+        });
+        if let Some(rels) = &self.embed_rels {
+            ui.label(format!("Target: {} selected sheets", rels.len()));
+            if ui.small_button("Use whole library").clicked() { self.embed_rels = None; }
+        } else {
+            ui.label("Target: whole library");
+        }
+        if self.embed_mode == embed::InputMode::Image {
+            ui.label(if self.settings.ai.embed_labels { "Source: images with captions and tags." } else { "Source: images only." });
+        } else {
+            ui.label("Source: saved captions and tags. Sheets without labels are skipped.");
+        }
+        for error in [&self.library.index.embed_error, &self.library.index.text_embed_error].into_iter().flatten() {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
         if let Some(run) = &self.embed_run {
-            ui.label(format!("Embedding {} sheets...", run.total));
+            let source = match run.mode { embed::InputMode::Image => "images", embed::InputMode::Text => "captions and tags" };
+            ui.label(format!("Embedding {} sheets from {source} in {}...", run.total, run.root.display()));
+            if stopped(ui.button("Cancel generation")).clicked() {
+                self.embed_run = None;
+                self.rescan_library();
+                self.status = "Generation cancelled. Saved batches remain available. An active request may still incur a charge.".into();
+            }
+        } else if self.embed_preparing.is_some() {
+            ui.label("Checking source files...");
+            if ui.button("Cancel preparation").clicked() { self.embed_preparing = None; }
         } else {
             let can = self.library.is_set() && self.library.index.error.is_none()
-                && !self.library.index.entries.is_empty();
-            if stopped(ui.add_enabled(can, egui::Button::new("Generate Embeddings (AI)..."))).clicked() {
-                self.embed_confirm = Some(self.embed_plan());
+                && !self.library.index.entries.is_empty() && self.embed_confirm.is_none();
+            if stopped(ui.add_enabled(can, egui::Button::new("Generate search embeddings (AI)..."))).clicked() {
+                self.prepare_embeddings(ui.ctx());
             }
         }
     }
@@ -2295,7 +2419,7 @@ impl App {
                 let can_embed = self.library.is_set() && self.library.index.error.is_none()
                     && !self.library.index.entries.is_empty();
                 if stopped(ui.add_enabled(can_embed, egui::Button::new("Embeddings (AI)..."))).clicked() {
-                    self.embed_confirm = Some(self.embed_plan());
+                    self.select_embedding_sources(None);
                 }
                 let ai = AI_VISIBLE.then_some(&mut self.ai_panel);
                 let clicked;
@@ -2443,6 +2567,9 @@ impl App {
 
     /// What a click or a menu in the LIBRARY tree asks for.
     fn library_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
+        let selection_changed = matches!(&action, TreeAction::Open(_) | TreeAction::Toggle(_) | TreeAction::Range(_, _)
+            | TreeAction::SweepStart(_) | TreeAction::Sweep(_) | TreeAction::ToggleDir(_) | TreeAction::SelectDir(_));
+        self.library_shift_anchor = None;
         match action {
             TreeAction::Open(i) => {
                 // A plain click selects this file alone: every other mark goes.
@@ -2459,36 +2586,36 @@ impl App {
                 }
                 self.library_batch.choice = None;
                 self.library_anchor = Some(i);
+                self.library.at = Some(tree::Row::File(i));
             }
             TreeAction::Range(i, additive) => {
                 let a = self.library_anchor.unwrap_or(i);
                 self.mark_library_range(a, i, additive);
                 self.library_batch.choice = None;
+                self.library.at = Some(tree::Row::File(i));
             }
             TreeAction::SweepStart(i) => {
                 self.library_sweep = Some(i);
                 self.library_anchor = Some(i);
                 self.library_batch.choice = None;
                 self.library_marked.clear();
+                self.library_marked_dirs.clear();
                 self.library_marked.insert(i);
+                self.library.at = Some(tree::Row::File(i));
             }
             TreeAction::Sweep(i) => {
                 let a = self.library_sweep.unwrap_or(i);
                 self.mark_library_range(a, i, false);
             }
             TreeAction::ToggleDir(dir) => {
+                self.library.at = Some(tree::Row::Dir(dir.clone()));
                 if !self.library_marked_dirs.remove(&dir) {
                     self.library_marked_dirs.insert(dir);
                 }
                 self.library_batch.choice = None;
             }
             TreeAction::BatchMarked => {
-                let mut rels: BTreeSet<String> = self.library_marked.iter()
-                    .filter_map(|&k| self.library.index.entries.get(k)).map(|e| e.rel.clone()).collect();
-                for dir in &self.library_marked_dirs {
-                    let prefix = format!("{dir}/");
-                    rels.extend(self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()));
-                }
+                let rels = self.marked_library_rels();
                 if !rels.is_empty() {
                     let count = rels.len();
                     self.library_batch.choose(rels, format!("{count} sheets"));
@@ -2508,24 +2635,23 @@ impl App {
                 }
             }
             TreeAction::SelectDir(dir) => {
+                self.library.at = Some(tree::Row::Dir(dir.clone()));
+                self.library_anchor = None;
+                self.library_marked.clear();
+                self.library_marked_dirs.clear();
+                self.library_marked_dirs.insert(dir);
+                self.library.sel = None;
+            }
+            TreeAction::Embeddings(ids) => {
+                let rels = ids.iter().filter_map(|&i| self.library.index.entries.get(i)).map(|e| e.rel.clone()).collect();
+                self.select_embedding_sources(Some(rels));
+            }
+            TreeAction::EmbeddingsDir(dir) => {
                 let prefix = format!("{dir}/");
-                let rels: BTreeSet<String> =
-                    self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
-                if !rels.is_empty() {
-                    let count = rels.len();
-                    self.library_marked.clear();
-                    self.library_marked_dirs.clear();
-                    self.library_marked_dirs.insert(dir.clone());
-                    self.library.sel = None;
-                    self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
-                }
+                let rels = self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
+                self.select_embedding_sources(Some(rels));
             }
-            TreeAction::Embeddings => {
-                let can = self.library.is_set() && self.library.index.error.is_none()
-                    && !self.library.index.entries.is_empty();
-                if can { self.embed_confirm = Some(self.embed_plan()); }
-                else { self.status = "Label at least one sheet before generating embeddings.".into(); }
-            }
+            TreeAction::EmbeddingsMarked => self.select_embedding_sources(Some(self.marked_library_rels().into_iter().collect())),
             TreeAction::Labels(i, action) => {
                 let rel = self.library.index.entries[i].rel.clone();
                 if self.library.sheet.as_ref().is_none_or(|s| s.rel != rel) { self.open_library(ctx, i); }
@@ -2541,6 +2667,22 @@ impl App {
             TreeAction::CopyDirPath(dir, whole) => self.copy_path(ctx, &self.library.index.root.clone(), &dir, whole),
             _ => {}
         }
+        if selection_changed {
+            let rels = self.marked_library_rels();
+            let count = rels.len();
+            self.library_batch.choose(rels, format!("{count} selected sheets"));
+        }
+    }
+
+    fn choose_quant_target(&mut self, ctx: &egui::Context, target: sidecar::QuantizeTarget) {
+        let members = self.project.index.quantize_members(&target);
+        if self.project.sheet.as_ref().is_some_and(|sheet| members.contains(&sheet.rel)) {
+            self.quant_set_target(target);
+        } else if let Some(rel) = members.first() {
+            self.request(ctx, Pending::Quantize(target, rel.clone()));
+        } else {
+            self.status = "This target contains no sheets.".into();
+        }
     }
 
     /// What a click, a drag, or a menu in the PROJECT tree asks for.
@@ -2548,17 +2690,18 @@ impl App {
     fn project_tree_action(&mut self, ctx: &egui::Context, action: TreeAction, project_order: &[usize]) {
         match action {
             // The project tree never offers these; only the library does.
-            TreeAction::Embeddings | TreeAction::ToggleDir(_) | TreeAction::SelectDir(_) | TreeAction::BatchMarked => {}
-            TreeAction::QuantizeDir(dir) => self.quant_set_target(sidecar::QuantizeTarget::Dir(dir)),
+            TreeAction::Embeddings(_) | TreeAction::EmbeddingsDir(_) | TreeAction::EmbeddingsMarked
+                | TreeAction::ToggleDir(_) | TreeAction::SelectDir(_) | TreeAction::BatchMarked => {}
+            TreeAction::QuantizeDir(dir) => self.choose_quant_target(ctx, sidecar::QuantizeTarget::Dir(dir)),
             TreeAction::QuantizeFile(i) => {
                 let rel = self.project.index.entries[i].rel.clone();
-                self.quant_set_target(sidecar::QuantizeTarget::Files(vec![rel]));
+                self.choose_quant_target(ctx, sidecar::QuantizeTarget::Files(vec![rel]));
             }
             TreeAction::QuantizeFiles(ids) => {
                 let mut rels: Vec<String> = ids.iter().map(|&i| self.project.index.entries[i].rel.clone()).collect();
                 rels.sort();
                 rels.dedup();
-                self.quant_set_target(sidecar::QuantizeTarget::Files(rels));
+                self.choose_quant_target(ctx, sidecar::QuantizeTarget::Files(rels));
             }
             TreeAction::Open(i) => {
                 // The plainly clicked file is the start of any group.
@@ -2708,6 +2851,8 @@ impl App {
         let ctx = &ui.ctx().clone();
         self.receive_label();
         self.receive_embeddings(ctx);
+        self.quant_poll_save();
+        if self.quant_picking.is_some() { ctx.request_repaint_after(Duration::from_millis(100)); }
         self.ensure_query_embedding(ctx);
         if std::mem::take(&mut self.embed_start) { self.start_embeddings(ctx); }
         let root = &self.library.index.root;
@@ -2780,22 +2925,30 @@ impl App {
                 // A click on a box ticks it and leaves the popup open, so
                 // that several can change at once.
                 egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                    ui.set_min_width(220.0);
+                    ui.set_min_width(280.0);
+                    ui.set_max_width(340.0);
                     ui.strong("Search in");
                     let first = ui.checkbox(&mut self.settings.search.folders, "folder names");
                     let second = ui.checkbox(&mut self.settings.search.files, "file names");
                     let third = ui.checkbox(&mut self.settings.search.captions, "captions");
                     let fourth = ui.checkbox(&mut self.settings.search.tags, "tags");
-                    let fifth = ui.checkbox(&mut self.settings.search.embeddings, "embeddings (meaning)");
-                    let changed = [&first, &second, &third, &fourth, &fifth].iter().any(|r| r.changed());
+                    ui.separator();
+                    let fifth = ui.checkbox(&mut self.settings.search.embeddings, "image meaning");
+                    let sixth = ui.checkbox(&mut self.settings.search.text_embeddings, "caption and tag meaning");
+                    let similarity = ui.add(egui::Slider::new(&mut self.settings.search.similarity, 0.0..=1.0).text("Minimum similarity"));
+                    let changed = [&first, &second, &third, &fourth, &fifth, &sixth, &similarity].iter().any(|r| r.changed());
                     popup_keys(ui, &r, &first);
                     if changed {
                         self.refresh_query();
                         if let Err(e) = self.settings.save() { self.status = e; }
                     }
-                    ui.weak("Words match by prefix. All words must match.\n\
-                        Captions and tags come from Generate Tags (AI).\n\
-                        Embeddings come from each sheet's image, made with Generate Embeddings (AI).");
+                    ui.weak("Word search requires every word. Meaning search can also add matches.");
+                    ui.weak("Enable one source at a time to compare results. Meaning search sends your query to the embedding provider.");
+                    if let Some((_, error)) = &self.query_error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                        if ui.button("Retry meaning search").clicked() { self.query_error = None; }
+                    }
+
                 });
                 let r = egui::TextEdit::singleline(&mut self.query)
                     .id(search_id())
@@ -3690,10 +3843,10 @@ mod tests {
 
     #[test]
     fn the_home_directory_is_a_squiggle() {
-        // SAFETY: the test runs alone in this process.
-        unsafe { std::env::set_var("HOME", "/home/x") };
-        assert_eq!(home_path(Path::new("/home/x/work/a.png")), "~/work/a.png");
-        assert_eq!(home_path(Path::new("/opt/a.png")), "/opt/a.png");
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+        assert_eq!(home_path(&home.join("work/a.png")), "~/work/a.png");
+        let outside = Path::new("/opt/a.png");
+        if !outside.starts_with(&home) { assert_eq!(home_path(outside), "/opt/a.png"); }
     }
 
     use crate::storage::tests::Folder;
@@ -3736,6 +3889,133 @@ mod tests {
             let i = self.app.project.index.position(rel).unwrap();
             self.app.open_project(&self.ctx, i);
         }
+    }
+
+    fn query_fixture(b: &mut Bench, query: &str) -> QueryKey {
+        let (provider, model) = b.app.settings.ai.chosen_embed().unwrap();
+        let key = QueryKey { text: query.into(), model: model.id.clone(), provider: embed::identity(provider) };
+        b.app.library.index.embed_model = key.model.clone();
+        b.app.library.index.embed_provider = key.provider.clone();
+        b.app.library.index.text_embed_model = key.model.clone();
+        b.app.library.index.text_embed_provider = key.provider.clone();
+        b.app.query = query.into();
+        b.app.refresh_query();
+        key
+    }
+
+    #[test]
+    fn a_query_reply_refreshes_the_tree_without_another_keystroke() {
+        let mut b = bench(&["a.png"], &[]);
+        let key = query_fixture(&mut b, "forest");
+        b.app.library.index.entries[0].embed = Some(vec![1.0, 0.0]);
+        assert_eq!(b.app.library.visible, Some(vec![false]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        b.app.query_embed = Some((key, rx));
+        tx.send(Ok(vec![1.0, 0.0])).unwrap();
+        b.app.ensure_query_embedding(&b.ctx);
+        assert_eq!(b.app.library.visible, Some(vec![true]));
+        b.app.settings.search.embeddings = false;
+        b.app.ensure_query_embedding(&b.ctx);
+        assert_eq!(b.app.library.visible, Some(vec![false]));
+    }
+
+    #[test]
+    fn a_failed_query_does_not_repeat_each_frame() {
+        let mut b = bench(&["a.png"], &[]);
+        let key = query_fixture(&mut b, "forest");
+        let (tx, rx) = std::sync::mpsc::channel();
+        b.app.query_embed = Some((key, rx));
+        tx.send(Err("Test provider rejected the query".into())).unwrap();
+        b.app.ensure_query_embedding(&b.ctx);
+        b.app.query_at = std::time::Instant::now() - Duration::from_secs(1);
+        for _ in 0..3 { b.app.ensure_query_embedding(&b.ctx); }
+        assert!(b.app.query_embed.is_none());
+        assert!(b.app.query_error.as_ref().unwrap().1.contains("rejected"));
+    }
+
+    #[test]
+    fn a_new_query_waits_for_the_old_request_and_discards_its_reply() {
+        let mut b = bench(&["a.png"], &[]);
+        let key = query_fixture(&mut b, "forest");
+        let (tx, rx) = std::sync::mpsc::channel();
+        b.app.query_embed = Some((key.clone(), rx));
+        b.app.query = "river".into();
+        b.app.refresh_query();
+        b.app.ensure_query_embedding(&b.ctx);
+        assert_eq!(b.app.query_embed.as_ref().unwrap().0, key);
+        tx.send(Ok(vec![1.0, 0.0])).unwrap();
+        b.app.ensure_query_embedding(&b.ctx);
+        assert!(b.app.embed_query.is_none());
+        assert!(b.app.library.embed_query.is_none());
+        assert_eq!(b.app.library.visible, Some(vec![false]));
+    }
+
+    #[test]
+    fn search_sources_can_be_compared_without_regenerating_vectors() {
+        let mut b = bench(&["a.png", "b.png"], &[]);
+        let key = query_fixture(&mut b, "forest");
+        b.app.embed_query = Some((key, vec![1.0, 0.0]));
+        b.app.library.index.entries[0].embed = Some(vec![1.0, 0.0]);
+        b.app.library.index.entries[1].text_embed = Some(vec![1.0, 0.0]);
+        b.app.ensure_query_embedding(&b.ctx);
+        assert_eq!(b.app.library.visible, Some(vec![true, false]));
+        b.app.settings.search.embeddings = false;
+        b.app.settings.search.text_embeddings = true;
+        b.app.ensure_query_embedding(&b.ctx);
+        assert_eq!(b.app.library.visible, Some(vec![false, true]));
+        assert!(b.app.query_embed.is_none());
+    }
+
+    #[test]
+    fn quantization_opens_a_target_member_after_the_save_decision() {
+        let mut b = bench(&[], &["a.png", "pack/one.png", "pack/two.png"]);
+        b.open_project("a.png");
+        b.app.project.sheet.as_mut().unwrap().dirty = true;
+        let target = sidecar::QuantizeTarget::Dir("pack".into());
+        b.app.choose_quant_target(&b.ctx, target.clone());
+        assert!(b.app.pending == Some(Pending::Quantize(target.clone(), "pack/one.png".into())));
+        assert_eq!(b.project_rel(), Some("a.png"));
+        let action = b.app.pending.take().unwrap();
+        b.app.answer_save(&b.ctx, action, false);
+        assert_eq!(b.project_rel(), Some("pack/one.png"));
+        assert_eq!(b.app.quant_target, Some(target));
+        assert_eq!(b.app.quant_open_rel.as_deref(), Some("pack/one.png"));
+    }
+
+    #[test]
+    fn embedding_actions_keep_their_selected_sources() {
+        let mut b = bench(&["a.png", "pack/one.png", "pack/two.png"], &[]);
+        b.app.library_tree_action(&b.ctx, TreeAction::Embeddings(vec![0]));
+        assert_eq!(b.app.embed_rels.as_ref().unwrap(), &["a.png"]);
+        b.app.library_tree_action(&b.ctx, TreeAction::EmbeddingsDir("pack".into()));
+        assert_eq!(b.app.embed_rels.as_ref().unwrap(), &["pack/one.png", "pack/two.png"]);
+        b.app.library_marked.insert(0);
+        b.app.library_marked_dirs.insert("pack".into());
+        b.app.library_tree_action(&b.ctx, TreeAction::EmbeddingsMarked);
+        assert_eq!(b.app.embed_rels.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn selecting_an_empty_folder_does_not_target_the_whole_library() {
+        let mut b = bench(&["a.png"], &[]);
+        b.app.library_tree_action(&b.ctx, TreeAction::Open(0));
+        b.app.library_tree_action(&b.ctx, TreeAction::SelectDir("empty".into()));
+        assert!(b.app.library_marked.is_empty());
+        assert!(b.app.library_batch.choice.as_ref().unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn file_ranges_and_sweeps_clear_old_folder_selections() {
+        let mut b = bench(&["a.png", "pack/one.png", "pack/two.png"], &[]);
+        b.app.library_order = vec![0, 1, 2];
+        b.app.library_tree_action(&b.ctx, TreeAction::SelectDir("pack".into()));
+        assert_eq!(b.app.library.at, Some(tree::Row::Dir("pack".into())));
+        b.app.library_tree_action(&b.ctx, TreeAction::Range(0, false));
+        assert!(b.app.library_marked_dirs.is_empty());
+        assert_eq!(b.app.library.at, Some(tree::Row::File(0)));
+        b.app.library_tree_action(&b.ctx, TreeAction::SelectDir("pack".into()));
+        b.app.library_tree_action(&b.ctx, TreeAction::SweepStart(0));
+        assert!(b.app.library_marked_dirs.is_empty());
     }
 
     #[test]
@@ -3909,7 +4189,8 @@ mod tests {
         let mut b = bench(&["a.png", "b.png"], &[]);
         b.app.open_library(&b.ctx, 0);
         let (_tx, result) = std::sync::mpsc::channel();
-        b.app.label_run = Some(labels::Run { guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
+        b.app.label_run = Some(labels::Run {
+            cancelled: Default::default(), guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
             rel: "a.png".into(), provider: "test".into(), model: "test".into(), started: std::time::Instant::now(), result });
         b.app.library_tree_action(&b.ctx, TreeAction::Labels(1, labels::Action::Show));
         assert!(b.app.label_view && b.app.dialog_open(&b.ctx));
@@ -3927,7 +4208,8 @@ mod tests {
         b.app.open_library(&b.ctx, 0);
         b.app.label_action(&b.ctx, labels::Action::Show);
         let (_tx, result) = std::sync::mpsc::channel();
-        b.app.label_run = Some(labels::Run { guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"),
+        b.app.label_run = Some(labels::Run {
+            cancelled: Default::default(), guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"),
             dir: b.library.0.clone(), rel: "a.png".into(), provider: "test".into(), model: "test".into(),
             started: std::time::Instant::now(), result });
         b.app.open_library(&b.ctx, 1);
@@ -3964,7 +4246,8 @@ mod tests {
         sidecar::store_labels(&b.library.0, [("a.png", Some(original.clone()))]).unwrap();
         b.app.apply_labels(&b.library.0, &[("a.png".into(), Some(original.clone()))]);
         let (tx, result) = std::sync::mpsc::channel();
-        b.app.label_run = Some(labels::Run { guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
+        b.app.label_run = Some(labels::Run {
+            cancelled: Default::default(), guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
             rel: "a.png".into(), provider: "test".into(), model: "new".into(), started: std::time::Instant::now(), result });
         tx.send(Ok(sidecar::Label { status: sidecar::Status::Unlabelable, caption: String::new(), ..original.clone() })).unwrap();
         b.app.receive_label();
@@ -3978,7 +4261,8 @@ mod tests {
         b.app.open_library(&b.ctx, 0);
         b.app.label_action(&b.ctx, labels::Action::Show);
         let (tx, result) = std::sync::mpsc::channel();
-        b.app.label_run = Some(labels::Run { guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
+        b.app.label_run = Some(labels::Run {
+            cancelled: Default::default(), guard: None, log: ai_log::Log::single("a.png"), path: b.library.0.join("a.png"), dir: b.library.0.clone(),
             rel: "a.png".into(), provider: "test".into(), model: "test".into(), started: std::time::Instant::now(), result });
         tx.send(Ok(sidecar::Label { provider: "test".into(), model: "test".into(), status: sidecar::Status::Labeled,
             caption: "Indoor furniture".into(), tags: vec!["indoor".into()], tag_list: None })).unwrap();

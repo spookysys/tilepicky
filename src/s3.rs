@@ -27,9 +27,13 @@ impl Store {
     /// The scheme and host of the endpoint, without the trailing slash.
     fn scheme_host(&self) -> Result<(String, String), String> {
         let endpoint = self.endpoint.trim().trim_end_matches('/');
-        let (scheme, rest) = endpoint.split_once("://").ok_or("The endpoint must start with http:// or https://.")?;
+        let uri: ureq::http::Uri = endpoint.parse().map_err(|_| "Invalid storage endpoint URL.")?;
+        let scheme = uri.scheme_str().ok_or("The endpoint must start with http:// or https://.")?;
         if scheme != "http" && scheme != "https" { return Err("The endpoint must start with http:// or https://.".into()); }
-        if rest.is_empty() || rest.contains('/') { return Err("The endpoint must be a host, with no path.".into()); }
+        let rest = uri.authority().ok_or("The endpoint needs a host.")?.as_str();
+        if rest.contains('@') || uri.query().is_some() || endpoint.contains('#') || uri.path() != "/" {
+            return Err("Use a storage endpoint without credentials, path, query, or fragment.".into());
+        }
         Ok((scheme.into(), rest.into()))
     }
 
@@ -48,6 +52,12 @@ pub struct Client { store: Store, secret: String, agent: ureq::Agent }
 impl Client {
     pub fn new(store: Store, secret: String) -> Result<Self, String> {
         store.scheme_host()?;
+        if store.bucket.trim().is_empty() || store.region.trim().is_empty() || store.access_key.trim().is_empty() || secret.trim().is_empty() {
+            return Err("Set the bucket, region, access key, and secret key.".into());
+        }
+        if !store.bucket.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_')) {
+            return Err("The bucket name contains an invalid character.".into());
+        }
         Ok(Self { store, secret, agent: crate::labels::agent() })
     }
 
@@ -104,6 +114,7 @@ impl Client {
     /// A URL the provider can fetch for `expires` seconds. The URL carries
     /// its own signature, so the bucket can stay private.
     pub fn presigned_get(&self, key: &str, expires: u64) -> Result<String, String> {
+        if !(1..=604_800).contains(&expires) { return Err("A signed URL must last between one second and seven days.".into()); }
         let (amzdate, date) = amz_time(now_secs());
         let (host, path) = self.store.target(key)?;
         let uri = uri_encode(&path, true);
@@ -126,11 +137,20 @@ impl Client {
     /// It proves the endpoint, the keys, and both URL styles work.
     pub fn check(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
         self.put(key, bytes, "image/png")?;
-        let url = self.presigned_get(key, 300)?;
-        let response = self.agent.get(&url).call().map_err(|e| format!("The signed URL did not fetch: {}", http_message(e)))?;
-        let status = response.status().as_u16();
-        let _ = self.delete(key);
-        if status == 200 { Ok(()) } else { Err(format!("The signed URL returned HTTP {status}.")) }
+        let fetched = self.presigned_get(key, 300).and_then(|url| {
+            let mut response = self.agent.get(&url).call()
+                .map_err(|e| format!("The signed URL did not fetch: {}", http_message(e)))?;
+            let status = response.status().as_u16();
+            if status != 200 { return Err(format!("The signed URL returned HTTP {status}.")); }
+            let received = response.body_mut().read_to_vec().map_err(|e| format!("Could not read the test object: {e}"))?;
+            if received != bytes { return Err("The signed URL returned different content.".into()); }
+            Ok(())
+        });
+        let deleted = self.delete(key);
+        match (fetched, deleted) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(fetch), Err(delete)) => Err(format!("{fetch} {delete}")),
+        }
     }
 }
 
@@ -311,6 +331,45 @@ mod tests {
         store.path_style = true; store.endpoint = "http://127.0.0.1:9000".into();
         assert_eq!(store.target("/tiles/a b.png").unwrap(), ("127.0.0.1:9000".into(), "/examplebucket/tiles/a b.png".into()));
         assert_eq!(uri_encode("/tiles/a b.png", true), "/tiles/a%20b.png");
+    }
+
+    #[test]
+    fn a_connection_test_checks_content_and_always_attempts_cleanup() {
+        use std::io::{Read, Write};
+        for (get_status, get_body, delete_status) in [(200, "png", 204), (200, "wrong", 204), (403, "", 204), (200, "png", 403)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                for (method, status, body) in [("PUT", 200, ""), ("GET", get_status, get_body), ("DELETE", delete_status, "")] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut request = Vec::new();
+                    loop {
+                        let mut byte = [0]; stream.read_exact(&mut byte).unwrap(); request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") { break; }
+                    }
+                    let headers = String::from_utf8(request).unwrap();
+                    assert!(headers.starts_with(method));
+                    let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:")
+                        .and_then(|n| n.trim().parse::<usize>().ok())).unwrap_or(0);
+                    stream.read_exact(&mut vec![0; length]).unwrap();
+                    write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let store = Store { endpoint: format!("http://{address}"), region: "test".into(), bucket: "bucket".into(),
+                access_key: "test".into(), path_style: true };
+            let result = Client::new(store, "test".into()).unwrap().check("test.png", b"png");
+            assert_eq!(result.is_ok(), get_status == 200 && get_body == "png" && delete_status == 204);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn storage_endpoints_reject_ambiguous_urls() {
+        for endpoint in ["https://user@bucket.test", "https://bucket.test?x=1", "https://bucket.test#x", "https://bucket.test/path"] {
+            let store = Store { endpoint: endpoint.into(), ..Store::default() };
+            assert!(store.scheme_host().is_err(), "{endpoint}");
+        }
     }
 
     #[test]

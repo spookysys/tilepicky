@@ -73,9 +73,10 @@ Search matches query terms as prefixes against sheet metadata:
 
 - Entering `gra` matches `grass`.
 - Multiple terms require all words to match.
-- The filter menu beside the input toggles target fields: folder names, file names, AI captions, AI tags, and embeddings (meaning).
+- The filter menu beside the input toggles target fields: folder names, file names, AI captions, AI tags, image meaning, and caption and tag meaning.
 
-The word fields are matched locally and synchronously on your machine. The embeddings field is a sibling of them, not a mode above them: a sheet shows when any enabled field matches. It needs an embedding index; see [Search by meaning](#search-by-meaning). Until the library has one, the checkbox matches nothing, the way an empty caption field does.
+Word search runs locally. Every query word must match an enabled word field. Either meaning source can add matching sheets.
+Meaning search needs saved embeddings; see [Search by meaning](#search-by-meaning).
 
 ## Labeling sheets with AI
 
@@ -137,19 +138,34 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 
 ### Search by meaning
 
-**Generate Embeddings (AI)...** turns each sheet's image into one vector, so that search can match a query by meaning rather than by prefix. Labels are not needed. The button sits in the library AI panel and beside the source header, and also in the right-click menu of a library file or folder.
+Open **Search embeddings** in the library AI panel. Choose **Images** or **Captions and tags**, then select **Generate search embeddings (AI)...**.
+A file or folder context menu selects that target. The panel also lets you return to the whole library.
 
-Each sheet's image goes to the embedding model, and the vector comes back. The confirm names the model and the number of sheets before anything is sent.
+- **Images** embeds each sheet's image. Labels are optional.
+- **Captions and tags** embeds saved label text without the image. It skips sheets without labels.
 
-The vectors live in `embeddings.json` beside the library, with the model that made them. Generating again embeds only the sheets whose image changed. A different embedding model re-embeds every sheet.
+The confirmation shows the provider, model, source type, and number of sheets. Generation can incur provider charges.
+Preparation and generation run in the background. Cancel stops further requests; completed batches remain saved.
+An active request may still incur a charge. Failed runs keep completed batches, so a retry need not repeat them.
 
-Choose the **Embeddings** model in Settings (`Ctrl+,`). It must read images as well as text, so that a text query can match a picture. The shipped default is `voyageai/voyage-multimodal-3.5`. OpenRouter serves embeddings through an OpenAI-style endpoint.
+Image vectors live in `embeddings.json`. Label vectors live independently in `embeddings-text.json`.
+Each file records its model and provider identity. Changed sources need new vectors. Changed models or providers require regeneration.
+Old vectors without a provider identity also need regeneration. Damaged files produce an error and remain unchanged.
 
-**Include captions and tags** (in Settings, beside the embeddings model) adds a labeled sheet's caption and tags to its embedding, so a query can match those words as well as the picture. Unlabeled sheets are embedded from their image alone. Turning it on or off, or editing a label, re-embeds the sheets it affects.
+Choose the **Embeddings** model in Settings (`Ctrl+,`). Image search requires a model that accepts both images and text.
+The shipped default is `voyageai/voyage-multimodal-3.5` through an OpenAI-compatible endpoint.
 
-The **embeddings (meaning)** checkbox in the search filter then matches a sheet whose vector is close to the query's. It is a peer of the word fields. A sheet with no vector, or a library whose vectors came from another model, matches nothing by meaning.
+**Include captions and tags**, beside the model setting, combines label text with the image input.
+Leave it off to compare image embeddings against independent label embeddings. Changing this option requires regenerating the image vectors.
+Label edits invalidate the affected label vectors and combined image vectors.
 
-With that checkbox on, the query text goes to the embedding model, once per settled query, so that Tilepicky can compare it. The word fields need no network.
+Use **image meaning** and **caption and tag meaning** in the search filter to compare the saved sources.
+Disable the other fields to test one source alone. **Minimum similarity** controls how close a vector must be.
+Results stay in folder order; the score does not rank them.
+
+Meaning search sends your query to the selected embedding provider after a short pause in typing.
+One query vector can search both sources when their model and provider match. Word search needs no network.
+Failed queries show an error and a **Retry meaning search** button. They do not retry on every frame.
 
 ### Label an entire library
 
@@ -166,7 +182,8 @@ Review the request count and confirm with **Start labeling**. Existing labels st
 To label part of a library, choose a folder or mark a group in the tree first.
 Click a folder to choose it alone; it wears the selection colour and the panel target becomes that folder.
 Ctrl+click folders and files to add or remove them from a marked group; a marked folder brings every sheet below it, in its subfolders too, so folders and files can share one selection. Marked rows wear the selection colour.
-Right-click a marked row and select **Generate Labels (AI)...**, or right-click an unmarked folder and choose **Generate Tags (AI)...** to take that folder alone.
+Right-click a marked row and select **Generate labels for selection (AI)...**.
+For an unmarked folder, **Generate labels for folder (AI)...** takes that folder alone.
 The panel names the target and offers **Label unlabeled in selection...** and **Rerun all in selection...**.
 Use **Whole library** to clear the choice.
 
@@ -192,7 +209,16 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-With an OpenAI-compatible provider such as OpenRouter, Tilepicky labels a library two ways. If the provider has **Sheet storage**, Tilepicky uploads each sheet to your bucket and submits one OpenRouter batch: it runs while Tilepicky is closed, and OpenRouter bills batch requests at about half rate. The sheets leave your machine only to that bucket, and Tilepicky deletes them when the batch finishes. Without storage, Tilepicky sends ordinary requests in the background, several at a time, and the app must stay open. OpenRouter's batch API accepts images only at public URLs, which is why storage is needed for a batch. With Google Gemini, Tilepicky submits requests through the Gemini batch API in batches of up to 100 sheets, and sends several batches at once. The full-height library panel displays progress and keeps job controls above the scrollable details. Completed labels are written directly to `tilepicky.json`. Some providers behind a model answer in prose instead of a label; such a sheet goes out again, up to three tries in all, and **Generate Tags (AI)** asks once more.
+OpenRouter with **Sheet storage** uploads images to your bucket and submits batches that can run while Tilepicky is closed.
+OpenRouter and its model providers fetch those images through signed URLs. Tilepicky deletes the objects after a confirmed terminal result.
+An ambiguous submission keeps its objects, because accepted work may still need them. Configure a bucket lifecycle rule for eventual cleanup.
+The excluded-host list applies to ordinary requests. OpenRouter batch routing uses the account settings.
+
+Other OpenAI-compatible endpoints use concurrent ordinary requests, even when storage is configured. The app must remain open for these jobs.
+Google Gemini uses batches of up to 100 sheets. Both batch methods count accepted, unfinished batches against the configured concurrency limit.
+The library panel shows progress and saves completed labels into `tilepicky.json`.
+Invalid label replies can retry up to three times. Cancelling a job stops new requests and discards late label results.
+
 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
@@ -349,17 +375,22 @@ Auto-detected grids are saved immediately to `tilepicky.json`. Manual grid adjus
 
 The paintbrush button in the tilesheet header opens the **Color quantization**
 panel. It previews how a sheet looks once its colors are reduced. It changes
-nothing on disk; it is a look ahead, not a conversion.
+no source pixels on disk. The preview runs in the background and refreshes after image or setting changes.
 
 Choose what the setting applies to:
 
 - The open sheet.
 - A marked group of files.
-- A folder, chosen with Ctrl+click in the project tree, like the library batch.
+- A folder, chosen through **Color quantization...** in its context menu.
 
 The panel shows the target, and a **paths** button lists the sheets it covers.
 A group shares one palette, so a whole scene is quantized together. A sheet
-can hold only one setting; the panel asks before it replaces an older one.
+can hold only one setting. **Apply** updates the same group directly and asks before it replaces overlapping groups.
+Opening a target shows one of its sheets, after any required save decision.
+SNES groups require matching tile sizes without gaps or offsets. General mode supports other grids.
+Settings and painted pins follow file renames and copies. Deleting files removes their saved targets and pins.
+When a moved sheet has a different setting from its destination folder, the source setting stays with the sheet.
+The destination group becomes an explicit file group to prevent overlap.
 
 Two modes:
 
@@ -375,11 +406,9 @@ Two modes:
 
 Dithering is offered in both modes.
 
-**Save Quantized...** writes the preview as an indexed PNG, with the palette
-inside it. It opens a save dialog, so you choose where the file goes. The
-file keeps the palette order and the index of every pixel, but a PNG has no
-tiles and the target engine may want a different palette order, so treat it
-as a preview.
+**Save Quantized...** saves the preview shown when the file dialog opens. It does not overwrite the source sheet.
+Indexed output preserves the palette and pixel indices. Downsample output and formats with per-pixel alpha use RGBA PNG.
+A failed write preserves the previous output file. PNG does not store the target engine's tile arrangement.
 
 ## Shortcuts
 

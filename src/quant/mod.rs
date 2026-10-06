@@ -4,10 +4,11 @@
 // Tilepicky is GPL-3.0-only, and the two licenses are compatible.
 //! Tile-aware palette quantization for indexed SNES graphics.
 //!
-//! A faithful port of the incremental quantizer in SuperFamiconv 0.12
+//! Adapted from the incremental quantizer in SuperFamiconv 0.12
 //! (`src/quant/incremental/`), which is itself based on Rilden's
 //! TiledPaletteQuant. The phases, constants, tie-breaking, and sample schedule
-//! match the reference, so the output matches for the same input and settings.
+//! follow the reference. Transparency uses a separate mask, and opaque pixels
+//! cannot select the reserved transparent entry.
 //!
 //! The method, in order:
 //! 1. Reduce every pixel to the mode's native color depth and collect each
@@ -60,6 +61,8 @@ pub struct Job {
     pub dither: Option<Dither>,
     /// Pixels equal to this color are index 0 and train nothing.
     pub color_zero: Option<Rgb>,
+    /// Explicit transparency. When present, RGB values never imply transparency.
+    pub transparent_pixels: Option<Vec<bool>>,
     /// Tile width in pixels.
     pub tile_width: u32,
     /// Tile height in pixels.
@@ -94,6 +97,7 @@ impl Job {
             colors,
             dither: None,
             color_zero: None,
+            transparent_pixels: None,
             tile_width: 8,
             tile_height: 8,
             deep_tiles: Vec::new(),
@@ -220,7 +224,7 @@ fn quantize_once(image: &[Rgb], width: u32, height: u32, job: &Job) -> Quantized
 
     let assignment = palette::assign_subpalettes(&subpalettes, &tiles, settings);
     let tile_colors: Vec<Vec<Oklab>> = tiles.iter().map(|tile| tile.colors.clone()).collect();
-    let palettes = finalize::finalize(&subpalettes, &assignment, &tile_colors, capacity, job.color_zero);
+    let palettes = finalize::finalize(&subpalettes, &assignment, &tile_colors, capacity, job.color_zero, job.transparent_pixels.is_some());
     let mut deep_colors = finalize::finalize_deep(&deep, &palettes, deep_capacity, job.color_zero);
     // Finalization drops deep-only colors that round to a color that is
     // there already. With dither, the run moves these colors so little that
@@ -290,7 +294,8 @@ fn quantize_once(image: &[Rgb], width: u32, height: u32, job: &Job) -> Quantized
 /// The error of `result` against `image` over blocks of `block` x `block`
 /// pixels, as `Quantized::pixel_error` and `Quantized::block_error` describe.
 fn output_error(image: &[Rgb], width: u32, height: u32, job: &Job, result: &Quantized, block: u32) -> f64 {
-    let mut cgram = [Rgb::new(0, 0, 0); 256];
+    let zero = job.color_zero.map_or(Rgb::new(0, 0, 0), |c| c.reduce().normalize());
+    let mut cgram = [zero; 256];
     for (index, color) in deep_entries(job, &result.palettes, &result.deep_colors) {
         cgram[usize::from(index)] = color;
     }
@@ -313,7 +318,10 @@ fn output_error(image: &[Rgb], width: u32, height: u32, job: &Job, result: &Quan
             }
         }
     }
-    let source: Vec<Oklab> = image.iter().map(|c| srgb_to_oklab(c.reduce().normalize())).collect();
+    let source: Vec<Oklab> = image.iter().enumerate().map(|(i, c)| {
+        let transparent = job.transparent_pixels.as_ref().is_some_and(|mask| mask[i]);
+        srgb_to_oklab(if transparent { zero } else { c.reduce().normalize() })
+    }).collect();
 
     let mean = |colors: &[Oklab], x: u32, y: u32| {
         let (mut l, mut a, mut b) = (0.0f32, 0.0f32, 0.0f32);
@@ -339,7 +347,7 @@ fn output_error(image: &[Rgb], width: u32, height: u32, job: &Job, result: &Quan
 fn deep_entries(job: &Job, palettes: &[Vec<Rgb>], deep_colors: &[Rgb]) -> Vec<(u8, Rgb)> {
     let stride = job.stride();
     let zero = job.color_zero.map_or(Rgb::new(0, 0, 0), |c| c.reduce().normalize());
-    let mut entries = vec![(0u8, zero)];
+    let mut entries = Vec::new();
     for (k, palette) in palettes.iter().enumerate() {
         for (i, &color) in palette.iter().enumerate().skip(1) {
             entries.push(((k * stride + i) as u8, color));
@@ -383,6 +391,9 @@ pub fn choose_deep_tiles(image: &[Rgb], width: u32, height: u32, job: &Job, coun
             if x >= width || y >= height {
                 continue;
             }
+            if job.transparent_pixels.as_ref().is_some_and(|mask| mask[(y * width + x) as usize]) {
+                continue;
+            }
             if job.shallow_pixels.get((y * width + x) as usize).copied().unwrap_or(false) {
                 mixed = true;
                 continue;
@@ -395,7 +406,7 @@ pub fn choose_deep_tiles(image: &[Rgb], width: u32, height: u32, job: &Job, coun
         if mixed {
             deep[tile] = gain > 0.0;
         } else {
-            gains.push((gain, tile));
+            if gain > 0.0 { gains.push((gain, tile)); }
         }
     }
     gains.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));

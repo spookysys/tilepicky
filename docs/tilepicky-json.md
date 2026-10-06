@@ -67,10 +67,9 @@ sheet: a pinned tile is 8bpp.
       }
     ]
 
-A sheet belongs to at most one group. The panel refuses a second setting over
-a sheet that already has one, unless you delete the old setting first. The
-groups are a preview: the tool reads them, it does not build the game assets
-from them.
+A sheet belongs to at most one group. Apply updates the same group directly.
+The panel asks before it replaces overlapping groups. A concurrent change on disk prevents an outdated panel from overwriting the groups.
+The preview preserves the source pixels. Export saves the selected sheet's current quantized result.
 
 Writes replace the complete book through a temporary file. A malformed or unreadable
 book blocks writes until you fix it. Keep backups of your project images and books.

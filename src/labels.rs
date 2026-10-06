@@ -266,6 +266,7 @@ pub fn save_result(dir: &Path, rel: &str, guard: Option<&Guard>, label: Label) -
 /// result arrives on `result`. To cancel, drop the `Run`: the result then
 /// has nowhere to go. The provider may still bill the request.
 pub struct Run {
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub guard: Option<Guard>,
     pub log: crate::ai_log::Log,
     pub path: PathBuf,
@@ -277,6 +278,10 @@ pub struct Run {
     pub result: std::sync::mpsc::Receiver<Result<Label, String>>,
 }
 
+impl Drop for Run {
+    fn drop(&mut self) { self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed); }
+}
+
 impl Run {
     pub fn start(
         input: Input, provider: String, model: String, list: Vec<String>, free_tags: usize,
@@ -285,14 +290,18 @@ impl Run {
     ) -> Result<Self, String> {
         let log = crate::ai_log::current().unwrap_or_else(|| crate::ai_log::Log::single_file(&input.dir, &input.rel));
         let (tx, result) = std::sync::mpsc::channel();
-        let run = Self { guard: None, log: log.clone(), path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(),
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = Self { cancelled: cancelled.clone(), guard: None, log: log.clone(), path: input.path.clone(), dir: input.dir.clone(), rel: input.rel.clone(),
             provider: provider.clone(), model: model.clone(), started: std::time::Instant::now(), result };
         std::thread::Builder::new().name("label sheet".into()).spawn(move || {
             let _scope = log.enter();
             // An answer in prose goes out once more; see `batch::one`.
             crate::ai_log::event("single_start", json!({"sheet":input.rel, "provider":provider, "model":model,
                 "tags_requested":list, "prompt":sheet_prompt(prompt(&list, free_tags), &input.rel), "image_size":[input.img.width(),input.img.height()]}));
-            let ask = |body: &Value| send(body).and_then(|reply| diagnosed_response(&input.rel, &provider, &model, &reply, &list));
+            let ask = |body: &Value| {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("The request was cancelled.".into()); }
+                send(body).and_then(|reply| diagnosed_response(&input.rel, &provider, &model, &reply, &list))
+            };
             let label = request_for_sheet(&model, &input.img, &list, &input.rel, free_tags)
                 .and_then(|body| match ask(&body) { Err(e) if e == INVALID => ask(&body), reply => reply })
                 .map(|reply| reply.into_label(&provider, &model, &list));
@@ -677,6 +686,25 @@ pub mod tests {
         assert_eq!((label.provider.as_str(), label.model.as_str()), ("test", "model"));
         assert_eq!(label.caption, "Village assets");
         assert_eq!(label.tags, ["pixel art", "tree"]);
+    }
+
+    #[test]
+    fn cancellation_prevents_an_automatic_retry() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc};
+        let log = crate::ai_log::Log::single("sheet.png"); let _scope = log.enter();
+        let input = Input { path: "sheet.png".into(), dir: "".into(), rel: "sheet.png".into(), img: RgbaImage::new(2, 2) };
+        let calls = Arc::new(AtomicUsize::new(0)); let counted = calls.clone();
+        let (started, waiting) = mpsc::channel(); let (release, gate) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        let run = Run::start(input, "test".into(), "model".into(), vec![], crate::sidecar::FREE_TAGS, move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            started.send(()).unwrap(); gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(json!({"choices":[{"finish_reason":"stop", "message":{"content":"Trees, in prose"}}]}))
+        }, move || { done.send(()).unwrap(); }).unwrap();
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(run); release.send(()).unwrap();
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     /// One answer in prose goes out again; a second one fails the label.

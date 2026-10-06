@@ -9,8 +9,8 @@ use super::*;
 pub trait Objects: std::marker::Send + Sync {
     /// Uploads one PNG and returns a URL the provider can fetch.
     fn upload(&self, key: &str, png: &[u8]) -> Result<String, String>;
-    /// Deletes one uploaded object. A failure is not fatal.
-    fn delete(&self, key: &str);
+    /// Deletes one uploaded object. A failure remains visible in the job.
+    fn delete(&self, key: &str) -> Result<(), String>;
 }
 
 /// Object storage over the S3 client.
@@ -20,20 +20,23 @@ impl Storage {
 }
 impl Objects for Storage {
     fn upload(&self, key: &str, png: &[u8]) -> Result<String, String> {
+        let url = self.0.presigned_get(key, URL_SECONDS)?;
         self.0.put(key, png, "image/png")?;
-        self.0.presigned_get(key, URL_SECONDS)
+        Ok(url)
     }
-    fn delete(&self, key: &str) { let _ = self.0.delete(key); }
+    fn delete(&self, key: &str) -> Result<(), String> { self.0.delete(key) }
 }
 
 /// The lifetime of a sheet URL, and the age a bucket lifecycle rule should
 /// delete objects at. The batch window is 24 hours.
 const URL_SECONDS: u64 = 2 * 24 * 60 * 60;
 
-/// The object key for one sheet, by content, so a repeat reuses it.
-fn object_key(png: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("tilepicky/{:x}.png", Sha256::digest(png))
+/// Each upload has its own key, including identical images in other jobs.
+fn object_key() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("tilepicky/{}-{stamp}-{sequence}.png", std::process::id())
 }
 
 fn batch_body(model: &str, requests: &[(usize, Value)]) -> Value {
@@ -49,18 +52,34 @@ pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), 
     for i in 0..job.sheets.len() {
         if job.sheets[i].taken { continue; }
         if requests.len() == MAX_REQUESTS { break; }
-        let bytes = std::fs::read(root.join(&job.sheets[i].rel)).map_err(|e| format!("Could not read the image: {e}"))?;
-        let image = image::load_from_memory(&bytes).map_err(|e| format!("Could not read the image: {e}"))?;
-        job.sheets[i].guard = Some(InputGuard { hash: { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(&bytes)) },
-            label: book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone()) });
-        let png = labels::png_bytes(&image.to_rgba8())?;
-        let object = object_key(&png);
-        let url = match objects.upload(&object, &png) {
-            Ok(url) => url,
+        // A failed cleanup must not lose its key or create another object.
+        if let Err(error) = delete_sheet(job, i, objects.as_ref()) {
+            job.sheets[i].error = error;
+            job.sheets[i].taken = true;
+            continue;
+        }
+        let existing = book.sheets.get(&job.sheets[i].rel).and_then(|s| s.label.clone());
+        let mut body = match image_request(job, root, i, existing) {
+            Ok(body) => body,
             Err(error) => { job.sheets[i].error = error; job.sheets[i].taken = true; continue; }
         };
-        job.sheets[i].stored = Some(object);
-        let mut body = chat_request(job, &image.to_rgba8(), &job.sheets[i].rel)?;
+        body.as_object_mut().unwrap().remove("provider");
+        use base64::Engine;
+        let encoded = body["messages"][1]["content"][1]["image_url"]["url"].as_str()
+            .and_then(|url| url.strip_prefix("data:image/png;base64,")).ok_or("The request has no PNG image.")?;
+        let png = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| "The request image is invalid.")?;
+        let object = object_key();
+        job.sheets[i].stored = Some(object.clone());
+        let url = match objects.upload(&object, &png) {
+            Ok(url) => url,
+            Err(error) => {
+                // A failed PUT can still have stored the object upstream.
+                let cleanup = delete_sheet(job, i, objects.as_ref()).err();
+                job.sheets[i].error = cleanup.map_or(error.clone(), |cleanup| format!("{error} {cleanup}"));
+                job.sheets[i].taken = true;
+                continue;
+            }
+        };
         body["messages"][1]["content"][1]["image_url"]["url"] = json!(url);
         requests.push((i, body));
         taken.push(i);
@@ -74,24 +93,31 @@ pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), 
         "detail":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel, "object":job.sheets[*i].stored})).collect::<Vec<_>>()}));
     match send("batches", Some(&batch_body(&job.model.clone(), &requests))) {
         Ok(response) => match response["id"].as_str() {
-            Some(id) => { job.groups[group].tracking.id = id.to_string(); job.groups[group].remote = Remote::Waiting(id.to_string()); }
-            None => {
-                delete_group(job, group);
+            Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) => {
+                job.groups[group].tracking.id = id.to_string();
+                job.groups[group].remote = Remote::Waiting(id.to_string());
+            }
+            _ => {
                 for &i in &taken { job.sheets[i].error = "The batch was accepted without an ID.".into(); }
                 job.groups[group].remote = Remote::Done;
             }
         },
-        Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429 | 500..=599, _))) => {
+        Err(failure @ (Failure::NotSent(_) | Failure::Status(401 | 403 | 429, _))) => {
             // The batch did not go out: the sheets may try again.
             delete_group(job, group);
             job.groups.remove(group);
             for &i in &taken { job.sheets[i].taken = false; }
             return job.save(dir).and(Err(failure.message()));
         }
+        Err(failure @ Failure::Status(400..=499, _)) => {
+            delete_group(job, group);
+            for &i in &taken { job.sheets[i].error = failure.message(); }
+            job.groups[group].remote = Remote::Done;
+        }
         Err(failure) => {
             // The batch may exist. OpenRouter has no client reference to find
             // it again, so the sheets end here rather than being sent twice.
-            delete_group(job, group);
+            // Keep the images available if the provider accepted this batch.
             for &i in &taken { job.sheets[i].error =
                 format!("{} The batch may have been accepted, so it was not sent again; retrying can bill twice.", failure.message()); }
             job.groups[group].remote = Remote::Done;
@@ -100,12 +126,42 @@ pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), 
     job.save(dir)
 }
 
-/// Deletes the objects of a group and clears their keys.
+/// A saved submission without an ID must never send the same paid work again.
+pub fn close_unconfirmed(job: &mut Job) {
+    for group in &mut job.groups {
+        if group.remote != Remote::Submitting { continue; }
+        for &i in &group.sheets {
+            job.sheets[i].error = "The batch submission was interrupted. It may have been accepted; retrying can bill twice.".into();
+        }
+        group.remote = Remote::Done;
+    }
+}
+
+/// Removes an object before its sheet can upload another one.
+fn delete_sheet(job: &mut Job, sheet: usize, objects: &dyn Objects) -> Result<(), String> {
+    let Some(object) = job.sheets[sheet].stored.clone() else { return Ok(()) };
+    match objects.delete(&object) {
+        Ok(()) => {
+            job.sheets[sheet].stored = None;
+            if job.sheets.iter().all(|sheet| sheet.stored.is_none()) { job.issues.remove("cleanup"); }
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("{object}: {error}");
+            let previous = job.issues.get("cleanup").map(|i| i.message.clone()).unwrap_or_default();
+            if !previous.contains(&object) {
+                job.issue("cleanup", format!("{previous}\nRemove this uploaded object from your bucket, or let its lifecycle rule remove it:\n{message}"),
+                    now_ms());
+            }
+            Err(format!("Object cleanup must finish before another upload: {message}"))
+        }
+    }
+}
+
+/// Deletes the objects of a group and clears only successfully removed keys.
 fn delete_group(job: &mut Job, group: usize) {
     let Some(objects) = job.objects.clone() else { return };
-    for &s in &job.groups[group].sheets {
-        if let Some(object) = job.sheets[s].stored.take() { objects.delete(&object); }
-    }
+    for sheet in job.groups[group].sheets.clone() { let _ = delete_sheet(job, sheet, objects.as_ref()); }
 }
 
 /// OpenRouter has no cancel call. The batch may still finish upstream, so the
@@ -176,7 +232,82 @@ mod tests {
             self.uploaded.lock().unwrap().push(key.to_string());
             Ok(format!("https://example.test/{key}"))
         }
-        fn delete(&self, key: &str) { self.deleted.lock().unwrap().push(key.to_string()); }
+        fn delete(&self, key: &str) -> Result<(), String> { self.deleted.lock().unwrap().push(key.to_string()); Ok(()) }
+    }
+
+    #[test]
+    fn a_rejected_submission_cannot_upload_again_while_cleanup_fails() {
+        struct Leaky { uploads: Mutex<usize> }
+        impl Objects for Leaky {
+            fn upload(&self, _: &str, _: &[u8]) -> Result<String, String> {
+                *self.uploads.lock().unwrap() += 1; Ok("https://example.test/image.png".into())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> { Err("HTTP 403".into()) }
+        }
+        let dir = crate::storage::tests::Folder::new();
+        RgbaImage::new(2, 2).save(dir.0.join("a.png")).unwrap();
+        let mut job = prepare(&crate::index::Index::scan(&dir.0, [16, 16]),
+            crate::batch::tests::provider(Kind::OpenAi), "test".into(), Scope::Unlabeled).unwrap();
+        let objects = Arc::new(Leaky { uploads: Mutex::new(0) }); job.objects = Some(objects.clone());
+        assert!(submit(&mut job, &dir.0, &dir.0, &mut |_, _| Err(Failure::Status(429, "Wait".into()))).is_err());
+        let key = job.sheets[0].stored.clone(); let message = job.issues["cleanup"].message.clone();
+        submit(&mut job, &dir.0, &dir.0, &mut |_, _| panic!("cleanup blocks another submission")).unwrap();
+        assert_eq!(*objects.uploads.lock().unwrap(), 1);
+        assert_eq!(job.sheets[0].stored, key);
+        assert_eq!(job.issues["cleanup"].message, message, "retries do not grow the cleanup report");
+        assert!(job.sheets[0].taken && job.sheets[0].error.contains("cleanup must finish"));
+    }
+
+    #[test]
+    fn failed_cleanup_keeps_the_object_key_and_explains_how_to_remove_it() {
+        struct CannotDelete;
+        impl Objects for CannotDelete {
+            fn upload(&self, _: &str, _: &[u8]) -> Result<String, String> { unreachable!() }
+            fn delete(&self, _: &str) -> Result<(), String> { Err("HTTP 403".into()) }
+        }
+        let dir = crate::storage::tests::Folder::new();
+        RgbaImage::new(2, 2).save(dir.0.join("a.png")).unwrap();
+        let mut job = prepare(&crate::index::Index::scan(&dir.0, [16, 16]),
+            crate::batch::tests::provider(Kind::OpenAi), "test".into(), Scope::Unlabeled).unwrap();
+        job.sheets[0].stored = Some("tilepicky/test.png".into());
+        job.objects = Some(Arc::new(CannotDelete));
+        job.groups.push(Group { sheets: vec![0], remote: Remote::Done, recovery: None, tracking: Tracking::default() });
+        delete_group(&mut job, 0);
+        assert_eq!(job.sheets[0].stored.as_deref(), Some("tilepicky/test.png"));
+        assert!(job.issues["cleanup"].message.contains("tilepicky/test.png: HTTP 403"));
+        job.save(&dir.0).unwrap();
+        assert!(Job::load(&dir.0).unwrap().unwrap().issues.contains_key("cleanup"));
+    }
+
+    #[test]
+    fn missing_images_fail_individually_and_do_not_block_the_batch() {
+        let dir = crate::storage::tests::Folder::new();
+        for name in ["a.png", "b.png"] { RgbaImage::new(2, 2).save(dir.0.join(name)).unwrap(); }
+        let mut job = prepare(&crate::index::Index::scan(&dir.0, [16, 16]),
+            crate::batch::tests::provider(Kind::OpenAi), "test".into(), Scope::Unlabeled).unwrap();
+        std::fs::remove_file(dir.0.join("a.png")).unwrap();
+        job.objects = Some(Arc::new(Fake { uploaded: Mutex::new(vec![]), deleted: Mutex::new(vec![]) }));
+        submit(&mut job, &dir.0, &dir.0, &mut |_, body| {
+            assert_eq!(body.unwrap()["requests"].as_array().unwrap().len(), 1);
+            Ok(json!({"id":"batch-1"}))
+        }).unwrap();
+        assert!(!job.sheets.iter().find(|s| s.rel == "a.png").unwrap().error.is_empty());
+        assert_eq!(job.groups.len(), 1);
+    }
+
+    #[test]
+    fn each_upload_owns_a_different_object() {
+        assert_ne!(object_key(), object_key());
+    }
+
+    #[test]
+    fn a_restart_closes_an_unconfirmed_submission_without_resending() {
+        let dir = crate::storage::tests::Folder::new();
+        let mut job = prepare(&crate::index::Index::scan(&dir.0, [16, 16]),
+            crate::batch::tests::provider(Kind::OpenAi), "test".into(), Scope::Unlabeled).unwrap();
+        job.groups.push(Group { sheets: vec![], remote: Remote::Submitting, recovery: None, tracking: Tracking::default() });
+        close_unconfirmed(&mut job);
+        assert!(job.done());
     }
 
     /// Upload, submit, poll a finished batch, save the labels, delete the
@@ -222,7 +353,7 @@ mod tests {
     }
 
     /// A submit whose reply is lost does not send the batch again. The sheets
-    /// end with a reason, the objects go, and the group closes.
+    /// end with a reason. Objects stay until the bucket lifecycle removes them.
     #[test]
     fn a_lost_submit_reply_does_not_resend_the_batch() {
         let dir = crate::storage::tests::Folder::new();
@@ -248,7 +379,7 @@ mod tests {
         assert!(job.sheets[0].taken);
         assert!(job.sheets[0].error.contains("not sent again"));
         assert!(matches!(job.groups[0].remote, Remote::Done));
-        assert!(job.sheets[0].stored.is_none());
-        assert_eq!(fake.deleted.lock().unwrap().len(), 1);
+        assert!(job.sheets[0].stored.is_some());
+        assert!(fake.deleted.lock().unwrap().is_empty());
     }
 }

@@ -123,6 +123,8 @@ impl Provider {
             .is_some_and(|url| url.host().is_some_and(|host| host.eq_ignore_ascii_case("openrouter.ai")))
     }
 
+    pub fn uses_batch_storage(&self) -> bool { self.is_openrouter() && self.store.is_some() }
+
     pub fn skipped(&self) -> Vec<String> {
         self.skip.clone().unwrap_or_else(|| if self.is_openrouter() { vec!["phala".into()] } else { vec![] })
     }
@@ -170,7 +172,7 @@ impl Provider {
 
 /// How a Library job on this provider runs, for the panel and the model editor.
 pub fn method(provider: &Provider) -> &'static str {
-    match (provider.kind, provider.store.is_some()) {
+    match (provider.kind, provider.uses_batch_storage()) {
         (Kind::OpenAi, true) => "OpenRouter batch",
         (Kind::OpenAi, false) => "Several sheets at a time",
         (Kind::Gemini, _) => "Google batch",
@@ -189,8 +191,7 @@ pub enum Role {
         /// The model runs library jobs.
         #[serde(default)]
         library: bool,
-        /// How many ordinary requests a library job keeps in flight. Only an
-        /// OpenAI-style provider reads it; a Gemini model submits batches.
+        /// Maximum active requests, or active batches when the provider uses batches.
         #[serde(default = "default_concurrency")]
         concurrency: u32,
     },
@@ -399,9 +400,9 @@ impl Ai {
         // The old shipped embedding model read label text. Image embeddings
         // need a multimodal one, so swap it where it was never changed.
         for m in &mut self.models {
-            if m.is_embed() && m.id == OLD_EMBED_MODEL { m.id = EMBED_MODEL.into(); }
+            if m.is_embed() && m.provider == "OpenRouter" && m.id == OLD_EMBED_MODEL { m.id = EMBED_MODEL.into(); }
         }
-        if let Some(r) = &mut self.embed && r.model == OLD_EMBED_MODEL { r.model = EMBED_MODEL.into(); }
+        if let Some(r) = &mut self.embed && r.provider == "OpenRouter" && r.model == OLD_EMBED_MODEL { r.model = EMBED_MODEL.into(); }
     }
 
     /// Adds a model, or adds its scopes to the model of the same name.
@@ -546,7 +547,9 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
     if let Some(selected) = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
         && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
         ui.add_space(4.0);
-        if provider.kind == Kind::OpenAi { configure |= endpoint_notice(ui, selected.concurrency().unwrap_or(DEFAULT_CONCURRENCY), provider.store.is_some()); }
+        if provider.kind == Kind::OpenAi {
+            configure |= endpoint_notice(ui, selected.concurrency().unwrap_or(DEFAULT_CONCURRENCY), provider.uses_batch_storage());
+        }
         else {
             ui.strong("Google batch");
             ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
@@ -710,6 +713,7 @@ fn providers_ui(
                     }
                 }
                 keys.rename(&old, &p.name);
+                keys.rename(&s3_secret_name(&old), &s3_secret_name(&p.name));
             }
             ui.end_row();
             ui.label("API type");
@@ -755,7 +759,7 @@ fn providers_ui(
                 KeySource::None => "no key: type one, or set the variable".to_string(),
             });
             ui.end_row();
-            if p.kind == Kind::OpenAi {
+            if p.is_openrouter() {
                 ui.label("Sheet storage");
                 let mut on = p.store.is_some();
                 if ui.checkbox(&mut on, "Upload sheets so a batch can fetch them").changed() {
@@ -765,6 +769,9 @@ fn providers_ui(
                 let secret = p.store_secret(keys);
                 let has_secret = secret.is_some();
                 if let Some(store) = &mut p.store {
+                    ui.label("");
+                    ui.small("Batch routing uses your OpenRouter account settings. The excluded hosts above apply to ordinary requests only.");
+                    ui.end_row();
                     for (label, value) in [("Endpoint", &mut store.endpoint), ("Region", &mut store.region),
                         ("Bucket", &mut store.bucket), ("Access key", &mut store.access_key)] {
                         ui.label(label);
@@ -788,18 +795,19 @@ fn providers_ui(
                     let test_id = egui::Id::new(("s3 test", &p.name));
                     let slot = ui.data_mut(|d| d.get_temp::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id));
                     if let Some(slot) = slot {
-                        match slot.lock().unwrap().take() {
+                        match slot.lock().unwrap().as_ref() {
                             None => { ui.weak("Testing the connection..."); ui.ctx().request_repaint_after(std::time::Duration::from_millis(250)); }
                             Some(Ok(())) => {
                                 ui.weak("Connection ok: upload, signed URL, and delete all work.");
-                                ui.data_mut(|d| d.remove::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id));
                             }
                             Some(Err(error)) => {
                                 ui.colored_label(ui.visuals().error_fg_color, error);
-                                ui.data_mut(|d| d.remove::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id));
                             }
                         }
-                    } else if ui.add_enabled(has_secret, egui::Button::new("Test connection")).clicked()
+                    }
+                    let running = ui.data_mut(|d| d.get_temp::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id))
+                        .is_some_and(|slot| slot.lock().unwrap().is_none());
+                    if ui.add_enabled(has_secret && !running, egui::Button::new("Test connection")).clicked()
                         && let Some(secret) = secret.clone() {
                         let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
                         ui.data_mut(|d| d.insert_temp(test_id, slot.clone()));
@@ -840,7 +848,7 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
     if let Some(m) = models.get_mut(sel) {
         let before = m.reference();
         let kind = providers.iter().find(|p| p.name == m.provider).map(|p| p.kind);
-        let store = providers.iter().find(|p| p.name == m.provider).is_some_and(|p| p.store.is_some());
+        let store = providers.iter().find(|p| p.name == m.provider).is_some_and(Provider::uses_batch_storage);
         egui::Grid::new("model fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("provider");
             egui::ComboBox::from_id_salt("model provider").selected_text(m.provider.clone()).show_ui(ui, |ui| {
@@ -873,16 +881,9 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
                     ui.checkbox(library, library_label);
                 });
                 ui.end_row();
-                // The methods that use the number: Gemini sends batches,
-                // OpenAI without storage sends requests. The OpenRouter
-                // batch path keeps none in flight.
-                let shows = *library && match kind {
-                    Some(Kind::Gemini) => true,
-                    Some(Kind::OpenAi) => !store,
-                    None => false,
-                };
+                let shows = *library && kind.is_some();
                 if shows {
-                    let (label, hover) = if kind == Some(Kind::Gemini) {
+                    let (label, hover) = if kind == Some(Kind::Gemini) || store {
                         ("Batches at once", "How many batches a library job of this model keeps in flight.")
                     } else {
                         ("Requests at once", "How many requests a library job of this model keeps in flight.")
@@ -1098,6 +1099,24 @@ mod tests {
         assert!(!m.serves(Mode::Instant) && !m.serves(Mode::Batch));
         assert_eq!(m.concurrency(), None);
         assert!(m.label().contains("embeddings"));
+    }
+
+    #[test]
+    fn custom_embedding_endpoints_keep_their_model() {
+        let mut ai = Ai::default();
+        ai.providers.push(Provider::new("Custom", Kind::OpenAi));
+        ai.models.push(Model { provider: "Custom".into(), id: OLD_EMBED_MODEL.into(), role: Role::Embed });
+        ai.embed = Some(ModelRef { provider: "Custom".into(), model: OLD_EMBED_MODEL.into() });
+        ai.heal();
+        assert_eq!(ai.chosen_embed().unwrap().1.id, OLD_EMBED_MODEL);
+    }
+
+    #[test]
+    fn generic_endpoints_do_not_use_openrouter_batches() {
+        let mut provider = Provider::new("Custom", Kind::OpenAi);
+        provider.store = Some(crate::s3::Store::default());
+        assert!(!provider.uses_batch_storage());
+        assert_eq!(method(&provider), "Several sheets at a time");
     }
 
     /// A fresh install names an embedding model, and a file from before

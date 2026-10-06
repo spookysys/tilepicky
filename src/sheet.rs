@@ -595,6 +595,9 @@ pub struct Sheet {
     pub preview_hovered: bool,
     /// The paint tool of that panel: pin a tile to 8bpp, or erase the pin.
     pub quant_tool: Option<crate::quant_panel::Tool>,
+    /// Changes whenever the source pixels or their grid change.
+    pub quant_revision: u64,
+    pub quant_pins: Vec<bool>,
     /// The quantized pixels, shown in place of the sheet while it previews.
     quant_preview: Option<Vec<(Rect, TextureHandle)>>,
     /// Which source file each pixel came from, in image coordinates.
@@ -762,6 +765,8 @@ impl Sheet {
             ppp: 1.0,
             preview_hovered: false,
             quant_tool: None,
+            quant_revision: 0,
+            quant_pins: Vec::new(),
             quant_preview: None,
             prov,
             frames: Vec::new(),
@@ -802,6 +807,8 @@ impl Sheet {
     /// past x1, y1), into the chunks it touches. Cheap for small edits on a
     /// large canvas.
     fn upload_region(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
+        self.quant_revision = self.quant_revision.wrapping_add(1);
+        self.clear_quant_preview();
         let (w, h) = self.img.dimensions();
         let (x1, y1) = (x1.min(w), y1.min(h));
         if x0 >= x1 || y0 >= y1 {
@@ -821,6 +828,8 @@ impl Sheet {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
+        self.quant_revision = self.quant_revision.wrapping_add(1);
+        self.clear_quant_preview();
         let (w, h) = self.img.dimensions();
         let side = CHUNK.min(ctx.input(|i| i.max_texture_side) as u32).max(64);
         self.chunks.clear();
@@ -1096,6 +1105,15 @@ impl Sheet {
                         for x in 0..self.cols() {
                             painter.rect_stroke(cell_rect(x, y), 0.0, grid, egui::StrokeKind::Outside);
                         }
+                    }
+                }
+            }
+            if self.quant_tool.is_some() {
+                let cols = self.cols().max(1);
+                for (i, &pinned) in self.quant_pins.iter().enumerate() {
+                    if pinned {
+                        let cell = cell_rect(i as u32 % cols, i as u32 / cols);
+                        painter.rect_stroke(cell, 0.0, Stroke::new(2.0, Color32::YELLOW), egui::StrokeKind::Inside);
                     }
                 }
             }
