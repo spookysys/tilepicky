@@ -92,6 +92,19 @@ pub fn request(model: &str, inputs: &[Value]) -> Value {
     json!({"model": model, "input": inputs, "encoding_format": "float"})
 }
 
+/// How many sheets still need a vector. It reads the images but does not
+/// decode them, so a plan can be counted without the work of a run.
+pub fn pending(root: &Path, rels: &[String], done: &Embeddings, model: &str) -> usize {
+    let same = done.model == model;
+    rels.iter()
+        .filter(|rel| {
+            let Ok(bytes) = std::fs::read(root.join(rel)) else { return false };
+            if image::guess_format(&bytes).is_err() { return false; }
+            !(same && done.sheets.get(*rel).is_some_and(|v| v.hash == hash_bytes(&bytes)))
+        })
+        .count()
+}
+
 /// The vectors of a reply, in the order of the input. An endpoint that drops
 /// the index falls back to the order it returned.
 pub fn response(value: &Value, count: usize) -> Result<Vec<Vec<f32>>, String> {
@@ -162,12 +175,14 @@ pub struct Run {
 
 impl Run {
     pub fn start(
-        root: PathBuf, model: String, total: usize, jobs: Vec<Job>, done: Embeddings,
+        root: PathBuf, model: String, total: usize, rels: Vec<String>, done: Embeddings,
         send: impl Fn(&Value) -> Result<Value, String> + Send + 'static,
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
         let (tx, result) = std::sync::mpsc::channel();
         std::thread::Builder::new().name("generate embeddings".into()).spawn(move || {
+            // The images are read and decoded here, off the UI thread.
+            let jobs = jobs(&root, &rels, &done, &model);
             let mut done = done;
             done.model = model.clone();
             let outcome = embed_all(&root, &model, &jobs, &mut done, &send);
@@ -228,10 +243,12 @@ mod tests {
         let rels: Vec<String> = ["a.png", "b.png", "broken.png"].iter().map(|s| s.to_string()).collect();
         let all = jobs(&folder.0, &rels, &Embeddings::default(), "m");
         assert_eq!(all.len(), 2, "the unreadable file is skipped");
+        assert_eq!(pending(&folder.0, &rels, &Embeddings::default(), "m"), 2, "the plan counts the same");
         let hash = all[0].hash.clone();
         let mut done = Embeddings { model: "m".into(), ..Default::default() };
         done.sheets.insert("a.png".into(), Vector { hash, vec: vec![1.0, 0.0] });
         assert_eq!(jobs(&folder.0, &rels, &done, "m").len(), 1, "the unchanged sheet stays");
+        assert_eq!(pending(&folder.0, &rels, &done, "m"), 1);
         assert_eq!(jobs(&folder.0, &rels, &done, "other").len(), 2, "a new model re-embeds all");
     }
 
@@ -247,8 +264,8 @@ mod tests {
     fn a_run_embeds_writes_and_reports() {
         let folder = folder_with(&["a.png", "b.png"]);
         let rels: Vec<String> = ["a.png", "b.png"].iter().map(|s| s.to_string()).collect();
-        let jobs = jobs(&folder.0, &rels, &Embeddings::default(), "m");
-        let run = Run::start(folder.0.clone(), "m".into(), jobs.len(), jobs, Embeddings::default(),
+        let total = pending(&folder.0, &rels, &Embeddings::default(), "m");
+        let run = Run::start(folder.0.clone(), "m".into(), total, rels, Embeddings::default(),
             |body| {
                 let n = body["input"].as_array().unwrap().len();
                 Ok(reply(&(0..n).map(|i| vec![1.0, i as f32]).collect::<Vec<_>>()))
