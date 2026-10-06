@@ -49,9 +49,10 @@ the person who uses the tool; this file is for an agent that works on it.
 - `src/index.rs`: the scan of a folder, and the search of names, captions,
   tags, and embeddings. The word search is local and synchronous; a semantic
   match uses a query vector that a worker made.
-- `src/embed.rs`: the embeddings of sheet labels for semantic search, in
-  `embeddings.json` beside the library. It holds the vectors, the request and
-  the reply checks, the cosine, and the generation over a library.
+- `src/embed.rs`: the embeddings of sheet images for semantic search, in
+  `embeddings.json` beside the library. A multimodal model embeds each sheet's
+  image, and the query as text, into one space. It holds the vectors, the
+  request and the reply checks, the cosine, and the generation over a library.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/quant/`: the color quantizer, a vendored port of SuperFamiconv 0.12's
   incremental tile-aware quantizer. It holds the SNES palettes, the dithers,

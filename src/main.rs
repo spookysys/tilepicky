@@ -657,7 +657,7 @@ impl App {
             && let Some(key) = provider.key(&self.keys) {
             match embed::Endpoint::new(&provider, key) {
                 Ok(endpoint) => {
-                    let body = provider.route(embed::request(&model, std::slice::from_ref(&query)));
+                    let body = provider.route(embed::request(&model, &[serde_json::json!(query.clone())]));
                     let (tx, rx) = std::sync::mpsc::channel();
                     let wake = ctx.clone();
                     std::thread::spawn(move || {
@@ -705,30 +705,25 @@ impl App {
             return;
         };
         let endpoint = match embed::Endpoint::new(&provider, key) { Ok(e) => e, Err(e) => { self.status = e; return; } };
-        let book = match sidecar::load_book(&root) { Ok(b) => b, Err(e) => { self.status = e; return; } };
+        let rels: Vec<String> = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
         let done = embed::read(&root).unwrap_or_default();
-        let jobs = embed::jobs(&book, &done, &model);
-        if jobs.is_empty() { self.status = "Every labeled sheet already has an embedding.".into(); return; }
-        let total = jobs.len();
+        let total = embed::pending(&root, &rels, &done, &model);
+        if total == 0 { self.status = "Every sheet already has an embedding.".into(); return; }
         let route = provider.clone();
         let wake = ctx.clone();
-        match embed::Run::start(root, model, total, jobs, done,
+        match embed::Run::start(root, model, total, rels, done,
             move |body| endpoint.send(&route.route(body.clone())), move || wake.request_repaint()) {
             Ok(run) => { self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
             Err(error) => self.status = error,
         }
     }
 
-    /// The model, and the labeled sheets that still need a vector.
+    /// The model, and the sheets that still need a vector.
     fn embed_plan(&self) -> (String, usize) {
         let model = self.settings.ai.chosen_embed().map(|(_, m)| m.id.clone()).unwrap_or_default();
-        let count = match sidecar::load_book(&self.library.index.root) {
-            Ok(book) => {
-                let done = embed::read(&self.library.index.root).unwrap_or_default();
-                embed::jobs(&book, &done, &model).len()
-            }
-            Err(_) => 0,
-        };
+        let rels: Vec<String> = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
+        let done = embed::read(&self.library.index.root).unwrap_or_default();
+        let count = embed::pending(&self.library.index.root, &rels, &done, &model);
         (model, count)
     }
 
@@ -1752,7 +1747,7 @@ impl App {
         ui.separator();
         if !self.library_batch.busy() {
             let can_clear = self.library.is_set() && self.library.index.error.is_none() && self.label_run.is_none()
-                && self.library.index.entries.iter().any(|e| e.side.label.is_some());
+                && !self.library.index.entries.is_empty();
             if stopped(ui.add_enabled(can_clear, egui::Button::new("Clear all labels..."))).clicked() {
                 self.clear_labels = Some(self.library.index.root.clone());
             }
@@ -1765,12 +1760,12 @@ impl App {
         }
         ui.add_space(6.0);
         ui.strong("Search embeddings");
-        ui.label("Embed each labeled sheet, so that search can match by meaning.");
+        ui.label("Embed each sheet's image, so that search can match by meaning.");
         if let Some(run) = &self.embed_run {
             ui.label(format!("Embedding {} sheets...", run.total));
         } else {
             let can = self.library.is_set() && self.library.index.error.is_none()
-                && self.library.index.entries.iter().any(|e| e.side.label.is_some());
+                && !self.library.index.entries.is_empty();
             if stopped(ui.add_enabled(can, egui::Button::new("Generate Embeddings (AI)..."))).clicked() {
                 self.embed_confirm = Some(self.embed_plan());
             }
@@ -2293,7 +2288,7 @@ impl App {
                     self.label_action(ctx, labels::Action::Show);
                 }
                 let can_embed = self.library.is_set() && self.library.index.error.is_none()
-                    && self.library.index.entries.iter().any(|e| e.side.label.is_some());
+                    && !self.library.index.entries.is_empty();
                 if stopped(ui.add_enabled(can_embed, egui::Button::new("Embeddings (AI)..."))).clicked() {
                     self.embed_confirm = Some(self.embed_plan());
                 }
@@ -2522,7 +2517,7 @@ impl App {
             }
             TreeAction::Embeddings => {
                 let can = self.library.is_set() && self.library.index.error.is_none()
-                    && self.library.index.entries.iter().any(|e| e.side.label.is_some());
+                    && !self.library.index.entries.is_empty();
                 if can { self.embed_confirm = Some(self.embed_plan()); }
                 else { self.status = "Label at least one sheet before generating embeddings.".into(); }
             }
@@ -2795,7 +2790,7 @@ impl App {
                     }
                     ui.weak("Words match by prefix. All words must match.\n\
                         Captions and tags come from Generate Tags (AI).\n\
-                        Embeddings come from Generate Embeddings (AI).");
+                        Embeddings come from each sheet's image, made with Generate Embeddings (AI).");
                 });
                 let r = egui::TextEdit::singleline(&mut self.query)
                     .id(search_id())
