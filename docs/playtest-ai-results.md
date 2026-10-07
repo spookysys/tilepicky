@@ -3,7 +3,8 @@
 Date: 2026-10-07.
 
 This pass used a new synthetic library, fresh settings, and a private Xvfb display.
-All native requests used a loopback provider with synthetic keys. No paid calls ran during this pass.
+A01-A15 and F02/F03 used a loopback provider with synthetic keys.
+A later native release pass closed A16 with three bounded live requests, as recorded below.
 The source PNG files match the untouched fixture copy byte for byte.
 
 Screenshot names below refer to the local `private/playtest-ai/shots/` evidence directory.
@@ -26,7 +27,7 @@ The driver records each mouse and keyboard sequence in numbered command files.
 | A13 | PASS | A changed model produced explicit replacement guidance for both indexes. Cancel returned without starting a request. Later cancellation also preserved existing indexes. `41-replacement-guidance.png`, `42-replacement-cancelled.png`. |
 | A14 | PASS | A local label failure preserved the previous label. Retry succeeded and removed the error text from the dialog and status bar. `51-label-error-old-retained.png`, `52-retry-success.png`. |
 | A15 | PASS | Started two concurrent caption-b requests, then selected caption-a. The job retained caption-b and its limit of four. Activity explained the distinction. `58-change-caption-during-job.png`, `59-job-old-model.png`, `60-job-finished-new-default.png`. |
-| A16 | COVERAGE EXCEPTION | Separate live application-module probes passed single-sheet captions and two concurrent captions. They did not exercise a native live library job. See `live-ai-validation.md`. |
+| A16 | PASS | Native release UI clicks saved one live caption, then two concurrent library captions. Activity showed 2/2 saved and zero failures. Labels survived restart. Evidence: `private/live-native-ai/shots/02-single-result.png`, `06-two-complete.png`, `10-houses-saved-offline.png`, `11-pines-saved-offline.png`, and `12-usage-offline.png`. See `live-ai-validation.md` for costs and limits. |
 | F02 | PASS | At 820 x 600, both settings windows remained usable. Search, selection, custom entry, scroll, and close controls were reachable. `62-narrow-ai-setup.png` through `68-layout-closed.png`. |
 | F03 | FIXED | Transient failures previously appeared finished while waiting for retry. The corrected display shows zero finished, two remaining, and a retry countdown. Recovery ends with two saved and no spinner. `71-activity-provider-failure.png`, `74-retry-progress-fixed.png`, `75-retry-completed.png`. |
 

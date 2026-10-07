@@ -454,7 +454,8 @@ Click a color to copy its hex value. Reduce color depth does not create a palett
   Choose `rgb565`, `rgba5658`, or `rgb233`.
 - **Limit palette colors** builds a palette with a maximum number of colors and maps pixels to it.
   Choose `rgb565`, `rgba5658`, `rgb888`, or `rgba8888`. The formats without alpha
-  can reserve color 0 as transparent. A palette has up to 256 colors.
+  can reserve color 0 as transparent. A palette has up to 256 entries.
+
 **SNES** is tile-aware. Pick the tile depth (`2bpp`, `4bpp`, `8bpp`, or
   `4bpp + 8bpp`), the number of palettes, and the total entries per palette. Index 0
   of every palette is transparent. With `4bpp + 8bpp`, the **auto** slider
@@ -465,7 +466,7 @@ Click a color to copy its hex value. Reduce color depth does not create a palett
   Undo and Redo affect pin strokes while a pin tool is selected. Click the selected tool again, or press Escape, to stop pinning.
   Changing the tile grid clears its pins because the tile boundaries change.
 
-Dithering is offered in both modes.
+All three methods offer dithering.
 
 **Save Quantized...** saves the preview shown when the file dialog opens. It does not overwrite the source sheet.
 Indexed output preserves the palette and pixel indices. Downsample output and formats with per-pixel alpha use RGBA PNG.

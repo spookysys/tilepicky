@@ -14,7 +14,6 @@ Record live requests and their costs before further paid requests. Do not send p
 
 PASS means the observed result meets the expectation. FIXED requires a recorded failure and a successful native retest.
 BLOCKED names the missing prerequisite. NOT RUN remains separate from PASS.
-COVERAGE EXCEPTION identifies a different test method that does not fulfill the planned native case.
 
 ## Tile depth painting
 
@@ -64,7 +63,7 @@ COVERAGE EXCEPTION identifies a different test method that does not fulfill the 
 | A13 | PASS | Change the embedding model after an index exists. Inspect replacement guidance and cancel without losing the index. |
 | A14 | PASS | Trigger a local label failure, then retry. Preserve the old label until success and clear stale error text. |
 | A15 | PASS | Start a small local concurrent job. Change settings while it runs; the existing job retains its captured model. |
-| A16 | COVERAGE EXCEPTION | Complete a budgeted live single-sheet label and a tiny multi-sheet job. Inspect saved labels, usage, and errors. |
+| A16 | PASS | Complete a budgeted live single-sheet label and a tiny multi-sheet job. Inspect saved labels, usage, and errors. |
 
 ## Transfers, search, and editing
 
@@ -90,16 +89,29 @@ COVERAGE EXCEPTION identifies a different test method that does not fulfill the 
 | F05 | PASS | Open export again and cancel. Confirm no extra file and no blocked app controls. |
 | F06 | PASS | Review screenshots and logs. Record clipping, unclear language, flicker, and missing feedback, including minor issues. |
 | F07 | PASS | Retest every fixed issue with its original action sequence. Record the new screenshot and relevant commit. |
-| F08 | PLANNED | Stop private test processes. Verify final files, commit contents, build, and cumulative live test cost. |
+| F08 | PASS | Stop private test processes. Verify final files, commit contents, build, and cumulative live test cost. |
 
 ## Findings
 
 The completed [AI pass](playtest-ai-results.md) records A01-A15, F02, and F03, with screenshots and native fix retests.
 The completed [workflow pass](playtest-workflow-results.md) records W01-W08, including the search guidance and scope fixes.
 
-A16 has a coverage exception. [Live application-module probes](live-ai-validation.md) tested single-sheet captions and concurrent captions.
-Those probes did not exercise a native paid library job. They do not count as a native A16 pass.
+A16 passed through native release UI actions: one live single-sheet caption and a two-sheet concurrent library job.
+The [live validation report](live-ai-validation.md) records the saved labels, request counts, and budget.
 
 The [pinning and export pass](playtest-pin-results.md) records P01-P24, layout, and export checks.
-Final cleanup and commit verification remain under F08. All other native cases have results.
+All 56 cases have results: 49 PASS and seven FIXED after native retests.
+No case remains planned, blocked, or excluded. Provider-native batch jobs and object storage were outside the live test scope.
 Each report records confusing interactions as findings, even when the application did not crash.
+
+## Final verification
+
+The full suite passed 321 tests, with four intentionally ignored. Clippy passed for all targets.
+The release build passed with the locked dependency set. Its source matches commit `eb124e5`.
+The private displays and helper processes stopped. Isolated live credentials were removed.
+Original fixture image pixels stayed unchanged. The user library, project, and settings were not modified.
+Conservative live accounting totals USD 0.11211586, approximately EUR 0.09949, within the EUR 1 limit.
+
+Achievement commits: `1147f7a` adds pinning; `e9b367a` fixes search guidance; `7921378` fixes AI guidance and retry progress.
+Commit `eb124e5` fixes group pins, grid typing, inspection protection, and moving Apply controls.
+The linked reports contain screenshot names, failure descriptions, and native retest evidence.

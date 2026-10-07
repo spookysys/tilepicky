@@ -2,7 +2,8 @@
 
 Test date: 2026-10-07.
 
-The tests used two generated 128 x 128 PNG sheets. One contained four trees; the other contained four houses.
+The module tests used two generated 128 x 128 PNG sheets with trees and houses.
+The native UI pass used three synthetic sheets, with two tree sheets and one house sheet.
 No user images, library metadata, private messages, or files went to a provider.
 The tests did not change the saved AI configuration.
 
@@ -29,20 +30,44 @@ The application did not need an embedding format change.
 
 The probes exercised `labels::request`, provider routing, label transport, Gemini conversion, and the application label parser.
 The embedding probes exercised the application input builder, request builder, transport, and vector validator.
-Two caption transports ran concurrently. This did not test the complete library job coordinator against a live provider.
-
-These were direct application-module tests, separate from the earlier native UI tests.
-They did not test native provider batch jobs, object storage, cancellation billing, or a large library.
+The first probes were direct application-module tests. A later native release UI pass tested the complete library job coordinator.
+Neither pass tested native provider batch jobs, object storage, cancellation billing, or a large library.
 A model catalogue entry does not establish access for an account. The real request can still fail.
+
+## Native release UI validation
+
+The release build included commit `eb124e5`. The app ran on a fresh private display with isolated configuration.
+Actual UI clicks submitted one sheet, then a library job with two unlabeled sheets.
+Both jobs used OpenRouter `google/gemini-2.5-flash`, with batch processing disabled and a concurrency limit of two.
+The confirmation correctly skipped the first saved label. Its estimate was less than USD 0.01.
+The two library requests started two milliseconds apart, before either response arrived.
+Activity finished with two saved labels and no failures. All three sheets had usable captions and tags.
+
+A restart without credentials confirmed the saved house and pine labels in the inspector.
+The Activity panel retained the completed job and reported usage below USD 0.01.
+The tree captions again described a white background despite source transparency.
+
+Private screenshots in `private/live-native-ai/shots/` record the UI evidence:
+
+- `02-single-result.png`: the saved single-sheet caption.
+- `04-two-sheet-estimate.png`: two remaining sheets and one skipped label.
+- `06-two-complete.png`: two saved labels and zero failures.
+- `10-houses-saved-offline.png` and `11-pines-saved-offline.png`: labels retained after restart.
+- `12-usage-offline.png`: the retained job and usage display.
+
+The app, private display, and helper processes were stopped after inspection.
+The isolated credentials were removed. The user configuration was unchanged.
 
 ## Cost and limits
 
-The user allowed EUR 1 for all live tests. The operational ceiling was USD 0.40.
-Every paid request used a fixed model ID. No automatic retries, search tools, or object storage were enabled.
+The user allowed EUR 1 for all live tests. The initial operational ceiling was USD 0.40.
+The later native pass reserved at most USD 0.15, with a cumulative ceiling of USD 0.26114746.
+Every paid request used a fixed model ID. No request was retried. Search tools and object storage were unused.
 Each caption request allowed 4096 output tokens. Preflight reserves also covered reasoning tokens and input images.
 A file marker prevented each temporary probe from running twice accidentally.
 
-Seven inference requests were sent: four caption requests and three embedding requests.
+Ten inference requests were sent: seven caption requests and three embedding requests.
+The native pass sent exactly three requests, with no retries. A watchdog bounded its request count and duration.
 Two requests failed before a useful result: the unavailable Google model and the malformed test harness input.
 
 | Successful request | Input tokens | Output tokens | Reported or estimated USD |
@@ -52,14 +77,18 @@ Two requests failed before a useful result: the unavailable Google model and the
 | Google trees, Flash-Lite | 1322 | 76 | 0.00044450 |
 | Voyage image | 89 reported | n/a | 0.00003000 |
 | Voyage text pair | 23 | n/a | 0.00000276 |
-| Total successful requests | | | 0.00114746 |
+| Native UI single tree sheet | 517 | 73 | 0.00033760 |
+| Native UI library houses | 517 | 54 | 0.00029010 |
+| Native UI library pines | 519 | 74 | 0.00034070 |
+| Total successful requests | | | 0.00211586 |
 
 OpenRouter reported upstream costs for the captions, although its own charge was zero because the route used BYOK.
 The total includes those upstream costs. Google's cost uses its returned token counts and published standard rates.
 The embedding rows use the returned cost values.
 
 The failed calls returned no usage. The accounting retains their full preflight reserves of USD 0.11.
-Successful costs plus these reserves total USD 0.11114746, about EUR 0.099.
+The native pass added USD 0.00096840, including BYOK upstream costs.
+Successful costs plus the failed-call reserves total USD 0.11211586, about EUR 0.09949.
 This is a conservative accounting total, not an invoice amount.
 
 The [ECB reference rate](https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html)
