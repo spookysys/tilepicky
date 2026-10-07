@@ -433,6 +433,7 @@ Choose what the setting applies to:
 The panel shows the target, and a **paths** button lists the sheets it covers.
 A group shares one palette, so a whole scene is quantized together. A sheet
 can hold only one setting. **Apply** updates the same group directly and asks before it replaces overlapping groups.
+Separating a sheet into its own group retains its settings and tile depth pins.
 Opening a target shows one of its sheets, after any required save decision.
 SNES groups require matching tile sizes without gaps or offsets. Reduce color depth and Limit palette colors support other grids.
 Settings and painted pins follow file renames and copies. Deleting files removes their saved targets and pins.

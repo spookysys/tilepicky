@@ -1090,7 +1090,7 @@ impl Sheet {
             }
             self.screen = rect;
             self.clip = ui.clip_rect();
-            if let Some(tool) = self.quant_tool {
+            if !eye && let Some(tool) = self.quant_tool {
                 let secondary = resp.secondary_clicked() || resp.dragged_by(egui::PointerButton::Secondary)
                     || (resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.secondary_down()));
                 if (secondary || resp.clicked() || resp.dragged_by(egui::PointerButton::Primary)

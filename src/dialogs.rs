@@ -72,28 +72,27 @@ impl App {
         self.damaged_dialog(ctx);
     }
 
-    /// The sheets a new quantization target would cover already carry a
-    /// setting. The user chooses to delete those, or to abort.
+    /// Confirms replacement of settings on overlapping quantization targets.
     fn quant_conflict_dialog(&mut self, ctx: &egui::Context) {
         let Some(conflict) = &self.quant_conflict else { return };
         let covered = conflict.covered.clone();
         let mut choice: Option<bool> = None;
         egui::Modal::new(Id::new("quant conflict")).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.heading("These sheets already have a color quantization");
+            ui.heading("Replace quantization settings?");
             egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                 for rel in &covered {
                     ui.weak(rel);
                 }
             });
             ui.add_space(4.0);
-            ui.label("Delete the settings those sheets have and apply the new one, or abort?");
+            ui.label("Apply these settings to the listed sheets? Other sheets keep their settings. Tile depth pins are retained.");
             ui.add_space(8.0);
             footer(ui, |ui| {
-                if ui.button("Delete and continue").clicked() {
+                if ui.button("Replace settings").clicked() {
                     choice = Some(true);
                 }
-                if ui.button("Abort").clicked() {
+                if ui.button("Cancel").clicked() {
                     choice = Some(false);
                 }
             });

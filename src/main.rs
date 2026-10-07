@@ -1536,7 +1536,7 @@ impl App {
         let in_half = self.pane.1 != Spot::Status;
         // The eye is for looking: a panel with it on takes no edit and no
         // selection. Copying, zooming, and the panels stay.
-        let painting = self.quant_panel && self.quant_tool.is_some() && self.active == Panel::Project;
+        let painting = self.quant_panel && self.quant_tool.is_some() && self.active == Panel::Project && !self.project_eye;
         let project_eye = self.project_eye || painting;
         let eye = project_eye && self.active == Panel::Project;
         // The window layer turns Ctrl+C into a Copy event, and Ctrl+V into a Paste
@@ -1843,7 +1843,9 @@ impl App {
                     return None;
                 };
                 let mut new_grid = None;
-                let grid_button = ui.menu_button("Grid...", |ui| {
+                let (grid_button, _) = egui::containers::menu::MenuButton::new("Grid...")
+                    .config(egui::containers::menu::MenuConfig::default().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                    .ui(ui, |ui| {
                     ui.label(format!("{cols} x {rows} tiles"));
                     ui.horizontal(|ui| {
                         ui.label("Tile size");
@@ -1858,9 +1860,11 @@ impl App {
                             ui.label("Offset");
                             if let Some(o) = offset_field(library).ui(ui, offset) { new_grid = Some((tile, gap, o)); }
                         });
+                    } else {
+                        ui.weak("Changing the tile size clears saved tile depth pins.");
                     }
                 });
-                stop(&grid_button.response);
+                stop(&grid_button);
                 ui.weak(format!("{zoom}x")).on_hover_text(sel.unwrap_or_else(|| "No tile selection".into()));
                 new_grid
             },
@@ -4077,6 +4081,32 @@ mod tests {
         b.app.quant_paint((0, 0), Tool::Auto);
         assert_eq!(b.app.quant_pins[0], TileDepth::Auto);
         assert_eq!(b.app.project.sheet.as_ref().unwrap().img, original);
+    }
+
+    #[test]
+    fn separating_a_quantization_group_preserves_both_members_pins() {
+        use sidecar::{QuantizeGroup, QuantizeTarget, TileDepth};
+        let mut b = bench(&[], &["a.png", "b.png"]);
+        b.open_project("a.png");
+        let mut setting = quant_panel::default_setting();
+        setting.snes.as_mut().unwrap().depth = sidecar::SnesDepth::Bpp4Plus8;
+        let group = QuantizeGroup {
+            target: QuantizeTarget::Files(vec!["a.png".into(), "b.png".into()]), setting: setting.clone(),
+            pins: [("a.png".into(), vec![TileDepth::Bpp4]), ("b.png".into(), vec![TileDepth::Bpp8])].into(),
+        };
+        sidecar::replace_quantize(&b.app.project.index.root, &[], std::slice::from_ref(&group)).unwrap();
+        b.app.project.index.quantize = vec![group];
+        b.app.quant_set_target(QuantizeTarget::Files(vec!["a.png".into()]));
+        assert_eq!(b.app.quant, setting);
+        assert_eq!(b.app.quant_pins, [TileDepth::Bpp4]);
+        b.app.quant_apply(true);
+        let groups = &b.app.project.index.quantize;
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.iter().find_map(|g| g.pins.get("a.png")).unwrap(), &[TileDepth::Bpp4]);
+        assert_eq!(groups.iter().find_map(|g| g.pins.get("b.png")).unwrap(), &[TileDepth::Bpp8]);
+        b.app.quant_clear();
+        assert_eq!(b.app.project.index.quantize.len(), 1);
+        assert_eq!(b.app.project.index.quantize[0].pins["b.png"], [TileDepth::Bpp8]);
     }
 
     fn query_fixture(b: &mut Bench, query: &str) -> QueryKey {

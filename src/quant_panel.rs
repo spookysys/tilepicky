@@ -901,6 +901,11 @@ impl App {
             .quantize
             .iter()
             .find(|g| g.target == target || self.project.index.quantize_members(&g.target) == members)
+            .or_else(|| {
+                let rel = &self.project.sheet.as_ref()?.rel;
+                if !members.contains(rel) { return None; }
+                self.project.index.quantize.iter().find(|g| self.project.index.quantize_members(&g.target).contains(rel))
+            })
             .cloned();
         match group {
             Some(g) => {
@@ -1252,8 +1257,10 @@ impl App {
         }
         if self.quant.mode == QuantizeMode::Snes
             && self.quant.snes.as_ref().is_some_and(|s| s.depth == SnesDepth::Bpp4Plus8)
-            && let Some(o) = &self.quant_preview {
-            ui.weak(format!("{} tiles are 8bpp", o.deep_tiles));
+        {
+            if let Some(o) = &self.quant_preview {
+                ui.weak(format!("{} tiles are 8bpp, including forced tiles", o.deep_tiles));
+            } else { ui.weak("Calculating tile depths..."); }
         }
         if !self.quant_error.is_empty() {
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &self.quant_error);
