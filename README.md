@@ -423,19 +423,24 @@ The panel shows the target, and a **paths** button lists the sheets it covers.
 A group shares one palette, so a whole scene is quantized together. A sheet
 can hold only one setting. **Apply** updates the same group directly and asks before it replaces overlapping groups.
 Opening a target shows one of its sheets, after any required save decision.
-SNES groups require matching tile sizes without gaps or offsets. General mode supports other grids.
+SNES groups require matching tile sizes without gaps or offsets. Reduce color depth and Limit palette colors support other grids.
 Settings and painted pins follow file renames and copies. Deleting files removes their saved targets and pins.
 When a moved sheet has a different setting from its destination folder, the source setting stays with the sheet.
 The destination group becomes an explicit file group to prevent overlap.
 
-Two modes:
+Choose one option from **Color reduction method**. Its settings appear under a separate heading.
+**Palette entries** counts every slot, including transparency when reserved. Four entries with transparency allow three visible colors.
+**Palettes** controls the number of separate SNES palettes. Each SNES palette always reserves index 0 for transparency.
+RGBA formats preserve alpha separately; their palette limit counts RGB colors, as the panel explains.
 
-- **General** reduces each pixel, with no palette (downsample), or builds a
-  palette and an index per pixel (indexed). The formats are `rgb565`,
-  `rgba5658`, `rgb233`, `rgb888`, and `rgba8888`. The formats without alpha
+- **SNES** uses tile palettes and hardware color limits, as described below.
+- **Reduce color depth** reduces each pixel's color precision without a palette. Image dimensions stay the same.
+  Choose `rgb565`, `rgba5658`, or `rgb233`.
+- **Limit palette colors** builds a palette with a maximum number of colors and maps pixels to it.
+  Choose `rgb565`, `rgba5658`, `rgb888`, or `rgba8888`. The formats without alpha
   can reserve color 0 as transparent. A palette has up to 256 colors.
-- **SNES** is tile-aware. Pick the tile depth (`2bpp`, `4bpp`, `8bpp`, or
-  `4bpp + 8bpp`), the number of palettes, and the colors per palette. Index 0
+**SNES** is tile-aware. Pick the tile depth (`2bpp`, `4bpp`, `8bpp`, or
+  `4bpp + 8bpp`), the number of palettes, and the total entries per palette. Index 0
   of every palette is transparent. With `4bpp + 8bpp`, the **auto** slider
   promotes a share of the tiles to 8bpp, and the **paint** and **erase**
   tools pin or unpin a tile by hand.

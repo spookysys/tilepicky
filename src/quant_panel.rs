@@ -671,24 +671,23 @@ fn snes_ui(ui: &mut egui::Ui, s: &mut Snes) -> bool {
     } else {
         s.palettes = 1;
     }
-    changed |= ui.add(egui::Slider::new(&mut s.colors, 1..=(stride - 1)).text("colors per palette")).changed();
+    let mut entries = (s.colors + 1).clamp(2, stride);
+    changed |= ui.add(egui::Slider::new(&mut entries, 2..=stride).text("palette entries")).changed();
+    if s.colors != entries - 1 { s.colors = entries - 1; changed = true; }
+    ui.weak(format!("{} colors + 1 transparent per palette", s.colors));
     if s.dither == QuantizeDither::FloydSteinberg { s.dither = QuantizeDither::None; changed = true; }
     changed |= dither_combo(ui, &mut s.dither, false);
     if matches!(s.depth, SnesDepth::Bpp4Plus8) {
         changed |= ui.add(egui::Slider::new(&mut s.auto_pct, 0..=100).text("auto 8bpp %")).changed();
         changed |= ui.add(egui::Slider::new(&mut s.extra_8bpp, 0..=(256usize.saturating_sub(s.palettes * stride))).text("extra 8bpp colors")).changed();
     }
-    ui.weak("index 0 of every palette is transparent");
+    ui.weak("SNES always reserves palette index 0 for transparency.");
     changed
 }
 
 /// The controls of a general setting. Returns whether anything changed.
 fn general_ui(ui: &mut egui::Ui, g: &mut General) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        changed |= ui.selectable_value(&mut g.kind, GeneralKind::Downsample, "downsample").changed();
-        changed |= ui.selectable_value(&mut g.kind, GeneralKind::Indexed, "indexed").changed();
-    });
     let formats: &[(GeneralFormat, &str)] = match g.kind {
         GeneralKind::Downsample => &[
             (GeneralFormat::Rgb565, "rgb565"),
@@ -721,7 +720,7 @@ fn general_ui(ui: &mut egui::Ui, g: &mut General) -> bool {
         changed = true;
     }
     if matches!(g.kind, GeneralKind::Indexed) {
-        changed |= ui.add(egui::Slider::new(&mut g.colors, 2..=256).text("palette colors")).changed();
+        changed |= ui.add(egui::Slider::new(&mut g.colors, 2..=256).text("palette entries")).changed();
     }
     if !g.format.has_alpha() {
         changed |= ui.checkbox(&mut g.key, "preserve transparency").changed();
@@ -729,8 +728,14 @@ fn general_ui(ui: &mut egui::Ui, g: &mut General) -> bool {
         g.key = false;
         changed = true;
     }
-    if g.format.has_alpha() && g.kind == GeneralKind::Indexed {
-        ui.weak("PNG keeps per-pixel alpha. Colors use the palette; the file is RGBA.");
+    if g.kind == GeneralKind::Indexed {
+        if g.key {
+            ui.weak(format!("{} colors + 1 transparent", g.colors.clamp(2, 256) - 1));
+        } else if g.format.has_alpha() {
+            ui.weak("The limit counts RGB colors. Per-pixel alpha is separate; the exported file is RGBA.");
+        } else {
+            ui.weak(format!("Up to {} colors, without transparency", g.colors.clamp(2, 256)));
+        }
     }
     changed |= dither_combo(ui, &mut g.dither, true);
     changed
@@ -1045,14 +1050,38 @@ impl App {
             }
         }
         ui.separator();
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut self.quant.mode, QuantizeMode::Snes, "SNES").changed();
-            changed |= ui.selectable_value(&mut self.quant.mode, QuantizeMode::General, "general").changed();
-        });
         let defaults = default_setting();
         if self.quant.snes.is_none() { self.quant.snes = defaults.snes; }
         if self.quant.general.is_none() { self.quant.general = defaults.general; }
+        let mut method = match self.quant.mode {
+            QuantizeMode::Snes => 0,
+            QuantizeMode::General => match self.quant.general.as_ref().map(|g| g.kind) {
+                Some(GeneralKind::Downsample) => 1,
+                _ => 2,
+            },
+        };
+        let previous = method;
+        let names = ["SNES", "Reduce color depth", "Limit palette colors"];
+        ui.label("Color reduction method");
+        egui::ComboBox::from_id_salt("quantization method").selected_text(names[method]).show_ui(ui, |ui| {
+            for (value, name) in names.into_iter().enumerate() {
+                ui.selectable_value(&mut method, value, name);
+            }
+        });
+        let mut changed = method != previous;
+        if changed {
+            self.quant.mode = if method == 0 { QuantizeMode::Snes } else { QuantizeMode::General };
+            if method != 0 && let Some(g) = self.quant.general.as_mut() {
+                g.kind = if method == 1 { GeneralKind::Downsample } else { GeneralKind::Indexed };
+            }
+        }
+        ui.weak(match method {
+            0 => "Use tile palettes and color limits for SNES graphics.",
+            1 => "Reduce the precision of each color channel. Image dimensions stay the same.",
+            _ => "Choose a maximum number of colors and build a shared palette.",
+        });
+        ui.add_space(8.0);
+        ui.strong(match method { 0 => "SNES settings", 1 => "Color depth settings", _ => "Palette settings" });
         match self.quant.mode {
             QuantizeMode::Snes => {
                 if let Some(s) = self.quant.snes.as_mut() {
@@ -1176,6 +1205,32 @@ mod tests {
         match run_general(&g, &sheet()).export {
             Export::Indexed { palette, .. } => assert!(palette.len() <= 16),
             Export::Image => panic!("the indexed kind exports a palette"),
+        }
+    }
+
+    #[test]
+    fn four_palette_entries_include_the_transparent_entry() {
+        let image = RgbaImage::from_fn(16, 8, |x, y| {
+            if x == 0 { image::Rgba([0, 0, 0, 0]) }
+            else { image::Rgba([(x * 17) as u8, (y * 31) as u8, 120, 255]) }
+        });
+        for key in [false, true] {
+            let setting = General { kind: GeneralKind::Indexed, format: GeneralFormat::Rgb888,
+                colors: 4, key, dither: QuantizeDither::None };
+            let result = run_general(&setting, &image);
+            let Export::Indexed { palette, indices, key: transparent } = &result.export else { panic!("Expected indexed output") };
+            assert!(*transparent == key);
+            assert!(palette.len() <= 4);
+            let visible: std::collections::HashSet<_> = indices.iter().copied().filter(|i| !key || *i != 0).collect();
+            assert!(visible.len() <= 4 - usize::from(key));
+            if key { assert_eq!(indices[0], 0); }
+            let dir = crate::storage::tests::Folder::new();
+            let path = dir.0.join("palette.png");
+            write(&result, &path, 16, 8).unwrap();
+            let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+            let reader = decoder.read_info().unwrap();
+            assert!(reader.info().palette.as_ref().unwrap().len() / 3 <= 4);
+            assert_eq!(reader.info().trns.is_some(), key);
         }
     }
 
