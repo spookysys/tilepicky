@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Task navigation, the visual library, and scoped search tools.
 
-use crate::{App, Panel, Spot, Index, labels, embed, settings, egui, Id};
+use crate::{App, Panel, Spot, Index, labels, settings, egui, Id};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Workspace { Library, Build }
@@ -17,6 +17,7 @@ impl App {
                 crate::stop(&ui.selectable_value(&mut self.workspace, Workspace::Build, "Build"));
                 if before != self.workspace {
                     self.drag = None;
+                    self.library_drag = None;
                     self.active = Panel::Library;
                     self.pane = (Panel::Library, Spot::Tree);
                     ui.ctx().memory_mut(|m| m.request_focus(crate::library_tree_id()));
@@ -25,7 +26,7 @@ impl App {
                 if ui.add_enabled(self.library.is_set(), egui::Button::new("Improve search...")).clicked() {
                     self.open_improve();
                 }
-                let running = self.label_run.is_some() || self.embed_run.is_some() || self.library_batch.busy();
+                let running = self.label_run.is_some() || self.embed_run.is_some() || self.library_batch.processing();
                 if ui.selectable_label(self.ai_panel, if running { "Activity (running)" } else { "Activity" }).clicked() {
                     self.ai_panel = !self.ai_panel;
                 }
@@ -36,6 +37,13 @@ impl App {
                     if ui.button("Refresh library").clicked() { self.rescan_library(); ui.close(); }
                 });
                 if self.workspace == Workspace::Build {
+                    let mut hints = !self.settings.hide_legend;
+                    let response = ui.checkbox(&mut hints, "Keyboard hints");
+                    ui.data_mut(|d| d.insert_temp(Id::new("shortcut setting response"), response.id));
+                    if response.changed() {
+                        self.settings.hide_legend = !hints;
+                        if let Err(error) = self.settings.save() { self.status = error; }
+                    }
                     if ui.add_enabled(self.project.sheet.is_some(), egui::Button::new("Save")).clicked() { self.save(); }
                     if ui.add_enabled(self.project.sheet.is_some(), egui::Button::new("Colors and export...")).clicked() {
                         self.quant_panel = !self.quant_panel;
@@ -77,6 +85,7 @@ impl App {
                         self.pane = (Panel::Library, Spot::Sheet);
                         ctx.memory_mut(|m| m.request_focus(crate::library_id()));
                     }
+                    if ui.button("Copy sheet to project").clicked() { self.copy_library_sheet(&ctx, i); }
                     if ui.button("Review / generate tags...").clicked() { self.label_action(&ctx, labels::Action::Show); }
                     if ui.button("Improve this sheet...").clicked() {
                         self.improve_rels = vec![self.library.index.entries[i].rel.clone()];
@@ -117,6 +126,7 @@ impl App {
             if let Some(i) = self.gallery.show_ordered(ui, &self.library.index, &order, self.library.sel, &mut self.library_marked) {
                 self.open_library(&ctx, i);
             }
+            if let Some(i) = self.gallery.take_drag() { self.start_library_drag(i); }
         });
     }
 
@@ -198,14 +208,13 @@ impl App {
                 if ui.add_enabled(!self.improve_rels.is_empty(), egui::Button::new("Try one sheet...")).clicked() { action = Some(3); }
             });
             ui.group(|ui| {
-                ui.strong("Image meaning");
-                ui.label("Find sheets from a visual description. This sends sheet images to your provider.");
-                if ui.button("Review image index...").clicked() { action = Some(1); }
-            });
-            ui.group(|ui| {
-                ui.strong("Label meaning");
-                ui.label("Find related ideas in saved captions and tags. Sheets without labels are skipped.");
-                if ui.button("Review label index...").clicked() { action = Some(2); }
+                ui.strong("Meaning search");
+                ui.checkbox(&mut self.embed_images, "Images");
+                ui.checkbox(&mut self.embed_text, "Captions and tags");
+                ui.label("Generate independent indexes with separate requests. Sheets without labels skip the text index.");
+                if ui.add_enabled(self.embed_images || self.embed_text, egui::Button::new("Review search indexes...")).clicked() {
+                    action = Some(1);
+                }
             });
             if crate::stopped(ui.button("AI setup...")).clicked() { self.settings_request = true; }
             ui.small("Your selection stays here while you configure AI. No generation starts from setup.");
@@ -222,10 +231,11 @@ impl App {
                     self.open_label_target(ctx, self.library.index.root.clone(), self.improve_rels[0].clone());
                 }
                 _ => {
-                    self.embed_mode = if action == 1 { embed::InputMode::Image } else { embed::InputMode::Text };
                     self.embed_rels = Some(self.improve_rels.clone());
-                    let configured = if action == 1 { self.settings.ai.chosen_embed() } else { self.settings.ai.chosen_text_embed() };
-                    if configured.is_none() { self.settings_request = true; return; }
+                    if (self.embed_images && self.settings.ai.chosen_embed().is_none())
+                        || (self.embed_text && self.settings.ai.chosen_text_embed().is_none()) {
+                        self.settings_request = true; return;
+                    }
                     if self.embed_run.is_some() || self.embed_preparing.is_some() {
                         self.status = "Wait for the current search index task or cancel it in Activity.".into();
                         return;

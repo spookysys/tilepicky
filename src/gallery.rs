@@ -30,6 +30,7 @@ pub struct Gallery {
     cache: HashMap<Key, Cached>,
     frame: u64,
     generation: u64,
+    drag: Option<usize>,
 }
 
 impl Default for Gallery {
@@ -43,7 +44,7 @@ impl Default for Gallery {
                 request.context.request_repaint();
             }
         });
-        Self { root: PathBuf::new(), requests, replies, pending: HashSet::new(), cache: HashMap::new(), frame: 0, generation: 0 }
+        Self { root: PathBuf::new(), requests, replies, pending: HashSet::new(), cache: HashMap::new(), frame: 0, generation: 0, drag: None }
     }
 }
 
@@ -64,6 +65,7 @@ fn ordered_indices(count: usize, order: &[usize]) -> Vec<usize> {
 }
 
 impl Gallery {
+    pub fn take_drag(&mut self) -> Option<usize> { self.drag.take() }
     fn prepare(&mut self, ui: &egui::Ui, index: &crate::index::Index) {
         if self.root != index.root {
             self.root.clone_from(&index.root);
@@ -150,13 +152,14 @@ impl Gallery {
                         ui.push_id(&entry.rel, |ui| {
                             ui.allocate_ui_with_layout(egui::vec2(width, CARD_HEIGHT), egui::Layout::top_down(egui::Align::Min), |ui| {
                                 ui.set_max_width(width);
-                                let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 130.0), egui::Sense::click());
+                                let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 130.0), egui::Sense::click_and_drag());
                                 ui.painter().rect_filled(rect, 5.0, ui.visuals().extreme_bg_color);
                                 self.paint_preview(ui, index, i, rect, &response);
                                 if selected == Some(i) || response.hovered() {
                                     let stroke = if selected == Some(i) { ui.visuals().selection.stroke } else { ui.visuals().widgets.hovered.fg_stroke };
                                     ui.painter().rect_stroke(rect, 5.0, stroke, egui::StrokeKind::Inside);
                                 }
+                                if response.drag_started() { self.drag = Some(i); }
                                 if response.on_hover_text(&entry.rel).clicked() { opened = Some(i); }
                                 ui.horizontal(|ui| {
                                     let mut checked = marked.contains(&i);

@@ -58,11 +58,13 @@ Use the top bar to switch between two workspaces:
 Switching workspaces keeps open sheets, selections, zoom, and unsaved project changes.
 Project edit shortcuts operate only in Build. Saving remains available in both workspaces.
 **Colors and export...** opens the existing palette, preview, and export tools for the project.
+The export dialog starts in the source sheet's folder and suggests a separate output filename.
 
 **Improve search...** captures the selected files and folders. With no selection, it targets the whole library.
 Review the scope, choose a task, and review its confirmation before any generation starts.
 **Activity** holds library tagging jobs and search index progress. You can close it and keep browsing.
-**AI setup...** opens a resizable settings window.
+**AI setup...** opens a resizable window for provider connections and AI models.
+The **Keyboard hints** checkbox in Build shows or hides the scrollable shortcut legend.
 
 Each Build canvas has a header with grid parameters, zoom, and selection details.
 The recordings in this README show the earlier layout. Their tile operations still apply in Build.
@@ -153,13 +155,15 @@ GIF sheets submit their first frame. Images with dimensions exceeding 2048 pixel
 
 ### Search by meaning
 
-Open **Improve search...** and choose **Review image index...** or **Review label index...**.
+Open **Improve search...** and select **Images**, **Captions and tags**, or both.
+Review the selected indexes together before generation starts.
 The dialog captures the selected sheets. File and folder context menus also provide scoped index actions.
 
-- **Images** embeds each sheet's image. Labels are optional.
+- **Images** embeds each sheet's image without label text.
 - **Captions and tags** embeds saved label text without the image. It skips sheets without labels.
 
-The confirmation shows the provider, model, source type, and number of sheets. Generation can incur provider charges.
+The confirmation shows each provider, model, source type, and sheet count. Generation can incur provider charges.
+Selecting both indexes runs separate requests in sequence. Each index keeps its own vectors.
 Preparation and generation run in the background. Cancel stops further requests; completed batches remain saved.
 An active request may still incur a charge. Failed runs keep completed batches, so a retry need not repeat them.
 
@@ -167,13 +171,13 @@ Image vectors live in `embeddings.json`. Label vectors live independently in `em
 Each file records its model and provider identity. Changed sources need new vectors. Changed models or providers require regeneration.
 Old vectors without a provider identity also need regeneration. Damaged files produce an error and remain unchanged.
 
-Choose **Image meaning** and **Label meaning** models in **AI setup...**. Image search requires a model that accepts images and text.
-Label meaning can use a separate text-only model. **Use image model** preserves the shared-model option.
+Choose **Search embeddings** in **AI setup...**. Both indexes use this model by default.
+Image search requires a model that accepts images and text.
+Open **Separate caption embedding model** to use a different, possibly text-only model for captions and tags.
 The shipped default is `voyageai/voyage-multimodal-3.5` through an OpenAI-compatible endpoint.
 
-**Include captions and tags in image embeddings**, under **Advanced task options**, combines label text with the image input.
-Leave it off to compare image embeddings against independent label embeddings. Changing this option requires regenerating the image vectors.
-Label edits invalidate the affected label vectors and combined image vectors.
+Older image indexes may combine images and labels. The generation confirmation warns before replacing these with image-only vectors.
+Label edits invalidate caption vectors. They do not invalidate image-only vectors.
 
 Use **image meaning** and **caption and tag meaning** in the search filter to compare the saved sources.
 Disable the other fields to test one source alone. **Minimum similarity** controls how close a vector must be.
@@ -205,8 +209,8 @@ Use **Whole library** to clear the choice.
 
 The confirmation estimates the job's cost in USD before you start. **Estimate details** shows input and output token ranges and price sources.
 It reads local image sizes and fetches OpenRouter's public model prices. It does not upload sheets to calculate the estimate.
-Google estimates use a dated table of batch prices. The table expires instead of silently keeping old prices.
-With **Sheet storage**, the OpenRouter estimate uses the batch rate, about half the live catalog price.
+Google estimates use a dated price table and the selected processing mode. The table expires instead of keeping old prices.
+With batch processing and **Sheet storage** enabled, the OpenRouter estimate uses the batch rate.
 For `gemini-flash-latest`, the confirmation names its price assumption because the alias can change.
 Unsupported models, expired prices, or a failed price lookup show an unavailable estimate. You can still start the job.
 
@@ -225,13 +229,14 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
-OpenRouter with **Sheet storage** uploads images to your bucket and submits batches that can run while Tilepicky is closed.
+With batch processing enabled, OpenRouter uses **Sheet storage** to upload images and submit batches that can run while Tilepicky is closed.
 OpenRouter and its model providers fetch those images through signed URLs. Tilepicky deletes the objects after a confirmed terminal result.
 An ambiguous submission keeps its objects, because accepted work may still need them. Configure a bucket lifecycle rule for eventual cleanup.
 The excluded-host list applies to ordinary requests. OpenRouter batch routing uses the account settings.
 
 Other OpenAI-compatible endpoints use concurrent ordinary requests, even when storage is configured. The app must remain open for these jobs.
-Google Gemini uses batches of up to 100 sheets. Both batch methods count accepted, unfinished batches against the configured concurrency limit.
+With batch processing enabled, Google Gemini uses batches of up to 100 sheets.
+Both batch methods count accepted, unfinished batches against the configured concurrency limit.
 Activity shows progress and saves completed labels into `tilepicky.json`.
 Invalid label replies can retry up to three times. Cancelling a job stops new requests and discards late label results.
 
@@ -294,18 +299,21 @@ Saved labels stay. **Rerun all...** also replaces existing labels.
 ### Model discovery
 
 **AI setup...** assigns models to tasks. Choosing **Captions and tags** sets the model for single-sheet and library requests.
-**Advanced task options** retains a separate library override.
+Each task has one model picker. Its **Browse models...** button opens the provider catalogue for that task.
+**Enable batch processing** reveals an optional batch model. Provider connections appear above the task settings.
 
-The provider catalogue refreshes when you open setup, and after an hour while it remains open.
+The provider catalogue refreshes when you browse models, and after an hour while the catalogue remains open.
 **Refresh available models** requests an immediate update. A private local cache keeps the last catalogue available after a failed refresh.
 Refreshing the catalogue never changes a selected model and never uploads sheets.
 
-The shortlist shows up to three compatible models, ordered by their listed input price.
-These are starting points, not measured quality recommendations. Output prices, routing, and image charges can change the total cost.
+The shortlist shows up to three starting points. It favors stable, recent releases from different model authors.
+Release dates and model IDs determine the order; the list does not measure model quality.
+Free routes are excluded by default because their usage limits can be stricter.
+Enable **Include free routes** to inspect them. Output prices, routing, and image charges can change the total cost.
 **Choose another model** searches the compatible catalogue. **Use a custom model ID** accepts an exact provider ID.
 
-Some providers do not report input capabilities. Those models appear only when you enable unverified capabilities.
-Gemini reports generation methods but does not establish image support in its model list.
+Some providers do not report input capabilities. Enable unverified capabilities to inspect these models.
+Google captioning suggestions show an explicit warning: its catalogue lists generation methods without establishing image support.
 Try one sheet before you start a large job with an unverified model.
 An ID containing `latest` can change at the provider. Use a versioned ID when you need a fixed model.
 
@@ -497,6 +505,16 @@ While dragging tiles:
 
 Dragging tiles onto an empty project canvas creates a new tilesheet matching the source tile dimensions.
 
+To copy a whole sheet, drag its Library thumbnail into the Project tree.
+You can also hold a Library file-tree row, then drag it into the Project tree.
+Dropping onto a project folder copies the complete image file and its grid, labels, animations, and provenance.
+Existing files stay unchanged. Repeated copies receive names such as `sheet copy.png`.
+The inspector's **Copy sheet to project** button copies into the project root.
+
+Drop a whole sheet onto the project canvas to place all its tiles. **Undo** restores the previous canvas.
+Hold Shift while dropping to preserve project pixels beneath transparent source pixels.
+
+
 ## File operations
 
 File trees accept the following mouse and keyboard actions:
@@ -520,10 +538,10 @@ Library files are read-only and cannot be moved, renamed, or deleted within Tile
 
 ## Settings
 
-Press `Ctrl+,` or click the gear icon on the status bar to open Settings.
+Press `Ctrl+,` or click the gear icon on the status bar to open **AI setup**.
 
-**Captions and tags**, **Image meaning**, and **Label meaning** select the models for new requests. Existing jobs keep their saved configuration.
-**How library jobs run** explains the execution method. **Set up Gemini...** opens its key field without changing the selected model.
+**Captions and tags** and **Search embeddings** select models for new requests. Existing jobs keep their saved configuration.
+Enable batch processing only when you want a separate native batch configuration.
 
 Give an OpenAI-compatible provider **Sheet storage** to use OpenRouter batch processing. The fields are the S3 endpoint (host only, no path), region, bucket, access key, and a path-style switch for MinIO. The secret key sits with the API keys, readable by your user alone. The bucket may stay private: Tilepicky hands OpenRouter a signed URL for each sheet. Any S3-compatible store works, for example Cloudflare R2, Backblaze B2, or MinIO. **Test connection** uploads one small object, fetches it through its signed URL, and deletes it, so a setup mistake shows here rather than mid-job.
 
@@ -531,14 +549,14 @@ Tilepicky deletes each object as soon as its batch ends. Add a bucket lifecycle 
 
 If the reply to a batch submission is lost, Tilepicky does not send that batch again, because OpenRouter offers no client reference to find it. Those sheets end with an error. Retrying them can bill twice.
 
-**API keys** shows one field per configured provider. The built-in providers and models are ready for their keys.
+**Provider connections** shows one API key field per configured provider. The built-in providers and models are ready for their keys.
 Open **Advanced connections and models** to add custom models or change connections. It starts collapsed.
 Removing a provider or model asks for confirmation and explains which active selections it clears.
 
 Click **Done**, press Escape, or close the Settings window to save. An outside click leaves Settings open.
 Closing Tilepicky also saves edits from an open Settings window. A save error keeps the app open.
 If saving fails, Settings stays open with the error and a **Retry save** button.
-The keyboard-shortcut checkbox controls the legend below the file trees in Build.
+The **Keyboard hints** checkbox lives in the Build toolbar and controls the legend below the file trees.
 
 Use the menu beside the search field to choose folders, files, captions, and tags for search matching.
 

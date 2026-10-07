@@ -295,12 +295,7 @@ pub struct Ai {
     /// An independent label-text model. None uses the image model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_embed: Option<ModelRef>,
-    /// Put a sheet's caption and tags into its embedding, when it has a label.
-    #[serde(default = "embed_labels_default")]
-    pub embed_labels: bool,
 }
-
-fn embed_labels_default() -> bool { true }
 
 /// A fresh install offers OpenRouter and Google models, without keys. Each
 /// model serves single sheets and library jobs; an OpenAI-style library job
@@ -314,14 +309,14 @@ impl Default for Ai {
         let on = |provider: &str, id: &str| Model { provider: provider.into(), id: id.into(),
             role: Role::Chat { single: true, library: true, concurrency: DEFAULT_CONCURRENCY } };
         let models = vec![
-            on("OpenRouter", "~deepseek/deepseek-flash-latest"),
-            on("OpenRouter", "z-ai/glm-5.3-flash"),
+            on("OpenRouter", "google/gemini-2.5-flash"),
+            on("OpenRouter", "openai/gpt-4.1-mini"),
             on("Google", "gemini-flash-latest"),
             Model { provider: "OpenRouter".into(), id: EMBED_MODEL.into(), role: Role::Embed },
         ];
         let (single, library) = (Some(models[0].reference()), Some(models[0].reference()));
         let embed = Some(models[3].reference());
-        Ai { providers: vec![openrouter, google], models, single, library, batch_processing: Some(false), embed, text_embed: None, embed_labels: true }
+        Ai { providers: vec![openrouter, google], models, single, library, batch_processing: Some(false), embed, text_embed: None }
     }
 }
 
@@ -532,124 +527,108 @@ impl Keys {
     }
 }
 
-/// The settings page: providers, configured models, and active models.
-/// Each of the first two shows one item, chosen in a selector, so the page
-/// stays short. Edits land in place; the caller writes both files when the
-/// dialog closes.
+/// Each task has one saved model choice and an optional provider catalogue.
 pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
-    let mut batch_on = ai.batch_enabled();
-    let Ai { providers, models, single, library, embed, text_embed, batch_processing, .. } = ai;
-    ui.heading("AI setup");
-    ui.label("Choose a model for each task. Connect its provider with an API key below.");
-    ui.small("Changes apply to new requests. Existing jobs keep their original models.");
-    if [single.as_ref(), library.as_ref(), embed.as_ref(), text_embed.as_ref()].into_iter().flatten()
-        .any(|reference| reference.model.contains("latest")) {
-        ui.small("A 'latest' model ID is a provider alias. Choose a versioned ID to keep the same model.");
-    }
-    egui::Grid::new("defaults").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-        ui.label("Captions and tags");
-        let current = single.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.serves(Mode::Instant)));
-        let text = current.map_or("Choose a model".to_string(), Model::label);
-        egui::ComboBox::from_id_salt("tag task model").selected_text(text).show_ui(ui, |ui| {
-            for m in models.iter_mut().filter(|m| !m.is_embed()) {
-                if ui.selectable_label(single.as_ref() == Some(&m.reference()), m.label()).clicked() {
-                    if let Role::Chat { single, library, .. } = &mut m.role { *single = true; *library = true; }
-                    *single = Some(m.reference());
-                }
-            }
-        });
-        ui.end_row();
-        ui.label("Maximum concurrent requests");
-        if let Some(model) = models.iter_mut().find(|m| single.as_ref().is_some_and(|r| m.is(r)))
-            && let Role::Chat { concurrency, .. } = &mut model.role {
-            ui.add(egui::DragValue::new(concurrency).range(1..=64));
-        } else { ui.weak("Choose a captioning model first"); }
-        ui.end_row();
-        ui.label("Image meaning");
-        let current = embed.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.is_embed()));
-        let text = current.map_or("Choose a model".to_string(), Model::label);
-        egui::ComboBox::from_id_salt("default embeddings").selected_text(text).show_ui(ui, |ui| {
-            for m in models.iter().filter(|m| m.is_embed()) {
-                ui.selectable_value(embed, Some(m.reference()), m.label());
-            }
-        });
-        ui.end_row();
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Label meaning");
-        let name = text_embed.as_ref().map_or("Use image model".to_owned(), |r| format!("{} ({})", r.model, r.provider));
-        egui::ComboBox::from_id_salt("label meaning model").selected_text(name).show_ui(ui, |ui| {
-            ui.selectable_value(text_embed, None, "Use image model");
-            for model in models.iter().filter(|m| m.is_embed()) {
-                ui.selectable_value(text_embed, Some(model.reference()), model.label());
-            }
-        });
-    });
-    ui.small("Image and label indexes stay separate. Label meaning can use a text-only embedding model.");
-    ui.small("A different search model needs new indexes before it can search existing sheets.");
-    if ui.checkbox(&mut batch_on, "Enable batch processing").changed() {
-        *batch_processing = Some(batch_on);
-    }
-    if batch_on {
-        ui.indent("batch settings", |ui| {
-            ui.label("Batch model");
-            let current = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r)));
-            egui::ComboBox::from_id_salt("batch model")
-                .selected_text(current.map_or("Choose a model".to_string(), Model::label)).show_ui(ui, |ui| {
-                    for m in models.iter_mut().filter(|m| !m.is_embed()) {
-                        if ui.selectable_label(library.as_ref() == Some(&m.reference()), m.label()).clicked() {
-                            if let Role::Chat { library, .. } = &mut m.role { *library = true; }
-                            *library = Some(m.reference());
-                        }
-                    }
-                });
-            model_concurrency_ui(ui, models, library.as_ref(), "Maximum concurrent batches");
-            ui.small("Uses the provider's batch API. Google or OpenRouter with sheet storage is required.");
-        });
-    } else {
-        ui.small("Library tagging uses concurrent requests to your captioning model. Keep Tilepicky open while it runs.");
-    }
-    let configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
-    let focus = if configure {
-        let (provider, model) = gemini_setup(providers, models);
-        show(ui, "provider", provider); show(ui, "model", model);
-        Some(provider)
-    } else { None };
-    ui.separator();
-    ui.strong("API keys");
-    ui.label("Add a key for each provider you want to use. The built-in models are already configured.");
-    egui::Grid::new("provider keys").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        for (i, provider) in providers.iter().enumerate() {
-            ui.label(&provider.name);
-            let field = ui.add(egui::TextEdit::singleline(keys.entry(&provider.name)).password(true)
-                .id(egui::Id::new(("provider key", &provider.name))).hint_text("API key").desired_width(f32::INFINITY));
-            if focus == Some(i) { field.request_focus(); field.scroll_to_me(None); }
-            ui.end_row();
-            ui.label("");
+    use catalog::Task;
+    let browse_id = egui::Id::new("browse task models");
+    let mut browse = ui.data(|d| d.get_temp::<Task>(browse_id));
+    ui.label("Connect a provider, then choose your models. Changes apply to new requests.");
+    egui::CollapsingHeader::new("Provider connections").default_open(true).show(ui, |ui| {
+        for provider in &ai.providers {
+            ui.horizontal(|ui| {
+                ui.label(&provider.name);
+                ui.add(egui::TextEdit::singleline(keys.entry(&provider.name)).password(true)
+                    .id(egui::Id::new(("provider key", &provider.name))).hint_text("API key").desired_width(260.0));
+            });
             ui.small(match provider.key_source(keys) {
                 KeySource::Typed => "Key entered".to_string(),
                 KeySource::Env(name) => format!("Using environment variable {name}"),
-                KeySource::None => "No key configured".to_string(),
+                KeySource::None => "Add a key to use this provider".to_string(),
             });
-            ui.end_row();
-        }
-    });
-    ui.add_space(6.0);
-    egui::CollapsingHeader::new("Advanced connections and models").show(ui, |ui| {
-        ui.label("Use this section to add custom models or providers, or change their connection settings.");
-        ui.small("A provider is the service you connect to. A model is the AI you choose from that service.");
-        ui.strong("Providers");
-        providers_ui(ui, providers, models, single, library, embed, text_embed, keys);
-        ui.separator();
-        ui.strong("Models");
-        if models_ui(ui, providers, models, single, library, embed, text_embed) {
-            ui.data_mut(|d| d.insert_temp(egui::Id::new("configure Gemini"), true));
-            ui.ctx().request_repaint();
         }
     });
     ui.separator();
-    catalog::ui(ui, ai, keys);
+    ui.strong("Captions and tags");
+    task_model_ui(ui, ai, Task::Tags, &mut browse);
+    model_concurrency_ui(ui, &mut ai.models, ai.single.as_ref(), "Maximum concurrent requests");
+    ui.small("One model labels single sheets and the library. Each model remembers its own request limit.");
+    let mut batch_on = ai.batch_enabled();
+    if ui.checkbox(&mut batch_on, "Enable batch processing").changed() { ai.batch_processing = Some(batch_on); }
+    if batch_on {
+        ui.indent("batch settings", |ui| {
+            ui.label("Batch model");
+            task_model_ui(ui, ai, Task::Batch, &mut browse);
+            model_concurrency_ui(ui, &mut ai.models, ai.library.as_ref(), "Maximum concurrent batches");
+            ui.small("Uses Google's batch API, or OpenRouter batches with object storage configured below.");
+        });
+    } else {
+        ui.small("Library jobs send concurrent requests to the captioning model. Keep Tilepicky open while they run.");
+    }
+    ui.separator();
+    ui.strong("Search embeddings");
+    task_model_ui(ui, ai, Task::Search, &mut browse);
+    ui.small("Use a model that accepts images and text. Image and caption indexes use separate requests and files.");
+    egui::CollapsingHeader::new("Separate caption embedding model").show(ui, |ui| {
+        let mut separate = ai.text_embed.is_some();
+        if ui.checkbox(&mut separate, "Use a different model for captions and tags").changed() {
+            ai.text_embed = if separate { ai.embed.clone() } else { None };
+        }
+        if separate { task_model_ui(ui, ai, Task::Text, &mut browse); }
+        ui.small("A text-only embedding model can serve the caption index. Otherwise both indexes use the model above.");
+    });
+    ui.small("Changing an embedding model requires new indexes. Your saved model choices never change automatically.");
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new("Advanced connections and models").show(ui, |ui| {
+        ui.label("Add providers, edit endpoints, configure object storage, or manage saved models.");
+        let Ai { providers, models, single, library, embed, text_embed, .. } = ai;
+        ui.strong("Providers");
+        providers_ui(ui, providers, models, single, library, embed, text_embed, keys);
+        ui.separator();
+        ui.strong("Saved models");
+        if models_ui(ui, providers, models, single, library, embed, text_embed) {
+            let (provider, model) = gemini_setup(providers, models);
+            show(ui, "provider", provider); show(ui, "model", model);
+        }
+    });
+    if let Some(task) = browse {
+        let title = match task {
+            Task::Tags => "Choose a captioning model", Task::Batch => "Choose a batch model",
+            Task::Search => "Choose an embedding model", Task::Text => "Choose a caption embedding model",
+        };
+        let mut open = true;
+        egui::Window::new(title).id(egui::Id::new("task model browser")).open(&mut open)
+            .default_width(520.0).vscroll(true).show(ui.ctx(), |ui| {
+                catalog::ui_for_task(ui, ai, keys, task);
+            });
+        if !open { browse = None; }
+    }
+    ui.data_mut(|d| {
+        if let Some(task) = browse { d.insert_temp(browse_id, task); }
+        else { d.remove::<Task>(browse_id); }
+    });
+}
 
+fn task_model_ui(ui: &mut egui::Ui, ai: &mut Ai, task: catalog::Task, browse: &mut Option<catalog::Task>) {
+    use catalog::Task;
+    let reference = match task {
+        Task::Tags => &mut ai.single, Task::Batch => &mut ai.library,
+        Task::Search => &mut ai.embed, Task::Text => &mut ai.text_embed,
+    };
+    let text = reference.as_ref().map_or("Choose a model".to_string(), |r| format!("{} ({})", r.model, r.provider));
+    ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt(format!("task model {task:?}")).selected_text(text).width(350.0).show_ui(ui, |ui| {
+            for model in ai.models.iter_mut().filter(|m| m.is_embed() == matches!(task, Task::Search | Task::Text)) {
+                if ui.selectable_label(reference.as_ref() == Some(&model.reference()), model.label()).clicked() {
+                    if let Role::Chat { single, library, .. } = &mut model.role { *single = true; *library = true; }
+                    *reference = Some(model.reference());
+                }
+            }
+        });
+        if ui.button("Browse models...").clicked() { *browse = Some(task); }
+    });
+    if reference.as_ref().is_some_and(|r| r.model.contains("latest")) {
+        ui.small("This model uses a provider alias. Its underlying version can change.");
+    }
 }
 
 /// Store the limit on the selected model, so switching models restores its value.
@@ -1084,8 +1063,8 @@ mod tests {
     fn the_defaults_name_a_model_for_each_mode() {
         let ai = Ai::default();
         let name = |c: Option<(&Provider, &Model)>| c.map(|(p, m)| (p.name.clone(), m.id.clone()));
-        assert_eq!(name(ai.chosen(Mode::Instant)), Some(("OpenRouter".into(), "~deepseek/deepseek-flash-latest".into())));
-        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "~deepseek/deepseek-flash-latest".into())));
+        assert_eq!(name(ai.chosen(Mode::Instant)), Some(("OpenRouter".into(), "google/gemini-2.5-flash".into())));
+        assert_eq!(name(ai.chosen(Mode::Batch)), Some(("OpenRouter".into(), "google/gemini-2.5-flash".into())));
     }
 
     /// An old file lists one model twice, once per scope. The pair becomes
@@ -1113,10 +1092,10 @@ mod tests {
         };
         ai.heal();
         let ids: Vec<_> = ai.models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["mine/vision", "~deepseek/deepseek-flash-latest", "z-ai/glm-5.3-flash", "gemini-flash-latest",
+        assert_eq!(ids, ["mine/vision", "google/gemini-2.5-flash", "openai/gpt-4.1-mini", "gemini-flash-latest",
             EMBED_MODEL]);
-        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
-        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
+        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("google/gemini-2.5-flash"));
+        assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("google/gemini-2.5-flash"));
     }
 
     /// A file from the tool that kept models inside the providers: no
@@ -1128,7 +1107,7 @@ mod tests {
         ai.library = Some(ModelRef { provider: "Google".into(), model: "gemini-3.7-flash".into() });
         ai.heal();
         assert_eq!(ai.models, Ai::default().models);
-        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("~deepseek/deepseek-flash-latest"));
+        assert_eq!(ai.chosen(Mode::Instant).map(|(_, m)| m.id.as_str()), Some("google/gemini-2.5-flash"));
         assert_eq!(ai.chosen(Mode::Batch).map(|(_, m)| m.id.as_str()), Some("gemini-flash-latest"));
     }
 

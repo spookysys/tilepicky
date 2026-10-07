@@ -244,7 +244,16 @@ impl Endpoint {
         let trace = crate::ai_log::Request::start(&self.url, Some(body), &self.key);
         let mut status = None;
         let result = (|| {
-            let mut response = self.client.post(&self.url)
+            let url = self.url.clone();
+            #[cfg(test)]
+            let url = if let Ok(base) = std::env::var("TILEPICKY_TEST_TRANSPORT") {
+                let uri: ureq::http::Uri = base.parse().map_err(|_| "Invalid test endpoint.")?;
+                if uri.scheme_str() != Some("http") || uri.host() != Some("127.0.0.1") {
+                    return Err("Test transport must use loopback.".into());
+                }
+                format!("{}/embeddings", base.trim_end_matches('/'))
+            } else { url };
+            let mut response = self.client.post(&url)
                 .header("Authorization", format!("Bearer {}", self.key)).send_json(body)
                 .map_err(|e| match e {
                     ureq::Error::Timeout(_) => "The embedding request timed out.",
@@ -412,6 +421,20 @@ mod tests {
         book.sheets.insert("a.png".into(), Sidecar { label: Some(Label { provider: "p".into(), model: "m".into(),
             status: Status::Labeled, caption: "Tree".into(), tags: vec!["green".into()], tag_list: None }), ..Default::default() });
         assert_eq!(pending(&folder.0, &book, &rels, &done, "m", true, InputMode::Image).unwrap(), 2, "including the label re-embeds a.png");
+    }
+
+    #[test]
+    fn image_only_generation_replaces_a_legacy_mixed_index() {
+        let folder = folder_with(&["a.png"]);
+        let rels = vec!["a.png".to_string()];
+        let book = Book::default();
+        let original = jobs(&folder.0, &book, &rels, &Embeddings::default(), "m", true, InputMode::Image).unwrap();
+        let mut done = Embeddings { model: "m".into(), labels: true, ..Default::default() };
+        done.sheets.insert("a.png".into(), Vector { hash: original[0].hash.clone(), vec: vec![1.0, 0.0] });
+        assert_eq!(pending(&folder.0, &book, &rels, &done, "m", false, InputMode::Image).unwrap(), 1);
+        let image_jobs = jobs(&folder.0, &book, &rels, &done, "m", false, InputMode::Image).unwrap();
+        assert_eq!(image_jobs[0].input["content"].as_array().unwrap().len(), 1);
+        assert_eq!(image_jobs[0].input["content"][0]["type"], "image_url");
     }
 
     #[test]

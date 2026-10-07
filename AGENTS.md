@@ -53,8 +53,8 @@ the person who uses the tool; this file is for an agent that works on it.
   tags, and embeddings. The word search is local and synchronous; a semantic
   match uses a query vector that a worker made.
 - `src/embed.rs`: image embeddings in `embeddings.json` and independent caption/tag embeddings in `embeddings-text.json`.
-  Image input can optionally include labels. Each store records its model, provider identity, and source hashes.
-  Generation checks replies and saves completed batches. Image and label searches can use separate models.
+  Image input excludes labels. Each store records its model, provider identity, and source hashes.
+  Generation checks replies and saves completed batches. Both indexes share a model unless a caption model override is set.
   Each source has a bounded query worker and explicit retry.
 - `src/detect.rs`: reads the tile size of a sheet that the book does not know.
 - `src/quant/`: the color quantizer, a vendored port of SuperFamiconv 0.12's
@@ -72,11 +72,11 @@ the person who uses the tool; this file is for an agent that works on it.
   An OpenAI-style provider may carry an S3 object store for batch uploads, and
   the matching `(S3 secret)` entry in `keys.json`.
   A model is a chat model, with the scopes it serves, or an embedding model.
-  Captions and tags assigns one model to both scopes, with an advanced library override.
+  Captions and tags assigns one model to both scopes. Optional batch processing reveals a separate batch model.
   Single-sheet labeling uses Google Gemini or an OpenAI-compatible endpoint.
-  Library jobs use the Library model through Google batches (several at once),
-  OpenRouter batches when object storage is set, or several OpenAI-compatible
-  requests at once.
+  Without batch processing, library jobs send concurrent requests through the captioning model, including on Google.
+  With batch processing, jobs use the batch model through Google or OpenRouter with object storage.
+  Each model retains its own concurrency limit. Task-specific model catalogues open from each model picker.
 - `src/s3.rs`: a small S3-compatible client for one bucket: put, delete, and a
   presigned GET, signed with AWS Signature Version 4, host style or path style.
 - `src/ai_log.rs`: diagnostics scoped to each job, with key and image redaction.

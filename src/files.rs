@@ -4,6 +4,69 @@
 use crate::sidecar;
 use std::path::Path;
 
+/// Copies a library sheet and its metadata into an existing project folder.
+pub fn import_sheet(library: &Path, project: &Path, source_rel: &str, target_dir: &str, default_tile: [u32; 2]) -> Result<String, String> {
+    use std::io::Write;
+    let valid = |rel: &str| !rel.is_empty() && !rel.contains(['\\', ':'])
+        && rel.split('/').all(|part| !part.is_empty() && part != "." && part != "..");
+    if !valid(source_rel) || (!target_dir.is_empty() && !valid(target_dir)) {
+        return Err("Choose a sheet and a folder inside the library and project.".into());
+    }
+    let library = library.canonicalize().map_err(|e| e.to_string())?;
+    let project = project.canonicalize().map_err(|e| e.to_string())?;
+    let source = library.join(source_rel).canonicalize().map_err(|e| e.to_string())?;
+    let target = project.join(target_dir).canonicalize().map_err(|e| e.to_string())?;
+    if !source.starts_with(&library) || !source.is_file() || !target.starts_with(&project) || !target.is_dir() {
+        return Err("The sheet or destination folder is outside its root.".into());
+    }
+    let source_book = sidecar::load_book(&library)?;
+    sidecar::load_book(&project)?;
+    let bytes = std::fs::read(&source).map_err(|e| e.to_string())?;
+    let image = image::load_from_memory(&bytes).map_err(|e| format!("Cannot read {source_rel}: {e}"))?.to_rgba8();
+    let mut side = source_book.sheets.get(source_rel).cloned().unwrap_or_default();
+    if side.tile.is_none() {
+        let (x, y) = crate::detect::grid(&image);
+        let tile = [if x.tile == 0 { default_tile[0].max(1) } else { x.tile },
+            if y.tile == 0 { default_tile[1].max(1) } else { y.tile }];
+        side.tile = Some(sidecar::Pair::of(tile));
+        side.gap.get_or_insert(sidecar::Pair::of([x.gap, y.gap]));
+        side.offset.get_or_insert(sidecar::Pair::of([x.offset, y.offset]));
+        side.read = true;
+    }
+    if side.provenance.is_empty() {
+        side.provenance.push(sidecar::Provenance { source: source_rel.into(), rects: vec![[0, 0, image.width(), image.height()]] });
+    }
+    let name = Path::new(source_rel).file_name().and_then(|n| n.to_str()).ok_or("Invalid sheet name")?;
+    let stem = Path::new(name).file_stem().and_then(|n| n.to_str()).ok_or("Invalid sheet name")?;
+    let ext = Path::new(name).extension().and_then(|n| n.to_str()).map(|s| format!(".{s}")).unwrap_or_default();
+    let mut created = None;
+    let result = sidecar::update_book(&project, |book| {
+        for number in 0u32.. {
+            let name = match number { 0 => name.to_string(), 1 => format!("{stem} copy{ext}"), n => format!("{stem} copy {n}{ext}") };
+            let rel = if target_dir.is_empty() { name.clone() } else { format!("{target_dir}/{name}") };
+            if book.sheets.contains_key(&rel) { continue; }
+            let path = target.join(&name);
+            let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            created = Some(path);
+            file.write_all(&bytes).and_then(|()| file.sync_all()).map_err(|e| e.to_string())?;
+            book.sheets.insert(rel.clone(), side.clone());
+            return Ok(rel);
+        }
+        Err("No unused sheet name is available.".into())
+    });
+    if let Err(error) = result {
+        if let Some(path) = created && let Err(rollback) = std::fs::remove_file(path) {
+            return Err(format!("{error}. Cannot remove the incomplete copy: {rollback}"));
+        }
+        return Err(error);
+    }
+    result
+}
+
 pub fn normalize_name(name: &str, ext: Option<&str>) -> Option<String> {
     let name = name.trim().trim_matches('/');
     if name.is_empty() || name.contains(['\\', ':']) || name.split('/').any(|p| p.trim().is_empty() || p == "." || p == "..") {
@@ -85,6 +148,82 @@ pub fn drop_own_sources(project: &Path, library: &Path) -> Result<usize, String>
 mod tests {
     use super::*;
     use crate::{sidecar::{Pair, Sidecar}, storage::tests::Folder};
+
+    fn import_fixture(root: &Path) {
+        std::fs::create_dir_all(root.join("pack")).unwrap();
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([12, 34, 56, 255])).save(root.join("pack/tree.png")).unwrap();
+    }
+
+    #[test]
+    fn import_preserves_bytes_metadata_and_existing_names() {
+        let (library, project) = (Folder::new(), Folder::new());
+        import_fixture(&library.0);
+        std::fs::create_dir(project.0.join("plants")).unwrap();
+        let side = Sidecar {
+            tile: Some(Pair::of([8, 16])), gap: Some(Pair::One(1)), offset: Some(Pair::of([-1, 2])),
+            animations: vec![sidecar::Animation { px: [0, 0], frame: [8, 8], frames: Pair::One(2), ms: 100 }],
+            label: Some(sidecar::Label { provider: "fixture".into(), model: "fixture".into(), status: sidecar::Status::Labeled,
+                caption: "Tree".into(), tags: vec!["tree".into()], tag_list: None }), ..Default::default()
+        };
+        sidecar::store_entry(&library.0, "pack/tree.png", &side).unwrap();
+        let source_book = std::fs::read(library.0.join(sidecar::BOOK)).unwrap();
+        std::fs::write(project.0.join("plants/tree.png"), b"keep").unwrap();
+        for expected in ["plants/tree copy.png", "plants/tree copy 2.png"] {
+            assert_eq!(import_sheet(&library.0, &project.0, "pack/tree.png", "plants", [16, 16]).unwrap(), expected);
+            assert_eq!(std::fs::read(project.0.join(expected)).unwrap(), std::fs::read(library.0.join("pack/tree.png")).unwrap());
+            let mut copied = sidecar::load_book(&project.0).unwrap().sheets[expected].clone();
+            assert_eq!(copied.provenance.remove(0), sidecar::Provenance { source: "pack/tree.png".into(), rects: vec![[0, 0, 16, 16]] });
+            assert_eq!(copied, side);
+        }
+        assert_eq!(std::fs::read(project.0.join("plants/tree.png")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(library.0.join(sidecar::BOOK)).unwrap(), source_book);
+    }
+
+    #[test]
+    fn import_rejects_broken_books_and_escaping_paths() {
+        let (library, project) = (Folder::new(), Folder::new());
+        import_fixture(&library.0);
+        for source in ["../tree.png", "/pack/tree.png", "pack/../tree.png"] {
+            assert!(import_sheet(&library.0, &project.0, source, "", [16, 16]).is_err());
+        }
+        assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "../outside", [16, 16]).is_err());
+        for root in [&library.0, &project.0] {
+            std::fs::write(root.join(sidecar::BOOK), b"broken").unwrap();
+            assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "", [16, 16]).is_err());
+            assert!(!project.0.join("tree.png").exists());
+            std::fs::remove_file(root.join(sidecar::BOOK)).unwrap();
+        }
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(&library.0, project.0.join("escape")).unwrap();
+            assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "escape", [16, 16]).is_err());
+        }
+    }
+
+    #[test]
+    fn import_detects_missing_grid_without_changing_library() {
+        let (library, project) = (Folder::new(), Folder::new());
+        import_fixture(&library.0);
+        let rel = import_sheet(&library.0, &project.0, "pack/tree.png", "", [8, 8]).unwrap();
+        let side = sidecar::load_book(&project.0).unwrap().sheets[&rel].clone();
+        assert!(side.read && side.tile.is_some() && side.gap.is_some() && side.offset.is_some());
+        assert!(!library.0.join(sidecar::BOOK).exists());
+    }
+
+    #[test]
+    fn import_rolls_back_only_its_copy_when_metadata_cannot_be_saved() {
+        let (library, project) = (Folder::new(), Folder::new());
+        import_fixture(&library.0);
+        std::fs::write(project.0.join("tree.png"), b"keep").unwrap();
+        for number in 0..100 {
+            let name = format!("{}.{}.{number}.tmp", sidecar::BOOK, std::process::id());
+            std::fs::write(project.0.join(name), b"keep temporary file").unwrap();
+        }
+        assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "", [16, 16]).is_err());
+        assert!(!project.0.join("tree copy.png").exists());
+        assert_eq!(std::fs::read(project.0.join("tree.png")).unwrap(), b"keep");
+        assert!(library.0.join("pack/tree.png").exists());
+        assert!(!project.0.join(sidecar::BOOK).exists());
+    }
 
     #[test]
     fn nested_paths_scan_rename_and_remove_with_the_book() {

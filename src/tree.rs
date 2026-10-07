@@ -42,6 +42,7 @@ pub enum TreeAction {
     /// The pointer held still on this file: it goes into the air, to be
     /// dropped on a folder.
     LiftFile(usize),
+    ImportFile(usize),
     /// Show the file in the desktop's file manager.
     Reveal(usize),
     /// Put the file's path on the clipboard: relative to the root, or whole.
@@ -295,9 +296,9 @@ impl Node {
                     action = Some(TreeAction::SweepStart(*i));
                 } else if v.sweeping && r.contains_pointer() {
                     action = Some(TreeAction::Sweep(*i));
-                } else if v.menus && r.is_pointer_button_down_on() && !r.dragged() {
+                } else if r.is_pointer_button_down_on() && !r.dragged() {
                     // Holding still on a file lifts it, as it does on a tile.
-                    // Only the project tree moves files between folders.
+                    // Library files copy; project files can move between folders.
                     const HOLD_S: f64 = 0.25;
                     const STILL_PX: f32 = 4.0;
                     let (t0, from, now, at) = ui.input(|inp| {
@@ -328,6 +329,10 @@ impl Node {
             let count = v.marked.map_or(0, HashSet::len);
             r.context_menu(|ui| {
                 if !v.menus {
+                    if ui.button("Copy sheet to project").clicked() {
+                        action = Some(TreeAction::ImportFile(*i));
+                        ui.close();
+                    }
                     let marked = is_marked && (group || v.marked_dirs.is_some_and(|d| !d.is_empty()));
                     if marked {
                         if ui.button("Generate labels for selection (AI)...").clicked() {

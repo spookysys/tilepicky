@@ -11,10 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum Task { #[default] Tags, Search, Text }
-impl Task {
-    fn label(self) -> &'static str { match self { Self::Tags => "Captions and tags", Self::Search => "Image meaning", Self::Text => "Label meaning" } }
-}
+pub(super) enum Task { #[default] Tags, Search, Text, Batch }
+
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Entry {
@@ -25,6 +23,12 @@ struct Entry {
     text: bool,
     unknown: bool,
     input_price: Option<f64>,
+    #[serde(default)]
+    output_price: Option<f64>,
+    #[serde(default)]
+    created: u64,
+    #[serde(default)]
+    generation: bool,
 }
 
 fn strings(value: &Value, key: &str) -> Vec<String> {
@@ -56,30 +60,56 @@ fn parse(value: &Value, kind: Kind, embeddings: bool) -> Result<Vec<Entry>, Stri
         };
         let input_price = item["pricing"]["prompt"].as_str().and_then(|s| s.parse::<f64>().ok())
             .or_else(|| item["pricing"]["prompt"].as_f64()).filter(|p| p.is_finite() && *p >= 0.0);
-        entries.push(Entry { id: id.to_owned(), name: name.to_owned(), tags, search, text, unknown, input_price });
+        let output_price = item["pricing"]["completion"].as_str().and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| item["pricing"]["completion"].as_f64()).filter(|p| p.is_finite() && *p >= 0.0);
+        let created = item.get("created").and_then(Value::as_u64).unwrap_or(0);
+        let generation = kind == Kind::Gemini && strings(item, "supportedGenerationMethods").iter().any(|m| m == "generateContent");
+        entries.push(Entry { id: id.to_owned(), name: name.to_owned(), tags, search, text, unknown, input_price, output_price, created, generation });
     }
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     entries.dedup_by(|a, b| a.id == b.id);
     Ok(entries)
 }
 
-fn compatible(entry: &Entry, task: Task) -> bool { match task { Task::Tags => entry.tags, Task::Search => entry.search, Task::Text => entry.text } }
+fn compatible(entry: &Entry, task: Task) -> bool {
+    match task { Task::Tags | Task::Batch => entry.tags || entry.generation, Task::Search => entry.search, Task::Text => entry.text }
+}
 
+fn free(entry: &Entry) -> bool {
+    entry.id.ends_with(":free") || (entry.input_price == Some(0.0) && entry.output_price.is_none_or(|price| price == 0.0))
+}
+fn preview(entry: &Entry) -> bool {
+    let id = entry.id.to_lowercase();
+    ["preview", "experimental", "-exp", ":extended"].iter().any(|part| id.contains(part))
+}
 fn suggestions(entries: &[Entry], task: Task) -> Vec<&Entry> {
-    let mut candidates: Vec<_> = entries.iter().filter(|e| compatible(e, task)).collect();
-    // A price can order starting points. It cannot establish a quality ranking.
-    candidates.sort_by(|a, b| match (a.input_price, b.input_price) {
-        (Some(a), Some(b)) => a.total_cmp(&b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        _ => a.id.cmp(&b.id),
-    });
-    candidates.truncate(3);
-    candidates
+    let mut candidates: Vec<_> = entries.iter().filter(|e| compatible(e, task) && !free(e))
+        .filter(|e| !e.generation || !["tts", "audio", "live", "image", "robotics"].iter().any(|part| e.id.contains(part))).collect();
+    // Prefer stable recent entries. A release date does not establish quality.
+    candidates.sort_by(|a, b| preview(a).cmp(&preview(b)).then(b.created.cmp(&a.created)).then(b.id.cmp(&a.id)));
+    let mut picks = Vec::new();
+    for entry in &candidates {
+        let author = entry.id.split('/').next().unwrap_or("");
+        if !picks.iter().any(|e: &&Entry| e.id.split('/').next().unwrap_or("") == author) { picks.push(*entry); }
+        if picks.len() == 3 { return picks; }
+    }
+    for entry in candidates {
+        if !picks.iter().any(|e| e.id == entry.id) { picks.push(entry); }
+        if picks.len() == 3 { break; }
+    }
+    picks
 }
 
 fn fetch(provider: &Provider, key: Option<&str>) -> Result<Vec<Entry>, String> {
     let base = crate::labels::checked_url(&provider.url)?;
+    #[cfg(test)]
+    let base = if let Ok(endpoint) = std::env::var("TILEPICKY_TEST_TRANSPORT") {
+        let uri: ureq::http::Uri = endpoint.parse().map_err(|_| "Invalid test endpoint.")?;
+        if uri.scheme_str() != Some("http") || uri.host() != Some("127.0.0.1") {
+            return Err("Test transport must use loopback.".into());
+        }
+        endpoint
+    } else { base };
     let client = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(12)))
         .max_redirects(0).build().new_agent();
     let mut entries = Vec::new();
@@ -131,7 +161,7 @@ struct Cache {
 #[derive(Serialize, Deserialize)]
 struct DiskCache { updated: u64, entries: Vec<Entry> }
 fn cache_path(identity: &str) -> Option<std::path::PathBuf> {
-    crate::settings::dir().map(|path| path.join("model-catalogues").join(format!("{:x}.json", Sha256::digest(identity.as_bytes()))))
+    crate::settings::dir().map(|path| path.join("model-catalogues").join(format!("{:x}.json", Sha256::digest(format!("v2:{identity}").as_bytes()))))
 }
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 fn read_cache(path: &std::path::Path) -> Option<DiskCache> {
@@ -146,7 +176,7 @@ struct View {
     cache: Arc<Mutex<Cache>>,
     busy: Arc<AtomicBool>,
     provider: String,
-    task: Task,
+    include_free: bool,
     filter: String,
     custom: String,
     all: bool,
@@ -154,51 +184,68 @@ struct View {
     notice: Option<String>,
 }
 
+fn supports_task(provider: &Provider, task: Task) -> bool {
+    match task {
+        Task::Tags => true,
+        Task::Batch => provider.kind == Kind::Gemini || provider.is_openrouter(),
+        Task::Search | Task::Text => provider.kind == Kind::OpenAi,
+    }
+}
+
+fn price_summary(entry: &Entry) -> String {
+    let price = |value: Option<f64>| value.map_or_else(|| "not listed".to_owned(), |p| format!("${:.2}", p * 1_000_000.0));
+    format!("Per million tokens: input {}, output {}", price(entry.input_price), price(entry.output_price))
+}
+
 fn select(ai: &mut Ai, provider: &str, id: &str, task: Task) -> Result<(), String> {
     let id = id.trim();
     if id.is_empty() { return Err("Enter a model ID.".into()); }
     let connection = ai.providers.iter().find(|p| p.name == provider).ok_or("Choose a provider first.")?;
-    if task != Task::Tags && connection.kind != Kind::OpenAi {
+    if task == Task::Batch && !supports_task(connection, task) {
+        return Err("Provider batch jobs require Google or OpenRouter. OpenRouter also needs object storage in Connections.".into());
+    }
+    if matches!(task, Task::Search | Task::Text) && connection.kind != Kind::OpenAi {
         return Err("Search embeddings require an OpenAI-compatible embedding endpoint.".into());
     }
     let role = match task {
-        Task::Tags => Role::Chat { single: true, library: true, concurrency: DEFAULT_CONCURRENCY },
+        Task::Tags | Task::Batch => Role::Chat { single: true, library: true, concurrency: DEFAULT_CONCURRENCY },
         Task::Search | Task::Text => Role::Embed,
     };
     let model = Model { provider: provider.to_owned(), id: id.to_owned(), role };
     let reference = model.reference();
     if let Some(existing) = ai.models.iter_mut().find(|m| m.is(&reference)) {
-        if existing.is_embed() != (task != Task::Tags) {
+        if existing.is_embed() != matches!(task, Task::Search | Task::Text) {
             return Err("This model is already configured for another kind of task. Check its role in Advanced connections and models.".into());
         }
-        if task == Task::Tags {
+        if matches!(task, Task::Tags | Task::Batch) {
             let concurrency = existing.concurrency().unwrap_or(DEFAULT_CONCURRENCY);
             existing.role = Role::Chat { single: true, library: true, concurrency };
         } else { existing.role = role; }
     } else { ai.models.push(model); }
     match task {
         Task::Tags => { ai.single = Some(reference); },
+        Task::Batch => ai.library = Some(reference),
         Task::Search => ai.embed = Some(reference),
         Task::Text => ai.text_embed = Some(reference),
     }
     Ok(())
 }
 
-pub(super) fn ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &Keys) {
-    let state_id = egui::Id::new("model catalogue view");
+pub(super) fn ui_for_task(ui: &mut egui::Ui, ai: &mut Ai, keys: &Keys, task: Task) {
+    let state_id = egui::Id::new(("model catalogue view", format!("{task:?}")));
     let mut view = ui.data(|d| d.get_temp::<View>(state_id)).unwrap_or_default();
-    if !ai.providers.iter().any(|p| p.name == view.provider) {
-        view.provider = ai.providers.first().map(|p| p.name.clone()).unwrap_or_default();
+    if !ai.providers.iter().any(|p| p.name == view.provider && supports_task(p, task)) {
+        let selected = match task { Task::Tags => &ai.single, Task::Batch => &ai.library, Task::Search => &ai.embed, Task::Text => &ai.text_embed };
+        view.provider = selected.as_ref().filter(|m| ai.providers.iter().any(|p| p.name == m.provider && supports_task(p, task))).map(|m| m.provider.clone())
+            .or_else(|| ai.providers.iter().find(|p| supports_task(p, task)).map(|p| p.name.clone())).unwrap_or_default();
     }
-    ui.strong("Choose a model for your task");
-    ui.small("The catalogue refreshes when opened and after an hour. This never changes your model or uploads sheets.");
+    ui.small("Models refresh hourly. Saved choices stay unchanged.");
     ui.horizontal_wrapped(|ui| {
         egui::ComboBox::from_id_salt("catalogue provider").selected_text(&view.provider).show_ui(ui, |ui| {
-            for provider in &ai.providers { ui.selectable_value(&mut view.provider, provider.name.clone(), &provider.name); }
+            for provider in ai.providers.iter().filter(|p| supports_task(p, task)) {
+                ui.selectable_value(&mut view.provider, provider.name.clone(), &provider.name);
+            }
         });
-        ui.selectable_value(&mut view.task, Task::Tags, Task::Tags.label());
-        ui.selectable_value(&mut view.task, Task::Search, Task::Search.label());
-        ui.selectable_value(&mut view.task, Task::Text, Task::Text.label());
     });
     if let Some(provider) = ai.providers.iter().find(|p| p.name == view.provider).cloned() {
         let identity = format!("{:?}:{}:{}", provider.kind, provider.name, provider.url);
@@ -255,24 +302,30 @@ pub(super) fn ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &Keys) {
         if let Some(updated) = cache.updated { ui.small(format!("Last checked {} minutes ago. Prices can change.", now().saturating_sub(updated) / 60)); }
         let mut chosen = None;
         if cache.updated.is_some() {
-            let picks = suggestions(&cache.entries, view.task);
-            ui.small("Starting points: compatible models with the lowest listed input prices. Quality and total cost can differ.");
+            let picks = suggestions(&cache.entries, task);
+            ui.small("Starting points: stable, recent releases from different authors. Free routes are excluded.")
+                .on_hover_text("Release dates and model IDs determine the order, not quality. Free routes can have stricter usage limits.");
             if picks.is_empty() { ui.label("No verified matches. Choose a configured model or inspect unverified models below."); }
+            if provider.kind == Kind::Gemini { ui.small("Google lists generation methods, but not image support. Try one sheet first."); }
             for entry in picks {
-                if ui.button(format!("Use {}", entry.name)).on_hover_text(&entry.id).clicked() { chosen = Some(entry.id.clone()); }
+                let suffix = if entry.unknown { " (image support unverified)" } else { "" };
+                if ui.button(format!("Use {}{suffix}", entry.name)).on_hover_text(&entry.id).clicked() { chosen = Some(entry.id.clone()); }
+                ui.small(price_summary(entry));
             }
             ui.checkbox(&mut view.all, "Choose another model");
             if view.all {
-                let allow_unknown = view.task == Task::Tags || provider.kind != Kind::Gemini;
+                let allow_unknown = matches!(task, Task::Tags | Task::Batch) || provider.kind != Kind::Gemini;
+                ui.checkbox(&mut view.include_free, "Include free routes");
                 ui.add(egui::TextEdit::singleline(&mut view.filter).hint_text("Find a model"));
                 if allow_unknown {
                     ui.checkbox(&mut view.unknown, "Include models with unverified capabilities");
                 }
                 let query = view.filter.to_lowercase();
                 egui::ScrollArea::vertical().id_salt("catalogue matches").max_height(180.0).show(ui, |ui| {
-                    for entry in cache.entries.iter().filter(|e| compatible(e, view.task) || (allow_unknown && view.unknown && e.unknown))
+                    for entry in cache.entries.iter().filter(|e| compatible(e, task) || (allow_unknown && view.unknown && e.unknown))
+                        .filter(|e| view.include_free || !free(e))
                         .filter(|e| e.id.to_lowercase().contains(&query) || e.name.to_lowercase().contains(&query)) {
-                        let suffix = if compatible(entry, view.task) { "" } else { " (unverified)" };
+                        let suffix = if !entry.unknown { "" } else { " (unverified)" };
                         if ui.selectable_label(false, format!("{}{suffix}", entry.name)).on_hover_text(&entry.id).clicked() {
                             chosen = Some(entry.id.clone());
                         }
@@ -283,18 +336,18 @@ pub(super) fn ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &Keys) {
         }
         drop(cache);
         if let Some(id) = chosen {
-            view.notice = Some(select(ai, &view.provider, &id, view.task)
+            view.notice = Some(select(ai, &view.provider, &id, task)
                 .map_or_else(|error| error, |()| format!("Selected {id}. This applies to new requests.")));
         }
     }
     egui::CollapsingHeader::new("Use a custom model ID").show(ui, |ui| {
         ui.add(egui::TextEdit::singleline(&mut view.custom).hint_text("Exact model ID from your provider"));
-        let supported = view.task == Task::Tags || ai.providers.iter().any(|p| p.name == view.provider && p.kind == Kind::OpenAi);
+        let supported = ai.providers.iter().any(|p| p.name == view.provider && supports_task(p, task));
         if ui.add_enabled(supported && !view.custom.trim().is_empty(), egui::Button::new("Use this model")).clicked() {
-            view.notice = Some(select(ai, &view.provider, &view.custom, view.task)
+            view.notice = Some(select(ai, &view.provider, &view.custom, task)
                 .map_or_else(|error| error, |()| format!("Selected {}. Try one sheet before a library job.", view.custom.trim())));
         }
-        if !supported { ui.small("Search embeddings require an OpenAI-compatible embedding endpoint."); }
+        if !supported { ui.small("Add a compatible provider in Connections first."); }
         ui.small("Custom models are unverified. Image meaning needs image and text input. Label meaning needs text input.");
     });
     if let Some(notice) = &view.notice { ui.label(notice); }
@@ -316,6 +369,56 @@ mod tests {
         assert_eq!(ai.chosen_text_embed().unwrap().1.id, "text-only");
         assert!(select(&mut ai, "OpenRouter", "text-only", Task::Tags).is_err());
         assert_eq!(ai.single, original_tags);
+    }
+
+    #[test]
+    fn choosing_batch_preserves_caption_model_and_concurrency() {
+        let mut ai = Ai::default();
+        let caption = ai.single.clone();
+        select(&mut ai, "Google", "gemini-batch", Task::Batch).unwrap();
+        assert_eq!(ai.single, caption);
+        assert_eq!(ai.library.as_ref().unwrap().model, "gemini-batch");
+    }
+
+    #[test]
+    fn shortlist_prefers_stable_recent_models_from_different_authors() {
+        let mut value = json!({"data": [
+            {"id":"a/free:free", "created":999, "pricing":{"prompt":"0"}},
+            {"id":"a/new", "created":100}, {"id":"a/other", "created":99},
+            {"id":"b/new", "created":98}, {"id":"c/old", "created":97},
+            {"id":"d/preview", "created":200}
+        ]});
+        for entry in value["data"].as_array_mut().unwrap() {
+            entry["architecture"] = json!({"input_modalities":["image"],"output_modalities":["text"]});
+        }
+        let entries = parse(&value, Kind::OpenAi, false).unwrap();
+        assert_eq!(suggestions(&entries, Task::Tags).iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a/new", "b/new", "c/old"]);
+    }
+
+    #[test]
+    fn provider_filters_and_selection_reject_unsupported_batch_endpoints() {
+        let mut ai = Ai::default();
+        let provider = Provider::new("Custom", Kind::OpenAi);
+        assert!(!supports_task(&provider, Task::Batch));
+        assert!(supports_task(&provider, Task::Search));
+        assert!(supports_task(&provider, Task::Text));
+        let google = Provider::new("Google", Kind::Gemini);
+        assert!(supports_task(&google, Task::Batch));
+        assert!(!supports_task(&google, Task::Search));
+        assert!(!supports_task(&google, Task::Text));
+        ai.providers.push(provider);
+        let original = ai.library.clone();
+        assert!(select(&mut ai, "Custom", "model", Task::Batch).unwrap_err().contains("require Google or OpenRouter"));
+        assert_eq!(ai.library, original);
+        assert!(!ai.models.iter().any(|m| m.provider == "Custom"));
+    }
+
+    #[test]
+    fn prices_use_million_token_units_and_report_missing_values() {
+        let entries = parse(&json!({"data":[{"id":"priced", "pricing":{"prompt":"0.000003", "completion":"0.000015"}},
+            {"id":"unknown"}]}), Kind::OpenAi, false).unwrap();
+        assert_eq!(price_summary(&entries[0]), "Per million tokens: input $3.00, output $15.00");
+        assert!(price_summary(&entries[1]).contains("not listed"));
     }
 
     #[test]
@@ -356,7 +459,7 @@ mod tests {
             {"name":"models/embed", "supportedGenerationMethods":["embedContent"]}
         ]}), Kind::Gemini, false).unwrap();
         assert!(entries.iter().find(|e| e.id == "gemini-example").unwrap().unknown);
-        assert!(suggestions(&entries, Task::Tags).is_empty());
+        assert_eq!(suggestions(&entries, Task::Tags)[0].id, "gemini-example");
         assert!(!entries.iter().find(|e| e.id == "embed").unwrap().unknown);
     }
     #[test]
@@ -375,7 +478,7 @@ mod tests {
     fn shortlist_is_bounded_and_prices_are_validated() {
         let entries = parse(&json!({"data": (0..6).map(|i| json!({"id":format!("m{i}"), "pricing":{"prompt":format!("{}", i)},
             "architecture":{"input_modalities":["image"],"output_modalities":["text"]}})).collect::<Vec<_>>() }), Kind::OpenAi, false).unwrap();
-        assert_eq!(suggestions(&entries, Task::Tags).iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["m0", "m1", "m2"]);
+        assert_eq!(suggestions(&entries, Task::Tags).iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["m5", "m4", "m3"]);
         assert!(parse(&json!({"error":"bad"}), Kind::OpenAi, false).is_err());
     }
 }

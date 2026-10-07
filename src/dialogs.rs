@@ -466,32 +466,35 @@ impl App {
     /// Shows the exact sources and provider before generation starts.
     fn embed_confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some(prepared) = &self.embed_confirm else { return };
-        let plan = &prepared.plan;
+        let total: usize = prepared.iter().map(|item| item.plan.total).sum();
         let mut start = false;
         let mut close = false;
         egui::Modal::new(Id::new("generate embeddings")).show(ctx, |ui| {
             ui.set_width(440.0_f32.min(ctx.content_rect().width() - 48.0));
             ui.heading("Generate search embeddings (AI)?");
-            ui.label(plan.root.display().to_string());
-            ui.label(format!("Provider: {}", prepared.provider.name));
-            ui.label(format!("Model: {}", plan.model));
-            ui.label(format!("Sheets that need an embedding: {}.", plan.total));
-            ui.label(match (plan.mode, plan.labels) {
-                (crate::embed::InputMode::Text, _) => "The provider receives the saved captions and tags. It receives no images.",
-                (_, true) => "The provider receives each image with its saved caption and tags.",
-                (_, false) => "The provider receives each image without its caption or tags.",
+            let height = (ctx.content_rect().height() - 180.0 - footer_height(ui)).max(80.0);
+            egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                for item in prepared {
+                    let plan = &item.plan;
+                    ui.group(|ui| {
+                        ui.strong(match plan.mode { crate::embed::InputMode::Image => "Images", crate::embed::InputMode::Text => "Captions and tags" });
+                        ui.label(format!("Provider: {}", item.provider.name));
+                        ui.label(format!("Model: {}", plan.model));
+                        ui.label(format!("Sheets that need an embedding: {}", plan.total));
+                        if !plan.done.sheets.is_empty() && (plan.done.model != plan.model || plan.done.provider != plan.provider
+                            || plan.done.labels != plan.labels) {
+                            ui.colored_label(ui.visuals().warn_fg_color, "The first saved batch replaces this source's existing index.");
+                            ui.label("Select the whole library to include every sheet in the new index.");
+                        }
+                    });
+                }
+                ui.label("Images and saved text use separate requests and indexes. Images never include captions or tags.");
+                ui.label("The provider may charge for these requests. This tool has no embedding cost estimate.");
+                ui.label("Completed batches stay saved if a later batch fails or you cancel.");
+                if total == 0 { ui.label("No selected sheets need embeddings for this source and model."); }
             });
-            if !plan.done.sheets.is_empty() && (plan.done.model != plan.model || plan.done.provider != plan.provider
-                || plan.done.labels != plan.labels) {
-                ui.colored_label(ui.visuals().warn_fg_color,
-                    "This changes the model, provider, or input type. The first saved batch replaces this source's existing index.");
-                ui.label("Choose the whole library if you want vectors for every sheet in the new index.");
-            }
-            ui.label("The provider may charge for these requests. This tool has no embedding cost estimate.");
-            ui.label("Completed batches stay saved if a later batch fails or you cancel.");
-            if plan.total == 0 { ui.label("No selected sheets need embeddings for this source and model."); }
             footer(ui, |ui| {
-                start = ui.add_enabled(plan.total > 0, egui::Button::new("Generate")).clicked();
+                start = ui.add_enabled(total > 0, egui::Button::new("Generate")).clicked();
                 close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
             });
         });

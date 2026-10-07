@@ -840,7 +840,7 @@ impl Activity {
             let count = body.and_then(|b| b.pointer("/batch/inputConfig/requests/requests"))
                 .and_then(Value::as_array).map_or(0, Vec::len);
             Self::Uploading(count)
-        } else if path == "chat/completions" { Self::Labeling }
+        } else if path == "chat/completions" || path.ends_with(":generateContent") { Self::Labeling }
         else if path.starts_with("batches?") { Self::Recovering }
         else { Self::Checking }
     }
@@ -851,7 +851,7 @@ impl Activity {
             Self::Uploading(count) => format!("Uploading {count} {} to {provider}", if count == 1 { "sheet" } else { "sheets" }),
             Self::Checking => format!("Checking results from {provider}"),
             Self::Recovering => format!("Looking up the interrupted submission at {provider}"),
-            Self::Labeling => format!("Labeling one sheet with {provider}"),
+            Self::Labeling => format!("Labeling sheets with {provider}"),
             Self::Cancelling => format!("Requesting cancellation from {provider}"),
         };
         format!("{action} ({seconds} s)")
@@ -891,6 +891,7 @@ impl Panel {
     fn running(&self) -> bool { self.job.as_ref().is_some_and(|j| !j.done()) }
     pub fn open(&self) -> bool { self.proposal.is_some() || self.resend_confirm }
     pub fn busy(&self) -> bool { self.running() || self.open() }
+    pub fn processing(&self) -> bool { self.job.as_ref().is_some_and(|job| !job.done() && self.mode(job) != Mode::Paused) }
     pub fn single_block_reason(&self) -> Option<&'static str> {
         if self.busy() { Some("Finish or cancel the library job before labeling a single sheet.") }
         else if !self.root.as_os_str().is_empty() && self.lock.is_none() { Some("Another window controls labeling for this library.") }
@@ -1177,11 +1178,15 @@ impl Panel {
                     ui.label("Copied"); ui.ctx().request_repaint_after(Duration::from_secs(1));
                 }
             });
-            if let Some((activity, started)) = self.activity {
+            if !job.done() && let Some((activity, started)) = self.activity {
                 ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label(activity.description(&job.provider.name, started.elapsed().as_secs())); });
             }
             let (queued, waiting, uncertain) = self.submission_counts(job);
-            ui.label(format!("{queued} not sent, {waiting} at {}, {uncertain} unconfirmed", job.provider.name));
+            if job.uses_batches() {
+                ui.label(format!("{queued} not sent, {waiting} at {}, {uncertain} unconfirmed", job.provider.name));
+            } else if !job.done() {
+                ui.label(format!("{} sheets remaining. Up to {} concurrent requests.", total - finished, job.concurrency.max(1)));
+            }
             if job.last_response_ms > 0 { ui.small(format!("Last provider response: {} s ago", now.saturating_sub(job.last_response_ms) / 1000)); }
             if waiting > 0 && job.poll_ms > now { ui.small(format!("Next results check in {} s", (job.poll_ms - now).div_ceil(1000))); }
             if mode != Mode::Paused && let Some(issue) = job.issues.iter().filter(|(operation, _)| operation.as_str() != "cleanup")

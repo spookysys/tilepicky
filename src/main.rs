@@ -11,6 +11,7 @@
 
 mod ai;
 mod gallery;
+mod library_transfer;
 mod workspace;
 #[cfg(test)]
 mod workspace_tests;
@@ -65,7 +66,7 @@ struct QueryState {
     pending: Option<(QueryKey, QueryEmbedding)>,
 }
 
-type EmbeddingPreparation = std::sync::mpsc::Receiver<Result<PreparedEmbeddings, String>>;
+type EmbeddingPreparation = std::sync::mpsc::Receiver<Result<Vec<PreparedEmbeddings>, String>>;
 use index::Index;
 use sheet::{Block, Sel, Sheet};
 use sidecar::{Animation, Pair};
@@ -197,10 +198,12 @@ struct App {
     embed_run: Option<embed::Run>,
     /// The confirm that asks before label text goes to the provider: the
     /// embedding model and the number of sheets it will embed.
-    embed_confirm: Option<PreparedEmbeddings>,
+    embed_confirm: Option<Vec<PreparedEmbeddings>>,
+    embed_queue: std::collections::VecDeque<PreparedEmbeddings>,
     embed_preparing: Option<EmbeddingPreparation>,
     embed_outcome: Option<String>,
-    embed_mode: embed::InputMode,
+    embed_images: bool,
+    embed_text: bool,
     embed_rels: Option<Vec<String>>,
     /// The confirm's Generate was pressed this frame.
     embed_start: bool,
@@ -265,6 +268,8 @@ struct App {
     library_order: Vec<usize>,
     /// Files held in the air, waiting for a folder to land in.
     file_drag: Option<Vec<String>>,
+    library_drag: Option<library_transfer::LibraryDrag>,
+    sheet_copy: Option<library_transfer::FileCopy>,
     /// Where the project pane sat last frame, for drops onto the empty pane.
     project_rect: Rect,
     /// A pending deletion, waiting for the user's yes.
@@ -506,8 +511,9 @@ impl App {
             label_outcome: None,
             label_view: false,
             label_target: None, label_focus: None, label_copied: None, label_copy_error: String::new(), label_options: None,
-            embed_run: None, embed_confirm: None, embed_start: false, embed_query: None, query_embed: None, text_query: QueryState::default(),
-            embed_preparing: None, embed_outcome: None, embed_mode: embed::InputMode::Image, embed_rels: None, query_error: None,
+            embed_run: None, embed_confirm: None, embed_queue: Default::default(), embed_start: false,
+            embed_query: None, query_embed: None, text_query: QueryState::default(),
+            embed_preparing: None, embed_outcome: None, embed_images: true, embed_text: true, embed_rels: None, query_error: None,
             prompt_view: None,
             library_batch: batch::Panel::default(),
             remove_label: None,
@@ -545,6 +551,8 @@ impl App {
             library_sweep: None,
             library_order: Vec::new(),
             file_drag: None,
+            library_drag: None,
+            sheet_copy: None,
             project_rect: Rect::NOTHING,
             confirm: None,
             pending: None,
@@ -812,69 +820,96 @@ impl App {
         let Some(run) = self.embed_run.take() else { return };
         match run.result.try_recv() {
             Ok(result) => {
+                let result_is_error = result.is_err();
                 let message = match result {
-                    Ok(count) => format!("Saved embeddings for {count} sheets."),
+                    Ok(count) => format!("Saved {} embeddings for {count} sheets.",
+                        if run.mode == embed::InputMode::Image { "image" } else { "caption and tag" }),
                     Err(error) => error,
                 };
                 if self.library.index.root == run.root { self.rescan_library(); }
                 if self.project.index.root == run.root { self.rescan_project(); }
-                self.embed_outcome = Some(message.clone());
-                self.status = message;
+                if result_is_error { self.embed_queue.clear(); }
+                self.embed_outcome = Some(match self.embed_outcome.take() {
+                    Some(previous) => format!("{previous} {message}"), None => message.clone(),
+                });
+                self.status = self.embed_outcome.clone().unwrap_or(message);
                 self.embed_query = None;
                 self.query_error = None;
                 self.text_query.cached = None;
                 self.text_query.error = None;
+                if !self.embed_queue.is_empty() { self.start_embeddings(ctx); }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.embed_run = Some(run);
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.status = "Embedding generation stopped.".into(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.embed_queue.clear();
+                self.status = "Embedding generation stopped.".into();
+            }
         }
     }
 
     /// Starts the exact operation shown in the confirmation.
     fn start_embeddings(&mut self, ctx: &egui::Context) {
         if self.embed_run.is_some() { return; }
-        let Some(PreparedEmbeddings { provider, plan }) = self.embed_confirm.take() else { return };
+        if let Some(prepared) = self.embed_confirm.take() {
+            self.embed_queue = prepared.into_iter().filter(|item| item.plan.total > 0).collect();
+            self.embed_outcome = None;
+        }
+        let Some(PreparedEmbeddings { provider, plan }) = self.embed_queue.pop_front() else { return };
         let Some(key) = provider.key(&self.keys) else {
             self.status = format!("Set the {} API key in Settings.", provider.name);
+            self.embed_queue.clear();
             return;
         };
-        let endpoint = match embed::Endpoint::new(&provider, key) { Ok(e) => e, Err(e) => { self.status = e; return; } };
+        let endpoint = match embed::Endpoint::new(&provider, key) {
+            Ok(endpoint) => endpoint,
+            Err(error) => { self.embed_queue.clear(); self.status = error; return; }
+        };
         let total = plan.total;
         let wake = ctx.clone();
         match embed::Run::start(plan,
             move |body| endpoint.send(&provider.route(body.clone())), move || wake.request_repaint()) {
-            Ok(run) => { self.embed_outcome = None; self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
-            Err(error) => self.status = error,
+            Ok(run) => { self.status = format!("Embedding {total} sheets..."); self.embed_run = Some(run); }
+            Err(error) => { self.embed_queue.clear(); self.status = error; }
         }
     }
 
     /// Reads and hashes the selected sources on a worker before confirmation.
     fn prepare_embeddings(&mut self, ctx: &egui::Context) {
         if self.embed_run.is_some() || self.embed_preparing.is_some() { return; }
-        let chosen = if self.embed_mode == embed::InputMode::Text { self.settings.ai.chosen_text_embed() }
-            else { self.settings.ai.chosen_embed() };
-        let Some((provider, model)) = chosen.map(|(p, m)| (p.clone(), m.id.clone())) else {
-            self.status = "Choose an embedding model in Settings.".into(); return;
-        };
+        let mut sources = Vec::new();
+        for (selected, mode, chosen) in [
+            (self.embed_images, embed::InputMode::Image, self.settings.ai.chosen_embed()),
+            (self.embed_text, embed::InputMode::Text, self.settings.ai.chosen_text_embed()),
+        ] {
+            if !selected { continue; }
+            let Some((provider, model)) = chosen else {
+                self.status = "Choose a model for each selected source in AI setup.".into(); return;
+            };
+            sources.push((mode, provider.clone(), model.id.clone()));
+        }
+        if sources.is_empty() { self.status = "Select images, captions and tags, or both.".into(); return; }
         let root = self.library.index.root.clone();
         let rels = self.embed_rels.clone().unwrap_or_else(|| self.library.index.entries.iter().map(|e| e.rel.clone()).collect());
-        let mode = self.embed_mode;
-        let labels = mode == embed::InputMode::Image && self.settings.ai.embed_labels;
         let (tx, rx) = std::sync::mpsc::channel();
         let wake = ctx.clone();
         let result = std::thread::Builder::new().name("prepare embeddings".into()).spawn(move || {
             let result = (|| {
                 let book = sidecar::load_book(&root)?;
-                let done = embed::read_mode(&root, mode)?;
-                let identity = embed::identity(&provider);
-                let empty = embed::Embeddings::default();
-                let comparison = if done.provider == identity { &done } else { &empty };
-                let total = embed::pending(&root, &book, &rels, comparison, &model, labels, mode)?;
-                let plan = embed::Plan { root, model, provider: identity, total, book, rels, labels, done, mode };
-                Ok(PreparedEmbeddings { provider, plan })
+                let mut prepared = Vec::new();
+                for (mode, provider, model) in sources {
+                    let done = embed::read_mode(&root, mode)?;
+                    let identity = embed::identity(&provider);
+                    let empty = embed::Embeddings::default();
+                    let comparison = if done.provider == identity { &done } else { &empty };
+                    let total = embed::pending(&root, &book, &rels, comparison, &model, false, mode)?;
+                    let plan = embed::Plan { root: root.clone(), model, provider: identity, total,
+                        book: book.clone(), rels: rels.clone(), labels: false, done, mode };
+                    prepared.push(PreparedEmbeddings { provider, plan });
+                }
+                Ok(prepared)
             })();
             let _ = tx.send(result);
             wake.request_repaint();
@@ -1399,17 +1434,12 @@ impl App {
         if std::mem::take(&mut self.settings_request) || gear.clicked() { self.settings_open = true; }
         let mut open = self.settings_open;
         let mut done = false;
-        egui::Window::new("AI setup and settings").id(Id::new("settings window"))
+        egui::Window::new("AI setup").id(Id::new("settings window"))
             .open(&mut open).default_width(580.0).default_height(560.0).vscroll(true).show(ui.ctx(), |ui| {
                 ui.small("Changes are saved when you close Settings. Existing jobs keep their models.");
                 if !self.settings_error.is_empty() {
                     ui.colored_label(ui.visuals().error_fg_color, labels::summary(&self.settings_error)).on_hover_text(&self.settings_error);
                 }
-                let mut legend = !self.settings.hide_legend;
-                let shortcuts = ui.checkbox(&mut legend, "Show Build keyboard shortcuts");
-                ui.data_mut(|d| d.insert_temp(Id::new("shortcut setting response"), shortcuts.id));
-                if shortcuts.changed() { self.settings.hide_legend = !legend; }
-                ui.separator();
                 ai::settings_ui(ui, &mut self.settings.ai, &mut self.keys);
                 ui.separator();
                 done = ui.button(if self.settings_error.is_empty() { "Done" } else { "Retry save" }).clicked();
@@ -1927,8 +1957,8 @@ impl App {
         if let Some(outcome) = &self.embed_outcome { ui.label(outcome); }
         ui.label("Compare image meaning, label meaning, and word search.");
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.embed_mode, embed::InputMode::Image, "Images");
-            ui.selectable_value(&mut self.embed_mode, embed::InputMode::Text, "Captions and tags");
+            ui.checkbox(&mut self.embed_images, "Images");
+            ui.checkbox(&mut self.embed_text, "Captions and tags");
         });
         if let Some(rels) = &self.embed_rels {
             ui.label(format!("Target: {} selected sheets", rels.len()));
@@ -1936,11 +1966,7 @@ impl App {
         } else {
             ui.label("Target: whole library");
         }
-        if self.embed_mode == embed::InputMode::Image {
-            ui.label(if self.settings.ai.embed_labels { "Source: images with captions and tags." } else { "Source: images only." });
-        } else {
-            ui.label("Source: saved captions and tags. Sheets without labels are skipped.");
-        }
+        ui.label("Each source uses separate requests and a separate index. Sheets without labels skip the text index.");
         for error in [&self.library.index.embed_error, &self.library.index.text_embed_error].into_iter().flatten() {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -1949,6 +1975,7 @@ impl App {
             ui.label(format!("Embedding {} sheets from {source} in {}...", run.total, run.root.display()));
             if stopped(ui.button("Cancel generation")).clicked() {
                 self.embed_run = None;
+                self.embed_queue.clear();
                 self.rescan_library();
                 self.status = "Generation cancelled. Saved batches remain available. An active request may still incur a charge.".into();
                 self.embed_outcome = Some(self.status.clone());
@@ -2700,6 +2727,8 @@ impl App {
                 self.library_marked_dirs.insert(dir);
                 self.library.sel = None;
             }
+            TreeAction::LiftFile(i) => self.start_library_drag(i),
+            TreeAction::ImportFile(i) => self.copy_library_sheet(ctx, i),
             TreeAction::Embeddings(ids) => {
                 let rels = ids.iter().filter_map(|&i| self.library.index.entries.get(i)).map(|e| e.rel.clone()).collect();
                 self.select_embedding_sources(Some(rels));
@@ -2860,7 +2889,7 @@ impl App {
                     focus: true,
                 });
             }
-            TreeAction::Labels(_, _) | TreeAction::BatchDir(_) => {}
+            TreeAction::Labels(_, _) | TreeAction::BatchDir(_) | TreeAction::ImportFile(_) => {}
         }
     }
 }
@@ -2912,6 +2941,7 @@ impl App {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = &ui.ctx().clone();
         self.receive_label();
+        self.poll_sheet_copy(ctx);
         self.receive_embeddings(ctx);
         self.quant_poll_save();
         if self.quant_picking.is_some() { ctx.request_repaint_after(Duration::from_millis(100)); }
@@ -3026,7 +3056,9 @@ impl App {
             });
             ui.add_space(4.0);
             if !hide_legend {
+                let legend_height = (ui.available_height() * 0.22).clamp(70.0, 180.0);
                 egui::Panel::bottom("legend").show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("shortcut legend scroll").max_height(legend_height).show(ui, |ui| {
                     ui.set_max_width(ui.available_width());
                     let ai_key = if AI_VISIBLE { " | I: library AI labels" } else { "" };
                     let legend = format!(
@@ -3045,12 +3077,15 @@ impl App {
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("click: hide the legend").clicked() {
                         self.legend_prompt = true;
                     }
+                    });
                 });
             }
+            let tree_height = if self.workspace == workspace::Workspace::Library { f32::INFINITY }
+                else { (ui.available_height() - 140.0).max(80.0) };
             egui::Panel::top(if self.workspace == workspace::Workspace::Library { "library folders" } else { "build folders" })
                 .resizable(true)
                 .default_size(ui.available_height() * if self.workspace == workspace::Workspace::Library { 0.98 } else { 0.45 })
-                .size_range(80.0..=f32::INFINITY)
+                .size_range(80.0..=tree_height)
                 .show(ui, |ui| {
                     ui.label(title_text("LIBRARY", keys == (Panel::Library, Spot::Tree)));
                     egui::ScrollArea::vertical().id_salt("library scroll").auto_shrink([false, false]).show(ui, |ui| {
@@ -3072,8 +3107,13 @@ impl App {
                                 ask = Some(Panel::Library);
                             }
                         }
+                        let untagged = (self.workspace == workspace::Workspace::Library && self.library_without_tags).then(|| {
+                            self.library.index.entries.iter().enumerate().map(|(i, entry)| {
+                                entry.side.label.is_none() && self.library.visible.as_ref().is_none_or(|visible| visible[i])
+                            }).collect::<Vec<_>>()
+                        });
                         let view = tree::View {
-                            visible: self.library.visible.as_deref(),
+                            visible: untagged.as_deref().or(self.library.visible.as_deref()),
                             selected: self.library.sel,
                             marked: Some(&self.library_marked),
                             marked_dirs: Some(&self.library_marked_dirs),
@@ -3084,7 +3124,7 @@ impl App {
                             cursor: on_rows.0.then_some(self.library.at.as_ref()).flatten(),
                             open_dir: self.library.open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                             sweeping: self.library_sweep.is_some(),
-                            lifting: false,
+                            lifting: self.library_drag.is_some(),
                             entries: &self.library.index.entries,
                         };
                         library_action = self.library.tree.show(ui, &view, "", &mut Vec::new(), &mut library_rows, &mut None);
@@ -3167,12 +3207,12 @@ impl App {
                         cursor: on_rows.1.then_some(self.project.at.as_ref()).flatten(),
                         open_dir: self.project.open_dir.as_ref().map(|(d, o)| (d.as_str(), *o)),
                         sweeping: self.sweep.is_some(),
-                        lifting: self.file_drag.is_some(),
+                        lifting: self.file_drag.is_some() || self.library_drag.is_some(),
                         entries: &self.project.index.entries,
                     };
                     // The tree area itself is the root folder; the tree names
                     // a folder inside it when the pointer is over one.
-                    if self.file_drag.is_some() && bg.contains_pointer() {
+                    if (self.file_drag.is_some() || self.library_drag.is_some()) && bg.contains_pointer() {
                         hover_dir = Some(String::new());
                     }
                     project_action = self.project.tree.show(ui, &view, "", &mut Vec::new(), &mut project_rows, &mut hover_dir);
@@ -3227,7 +3267,7 @@ impl App {
             self.sweep = None;
             self.library_sweep = None;
         }
-        self.drop_files(ctx, hover_dir);
+        self.drop_files(ctx, hover_dir.clone());
         if create {
             self.request(ctx, Pending::Create);
         }
@@ -3238,7 +3278,7 @@ impl App {
         self.dialogs(ctx);
 
         self.workflow_windows(ctx);
-        let dragging = self.drag.is_some();
+        let dragging = self.drag.is_some() || self.library_drag.is_some();
         let (library_out, project_out) = if self.workspace == workspace::Workspace::Library {
             self.project_rect = Rect::NOTHING;
             if let Some(sheet) = &mut self.project.sheet { sheet.clip = Rect::NOTHING; }
@@ -3286,6 +3326,7 @@ impl App {
             ctx.request_repaint();
         }
         self.update_drag(ctx);
+        self.drop_library_sheet(ctx, hover_dir);
     }
 }
 
@@ -4083,6 +4124,48 @@ mod tests {
     }
 
     #[test]
+    fn embedding_review_prepares_both_sources_without_mixing_labels() {
+        let mut b = bench(&["a.png", "b.png"], &[]);
+        b.app.embed_images = true;
+        b.app.embed_text = true;
+        b.app.embed_rels = Some(vec!["a.png".into()]);
+        b.app.prepare_embeddings(&b.ctx);
+        let prepared = b.app.embed_preparing.take().expect("preparation worker")
+            .recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].plan.mode, embed::InputMode::Image);
+        assert_eq!(prepared[0].plan.total, 1);
+        assert_eq!(prepared[1].plan.mode, embed::InputMode::Text);
+        assert_eq!(prepared[1].plan.total, 0);
+        for item in prepared {
+            assert!(!item.plan.labels);
+            assert_eq!(item.plan.rels, vec!["a.png"]);
+            assert_eq!(item.plan.root, b.library.0);
+        }
+        assert!(b.app.embed_run.is_none());
+    }
+
+    #[test]
+    fn an_embedding_failure_stops_the_second_source() {
+        let mut b = bench(&["a.png"], &[]);
+        b.app.prepare_embeddings(&b.ctx);
+        let mut prepared = b.app.embed_preparing.take().unwrap()
+            .recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        let image = prepared.remove(0);
+        b.app.embed_queue = prepared.into();
+        b.app.embed_run = Some(embed::Run::start(image.plan, |_| Err("Fixture request failed".into()), || {}).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while b.app.embed_run.is_some() && std::time::Instant::now() < deadline {
+            b.app.receive_embeddings(&b.ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(b.app.embed_run.is_none());
+        assert!(b.app.embed_queue.is_empty());
+        assert_eq!(b.app.status, "Fixture request failed");
+        assert!(!b.library.0.join("embeddings-text.json").exists());
+    }
+
+    #[test]
     fn embedding_actions_keep_their_selected_sources() {
         let mut b = bench(&["a.png", "pack/one.png", "pack/two.png"], &[]);
         b.app.library_tree_action(&b.ctx, TreeAction::Embeddings(vec![0]));
@@ -4137,10 +4220,10 @@ mod tests {
     }
 
     #[test]
-    fn settings_can_restore_the_hidden_shortcut_legend() {
+    fn build_can_restore_the_hidden_shortcut_legend() {
         let mut b = bench(&["sheet.png"], &["canvas.png"]);
         b.app.settings.hide_legend = true;
-        b.app.settings_open = true;
+        b.app.workspace = workspace::Workspace::Build;
         let mut previous = None;
         let mut stable = 0;
         for _ in 0..20 {
@@ -4154,7 +4237,7 @@ mod tests {
             previous = rect;
             if stable >= 2 { break; }
         }
-        assert!(stable >= 2, "Settings must settle before the click.");
+        assert!(stable >= 2, "Build must settle before the click.");
         let checkbox = b.ctx.data(|d| d.get_temp::<Id>(Id::new("shortcut setting response"))).and_then(|id| b.ctx.read_response(id)).unwrap();
         let at = checkbox.rect.center();
         for pressed in [true, false] {
@@ -4167,7 +4250,7 @@ mod tests {
             }, |ui| b.app.draw(ui));
             out.textures_delta.clear();
         }
-        assert!(!b.app.settings.hide_legend, "The Settings checkbox must restore the legend.");
+        assert!(!b.app.settings.hide_legend, "The Build checkbox must restore the legend.");
     }
 
     #[test]

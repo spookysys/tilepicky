@@ -1061,7 +1061,9 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = (|| {
-                let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name(name).save_file() else {
+                let directory = source.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"])
+                    .set_directory(directory).set_file_name(name).save_file() else {
                     return Ok(None);
                 };
                 if path == source || path.canonicalize().ok().zip(source.canonicalize().ok()).is_some_and(|(a, b)| a == b) {
