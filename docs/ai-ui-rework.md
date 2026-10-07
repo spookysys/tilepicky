@@ -1,5 +1,7 @@
 # AI interface rework plan
 
+Historical report. See the [documentation guide](README.md) for current instructions and the latest test reports.
+
 Status: implemented and reviewed with automated tests and native screenshots.
 Delivery checks are recorded with the commit and installation report.
 Baseline: commit `6d68605`.

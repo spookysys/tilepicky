@@ -1,5 +1,7 @@
 # Native UI acceptance checks
 
+Historical report. See the [documentation guide](README.md) for current instructions and the latest test reports.
+
 Date: 2026-10-07.
 
 The pass used generated image sheets, synthetic labels, isolated settings, and a private display.

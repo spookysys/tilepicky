@@ -1,5 +1,7 @@
 # Interactive test pass
 
+Historical report. See the [documentation guide](README.md) for current instructions and the latest test reports.
+
 This pass used disposable library and project folders on private X11 displays.
 The checks used mouse clicks, drags, keyboard input, screenshots, and saved files.
 The checks did not change the user's sheets.

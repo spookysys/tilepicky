@@ -49,8 +49,9 @@ ignores that key and leaves it out the next time it writes the book.
 
 The project book may hold a `quantize` list. Each group shares one setting
 across the sheets it covers, so a scene shares its palettes. The `target` is
-a folder or a list of sheets, and `pins` holds one flag per tile of a member
-sheet: a pinned tile is 8bpp.
+a folder or a list of sheets. Each member's `pins` array stores tile depth overrides in row order, from left to right.
+Values are `"auto"`, `"4bpp"`, or `"8bpp"`. Missing entries use automatic depth.
+Old boolean values remain readable: `false` means automatic depth, and `true` means forced 8bpp.
 
     "quantize": [
       {
@@ -59,7 +60,7 @@ sheet: a pinned tile is 8bpp.
           "mode": "snes",
           "snes": { "depth": "bpp4_plus8", "palettes": 8, "colors": 15, "dither": "checker", "auto_pct": 25, "extra_8bpp": 8 }
         },
-        "pins": { "props/tree.png": [false, true, false] }
+        "pins": { "props/tree.png": ["auto", "8bpp", "4bpp"] }
       },
       {
         "target": { "files": ["village.png"] },
@@ -67,9 +68,26 @@ sheet: a pinned tile is 8bpp.
       }
     ]
 
+The saved SNES `colors` value excludes transparent index 0. The UI shows this value plus one as **Palette entries**.
+General indexed `colors` includes the transparent entry when `key` is true. Formats with separate alpha count RGB colors.
+
+**Apply** saves settings and pins. Changing a project sheet's tile grid clears its saved pins.
+
 A sheet belongs to at most one group. Apply updates the same group directly.
 The panel asks before it replaces overlapping groups. A concurrent change on disk prevents an outdated panel from overwriting the groups.
 The preview preserves the source pixels. Export saves the selected sheet's current quantized result.
 
 Writes replace the complete book through a temporary file. A malformed or unreadable
 book blocks writes until you fix it. Keep backups of your project images and books.
+
+## Jobs and search indexes
+
+The root `ai_batch` record stores the library job, its progress, and its pause or cancellation requests.
+The job retains its original model, provider, prompt, and tags. API keys stay in the app configuration.
+Use the app to change job state. Manual edits can conflict with its coordinator.
+
+Image vectors live in `embeddings.json`; caption and tag vectors live in `embeddings-text.json`.
+Each index records its model and provider identity. A changed model or provider requires new vectors.
+Label edits invalidate caption vectors, but leave image-only vectors valid.
+
+See the [user guide](../README.md) for job controls and search index generation.

@@ -88,9 +88,9 @@ the person who uses the tool; this file is for an agent that works on it.
   thread; to cancel, drop the `Run`. Save guards preserve newer local changes. Tests use fake responses.
 - `src/batch.rs`: library batches: through the Gemini batch API (several batches
   at once), or through OpenRouter's batch API when the provider has object
-  storage (each sheet is uploaded and handed over as a signed URL). Without
-  storage, it sends several OpenAI-compatible requests at once. It also displays
-  job snapshots and saves labels from the UI thread.
+  storage (each sheet is uploaded and handed over as a signed URL). With batch processing off,
+  it sends concurrent requests to the captioning model through Google or an OpenAI-compatible endpoint.
+  An unsupported batch configuration blocks submission. It also displays job snapshots and saves labels from the UI thread.
 - `src/batch/openrouter.rs`: the OpenRouter batch path: upload each sheet,
   build the batch, poll it, save the labels, and delete the objects. OpenRouter
   has no client reference, so a submit whose reply is lost ends those sheets

@@ -12,7 +12,7 @@ Open a project sheet, search the library for the tiles you need, select a region
 
 Tilepicky organizes your work into two directories:
 
-- **Library**: Holds your collected sprite sheets. Tilepicky treats this directory as read-only. It creates only a `tilepicky.json` metadata file to record grids, animations, and labels.
+- **Library**: Holds your collected sprite sheets. Tilepicky preserves the source images. It writes grids, animations, labels, and job state to `tilepicky.json`. Search indexes and job logs use separate files beside it.
 - **Project**: Holds the tilesheets you create and edit. Tilepicky writes output image files here, along with a project-specific `tilepicky.json`.
 
 Use **Folders** to open or change the library and project folders. Both paths are stored in `~/.config/tilepicky/settings.json`.
@@ -45,6 +45,12 @@ To compile and install from source, run:
 
     cargo install --locked --path .
 
+To run from a source checkout without installing:
+
+    cargo run --release -- [<library dir> [<project dir>]]
+
+The folder arguments are optional. Replace the placeholders and omit the square brackets.
+
 ## Layout
 
 Use the top bar to switch between two workspaces:
@@ -60,7 +66,7 @@ Project edit shortcuts operate only in Build. Saving remains available in both w
 **Colors and export...** opens the existing palette, preview, and export tools for the project.
 The export dialog starts in the source sheet's folder and suggests a separate output filename.
 
-**Improve search...** captures the selected files and folders. With no selection, it targets the whole library.
+**Improve search...** captures the selected files and folders. With no selection, it targets the whole library, even when search hides some sheets.
 Review the scope, choose a task, and review its confirmation before any generation starts.
 **Activity** holds library tagging jobs and search index progress. You can close it and keep browsing.
 **AI setup...** opens a resizable window for provider connections and AI models.
@@ -94,6 +100,7 @@ The gallery combines separate source rankings. It does not compare raw similarit
 The inspector names the matching sources. The folder tree keeps its folder order.
 **Compare search** shows separate result lists for words, image meaning, and label meaning.
 Each meaning column shows index coverage and offers recovery after a failed query.
+A missing or incompatible index offers **Review index generation...**. Incompatible indexes show the saved and selected models.
 
 ## Labeling sheets with AI
 
@@ -234,7 +241,8 @@ OpenRouter and its model providers fetch those images through signed URLs. Tilep
 An ambiguous submission keeps its objects, because accepted work may still need them. Configure a bucket lifecycle rule for eventual cleanup.
 The excluded-host list applies to ordinary requests. OpenRouter batch routing uses the account settings.
 
-Other OpenAI-compatible endpoints use concurrent ordinary requests, even when storage is configured. The app must remain open for these jobs.
+With batch processing off, library jobs use concurrent requests to the captioning model. The app must remain open for these jobs.
+An unsupported batch configuration shows an error; it does not silently switch to ordinary requests.
 With batch processing enabled, Google Gemini uses batches of up to 100 sheets.
 Both batch methods count accepted, unfinished batches against the configured concurrency limit.
 Activity shows progress and saves completed labels into `tilepicky.json`.
@@ -288,7 +296,7 @@ A failed library write retries from stored results without another model request
 New jobs record the image and existing label before submission, so delayed results cannot silently replace newer work.
 
 Single-sheet actions live in the sheet dialog. Library jobs live in **Activity**.
-The panel identifies its execution method as **Google batch**, **OpenRouter batch**, or **Several sheets at a time**.
+The panel identifies its execution method as **Google batch**, **OpenRouter batch**, or **Concurrent requests**.
 A running job keeps its original provider, model, prompt, and tags.
 Resume and retry also use the saved model. Changing Settings selects the model for new jobs.
 The panel shows a notice when the saved job and Settings use different models.
@@ -392,13 +400,15 @@ Animated GIFs play directly in the library panel. Copying an animated region ext
 
 Tilepicky reads PNG, GIF, JPEG, WebP, BMP, and TGA image formats.
 
-Tilepicky exports sheets exclusively as 32-bit RGBA PNG files with straight alpha transparency.
+Normal saves produce 32-bit RGBA PNG files with straight alpha transparency.
+**Save Quantized...** can produce indexed PNG files that retain palette entries and pixel indices.
+Color reduction without a palette, and formats with per-pixel alpha, produce RGBA PNG files.
 
 Saving an edited project sheet from another format prompts for a PNG name and leaves the original file untouched.
 
 ## Grid configuration
 
-Each sheet maintains independent grid parameters:
+Library sheets have the following grid parameters. Project sheets expose the tile size:
 
 | Field | Description | Examples |
 | --- | --- | --- |
@@ -410,9 +420,10 @@ You can modify each grid field with three input methods:
 
 - Drag horizontally to adjust width.
 - Rotate the mouse wheel over the field to adjust height.
-- Click to enter numeric values directly.
+- Click to enter numeric values directly, then press Enter to apply them.
 
 Entering a single value sets uniform width and height.
+Changing a project sheet's tile grid clears its saved depth pins. The grid popup warns before this change.
 
 Tilepicky analyzes new sheets automatically to detect repeating pixel pitch. Images without repeating patterns default to a single tile covering the full image dimensions.
 
@@ -496,6 +507,9 @@ A failed write preserves the previous output file. PNG does not store the target
 | Ctrl+Scroll, `+` / `-` | Adjust zoom |
 | Escape | Clear selection, cancel active drag, or leave text field |
 
+While a pin tool is selected, left-drag paints depth overrides and right-drag removes them.
+Undo and Redo affect pin strokes. Escape leaves the pin tool. Inspector mode blocks pin changes.
+
 ### Drag modifiers
 
 While dragging tiles:
@@ -531,7 +545,7 @@ File trees accept the following mouse and keyboard actions:
 | Up / Down | Move cursor without opening file |
 | Right / Left | Expand or collapse selected folder |
 | Enter / Space | Open selected file or toggle folder expansion |
-| Shift+Up / Shift+Down | Extend marked file group (project tree only) |
+| Shift+Up / Shift+Down | Extend marked group in either tree |
 | Ctrl+Click, Shift+Click | Select single file or range of files |
 | Drag across rows | Select all crossed files |
 | Click, hold (~250 ms), and drag | Move selected files into destination folder |
@@ -549,7 +563,7 @@ Press `Ctrl+,` or click the gear icon on the status bar to open **AI setup**.
 **Captions and tags** and **Search embeddings** select models for new requests. Existing jobs keep their saved configuration.
 Enable batch processing only when you want a separate native batch configuration.
 
-Give an OpenAI-compatible provider **Sheet storage** to use OpenRouter batch processing. The fields are the S3 endpoint (host only, no path), region, bucket, access key, and a path-style switch for MinIO. The secret key sits with the API keys, readable by your user alone. The bucket may stay private: Tilepicky hands OpenRouter a signed URL for each sheet. Any S3-compatible store works, for example Cloudflare R2, Backblaze B2, or MinIO. **Test connection** uploads one small object, fetches it through its signed URL, and deletes it, so a setup mistake shows here rather than mid-job.
+Configure **Sheet storage** on the OpenRouter connection to use OpenRouter batch processing. The fields are the S3 endpoint (host only, no path), region, bucket, access key, and a path-style switch for MinIO. The secret key sits with the API keys, readable by your user alone. The bucket may stay private: Tilepicky hands OpenRouter a signed URL for each sheet. Any S3-compatible store works, for example Cloudflare R2, Backblaze B2, or MinIO. **Test connection** uploads one small object, fetches it through its signed URL, and deletes it, so a setup mistake shows here rather than mid-job.
 
 Tilepicky deletes each object as soon as its batch ends. Add a bucket lifecycle rule that deletes objects older than two days, to cover a crash after upload or a discarded job. Two days also matches the signed URL, which outlives the 24-hour batch window.
 
@@ -570,9 +584,9 @@ Settings are stored in `~/.config/tilepicky/settings.json`.
 
 ### Setting up a bucket
 
-Use any S3-compatible object store. Cloudflare R2 is a common choice: 10 GB free and no egress fees, though it asks for a payment method before it activates, even on the free tier. Backblaze B2 is an alternative.
+Use an S3-compatible object store. Check its current storage, request, and transfer prices before creating a bucket.
 
-The store must be reachable from the internet, because OpenRouter fetches the signed URL. A MinIO instance on your own machine works for **Test connection** but not for a batch.
+The store must be reachable from the internet, because OpenRouter fetches the signed URL. A server reachable only from your machine can pass **Test connection**, but OpenRouter cannot fetch its images.
 
 1. Make an account, enable the object store, and create a bucket.
 2. Create an API token scoped to that one bucket, read and write objects. It gives an access key ID and a secret access key.
@@ -587,6 +601,10 @@ Tilepicky tracks the origin of pixels pasted into project sheets. When you copy 
 Activate inspector mode (`E`) and hover over any tile to view its source pack and filename in a tooltip:
 
     kenney_tiny-town/Tilemap/tilemap_packed.png
+
+## Documentation
+
+See the [documentation guide](docs/README.md) for the saved metadata format, design notes, and native UI test reports.
 
 ## Credits
 
