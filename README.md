@@ -457,8 +457,12 @@ Click a color to copy its hex value. Reduce color depth does not create a palett
 **SNES** is tile-aware. Pick the tile depth (`2bpp`, `4bpp`, `8bpp`, or
   `4bpp + 8bpp`), the number of palettes, and the total entries per palette. Index 0
   of every palette is transparent. With `4bpp + 8bpp`, the **auto** slider
-  promotes a share of the tiles to 8bpp, and the **paint** and **erase**
-  tools pin or unpin a tile by hand.
+  promotes a share of eligible tiles to 8bpp. **Force 4bpp** and **Force 8bpp** pin tiles to that depth.
+  Drag over tiles to paint a stroke. **Auto** or right-click removes an override; right-drag removes several.
+  Blue outlines with a 4 mark forced 4bpp tiles. Yellow outlines with an 8 mark forced 8bpp tiles.
+  Automatic selection respects both forced depths. **Apply** saves the pins; old boolean 8bpp pins remain readable.
+  Undo and Redo affect pin strokes while a pin tool is selected. Click the selected tool again, or press Escape, to stop pinning.
+  Changing the tile grid clears its pins because the tile boundaries change.
 
 Dithering is offered in both modes.
 

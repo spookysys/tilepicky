@@ -284,14 +284,45 @@ pub struct Quantize {
     pub snes: Option<Snes>,
 }
 
+/// A manual tile depth override. Auto lets the quantizer choose.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TileDepth {
+    #[default]
+    Auto,
+    #[serde(rename = "4bpp")]
+    Bpp4,
+    #[serde(rename = "8bpp")]
+    Bpp8,
+}
+
+impl<'de> Deserialize<'de> for TileDepth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum Name {
+            #[serde(rename = "auto")] Auto,
+            #[serde(rename = "4bpp")] Bpp4,
+            #[serde(rename = "8bpp")] Bpp8,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Saved { Legacy(bool), Named(Name) }
+        Ok(match Saved::deserialize(deserializer)? {
+            Saved::Legacy(false) | Saved::Named(Name::Auto) => Self::Auto,
+            Saved::Legacy(true) | Saved::Named(Name::Bpp8) => Self::Bpp8,
+            Saved::Named(Name::Bpp4) => Self::Bpp4,
+        })
+    }
+}
+
 /// A setting shared by a group of sheets, and the per-sheet tile pins.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct QuantizeGroup {
     pub target: QuantizeTarget,
     pub setting: Quantize,
-    /// One flag per tile of a member sheet: true pins the tile to 8bpp.
+    /// One depth override per tile of a member sheet. Old boolean pins remain readable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub pins: BTreeMap<String, Vec<bool>>,
+    pub pins: BTreeMap<String, Vec<TileDepth>>,
 }
 
 /// The book of one directory: the tile size the directory used last, and
@@ -784,6 +815,15 @@ mod tests {
         assert_eq!(free_tags(&load_book(dir).unwrap()), FREE_TAGS_MAX, "a count above the ceiling is held to it");
     }
 
+    #[test]
+    fn tile_depth_pins_read_legacy_booleans_and_keep_all_three_states() {
+        let pins: Vec<TileDepth> = serde_json::from_str(r#"[false,true,"4bpp","8bpp","auto"]"#).unwrap();
+        assert_eq!(pins, [TileDepth::Auto, TileDepth::Bpp8, TileDepth::Bpp4, TileDepth::Bpp8, TileDepth::Auto]);
+        let stored = serde_json::to_string(&pins).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<TileDepth>>(&stored).unwrap(), pins);
+        assert!(serde_json::from_str::<TileDepth>(r#""2bpp""#).is_err());
+    }
+
     /// A group keeps its target, its setting, and its per-sheet tile pins.
     #[test]
     fn quantization_save_does_not_replace_a_concurrent_change() {
@@ -813,7 +853,7 @@ mod tests {
                     extra_8bpp: 8,
                 }),
             },
-            pins: [("props/tree.png".to_string(), vec![false, true, false])].into_iter().collect(),
+            pins: [("props/tree.png".to_string(), vec![TileDepth::Auto, TileDepth::Bpp8, TileDepth::Auto])].into_iter().collect(),
         };
         store_quantize(dir, std::slice::from_ref(&group)).unwrap();
         assert_eq!(load_book(dir).unwrap().quantize, vec![group]);

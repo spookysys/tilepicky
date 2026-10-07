@@ -4,7 +4,7 @@
 
 use crate::quant::{self, Dither, Job, Oklab, Rgb};
 use crate::sidecar::{
-    General, GeneralFormat, GeneralKind, Quantize, QuantizeDither, QuantizeGroup, QuantizeMode, QuantizeTarget, Snes, SnesDepth,
+    General, GeneralFormat, GeneralKind, Quantize, QuantizeDither, QuantizeGroup, QuantizeMode, QuantizeTarget, Snes, SnesDepth, TileDepth,
 };
 use crate::App;
 use eframe::egui;
@@ -13,8 +13,38 @@ use image::RgbaImage;
 /// The paint tool of the panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
-    Paint,
-    Erase,
+    Force4,
+    Force8,
+    Auto,
+}
+
+/// One brush stroke forms one undo step. History belongs to the open sheet.
+#[derive(Default)]
+pub struct PinHistory {
+    last: Option<((u32, u32), Tool)>,
+    recorded: bool,
+    undo: Vec<Vec<TileDepth>>,
+    redo: Vec<Vec<TileDepth>>,
+}
+impl PinHistory {
+    pub fn end_stroke(&mut self) { self.last = None; self.recorded = false; }
+}
+
+fn stroke_cells(from: (u32, u32), to: (u32, u32)) -> Vec<(u32, u32)> {
+    let (mut x, mut y) = (i64::from(from.0), i64::from(from.1));
+    let (tx, ty) = (i64::from(to.0), i64::from(to.1));
+    let (dx, dy) = ((tx - x).abs(), -(ty - y).abs());
+    let (sx, sy) = (if x < tx { 1 } else { -1 }, if y < ty { 1 } else { -1 });
+    let mut error = dx + dy;
+    let mut cells = Vec::new();
+    loop {
+        cells.push((x as u32, y as u32));
+        if x == tx && y == ty { break; }
+        let twice = 2 * error;
+        if twice >= dy { error += dy; x += sx; }
+        if twice <= dx { error += dx; y += sy; }
+    }
+    cells
 }
 
 /// What an export writes.
@@ -53,7 +83,7 @@ struct Identity {
     offset: [i32; 2],
     target: QuantizeTarget,
     setting: Quantize,
-    pins: Vec<bool>,
+    pins: Vec<TileDepth>,
 }
 
 /// One preview run. Its identity also describes the last completed preview.
@@ -66,7 +96,7 @@ fn build_preview(
     request: &Identity,
     image: RgbaImage,
     inputs: Vec<(String, crate::sidecar::Sidecar)>,
-    group_pins: std::collections::BTreeMap<String, Vec<bool>>,
+    group_pins: std::collections::BTreeMap<String, Vec<TileDepth>>,
 ) -> Result<Outcome, String> {
     let mut images = Vec::new();
     for (rel, side) in inputs {
@@ -124,9 +154,9 @@ fn dither(which: QuantizeDither) -> Option<Dither> {
     })
 }
 
-/// Runs one sheet through the SNES quantizer. `pins` is one flag per tile;
+/// Runs one sheet through the SNES quantizer. `pins` is one override per tile;
 /// it is empty when the depth is not `4bpp+8bpp`.
-pub fn run_snes(setting: &Snes, img: &RgbaImage, tile: [u32; 2], pins: &[bool], seed: u64) -> Outcome {
+pub fn run_snes(setting: &Snes, img: &RgbaImage, tile: [u32; 2], pins: &[TileDepth], seed: u64) -> Outcome {
     let (w, h) = img.dimensions();
     let (tw, th) = (tile[0].clamp(1, w.max(1)), tile[1].clamp(1, h.max(1)));
     let bpp = match setting.depth {
@@ -153,7 +183,8 @@ pub fn run_snes(setting: &Snes, img: &RgbaImage, tile: [u32; 2], pins: &[bool], 
 
     if matches!(setting.depth, SnesDepth::Bpp4Plus8) {
         let count = (w.div_ceil(tw) * h.div_ceil(th)) as usize;
-        let pinned: Vec<bool> = (0..count).map(|i| pins.get(i).copied().unwrap_or(false)).collect();
+        let pinned: Vec<bool> = (0..count).map(|i| pins.get(i) == Some(&TileDepth::Bpp8)).collect();
+        job.shallow_tiles = (0..count).map(|i| pins.get(i) == Some(&TileDepth::Bpp4)).collect();
         let start = palettes as u32 * stride;
         let extra = setting.extra_8bpp.min((256u32.saturating_sub(start)) as usize);
         job.deep_entries = (0..extra as u32).map(|i| (start + i) as u8).collect();
@@ -433,7 +464,7 @@ fn paint_preview(img: &RgbaImage, table: &[Rgb], indices: &[u8]) -> RgbaImage {
 /// One member of a group, for a run that shares one palette.
 pub struct Member<'a> {
     pub image: &'a RgbaImage,
-    pub pins: Vec<bool>,
+    pub pins: Vec<TileDepth>,
     pub open: bool,
 }
 
@@ -489,7 +520,7 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
     let mut pixels: Vec<Rgb> = Vec::new();
     let mut transparent = Vec::new();
     let mut real_tiles = 0usize;
-    let mut pins: Vec<bool> = Vec::new();
+    let mut pins: Vec<TileDepth> = Vec::new();
     let mut open_at = (0u32, 0u32, 0u32, 0u32);
     let mut y = 0u32;
     for m in members {
@@ -514,7 +545,8 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
         for ty in 0..(ph / th) {
             for tx in 0..across {
                 let inside = tx < mcols && ty < mrows;
-                pins.push(inside && m.pins.get((ty * mcols + tx) as usize).copied().unwrap_or(false));
+                pins.push(if inside { m.pins.get((ty * mcols + tx) as usize).copied().unwrap_or_default() }
+                    else { TileDepth::Bpp4 });
             }
         }
         if m.open {
@@ -536,8 +568,9 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
         let extra = setting.extra_8bpp.min((256u32.saturating_sub(start)) as usize);
         job.deep_entries = (0..extra as u32).map(|i| (start + i) as u8).collect();
         let want = (setting.auto_pct.min(100) as usize * real_tiles + 50) / 100;
-        let have = pins.iter().filter(|&&d| d).count();
-        job.deep_tiles = pins;
+        let have = pins.iter().filter(|&&d| d == TileDepth::Bpp8).count();
+        job.deep_tiles = pins.iter().map(|&d| d == TileDepth::Bpp8).collect();
+        job.shallow_tiles = pins.iter().map(|&d| d == TileDepth::Bpp4).collect();
         if want > have { job.deep_tiles = quant::choose_deep_tiles(&pixels, width, height, &job, want - have); }
     }
     let result = quant::quantize(&pixels, width, height, &job);
@@ -575,8 +608,8 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
     Outcome { preview, export: Export::Indexed { palette: table, indices: out_indices, key: true }, deep_tiles, palette }
 }
 
-/// Runs the open sheet through its setting. `pins` is one flag per tile.
-pub fn run(setting: &Quantize, img: &RgbaImage, tile: [u32; 2], pins: &[bool]) -> Result<Outcome, String> {
+/// Runs the open sheet through its setting. `pins` is one override per tile.
+pub fn run(setting: &Quantize, img: &RgbaImage, tile: [u32; 2], pins: &[TileDepth]) -> Result<Outcome, String> {
     match setting.mode {
         QuantizeMode::Snes => match &setting.snes {
             Some(s) => Ok(run_snes(s, img, tile, pins, 0)),
@@ -808,27 +841,59 @@ fn general_ui(ui: &mut egui::Ui, g: &mut General) -> bool {
 }
 
 impl App {
-    /// Pins or unpins the tile under a paint click.
-    pub fn quant_paint(&mut self, cell: (u32, u32)) {
+    /// Paints the complete stroke, including tiles between pointer events.
+    pub fn quant_paint(&mut self, cell: (u32, u32), tool: Tool) {
         let Some(sheet) = self.project.sheet.as_ref() else { return };
-        let count = (sheet.cols() * sheet.rows()) as usize;
-        let index = (cell.1 * sheet.cols() + cell.0) as usize;
-        if index >= count {
-            return;
+        let (cols, rows) = (sheet.cols(), sheet.rows());
+        if cell.0 >= cols || cell.1 >= rows { return; }
+        let count = (cols * rows) as usize;
+        let set = match tool { Tool::Force4 => TileDepth::Bpp4, Tool::Force8 => TileDepth::Bpp8, Tool::Auto => TileDepth::Auto };
+        let previous = self.quant_history.last.filter(|(_, old_tool)| *old_tool == tool).map_or(cell, |(at, _)| at);
+        let cells = stroke_cells(previous, cell);
+        self.quant_history.last = Some((cell, tool));
+        if !cells.iter().any(|&(x, y)| self.quant_pins.get((y * cols + x) as usize).copied().unwrap_or_default() != set) { return; }
+        if !self.quant_history.recorded {
+            if self.quant_history.undo.len() == 32 { self.quant_history.undo.remove(0); }
+            self.quant_history.undo.push(self.quant_pins.clone());
+            self.quant_history.redo.clear();
+            self.quant_history.recorded = true;
         }
-        if cell.0 >= sheet.cols() || cell.1 >= sheet.rows() { return; }
-        let set = self.quant_tool == Some(Tool::Paint);
-        if self.quant_pins.len() != count {
-            self.quant_pins.resize(count, false);
-        }
-        if self.quant_pins[index] != set {
-            self.quant_pins[index] = set;
+        self.quant_pins.resize(count, TileDepth::Auto);
+        for (x, y) in cells { self.quant_pins[(y * cols + x) as usize] = set; }
+        self.quant_dirty = true;
+    }
+
+    pub fn quant_undo_pins(&mut self, redo: bool) {
+        self.quant_history.end_stroke();
+        let (from, to) = if redo { (&mut self.quant_history.redo, &mut self.quant_history.undo) }
+            else { (&mut self.quant_history.undo, &mut self.quant_history.redo) };
+        if let Some(previous) = from.pop() {
+            to.push(std::mem::replace(&mut self.quant_pins, previous));
             self.quant_dirty = true;
         }
     }
 
+    /// A different grid has different tile identities. Remove its old overrides.
+    pub fn quant_clear_grid_pins(&mut self) -> Result<bool, String> {
+        let Some(sheet) = &self.project.sheet else { return Ok(false) };
+        let mut groups = self.project.index.quantize.clone();
+        let mut cleared = self.quant_pins.iter().any(|pin| *pin != TileDepth::Auto);
+        for group in &mut groups {
+            if let Some(pins) = group.pins.remove(&sheet.rel) { cleared |= pins.iter().any(|pin| *pin != TileDepth::Auto); }
+        }
+        if groups != self.project.index.quantize {
+            crate::sidecar::replace_quantize(&self.project.index.root, &self.project.index.quantize, &groups)?;
+            self.project.index.quantize = groups;
+        }
+        self.quant_pins.clear();
+        self.quant_history = PinHistory::default();
+        self.quant_dirty = true;
+        Ok(cleared)
+    }
+
     /// Chooses a target from the tree and opens the panel on it.
     pub fn quant_set_target(&mut self, target: QuantizeTarget) {
+        self.quant_history = PinHistory::default();
         let members = self.project.index.quantize_members(&target);
         let group = self
             .project
@@ -856,6 +921,7 @@ impl App {
 
     /// Loads the open sheet's group into the panel, or a fresh setting.
     pub fn quant_open_sheet(&mut self) {
+        self.quant_history = PinHistory::default();
         let rel = self.project.sheet.as_ref().map(|s| s.rel.clone()).unwrap_or_default();
         let found = self
             .project
@@ -1000,7 +1066,7 @@ impl App {
             QuantizeTarget::Files(rels) => !rels.is_empty(),
             QuantizeTarget::Dir(_) => true,
         });
-        let mut pins: std::collections::BTreeMap<String, Vec<bool>> = self.project.index.quantize.iter()
+        let mut pins: std::collections::BTreeMap<String, Vec<TileDepth>> = self.project.index.quantize.iter()
             .flat_map(|g| g.pins.iter()).filter(|(rel, _)| members.contains(rel)).map(|(rel, pins)| (rel.clone(), pins.clone())).collect();
         if let Some(sheet) = &self.project.sheet
             && members.contains(&sheet.rel)
@@ -1170,17 +1236,17 @@ impl App {
         if matches!(self.quant.mode, QuantizeMode::Snes)
             && self.quant.snes.as_ref().is_some_and(|s| matches!(s.depth, SnesDepth::Bpp4Plus8))
         {
-            ui.strong("Tile color depth");
-            ui.weak("Yellow outlines mark manual 8bpp pins. Erase removes a pin; auto can still select the tile.");
-            ui.horizontal(|ui| {
-                let tool = self.quant_tool;
-                if ui.selectable_label(tool == Some(Tool::Paint), "paint 8bpp").clicked() {
-                    self.quant_tool = if tool == Some(Tool::Paint) { None } else { Some(Tool::Paint) };
-                }
-                if ui.selectable_label(tool == Some(Tool::Erase), "erase").clicked() {
-                    self.quant_tool = if tool == Some(Tool::Erase) { None } else { Some(Tool::Erase) };
+            ui.strong("Pin tile depth");
+            ui.weak("Draw over tiles to set their depth. Right-click or use Auto to remove a pin.");
+            ui.horizontal_wrapped(|ui| {
+                for (tool, label) in [(Tool::Force4, "Force 4bpp"), (Tool::Force8, "Force 8bpp"), (Tool::Auto, "Auto")] {
+                    if ui.selectable_label(self.quant_tool == Some(tool), label).clicked() {
+                        self.quant_tool = if self.quant_tool == Some(tool) { None } else { Some(tool) };
+                    }
                 }
             });
+            ui.weak("Blue = 4bpp, yellow = 8bpp. Click the selected tool again to stop pinning.");
+            ui.weak("Undo and Redo affect pins while a tool is selected. Apply saves the pins.");
         } else {
             self.quant_tool = None;
         }
@@ -1215,7 +1281,9 @@ impl App {
         if self.quant_picking.is_some() { ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)); }
         if let Some(sheet) = self.project.sheet.as_mut() {
             sheet.quant_tool = self.quant_tool;
-            sheet.quant_pins.clone_from(&self.quant_pins);
+            if self.quant.mode == QuantizeMode::Snes && self.quant.snes.as_ref().is_some_and(|s| s.depth == SnesDepth::Bpp4Plus8) {
+                sheet.quant_pins.clone_from(&self.quant_pins);
+            } else { sheet.quant_pins.clear(); }
         }
     }
 }
@@ -1372,7 +1440,7 @@ mod tests {
         });
         for depth in [SnesDepth::Bpp2, SnesDepth::Bpp4Plus8] {
             let setting = Snes { depth, palettes: 2, colors: 3, dither: QuantizeDither::None, auto_pct: 0, extra_8bpp: 8 };
-            let out = run_snes(&setting, &img, [8, 8], &[false, true], 0);
+            let out = run_snes(&setting, &img, [8, 8], &[TileDepth::Auto, TileDepth::Bpp8], 0);
             let dir = crate::storage::tests::Folder::new();
             let path = dir.0.join("preview.png");
             write(&out, &path, 16, 8).unwrap();
@@ -1393,8 +1461,22 @@ mod tests {
         let img = RgbaImage::from_fn(32, 8, |x, y| image::Rgba([(x * 31) as u8, (y * 43) as u8, (x * y * 19) as u8, 255]));
         let setting = Snes { depth: SnesDepth::Bpp4Plus8, palettes: 2, colors: 2,
             dither: QuantizeDither::None, auto_pct: 100, extra_8bpp: 4 };
-        let out = run_snes(&setting, &img, [8, 8], &[true, true, true, false], 0);
+        let out = run_snes(&setting, &img, [8, 8], &[TileDepth::Bpp8, TileDepth::Bpp8, TileDepth::Bpp8, TileDepth::Auto], 0);
         assert!(out.deep_tiles >= 3, "automatic selection must keep all three manual pins");
+    }
+
+    #[test]
+    fn forced_4bpp_survives_full_automatic_allocation_and_group_padding() {
+        let img = RgbaImage::from_fn(32, 8, |x, y| image::Rgba([(x * 31) as u8, (y * 43) as u8, (x * y * 19) as u8, 255]));
+        let snes = Snes { depth: SnesDepth::Bpp4Plus8, palettes: 2, colors: 2,
+            dither: QuantizeDither::None, auto_pct: 100, extra_8bpp: 4 };
+        let pins = vec![TileDepth::Bpp4, TileDepth::Bpp8, TileDepth::Bpp4, TileDepth::Bpp4];
+        assert_eq!(run_snes(&snes, &img, [8, 8], &pins, 0).deep_tiles, 1);
+        let small = RgbaImage::from_pixel(8, 8, image::Rgba([120, 40, 80, 255]));
+        let members = [Member { image: &img, pins, open: true },
+            Member { image: &small, pins: vec![TileDepth::Bpp4], open: false }];
+        let setting = Quantize { mode: QuantizeMode::Snes, general: None, snes: Some(snes) };
+        assert_eq!(run_group(&setting, &members, [8, 8]).unwrap().deep_tiles, 1);
     }
 
     #[test]

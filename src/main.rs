@@ -109,7 +109,7 @@ struct PanelOut {
     /// A right click deleted the content of the selection.
     deleted: bool,
     /// A click or drag with the quantization paint tool, on this cell.
-    quant_cell: Option<(u32, u32)>,
+    quant_cell: Option<((u32, u32), quant_panel::Tool)>,
 }
 
 impl Default for PanelOut {
@@ -240,7 +240,8 @@ struct App {
     quant_open_rel: Option<String>,
     quant: sidecar::Quantize,
     quant_target: Option<sidecar::QuantizeTarget>,
-    quant_pins: Vec<bool>,
+    quant_pins: Vec<sidecar::TileDepth>,
+    quant_history: quant_panel::PinHistory,
     /// The member images of the current target, loaded once for the shared run.
     quant_preview: Option<quant_panel::Outcome>,
     quant_worker: Option<quant_panel::Worker>,
@@ -529,6 +530,7 @@ impl App {
             quant: quant_panel::default_setting(),
             quant_target: None,
             quant_pins: Vec::new(),
+            quant_history: quant_panel::PinHistory::default(),
             quant_preview: None,
             quant_worker: None,
             quant_dirty: false,
@@ -1534,7 +1536,8 @@ impl App {
         let in_half = self.pane.1 != Spot::Status;
         // The eye is for looking: a panel with it on takes no edit and no
         // selection. Copying, zooming, and the panels stay.
-        let project_eye = self.project_eye;
+        let painting = self.quant_panel && self.quant_tool.is_some() && self.active == Panel::Project;
+        let project_eye = self.project_eye || painting;
         let eye = project_eye && self.active == Panel::Project;
         // The window layer turns Ctrl+C into a Copy event, and Ctrl+V into a Paste
         // event that only exists when the system clipboard holds text.
@@ -1572,11 +1575,13 @@ impl App {
         // A step back, and a step forward again. They belong to the sheet
         // you are in, so the library's grid and animation changes take them
         // as well. Shift goes first, or the plain one eats it.
-        if in_half && !eye {
+        if in_half && (!eye || painting) {
             let panel = self.active;
             let again = key(cmd | Modifiers::SHIFT, Key::Z) || key(cmd, Key::Y);
             let back = !again && key(cmd, Key::Z);
-            if again || back {
+            if (again || back) && panel == Panel::Project && self.quant_panel && self.quant_tool.is_some() {
+                self.quant_undo_pins(again);
+            } else if again || back {
                 if let Some(sheet) = self.sheet_mut(panel) {
                     if again {
                         sheet.redo(ctx);
@@ -1643,8 +1648,9 @@ impl App {
                 }
             }
         }
-        if in_half && key(Modifiers::NONE, Key::Escape) && let Some(s) = self.sheet_mut(self.active) {
-            s.sel = Sel::default();
+        if in_half && key(Modifiers::NONE, Key::Escape) {
+            if painting { self.quant_tool = None; self.quant_history.end_stroke(); }
+            else if let Some(s) = self.sheet_mut(self.active) { s.sel = Sel::default(); }
         }
         // + and - zoom the view under the pointer, else the active sheet.
         let dir = if key(Modifiers::NONE, Key::Plus) || key(Modifiers::NONE, Key::Equals) {
@@ -2216,7 +2222,18 @@ impl App {
         if !sheet.set_grid(ctx, t, gap, offset) {
             return;
         }
+        let cleared = if panel == Panel::Project {
+            match self.quant_clear_grid_pins() {
+                Ok(cleared) => cleared,
+                Err(error) => {
+                    if let Some(sheet) = self.project.sheet.as_mut() { sheet.undo(ctx); }
+                    self.status = error;
+                    return;
+                }
+            }
+        } else { false };
         self.status = format!("grid: {} px tiles, {} px gap, {} px offset", show_tile(t), show_tile(gap), show_tile(offset));
+        if cleared { self.status.push_str(". Tile depth pins cleared for the new grid."); }
         // The folder keeps the size, so the next sheet without an entry of
         // its own starts with it.
         self.remember_tile(panel, t);
@@ -2576,6 +2593,7 @@ impl App {
             if let Some(s) = self.project.sheet.as_mut() {
                 s.clear_quant_preview();
                 s.quant_tool = None;
+                s.quant_pins.clear();
             }
         }
         if self.quant_panel {
@@ -2628,8 +2646,8 @@ impl App {
         if let Some(g) = out.grid {
             self.change_grid(ctx, panel, g);
         }
-        if let Some(cell) = out.quant_cell {
-            self.quant_paint(cell);
+        if let Some((cell, tool)) = out.quant_cell {
+            self.quant_paint(cell, tool);
         }
         if out.deleted {
             self.after_edit();
@@ -2940,6 +2958,10 @@ impl eframe::App for App {
 impl App {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = &ui.ctx().clone();
+        if !ctx.input(|i| i.pointer.primary_down() || i.pointer.secondary_down())
+            || !ctx.pointer_latest_pos().is_some_and(|p| self.project_rect.contains(p)) {
+            self.quant_history.end_stroke();
+        }
         self.receive_label();
         self.poll_sheet_copy(ctx);
         self.receive_embeddings(ctx);
@@ -4030,6 +4052,31 @@ mod tests {
             let i = self.app.project.index.position(rel).unwrap();
             self.app.open_project(&self.ctx, i);
         }
+    }
+
+    #[test]
+    fn pin_strokes_fill_crossed_tiles_and_undo_without_editing_pixels() {
+        use quant_panel::Tool;
+        use sidecar::TileDepth;
+        let mut b = bench(&[], &["canvas.png"]);
+        b.open_project("canvas.png");
+        b.app.project.sheet.as_mut().unwrap().set_grid(&b.ctx, [4, 4], [0, 0], [0, 0]);
+        let original = b.app.project.sheet.as_ref().unwrap().img.clone();
+        b.app.quant_paint((0, 0), Tool::Force4);
+        b.app.quant_paint((3, 0), Tool::Force4);
+        assert_eq!(&b.app.quant_pins[..4], &[TileDepth::Bpp4; 4]);
+        b.app.quant_history.end_stroke();
+        b.app.quant_paint((1, 0), Tool::Force8);
+        b.app.quant_undo_pins(false);
+        assert_eq!(&b.app.quant_pins[..4], &[TileDepth::Bpp4; 4]);
+        b.app.quant_undo_pins(false);
+        assert!(b.app.quant_pins.is_empty());
+        b.app.quant_undo_pins(true);
+        assert_eq!(&b.app.quant_pins[..4], &[TileDepth::Bpp4; 4]);
+        b.app.quant_history.end_stroke();
+        b.app.quant_paint((0, 0), Tool::Auto);
+        assert_eq!(b.app.quant_pins[0], TileDepth::Auto);
+        assert_eq!(b.app.project.sheet.as_ref().unwrap().img, original);
     }
 
     fn query_fixture(b: &mut Bench, query: &str) -> QueryKey {

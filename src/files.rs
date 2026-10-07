@@ -298,7 +298,8 @@ mod tests {
     fn quant_group(target: sidecar::QuantizeTarget, rel: &str, colors: usize) -> sidecar::QuantizeGroup {
         let mut setting = crate::quant_panel::default_setting();
         setting.snes.as_mut().unwrap().colors = colors;
-        sidecar::QuantizeGroup { target, setting, pins: [(rel.into(), vec![true, false])].into() }
+        let pins = [(rel.into(), vec![sidecar::TileDepth::Bpp8, sidecar::TileDepth::Bpp4, sidecar::TileDepth::Auto])].into();
+        sidecar::QuantizeGroup { target, setting, pins }
     }
 
     fn create_image_file(root: &Path, rel: &str) {
@@ -317,12 +318,12 @@ mod tests {
         relocate(&dir.0, "a.png", "pack/b.png", false).unwrap();
         let book = sidecar::load_book(&dir.0).unwrap();
         assert_eq!(book.quantize[0].target, Files(vec!["pack/b.png".into()]));
-        assert_eq!(book.quantize[0].pins["pack/b.png"], [true, false]);
+        assert_eq!(book.quantize[0].pins["pack/b.png"], [sidecar::TileDepth::Bpp8, sidecar::TileDepth::Bpp4, sidecar::TileDepth::Auto]);
         assert!(!book.quantize[0].pins.contains_key("a.png"));
         relocate(&dir.0, "pack/b.png", "pack/c.png", true).unwrap();
         let book = sidecar::load_book(&dir.0).unwrap();
         assert_eq!(book.quantize[0].target, Files(vec!["pack/b.png".into(), "pack/c.png".into()]));
-        assert_eq!(book.quantize[0].pins["pack/c.png"], [true, false]);
+        assert_eq!(book.quantize[0].pins["pack/c.png"], [sidecar::TileDepth::Bpp8, sidecar::TileDepth::Bpp4, sidecar::TileDepth::Auto]);
         assert!(remove(&dir.0, &["pack/b.png".into(), "absent.png".into()]).is_err());
         let book = sidecar::load_book(&dir.0).unwrap();
         assert_eq!(book.quantize[0].target, Files(vec!["pack/c.png".into()]));
@@ -345,7 +346,7 @@ mod tests {
         relocate(&dir.0, "pack", "renamed", false).unwrap();
         let book = sidecar::load_book(&dir.0).unwrap();
         assert_eq!(book.quantize[0].target, Dir("renamed/sub".into()));
-        assert_eq!(book.quantize[0].pins["renamed/sub/b.png"], [true, false]);
+        assert_eq!(book.quantize[0].pins["renamed/sub/b.png"], [sidecar::TileDepth::Bpp8, sidecar::TileDepth::Bpp4, sidecar::TileDepth::Auto]);
         assert_eq!(book.quantize[1].target, Files(vec!["renamed/a.png".into()]));
         remove(&dir.0, &["renamed".into()]).unwrap();
         assert!(sidecar::load_book(&dir.0).unwrap().quantize.is_empty());
@@ -370,8 +371,8 @@ mod tests {
             assert_eq!(book.quantize[1].target, Files(vec!["destination/b.png".into()]));
             assert_eq!(book.quantize[2].target, Files(vec!["destination/a.png".into()]));
             assert_eq!(book.quantize[2].setting, groups[0].setting);
-            assert_eq!(book.quantize[2].pins["destination/a.png"], [true, false]);
-            assert_eq!(book.quantize[1].pins["destination/b.png"], [true, false]);
+            assert_eq!(book.quantize[2].pins["destination/a.png"], [sidecar::TileDepth::Bpp8, sidecar::TileDepth::Bpp4, sidecar::TileDepth::Auto]);
+            assert_eq!(book.quantize[1].pins["destination/b.png"], [sidecar::TileDepth::Bpp8, sidecar::TileDepth::Bpp4, sidecar::TileDepth::Auto]);
         }
     }
 
@@ -388,7 +389,7 @@ mod tests {
         assert_eq!(book.quantize[0].target, Dir("source".into()));
         assert!(book.quantize[0].pins.is_empty());
         assert_eq!(book.quantize[1].target, Files(vec!["moved/a.png".into()]));
-        assert_eq!(book.quantize[1].pins["moved/a.png"], [true, false]);
+        assert_eq!(book.quantize[1].pins["moved/a.png"], [sidecar::TileDepth::Bpp8, sidecar::TileDepth::Bpp4, sidecar::TileDepth::Auto]);
     }
 
     #[test]

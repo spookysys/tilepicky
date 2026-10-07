@@ -155,7 +155,8 @@ pub(crate) fn extract(
     };
     let all = |_: u32, _: u32| true;
     for (index, view) in tiles(width, height, tw, th).into_iter().enumerate() {
-        let deep = job.deep_tiles.get(index).copied().unwrap_or(false);
+        let deep = job.deep_tiles.get(index).copied().unwrap_or(false)
+            && !job.shallow_tiles.get(index).copied().unwrap_or(false);
         let mixed = deep && (0..th).any(|row| (0..tw).any(|col| shallow(view.x + col, view.y + row)));
         layout.push(Layout {
             first: tile_data.len(),

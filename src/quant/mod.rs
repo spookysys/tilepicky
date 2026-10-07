@@ -70,6 +70,9 @@ pub struct Job {
     /// One flag per tile, in tile order: true makes the tile deep (8bpp).
     /// Empty, or shorter than the tile count, means shallow for the rest.
     pub deep_tiles: Vec<bool>,
+    /// One flag per tile: true keeps the tile shallow, even if its deep flag is set.
+    /// Empty, or shorter than the tile count, leaves the rest unrestricted.
+    pub shallow_tiles: Vec<bool>,
     /// CGRAM entries that only deep pixels use, such as the transparent
     /// slots of the subpalettes or entries above 127.
     pub deep_entries: Vec<u8>,
@@ -101,6 +104,7 @@ impl Job {
             tile_width: 8,
             tile_height: 8,
             deep_tiles: Vec::new(),
+            shallow_tiles: Vec::new(),
             deep_entries: Vec::new(),
             deep_weight: 0,
             shallow_pixels: Vec::new(),
@@ -362,7 +366,7 @@ fn deep_entries(job: &Job, palettes: &[Vec<Rgb>], deep_colors: &[Rgb]) -> Vec<(u
 }
 
 /// Chooses deep tiles where 8bpp lowers the error most, in addition to the
-/// tiles that `Job::deep_tiles` marks already.
+/// tiles that `Job::deep_tiles` marks already. Forced shallow tiles stay shallow.
 ///
 /// It quantizes once with no deep tiles, and measures for each tile how much
 /// its error falls if each pixel takes the nearest of all the colors that a
@@ -377,10 +381,12 @@ pub fn choose_deep_tiles(image: &[Rgb], width: u32, height: u32, job: &Job, coun
         deep_entries(job, &result.palettes, &result.deep_colors).iter().map(|&(_, c)| srgb_to_oklab(c)).collect();
     let (tw, th) = (job.tile_width.max(1), job.tile_height.max(1));
     let across = width.div_ceil(tw);
-    let mut deep: Vec<bool> = (0..result.tiles.len()).map(|t| job.deep_tiles.get(t).copied().unwrap_or(false)).collect();
+    let mut deep: Vec<bool> = (0..result.tiles.len())
+        .map(|t| job.deep_tiles.get(t).copied().unwrap_or(false) && !job.shallow_tiles.get(t).copied().unwrap_or(false))
+        .collect();
     let mut gains: Vec<(f32, usize)> = Vec::new();
     for (tile, indices) in result.tiles.iter().enumerate() {
-        if deep[tile] {
+        if deep[tile] || job.shallow_tiles.get(tile).copied().unwrap_or(false) {
             continue;
         }
         let palette = &result.palettes[result.tile_palette[tile]];
@@ -613,6 +619,38 @@ mod tests {
         // A tile that the job marks stays deep and does not count either.
         let job = Job { shallow_pixels: Vec::new(), deep_tiles: vec![false, true], ..job };
         assert_eq!(choose_deep_tiles(&two_tiles(), 16, 8, &job, 1), [true, true]);
+    }
+
+    #[test]
+    fn forced_shallow_tiles_stay_shallow_with_an_unlimited_auto_budget() {
+        let job = Job {
+            color_zero: Some(BLACK),
+            deep_entries: vec![16, 32],
+            deep_tiles: vec![false, true],
+            shallow_tiles: vec![true],
+            ..Job::new(4, 8, 15)
+        };
+        assert_eq!(choose_deep_tiles(&two_tiles(), 16, 8, &job, usize::MAX), [false, true]);
+        // Mixed pixels must not bypass the tile's shallow override.
+        let job = Job { shallow_pixels: (0..16 * 8).map(|i| i < 8).collect(), ..job };
+        assert_eq!(choose_deep_tiles(&two_tiles(), 16, 8, &job, usize::MAX), [false, true]);
+    }
+
+    #[test]
+    fn a_shallow_override_wins_over_a_conflicting_deep_flag() {
+        let job = Job {
+            color_zero: Some(BLACK),
+            deep_entries: vec![16, 32],
+            deep_tiles: vec![true, true],
+            shallow_tiles: vec![true, false],
+            shallow_pixels: (0..16 * 8).map(|i| i < 8).collect(),
+            ..Job::new(4, 8, 15)
+        };
+        assert_eq!(choose_deep_tiles(&two_tiles(), 16, 8, &job, usize::MAX), [false, true]);
+        let result = quantize(&two_tiles(), 16, 8, &job);
+        assert_eq!(result.tile_deep, [false, true]);
+        assert!(result.shallow_parts[0].is_none());
+        assert!(result.tiles[0].iter().all(|&index| index < 16));
     }
 
     #[test]

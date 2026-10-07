@@ -386,7 +386,7 @@ pub struct ViewEvent {
     /// Right click inside the selection: delete its content, keep the selection.
     pub delete: bool,
     /// A click or drag with the quantization paint tool, on this cell.
-    pub quant_cell: Option<(u32, u32)>,
+    pub quant_cell: Option<((u32, u32), crate::quant_panel::Tool)>,
 }
 
 /// Which source file each pixel came from: an index into `sources`, or -1.
@@ -608,11 +608,11 @@ pub struct Sheet {
     pub ppp: f32,
     /// The pointer was over the animation preview last frame.
     pub preview_hovered: bool,
-    /// The paint tool of that panel: pin a tile to 8bpp, or erase the pin.
+    /// The active depth brush. It sets or removes a tile depth override.
     pub quant_tool: Option<crate::quant_panel::Tool>,
     /// Changes whenever the source pixels or their grid change.
     pub quant_revision: u64,
-    pub quant_pins: Vec<bool>,
+    pub quant_pins: Vec<sidecar::TileDepth>,
     /// The quantized pixels, shown in place of the sheet while it previews.
     quant_preview: Option<Vec<(Rect, TextureHandle)>>,
     /// Which source file each pixel came from, in image coordinates.
@@ -1090,8 +1090,14 @@ impl Sheet {
             }
             self.screen = rect;
             self.clip = ui.clip_rect();
-            if self.quant_tool.is_some() && (resp.clicked() || resp.dragged()) && let Some(pos) = resp.interact_pointer_pos() {
-                event.quant_cell = self.cell_at(pos);
+            if let Some(tool) = self.quant_tool {
+                let secondary = resp.secondary_clicked() || resp.dragged_by(egui::PointerButton::Secondary)
+                    || (resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.secondary_down()));
+                if (secondary || resp.clicked() || resp.dragged_by(egui::PointerButton::Primary)
+                    || (resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down())))
+                    && let Some(pos) = resp.interact_pointer_pos() {
+                    event.quant_cell = self.cell_at(pos).map(|cell| (cell, if secondary { crate::quant_panel::Tool::Auto } else { tool }));
+                }
             }
             let painter = ui.painter_at(rect);
             checkerboard(&painter, rect);
@@ -1123,12 +1129,20 @@ impl Sheet {
                     }
                 }
             }
-            if self.quant_tool.is_some() {
+            if !self.quant_pins.is_empty() {
                 let cols = self.cols().max(1);
                 for (i, &pinned) in self.quant_pins.iter().enumerate() {
-                    if pinned {
-                        let cell = cell_rect(i as u32 % cols, i as u32 / cols);
-                        painter.rect_stroke(cell, 0.0, Stroke::new(2.0, Color32::YELLOW), egui::StrokeKind::Inside);
+                    let color = match pinned {
+                        sidecar::TileDepth::Auto => continue,
+                        sidecar::TileDepth::Bpp4 => Color32::from_rgb(40, 150, 255),
+                        sidecar::TileDepth::Bpp8 => Color32::YELLOW,
+                    };
+                    let cell = cell_rect(i as u32 % cols, i as u32 / cols);
+                    painter.rect_stroke(cell, 0.0, Stroke::new(2.0, color), egui::StrokeKind::Inside);
+                    if tile_px.min_elem() >= 24.0 {
+                        let text = if pinned == sidecar::TileDepth::Bpp4 { "4" } else { "8" };
+                        painter.rect_filled(Rect::from_min_size(cell.min, Vec2::splat(14.0)), 0.0, Color32::BLACK);
+                        painter.text(cell.min + Vec2::splat(7.0), egui::Align2::CENTER_CENTER, text, egui::FontId::monospace(12.0), color);
                     }
                 }
             }
@@ -1159,7 +1173,7 @@ impl Sheet {
                 );
             }
             // The selection has no function in eye mode, so it stays hidden.
-            if !eye {
+            if !eye && self.quant_tool.is_none() {
                 for (x, y) in self.sel.iter() {
                     let r = cell_rect(x, y);
                     // Grey says this cell has no part in anything right now:
@@ -1213,6 +1227,18 @@ impl Sheet {
                     }
                     resp.clone().on_hover_text_at_pointer(name);
                 }
+                return;
+            }
+            if self.quant_tool.is_some() {
+                if event.quant_cell.is_some() { event.interacted = true; resp.request_focus(); }
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    let before = self.zoom.level;
+                    if self.zoom.wheel(ui) != 0 && let Some(p) = resp.hover_pos() {
+                        rezoom = Some((p - rect.min, self.zoom.level / before));
+                    }
+                }
+                own_drag = resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Secondary);
                 return;
             }
             let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
