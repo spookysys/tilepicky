@@ -131,7 +131,8 @@ fn fetch(provider: &Provider, key: Option<&str>) -> Result<Vec<Entry>, String> {
             }
             // Do not show response bodies or transport URLs: either may echo credentials.
             let mut response = request.call().map_err(|error| match error {
-                ureq::Error::StatusCode(code) => format!("The catalogue request failed (HTTP {code}). Check the connection and API key."),
+                ureq::Error::StatusCode(code @ (401 | 403)) => format!("The catalogue request failed (HTTP {code}). Check the API key and account access."),
+                ureq::Error::StatusCode(code) => format!("The catalogue request failed (HTTP {code}). Try again later or use a custom model ID."),
                 _ => "Could not connect to the model catalogue. Check the provider address and try again.".into(),
             })?;
             let value: Value = response.body_mut().with_config().limit(8 * 1024 * 1024).read_json()
@@ -303,7 +304,7 @@ pub(super) fn ui_for_task(ui: &mut egui::Ui, ai: &mut Ai, keys: &Keys, task: Tas
         let mut chosen = None;
         if cache.updated.is_some() {
             let picks = suggestions(&cache.entries, task);
-            ui.small("Starting points: stable, recent releases from different authors. Free routes are excluded.")
+            ui.small("Starting points favor stable, recent releases from different authors. Free routes are excluded.")
                 .on_hover_text("Release dates and model IDs determine the order, not quality. Free routes can have stricter usage limits.");
             if picks.is_empty() { ui.label("No verified matches. Choose a configured model or inspect unverified models below."); }
             if provider.kind == Kind::Gemini { ui.small("Google lists generation methods, but not image support. Try one sheet first."); }
@@ -348,7 +349,11 @@ pub(super) fn ui_for_task(ui: &mut egui::Ui, ai: &mut Ai, keys: &Keys, task: Tas
                 .map_or_else(|error| error, |()| format!("Selected {}. Try one sheet before a library job.", view.custom.trim())));
         }
         if !supported { ui.small("Add a compatible provider in Connections first."); }
-        ui.small("Custom models are unverified. Image meaning needs image and text input. Label meaning needs text input.");
+        ui.small(match task {
+            Task::Tags | Task::Batch => "Custom models are unverified. Caption models must accept images and return structured JSON labels.",
+            Task::Search => "Custom models are unverified. Image search needs a model that embeds images and text in the same space.",
+            Task::Text => "Custom models are unverified. Caption search needs a model that embeds text.",
+        });
     });
     if let Some(notice) = &view.notice { ui.label(notice); }
     ui.data_mut(|d| d.insert_temp(state_id, view));

@@ -218,9 +218,19 @@ impl Job {
             if sheet.imported && let Some(label) = &sheet.label {
                 counts[if label.status == Status::Labeled { 0 } else { 2 }] += 1;
             } else if sheet.cancelled { counts[3] += 1; }
-            else if sheet.label.is_none() && !sheet.error.is_empty() { counts[1] += 1; }
+            else if sheet.taken && sheet.label.is_none() && !sheet.error.is_empty() { counts[1] += 1; }
         }
         counts
+    }
+
+    fn retry_wait(&self, now: u64) -> Option<u64> {
+        if self.uses_batches() { return None; }
+        let mut next = None;
+        for sheet in self.sheets.iter().filter(|sheet| !sheet.taken) {
+            if sheet.retry_ms <= now { return None; }
+            next = Some(next.map_or(sheet.retry_ms, |value: u64| value.min(sheet.retry_ms)));
+        }
+        next
     }
 
     /// A Gemini batch went out and no reply confirmed it. An OpenAI-style job
@@ -1079,10 +1089,8 @@ impl Panel {
                 "Uploads paused; submitted work can continue".into()
             } else { "Labeling paused".into() };
         }
-        if job.issues.contains_key("upload")
-            || (!job.uses_batches() && job.sheets.iter().any(|s| !s.taken && s.retry_ms > now_ms())) {
-            return "Uploads interrupted; retry pending".into();
-        }
+        if job.issues.contains_key("upload") { return "Uploads interrupted; retry pending".into(); }
+        if job.retry_wait(now_ms()).is_some() { return "Labeling interrupted; retry pending".into(); }
         if job.issues.contains_key("check") { return format!("Waiting for {}; connection interrupted", job.provider.name); }
         if job.untaken() && job.groups.iter().filter(|g| g.remote == Remote::Submitting).count() >= job.concurrency.max(1) as usize {
             return "Waiting for upload confirmations".into();
@@ -1178,7 +1186,8 @@ impl Panel {
                     ui.label("Copied"); ui.ctx().request_repaint_after(Duration::from_secs(1));
                 }
             });
-            if !job.done() && let Some((activity, started)) = self.activity {
+            let retry_wait = job.retry_wait(now);
+            if !job.done() && retry_wait.is_none() && mode == Mode::Running && let Some((activity, started)) = self.activity {
                 ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label(activity.description(&job.provider.name, started.elapsed().as_secs())); });
             }
             let (queued, waiting, uncertain) = self.submission_counts(job);
@@ -1186,6 +1195,9 @@ impl Panel {
                 ui.label(format!("{queued} not sent, {waiting} at {}, {uncertain} unconfirmed", job.provider.name));
             } else if !job.done() {
                 ui.label(format!("{} sheets remaining. Up to {} concurrent requests.", total - finished, job.concurrency.max(1)));
+            }
+            if mode == Mode::Running && let Some(next) = retry_wait {
+                ui.label(format!("Automatic retry in {} s.", next.saturating_sub(now).div_ceil(1000)));
             }
             if job.last_response_ms > 0 { ui.small(format!("Last provider response: {} s ago", now.saturating_sub(job.last_response_ms) / 1000)); }
             if waiting > 0 && job.poll_ms > now { ui.small(format!("Next results check in {} s", (job.poll_ms - now).div_ceil(1000))); }
@@ -1279,7 +1291,15 @@ impl Panel {
             ui.small(if ai.batch_enabled() { crate::ai::method(provider) } else { "Concurrent requests" });
         }
         ui.label(format!("{done} of {total} sheets have usable labels"));
-        if !ready { ui.label("Choose a captioning model and connect its provider in AI setup (Ctrl+,)."); }
+        match configured {
+            None => { ui.label("Choose a model for this job in AI setup (Ctrl+,)."); }
+            Some((provider, _)) => {
+                if provider.key_source(keys) == crate::ai::KeySource::None {
+                    ui.label("Enter this provider's API key in AI setup (Ctrl+,).");
+                }
+                if endpoint(provider).is_err() { ui.label("Check this provider's address in AI setup (Ctrl+,)."); }
+            }
+        }
         if ai.batch_enabled() && configured.is_some_and(|(p, _)| p.kind != Kind::Gemini && !p.uses_batch_storage()) {
             ui.label("Provider batches need Google or OpenRouter with object storage. Configure them in AI setup.");
         }
@@ -1574,7 +1594,7 @@ mod tests {
         let label = crate::sidecar::Label { status: Status::Labeled, caption: "Torch".into(), tags: vec![],
             provider: "test".into(), model: "test".into(), tag_list: None };
         job.sheets[0].label = Some(label.clone()); job.sheets[0].imported = true;
-        job.sheets[1].error = "Failed".into();
+        job.sheets[1].error = "Failed".into(); job.sheets[1].taken = true;
         job.sheets[2].label = Some(crate::sidecar::Label { status: Status::Unlabelable, ..label }); job.sheets[2].imported = true;
         job.sheets[3].cancelled = true; job.sheets[3].error = "Cancelled after a failed attempt".into();
         assert_eq!(job.outcomes(), [1, 1, 1, 1]);
@@ -1608,6 +1628,26 @@ mod tests {
         let (job, _) = files.advance(files.prepare(Kind::Gemini), id("batches/test"));
         let panel = Panel { activity: Some((Activity::Checking, Instant::now())), ..Panel::default() };
         assert_eq!(panel.state(&job), "Waiting for results from test");
+    }
+
+    #[test]
+    fn transient_failures_remain_pending_until_retry_finishes() {
+        let files = Files::new();
+        let mut job = files.prepare(Kind::OpenAi);
+        let now = now_ms();
+        for sheet in &mut job.sheets {
+            sheet.error = "Provider unavailable".into();
+            sheet.retry_ms = now + 30_000;
+        }
+        assert_eq!(job.outcomes(), [0, 0, 0, 0]);
+        assert_eq!(job.retry_wait(now), Some(now + 30_000));
+        assert_eq!(Panel::default().state(&job), "Labeling interrupted; retry pending");
+        job.sheets[0].retry_ms = now;
+        assert_eq!(job.retry_wait(now), None, "An active request must remain visible.");
+        for sheet in &mut job.sheets { sheet.taken = true; }
+        assert_eq!(job.outcomes(), [0, job.sheets.len(), 0, 0]);
+        assert_eq!(job.retry_wait(now), None);
+        assert!(job.done());
     }
 
     #[test]
