@@ -239,9 +239,12 @@ Invalid label replies can retry up to three times. Cancelling a job stops new re
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
 Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
-A model is a chat model or an embedding model. A chat model serves single sheets, library jobs, or both; the editor ticks each scope, and sets how many requests or batches a library job keeps in flight. An embedding model makes vectors for search and serves no sheet.
-Library models show **OpenRouter batch**, **Several sheets at a time**, or **Google batch**, depending on the provider and its storage.
-Choose a model that accepts images. Google Gemini supports image requests through its native batch API.
+Choose one captioning model for single sheets and library tagging.
+With **Enable batch processing** off, library tagging sends concurrent requests to that model, including on Google.
+Each model remembers its **Maximum concurrent requests** limit.
+Enable batch processing to select a separate batch model and its concurrency limit.
+Native batches require Google or OpenRouter with sheet storage. Existing jobs keep their saved model and transport.
+Choose a captioning model that accepts images. Embedding models make vectors for search.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
 API key errors offer a Settings button. Saved labels remain unchanged when a request fails.
 Repeated errors appear once, with the affected sheet count. **Error details** keeps the full explanations and affected sheet paths.

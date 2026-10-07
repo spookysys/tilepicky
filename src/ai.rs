@@ -286,6 +286,9 @@ pub struct Ai {
     /// The model for new library jobs. Older files named it `batch`.
     #[serde(default, alias = "batch", skip_serializing_if = "Option::is_none")]
     pub library: Option<ModelRef>,
+    /// None preserves the processing mode from older settings.
+    #[serde(default)]
+    pub batch_processing: Option<bool>,
     /// The model that makes embeddings for semantic search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed: Option<ModelRef>,
@@ -318,7 +321,7 @@ impl Default for Ai {
         ];
         let (single, library) = (Some(models[0].reference()), Some(models[0].reference()));
         let embed = Some(models[3].reference());
-        Ai { providers: vec![openrouter, google], models, single, library, embed, text_embed: None, embed_labels: true }
+        Ai { providers: vec![openrouter, google], models, single, library, batch_processing: Some(false), embed, text_embed: None, embed_labels: true }
     }
 }
 
@@ -434,6 +437,16 @@ impl Ai {
         Some((p, m))
     }
 
+    /// New library jobs use the caption model unless provider batches are enabled.
+    pub fn chosen_library(&self) -> Option<(&Provider, &Model)> {
+        self.chosen(if self.batch_enabled() { Mode::Batch } else { Mode::Instant })
+    }
+
+    pub fn batch_enabled(&self) -> bool {
+        self.batch_processing.unwrap_or_else(|| self.chosen(Mode::Batch)
+            .is_some_and(|(p, _)| p.kind == Kind::Gemini || p.uses_batch_storage()))
+    }
+
     /// The embedding model, with its provider, while both exist.
     pub fn chosen_embed(&self) -> Option<(&Provider, &Model)> {
         let r = self.embed.as_ref()?;
@@ -524,7 +537,8 @@ impl Keys {
 /// stays short. Edits land in place; the caller writes both files when the
 /// dialog closes.
 pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
-    let Ai { providers, models, single, library, embed, text_embed, embed_labels } = ai;
+    let mut batch_on = ai.batch_enabled();
+    let Ai { providers, models, single, library, embed, text_embed, batch_processing, .. } = ai;
     ui.heading("AI setup");
     ui.label("Choose a model for each task. Connect its provider with an API key below.");
     ui.small("Changes apply to new requests. Existing jobs keep their original models.");
@@ -541,10 +555,15 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
                 if ui.selectable_label(single.as_ref() == Some(&m.reference()), m.label()).clicked() {
                     if let Role::Chat { single, library, .. } = &mut m.role { *single = true; *library = true; }
                     *single = Some(m.reference());
-                    *library = single.clone();
                 }
             }
         });
+        ui.end_row();
+        ui.label("Maximum concurrent requests");
+        if let Some(model) = models.iter_mut().find(|m| single.as_ref().is_some_and(|r| m.is(r)))
+            && let Role::Chat { concurrency, .. } = &mut model.role {
+            ui.add(egui::DragValue::new(concurrency).range(1..=64));
+        } else { ui.weak("Choose a captioning model first"); }
         ui.end_row();
         ui.label("Image meaning");
         let current = embed.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.is_embed()));
@@ -568,32 +587,29 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
     });
     ui.small("Image and label indexes stay separate. Label meaning can use a text-only embedding model.");
     ui.small("A different search model needs new indexes before it can search existing sheets.");
-    egui::CollapsingHeader::new("Advanced task options").show(ui, |ui| {
-        ui.checkbox(embed_labels, "Include captions and tags in image embeddings");
-        ui.small("Use this to compare combined image and text input with the separate indexes.");
-        ui.label("Library tagging override");
-        let current = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r) && m.serves(Mode::Batch)));
-        egui::ComboBox::from_id_salt("library task override")
-            .selected_text(current.map_or("Choose a model".to_string(), Model::label)).show_ui(ui, |ui| {
-                for m in models.iter().filter(|m| m.serves(Mode::Batch)) {
-                    ui.selectable_value(library, Some(m.reference()), m.label());
-                }
-            });
-    });
-    if single != library { ui.small("Library tagging uses a separate model. See Advanced task options."); }
-    let mut configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
-    if let Some(selected) = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r)))
-        && let Some(provider) = providers.iter().find(|p| p.name == selected.provider) {
-        egui::CollapsingHeader::new("How library jobs run").show(ui, |ui| {
-            if provider.kind == Kind::OpenAi {
-                configure |= endpoint_notice(ui, selected.concurrency().unwrap_or(DEFAULT_CONCURRENCY), provider.uses_batch_storage());
-            } else {
-                ui.strong("Google batch");
-                ui.label("Google labels uploaded sheets together. After upload, you can close Tilepicky while Google works.");
-                ui.label("Reopen this library to collect the labels. Sheets not yet uploaded wait until you return.");
-            }
-        });
+    if ui.checkbox(&mut batch_on, "Enable batch processing").changed() {
+        *batch_processing = Some(batch_on);
     }
+    if batch_on {
+        ui.indent("batch settings", |ui| {
+            ui.label("Batch model");
+            let current = library.as_ref().and_then(|r| models.iter().find(|m| m.is(r)));
+            egui::ComboBox::from_id_salt("batch model")
+                .selected_text(current.map_or("Choose a model".to_string(), Model::label)).show_ui(ui, |ui| {
+                    for m in models.iter_mut().filter(|m| !m.is_embed()) {
+                        if ui.selectable_label(library.as_ref() == Some(&m.reference()), m.label()).clicked() {
+                            if let Role::Chat { library, .. } = &mut m.role { *library = true; }
+                            *library = Some(m.reference());
+                        }
+                    }
+                });
+            model_concurrency_ui(ui, models, library.as_ref(), "Maximum concurrent batches");
+            ui.small("Uses the provider's batch API. Google or OpenRouter with sheet storage is required.");
+        });
+    } else {
+        ui.small("Library tagging uses concurrent requests to your captioning model. Keep Tilepicky open while it runs.");
+    }
+    let configure = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("configure Gemini"))).unwrap_or(false);
     let focus = if configure {
         let (provider, model) = gemini_setup(providers, models);
         show(ui, "provider", provider); show(ui, "model", model);
@@ -636,20 +652,15 @@ pub fn settings_ui(ui: &mut egui::Ui, ai: &mut Ai, keys: &mut Keys) {
 
 }
 
-/// Explain the library execution method where the user chooses it.
-fn endpoint_notice(ui: &mut egui::Ui, concurrency: u32, batch: bool) -> bool {
-    if batch {
-        ui.strong("OpenRouter batch");
-        ui.label("OpenRouter labels the uploaded sheets together. After upload, you can close Tilepicky while OpenRouter works.");
-        ui.label("Reopen this library to collect the labels. Sheets not yet uploaded wait until you return.");
-        return false;
+/// Store the limit on the selected model, so switching models restores its value.
+fn model_concurrency_ui(ui: &mut egui::Ui, models: &mut [Model], selected: Option<&ModelRef>, label: &str) {
+    if let Some(model) = models.iter_mut().find(|m| selected.is_some_and(|r| m.is(r)))
+        && let Role::Chat { concurrency, .. } = &mut model.role {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            ui.add(egui::DragValue::new(concurrency).range(1..=64));
+        });
     }
-    ui.strong("Several sheets at a time");
-    ui.label(format!("Tilepicky keeps {concurrency} requests in flight while it labels the library."));
-    ui.label("Keep Tilepicky open while it labels the library. Closing Tilepicky pauses the job.");
-    ui.label("Reopen this library to continue.");
-    ui.small("Want processing to continue while Tilepicky is closed? Add a Google key, or give this provider sheet storage.");
-    ui.button("Set up Gemini...").clicked()
 }
 
 /// Prepare the editor without changing either active model or sending a request.
@@ -880,7 +891,7 @@ fn providers_ui(
 /// it makes embeddings. Active selections follow edits.
 fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
     single: &mut Option<ModelRef>, library: &mut Option<ModelRef>, embed: &mut Option<ModelRef>, text_embed: &mut Option<ModelRef>) -> bool {
-    let mut configure = false;
+    let configure = false;
     let names = models.iter().map(Model::label).collect();
     let first = providers.first().map(|p| p.name.clone()).unwrap_or_default();
     let (sel, remove) = selector(ui, "model", names, &mut || models.push(Model {
@@ -889,8 +900,6 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
     }));
     if let Some(m) = models.get_mut(sel) {
         let before = m.reference();
-        let kind = providers.iter().find(|p| p.name == m.provider).map(|p| p.kind);
-        let store = providers.iter().find(|p| p.name == m.provider).is_some_and(Provider::uses_batch_storage);
         egui::Grid::new("model fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("provider");
             egui::ComboBox::from_id_salt("model provider").selected_text(m.provider.clone()).show_ui(ui, |ui| {
@@ -915,27 +924,11 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
             }
             ui.end_row();
             if let Role::Chat { single, library, concurrency } = &mut m.role {
-                ui.label("Use for");
-                ui.horizontal(|ui| {
-                    ui.checkbox(single, "Single sheet");
-                    let library_label = if kind == Some(Kind::Gemini) { "Library (Google batch)" }
-                        else if store { "Library (OpenRouter batch)" } else { "Library (requests at once)" };
-                    ui.checkbox(library, library_label);
-                });
+                *single = true;
+                *library = true;
+                ui.label("Maximum concurrent requests");
+                ui.add(egui::DragValue::new(concurrency).range(1..=64));
                 ui.end_row();
-                let shows = *library && kind.is_some();
-                if shows {
-                    let (label, hover) = if kind == Some(Kind::Gemini) || store {
-                        ("Batches at once", "How many batches a library job of this model keeps in flight.")
-                    } else {
-                        ("Requests at once", "How many requests a library job of this model keeps in flight.")
-                    };
-                    ui.label(label);
-                    ui.add(egui::DragValue::new(concurrency).range(1..=64)).on_hover_text(hover);
-                    ui.end_row();
-                }
-                // A chat model must serve at least one scope; an empty one is useless.
-                if !*single && !*library { *single = true; }
             }
         });
         let after = m.reference();
@@ -950,9 +943,7 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
         if !m.is_embed() {
             for slot in [&mut *embed, &mut *text_embed] { if slot.as_ref() == Some(&after) { *slot = None; } }
         }
-        if let Role::Chat { library: true, concurrency, .. } = m.role && kind == Some(Kind::OpenAi) {
-            configure = endpoint_notice(ui, concurrency, store);
-        }
+
     }
     if remove && sel < models.len() {
         let gone = models.remove(sel).reference();
@@ -968,6 +959,39 @@ fn models_ui(ui: &mut egui::Ui, providers: &[Provider], models: &mut Vec<Model>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_processing_is_explicit_and_old_choices_survive() {
+        let mut ai = Ai::default();
+        ai.single = Some(ai.models[0].reference());
+        ai.library = Some(ai.models[2].reference());
+        assert!(!ai.batch_enabled());
+        assert_eq!(ai.chosen_library().unwrap().1.reference(), ai.single.clone().unwrap());
+        ai.batch_processing = Some(true);
+        assert!(ai.batch_enabled());
+        assert_eq!(ai.chosen_library().unwrap().1.reference(), ai.library.clone().unwrap());
+        let mut legacy = serde_json::to_value(&ai).unwrap();
+        legacy.as_object_mut().unwrap().remove("batch_processing");
+        let restored: Ai = serde_json::from_value(legacy).unwrap();
+        assert!(restored.batch_enabled());
+        assert_eq!(restored.chosen_library().unwrap().1.reference(), ai.library.unwrap());
+    }
+
+    #[test]
+    fn caption_models_keep_independent_concurrency_limits() {
+        let mut ai = Ai::default();
+        let first = ai.models[0].reference();
+        let second = ai.models[2].reference();
+        for (reference, limit) in [(&first, 3), (&second, 11)] {
+            let model = ai.models.iter_mut().find(|m| m.is(reference)).unwrap();
+            if let Role::Chat { concurrency, .. } = &mut model.role { *concurrency = limit; }
+        }
+        let mut restored: Ai = serde_json::from_slice(&serde_json::to_vec(&ai).unwrap()).unwrap();
+        for (reference, limit) in [(first.clone(), 3), (second, 11), (first, 3)] {
+            restored.single = Some(reference);
+            assert_eq!(restored.chosen_library().unwrap().1.concurrency(), Some(limit));
+        }
+    }
 
     #[test]
     fn text_model_is_independent_and_survives_migration() {

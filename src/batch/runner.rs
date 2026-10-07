@@ -109,9 +109,9 @@ impl Runner {
             for group in &mut coordinator.job.groups {
                 if let Remote::Waiting(id) = &group.remote { group.tracking.id = id.clone(); }
             }
-            if coordinator.job.provider.uses_batch_storage() { openrouter::close_unconfirmed(&mut coordinator.job); }
+            if coordinator.job.uses_batches() && coordinator.job.provider.uses_batch_storage() { openrouter::close_unconfirmed(&mut coordinator.job); }
             coordinator.job.poll_ms = coordinator.job.next_poll();
-            if coordinator.job.provider.uses_batch_storage()
+            if coordinator.job.uses_batches() && coordinator.job.provider.uses_batch_storage()
                 && let Some(store) = coordinator.job.provider.store.clone() {
                 match secret {
                     Some(secret) => match crate::s3::Client::new(store, secret) {
@@ -172,7 +172,7 @@ impl Runner {
                     }
                     continue;
                 }
-                if coordinator.job.provider.kind == Kind::OpenAi && !coordinator.job.provider.uses_batch_storage() {
+                if !coordinator.job.uses_batches() {
                     if !key.is_empty() && (label_send.is_none() || label_key != key) {
                         match Transport::new(&coordinator.job.provider, key.clone()) {
                             Ok(transport) => {
@@ -348,9 +348,10 @@ impl Coordinator {
             };
             pump.busy.insert(i);
             let (tx, send, log) = (pump.tx.clone(), send.clone(), log.clone());
+            let path = self.job.label_path();
             std::thread::spawn(move || {
                 let _scope = log.enter();
-                let reply = send("chat/completions", Some(&request));
+                let reply = send(&path, Some(&request));
                 let _ = tx.send((i, reply));
             });
             worked = true;
@@ -488,7 +489,7 @@ impl Job {
         let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
         let recoverable = self.groups.iter().any(|g| g.remote == Remote::Submitting && g.recovery.is_some());
         let allowed = |op: Operation| self.due(op.name(), now) && match op {
-            Operation::Label => self.provider.kind == Kind::OpenAi && !self.provider.uses_batch_storage()
+            Operation::Label => !self.uses_batches()
                 && self.mode == Mode::Running && self.untaken() && !self.pending_save(),
             // Gemini submissions run on the dispatcher's own pool. An OpenRouter
             // batch submission runs through this ordinary operation path.
@@ -575,6 +576,61 @@ mod tests {
         }
         assert_eq!(calls.load(AtomicOrdering::Relaxed), c.job.sheets.len());
         assert!(c.job.sheets.iter().all(|s| s.taken && s.label.is_some()));
+    }
+
+    #[test]
+    fn google_without_batches_uses_concurrent_generate_content() {
+        let f = Fixture::new();
+        for name in ["b.png", "c.png"] {
+            RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])).save(f.root.join(name)).unwrap();
+        }
+        let mut job = f.job();
+        job.native_batch = false;
+        job.concurrency = 3;
+        assert_eq!(job.operation(), Operation::Label);
+        let mut c = Coordinator { job, root: f.root.clone(), dir: f.dir.clone(), book: None };
+        let mut pump = Pump::new();
+        let send: Arc<SendFn> = Arc::new(move |path, body| {
+            assert_eq!(path, "models/test:generateContent");
+            assert!(body.unwrap()["contents"].is_array());
+            Ok(json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":
+                "{\"status\":\"labeled\",\"caption\":\"Forest\",\"tags\":[],\"listed\":{}}"}]}}]}))
+        });
+        assert!(c.dispatch_labels(&mut pump, &send, &crate::ai_log::Log::single("test"), 1000));
+        assert_eq!(pump.inflight(), 3);
+        while pump.inflight() > 0 {
+            let reply = pump.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            pump.busy.remove(&reply.0);
+            c.collect(reply, 1000);
+        }
+        assert!(c.job.sheets.iter().all(|s| s.label.is_some()));
+        assert!(c.job.groups.is_empty());
+        let restored: Job = serde_json::from_value(serde_json::to_value(&c.job).unwrap()).unwrap();
+        assert!(!restored.uses_batches());
+    }
+
+    #[test]
+    fn disabled_batches_ignore_configured_object_storage() {
+        let f = Fixture::new();
+        let mut job = f.job();
+        job.provider = super::super::tests::provider(Kind::OpenAi);
+        job.provider.store = Some(crate::s3::Store::default());
+        job.native_batch = false;
+        assert!(!job.uses_batches());
+        assert_eq!(job.operation(), Operation::Label);
+        assert_eq!(job.label_path(), "chat/completions");
+    }
+
+    #[test]
+    fn legacy_saved_google_jobs_keep_the_batch_transport() {
+        let f = Fixture::new();
+        let job = f.job();
+        let mut value = serde_json::to_value(&job).unwrap();
+        value.as_object_mut().unwrap().remove("native_batch");
+        let restored: Job = serde_json::from_value(value).unwrap();
+        assert!(restored.uses_batches());
+        assert_eq!(restored.operation(), Operation::Submit);
+        assert_eq!(restored.model, job.model);
     }
 
     #[test]

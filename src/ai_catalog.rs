@@ -177,7 +177,7 @@ fn select(ai: &mut Ai, provider: &str, id: &str, task: Task) -> Result<(), Strin
         } else { existing.role = role; }
     } else { ai.models.push(model); }
     match task {
-        Task::Tags => { ai.single = Some(reference.clone()); ai.library = Some(reference); },
+        Task::Tags => { ai.single = Some(reference); },
         Task::Search => ai.embed = Some(reference),
         Task::Text => ai.text_embed = Some(reference),
     }
@@ -360,11 +360,12 @@ mod tests {
         assert!(!entries.iter().find(|e| e.id == "embed").unwrap().unknown);
     }
     #[test]
-    fn choosing_tags_sets_both_scopes_and_preserves_search() {
+    fn choosing_tags_preserves_batch_and_search_models() {
         let mut ai = Ai::default();
         let search = ai.embed.clone();
+        let batch = ai.library.clone();
         select(&mut ai, "OpenRouter", "new-vision", Task::Tags).unwrap();
-        assert_eq!(ai.single, ai.library);
+        assert_eq!(ai.library, batch);
         assert_eq!(ai.single.as_ref().unwrap().model, "new-vision");
         assert_eq!(ai.embed, search);
         select(&mut ai, "OpenRouter", "new-vision", Task::Tags).unwrap();

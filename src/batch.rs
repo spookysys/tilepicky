@@ -125,6 +125,9 @@ pub struct Job {
     log_id: String,
     pub provider: Provider,
     pub model: String,
+    /// Saved jobs retain their original transport when settings change.
+    #[serde(default = "legacy_native_batch")]
+    pub native_batch: bool,
     /// Maximum active requests, or active batches when the provider uses batches.
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
@@ -179,10 +182,23 @@ pub struct Job {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation { Label, Submit, Poll, Recover, Cancel }
 
+fn legacy_native_batch() -> bool { true }
+
 impl Job {
+    pub fn uses_batches(&self) -> bool {
+        self.native_batch && (self.provider.kind == Kind::Gemini || self.provider.uses_batch_storage())
+    }
+    fn method(&self) -> &'static str {
+        if self.uses_batches() { crate::ai::method(&self.provider) } else { "Concurrent requests" }
+    }
+    fn label_path(&self) -> String {
+        if self.provider.kind == Kind::Gemini {
+            format!("models/{}:generateContent", self.model.trim_start_matches("models/"))
+        } else { "chat/completions".into() }
+    }
     fn operation(&self) -> Operation {
         let waiting = self.groups.iter().any(|g| matches!(g.remote, Remote::Waiting(_)));
-        if self.provider.kind == Kind::OpenAi && !self.provider.uses_batch_storage() { Operation::Label }
+        if !self.uses_batches() { Operation::Label }
         else if waiting && (self.poll_next || (!self.untaken() && !self.uncertain())) { Operation::Poll }
         else if self.uncertain() && (!self.submit_next || !self.untaken()) { Operation::Recover }
         else if self.untaken() { Operation::Submit }
@@ -317,7 +333,7 @@ pub fn prepare_of(index: &Index, provider: Provider, model: String, scope: Scope
     let open = index.entries.iter().filter(|e| keep(e) && (all || e.side.label.is_none()));
     Ok(Job {
         log_id: crate::ai_log::id(),
-        provider, model: model.trim_end_matches(":batch").into(), concurrency: crate::ai::DEFAULT_CONCURRENCY,
+        provider, native_batch: true, model: model.trim_end_matches(":batch").into(), concurrency: crate::ai::DEFAULT_CONCURRENCY,
         groups: vec![], skipped: if all { 0 } else { labeled },
         replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), free_tags: index.free_tags,
         prompt: Some(labels::prompt(&index.tag_list, index.free_tags)),
@@ -584,7 +600,7 @@ fn one(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String>
             job.sheets[i].taken = true;
             return job.save(dir);
         }
-        Ok(request) => send("chat/completions", Some(&request)),
+        Ok(request) => send(&job.label_path(), Some(&request)),
     };
     finish_one(job, dir, i, reply, now_ms())
 }
@@ -597,6 +613,7 @@ fn finish_one(job: &mut Job, dir: &Path, i: usize, reply: Result<Value, Failure>
     let reply = match reply {
         Ok(value) => {
             job.usage.record(&value);
+            let value = if job.provider.kind == Kind::Gemini { crate::gemini::response(&value) } else { value };
             match labels::diagnosed_response(&job.sheets[i].rel, &job.provider.name, &job.model, &value, &job.tag_list) {
             Err(error) if error == labels::INVALID && job.sheets[i].unknown + 1 < UNKNOWN_TRIES => {
                 job.sheets[i].unknown += 1;
@@ -1057,12 +1074,12 @@ impl Panel {
             return if job.issues.contains_key("save") { "Could not save labels; retry pending".into() } else { "Saving received labels".into() };
         }
         if self.mode(job) == Mode::Paused {
-            return if job.provider.kind == Kind::Gemini || job.provider.uses_batch_storage() {
+            return if job.uses_batches() {
                 "Uploads paused; submitted work can continue".into()
             } else { "Labeling paused".into() };
         }
         if job.issues.contains_key("upload")
-            || (job.provider.kind == Kind::OpenAi && job.sheets.iter().any(|s| !s.taken && s.retry_ms > now_ms())) {
+            || (!job.uses_batches() && job.sheets.iter().any(|s| !s.taken && s.retry_ms > now_ms())) {
             return "Uploads interrupted; retry pending".into();
         }
         if job.issues.contains_key("check") { return format!("Waiting for {}; connection interrupted", job.provider.name); }
@@ -1073,7 +1090,7 @@ impl Panel {
             return "Waiting for submitted batches to finish".into();
         }
         if job.untaken() {
-            return if job.provider.kind == Kind::Gemini || job.provider.uses_batch_storage() {
+            return if job.uses_batches() {
                 "Uploading remaining sheets".into()
             } else { "Labeling sheets".into() };
         }
@@ -1091,8 +1108,10 @@ impl Panel {
 
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, index: &Index, ai: &crate::ai::Ai, keys: &crate::ai::Keys, single_running: bool) {
         use eframe::egui;
-        let configured = ai.chosen(crate::ai::Mode::Batch);
-        let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok() && p.key_source(keys) != crate::ai::KeySource::None);
+        let configured = ai.chosen_library();
+        let ready = configured.is_some_and(|(p, _)| endpoint(p).is_ok()
+            && (!ai.batch_enabled() || p.kind == Kind::Gemini || p.uses_batch_storage())
+            && p.key_source(keys) != crate::ai::KeySource::None);
         let problems = self.problems();
         if self.job.is_none() {
             for (message, _) in &problems { self.settings_requested |= labels::problem(message).show(ui, message, false); }
@@ -1107,13 +1126,14 @@ impl Panel {
             if self.root != index.root { ui.label(format!("Active job for {}", self.root.display())); }
             ui.strong("Saved library job");
             ui.label(format!("{} / {}", job.provider.name, job.model));
-            ui.small(crate::ai::method(&job.provider));
+            ui.small(job.method());
             if let Some((provider, model)) = configured
                 && (provider.name != job.provider.name || provider.kind != job.provider.kind || provider.url != job.provider.url
-                    || model.id.trim_end_matches(":batch") != job.model.trim_end_matches(":batch")) {
+                    || model.id.trim_end_matches(":batch") != job.model.trim_end_matches(":batch")
+                    || ai.batch_enabled() != job.uses_batches()) {
                 ui.group(|ui| {
                     ui.label(format!("Settings select {} / {} for new jobs.", provider.name, model.id.trim_end_matches(":batch")));
-                    ui.label("This saved job keeps its original model, including resume and retry.");
+                    ui.label("This saved job keeps its original model and processing mode, including resume and retry.");
                     ui.label(if job.done() {
                         "Start a new library job below to use the selected model."
                     } else {
@@ -1143,7 +1163,7 @@ impl Panel {
             ui.horizontal_wrapped(|ui| {
                 if !job.done() && mode != Mode::Cancelling {
                     let text = if mode == Mode::Paused { "Resume" }
-                        else if job.provider.kind == Kind::Gemini || job.provider.uses_batch_storage() { "Pause uploads" } else { "Pause" };
+                        else if job.uses_batches() { "Pause uploads" } else { "Pause" };
                     if crate::stopped(ui.button(text)).clicked() { pause = Some(if mode == Mode::Paused { Mode::Running } else { Mode::Paused }); }
                     if crate::stopped(ui.button("Cancel job")).clicked() { cancel = true; }
                 }
@@ -1181,8 +1201,8 @@ impl Panel {
                     });
                 }
                 if !job.done() {
-                    ui.small(if job.provider.kind == Kind::Gemini {
-                        "Closing pauses local work. Google can continue accepted work. Reopen this library to collect results."
+                    ui.small(if job.uses_batches() {
+                        "Closing pauses local work. The provider can continue accepted work. Reopen this library to collect results."
                     } else { "Closing pauses labeling. Reopen this library to continue." });
                 }
                 egui::CollapsingHeader::new(if problems.is_empty() { "Details" } else { "Error details" })
@@ -1251,10 +1271,13 @@ impl Panel {
         }
         if let Some((provider, model)) = configured {
             ui.label(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
-            ui.small(crate::ai::method(provider));
+            ui.small(if ai.batch_enabled() { crate::ai::method(provider) } else { "Concurrent requests" });
         }
         ui.label(format!("{done} of {total} sheets have usable labels"));
-        if !ready { ui.label("Set a library model and its key in Settings (Ctrl+,)."); }
+        if !ready { ui.label("Choose a captioning model and connect its provider in AI setup (Ctrl+,)."); }
+        if ai.batch_enabled() && configured.is_some_and(|(p, _)| p.kind != Kind::Gemini && !p.uses_batch_storage()) {
+            ui.label("Provider batches need Google or OpenRouter with object storage. Configure them in AI setup.");
+        }
         for (text, scope) in [
             (if target.is_some() { "Label unlabeled in selection..." } else { "Label unlabeled sheets..." }, Scope::Unlabeled),
             (if target.is_some() { "Rerun all in selection..." } else { "Rerun all..." }, Scope::All),
@@ -1274,6 +1297,7 @@ impl Panel {
                 match job {
                     Ok(mut job) => {
                         job.concurrency = concurrency;
+                        job.native_batch = ai.batch_enabled();
                         self.cost_error.clear();
                         self.cost_preview = match cost::Preview::start(job.clone(), index.root.clone(), self.job.as_ref(), ui.ctx().clone()) {
                             Ok(preview) => Some(preview), Err(error) => { self.cost_error = error; None }
@@ -1338,7 +1362,7 @@ impl Panel {
                 ui.label(self.root.display().to_string());
                 if let Some((_, name)) = &self.choice { ui.weak(format!("Target: {name}")); }
                 ui.weak(format!("{} / {} (from Settings)", job.provider.name, job.model));
-                if job.provider.kind == Kind::Gemini { ui.weak("Google batch requests require a paid API project."); }
+                if job.uses_batches() && job.provider.kind == Kind::Gemini { ui.weak("Google batch requests require a paid API project."); }
                 if job.sheets.is_empty() {
                     ui.label("Every sheet has a label already.");
                 } else {
@@ -1358,9 +1382,9 @@ impl Panel {
                         ui.horizontal(|ui| { ui.spinner(); ui.label("Estimating cost..."); });
                         ui.small("Reading local image sizes and model prices. No sheets are uploaded.");
                     } else { ui.label(&self.cost_error); }
-                    ui.weak(if job.provider.kind == Kind::Gemini {
-                        "Closing pauses uploads and saves. Google continues accepted work. Reopen this library to collect results."
-                    } else { "This provider labels sheets one by one. Closing pauses the job until you reopen this library." });
+                    ui.weak(if job.uses_batches() {
+                        "Closing pauses uploads and saves. The provider continues accepted work. Reopen this library to collect results."
+                    } else { "This job sends concurrent requests. Closing pauses the job until you reopen this library." });
                 }
             });
             crate::dialogs::footer(ui, |ui| {

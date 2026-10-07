@@ -152,6 +152,7 @@ fn google_rates(model: &str, now: u64) -> Option<Rates> {
 
 fn prices(job: &Job, now: u64) -> (Option<Rates>, String) {
     if job.provider.kind == Kind::Gemini {
+        if !job.uses_batches() { return (None, "Standard Google request prices are not available in this price snapshot.".into()); }
         // Custom endpoints do not necessarily bill at Google's prices.
         let official = super::endpoint(&job.provider).ok().and_then(|s| s.parse::<ureq::http::Uri>().ok())
             .is_some_and(|u| u.host() == Some("generativelanguage.googleapis.com"));
@@ -164,7 +165,7 @@ fn prices(job: &Job, now: u64) -> (Option<Rates>, String) {
         return (rates, note.into());
     }
     if !job.provider.is_openrouter() { return (None, "This endpoint does not provide a supported price catalog.".into()); }
-    let batch = job.provider.store.is_some();
+    let batch = job.uses_batches();
     let result = fetch_router_prices(&job.model).and_then(|v| router_rates(&v, &job.model, batch));
     match result {
         Ok(rates) => (Some(rates), if batch {
