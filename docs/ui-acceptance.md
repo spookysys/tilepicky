@@ -135,3 +135,5 @@ The fixture images do not cover every animated or unusually large image format.
 Final release checks: the export chooser starts beside the source (138). The exported indexed PNG retains 128 x 96 pixels and transparency (139).
 The source bytes remain unchanged. Keyboard hints can be hidden and restored (140). AI setup remains usable at 820 x 600 (141).
 The final process check found no processes on the private display. The release application log was empty.
+
+The release command-line help check preserves synthetic legacy logs and creates no settings file.

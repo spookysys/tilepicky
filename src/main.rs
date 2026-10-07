@@ -3855,7 +3855,6 @@ const WGPU: bool = cfg!(feature = "wgpu");
 fn default_renderer() -> eframe::Renderer { eframe::Renderer::default() }
 
 fn main() -> eframe::Result {
-    ai_log::init();
     let mut dirs: Vec<String> = Vec::new();
     let mut renderer = default_renderer();
     for a in std::env::args().skip(1) {
@@ -3878,6 +3877,7 @@ fn main() -> eframe::Result {
         eprintln!("usage: tilepicky [--glow{}] [<library dir> [<project dir>]]", if WGPU { " | --wgpu" } else { "" });
         std::process::exit(2);
     }
+    ai_log::init();
     let (mut settings, damaged) = settings::Settings::load();
     // A folder named on the command line wins for this run, and is what the
     // tool offers next time.
