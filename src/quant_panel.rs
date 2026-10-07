@@ -32,6 +32,15 @@ pub struct Outcome {
     pub preview: RgbaImage,
     pub export: Export,
     pub deep_tiles: usize,
+    palette: Vec<PaletteGroup>,
+}
+
+#[derive(Clone)]
+struct PaletteGroup {
+    name: String,
+    first: usize,
+    colors: Vec<Rgb>,
+    transparent: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -159,7 +168,8 @@ pub fn run_snes(setting: &Snes, img: &RgbaImage, tile: [u32; 2], pins: &[bool], 
     let indices = quant::index_image(&result, &job, w, h);
     let deep_tiles = result.tile_deep.iter().filter(|&&d| d).count();
     let preview = paint_preview(img, &table, &indices);
-    Outcome { preview, export: Export::Indexed { palette: table, indices, key: true }, deep_tiles }
+    let palette = snes_palette(&result, &job);
+    Outcome { preview, export: Export::Indexed { palette: table, indices, key: true }, deep_tiles, palette }
 }
 
 /// Runs one sheet through the general path.
@@ -197,7 +207,7 @@ fn run_downsample(setting: &General, img: &RgbaImage) -> Outcome {
             }
         }
     }
-    Outcome { preview, export: Export::Image, deep_tiles: 0 }
+    Outcome { preview, export: Export::Image, deep_tiles: 0, palette: Vec::new() }
 }
 
 /// Quantizes to a palette, then writes each pixel as an index. `train` is
@@ -277,12 +287,16 @@ fn run_indexed_with(setting: &General, train: &[quantette::deps::palette::Srgb<u
             *p = image::Rgba([c.r, c.g, c.b, alpha]);
         }
     }
+    let palette = vec![PaletteGroup {
+        name: if setting.format.has_alpha() { "RGB palette (alpha is separate)" } else { "Palette" }.into(),
+        first: 0, colors: formatted.clone(), transparent: setting.key,
+    }];
     let export = if setting.format.has_alpha() {
         Export::Image
     } else {
         Export::Indexed { palette: formatted, indices, key: setting.key }
     };
-    Outcome { preview, export, deep_tiles: 0 }
+    Outcome { preview, export, deep_tiles: 0, palette }
 }
 
 /// The training pixels of one sheet: its opaque colors.
@@ -557,7 +571,8 @@ fn run_snes_group(setting: &Snes, members: &[Member], tile: [u32; 2], seed: u64)
             }
         }
     }
-    Outcome { preview, export: Export::Indexed { palette: table, indices: out_indices, key: true }, deep_tiles }
+    let palette = snes_palette(&result, &job);
+    Outcome { preview, export: Export::Indexed { palette: table, indices: out_indices, key: true }, deep_tiles, palette }
 }
 
 /// Runs the open sheet through its setting. `pins` is one flag per tile.
@@ -572,6 +587,57 @@ pub fn run(setting: &Quantize, img: &RgbaImage, tile: [u32; 2], pins: &[bool]) -
             None => Err("a general group has no general setting".into()),
         },
     }
+}
+
+/// Keep the computed palettes with their result, so a new setting cannot relabel an old preview.
+fn snes_palette(result: &quant::Quantized, job: &Job) -> Vec<PaletteGroup> {
+    let mut groups: Vec<_> = result.palettes.iter().enumerate().map(|(i, colors)| PaletteGroup {
+        name: format!("Palette {}", i + 1), first: i * (1usize << job.bpp), colors: colors.clone(), transparent: true,
+    }).collect();
+    if let Some(first) = job.deep_entries.first() && !result.deep_colors.is_empty() {
+        groups.push(PaletteGroup { name: "Extra 8bpp colors".into(), first: usize::from(*first),
+            colors: result.deep_colors.clone(), transparent: false });
+    }
+    groups
+}
+
+fn palette_ui(ui: &mut egui::Ui, outcome: &Outcome) {
+    ui.separator();
+    ui.strong("Palette preview");
+    if outcome.palette.is_empty() {
+        ui.weak("This method reduces color depth without creating a palette.");
+        return;
+    }
+    ui.small("T = transparent. Hover for the index and RGB value. Click a color to copy its hex value.");
+    egui::ScrollArea::vertical().id_salt("quantized palettes").max_height(220.0).show(ui, |ui| {
+        for group in &outcome.palette {
+            ui.push_id((&group.name, group.first), |ui| {
+                let visible = group.colors.len().saturating_sub(usize::from(group.transparent));
+                ui.label(format!("{}: {} entries", group.name, group.colors.len()));
+                if group.transparent { ui.small(format!("{visible} colors + 1 transparent")); }
+                ui.horizontal_wrapped(|ui| {
+                    for (offset, color) in group.colors.iter().enumerate() {
+                        let index = group.first + offset;
+                        let transparent = group.transparent && offset == 0;
+                        let hex = format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b);
+                        let fill = if transparent { ui.visuals().faint_bg_color }
+                            else { egui::Color32::from_rgb(color.r, color.g, color.b) };
+                        let ink = if transparent { ui.visuals().text_color() }
+                            else if u32::from(color.r) * 299 + u32::from(color.g) * 587 + u32::from(color.b) * 114 > 140_000 {
+                                egui::Color32::BLACK
+                            } else { egui::Color32::WHITE };
+                        let text = if transparent { "T".into() } else { index.to_string() };
+                        let description = if transparent { format!("Entry {index}: transparent") }
+                            else { format!("Entry {index}: {hex} / RGB {}, {}, {}", color.r, color.g, color.b) };
+                        let response = ui.add(egui::Button::new(egui::RichText::new(text).color(ink))
+                            .fill(fill).min_size(egui::vec2(30.0, 30.0))).on_hover_text(description);
+                        if response.clicked() && !transparent { ui.ctx().copy_text(hex); }
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        }
+    });
 }
 
 /// Writes an outcome to `path`.
@@ -1028,6 +1094,10 @@ impl App {
 
     /// The right side panel of the project half.
     pub fn quant_side_panel(&mut self, ui: &mut egui::Ui, keys: bool) {
+        egui::ScrollArea::vertical().id_salt("color quantization controls").show(ui, |ui| self.quant_controls(ui, keys));
+    }
+
+    fn quant_controls(&mut self, ui: &mut egui::Ui, keys: bool) {
         self.quant_poll_save();
         ui.heading(crate::title_text("Color quantization", keys));
         let target = self.quant_target.clone();
@@ -1098,7 +1168,7 @@ impl App {
         if matches!(self.quant.mode, QuantizeMode::Snes)
             && self.quant.snes.as_ref().is_some_and(|s| matches!(s.depth, SnesDepth::Bpp4Plus8))
         {
-            ui.label("draw on tiles");
+            ui.strong("Tile color depth");
             ui.weak("Yellow outlines mark manual 8bpp pins. Erase removes a pin; auto can still select the tile.");
             ui.horizontal(|ui| {
                 let tool = self.quant_tool;
@@ -1139,6 +1209,7 @@ impl App {
         if self.quant_worker.as_ref().is_some_and(|worker| worker.receiver.is_some()) {
             ui.horizontal(|ui| { ui.spinner(); ui.label("Computing preview..."); });
         }
+        if let Some(outcome) = &self.quant_preview { palette_ui(ui, outcome); }
         if self.quant_picking.is_some() { ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)); }
         if let Some(sheet) = self.project.sheet.as_mut() {
             sheet.quant_tool = self.quant_tool;
@@ -1231,6 +1302,37 @@ mod tests {
             let reader = decoder.read_info().unwrap();
             assert!(reader.info().palette.as_ref().unwrap().len() / 3 <= 4);
             assert_eq!(reader.info().trns.is_some(), key);
+        }
+    }
+
+    #[test]
+    fn palette_view_keeps_rgb_palettes_when_export_has_separate_alpha() {
+        let setting = General { kind: GeneralKind::Indexed, format: GeneralFormat::Rgba8888,
+            colors: 4, key: false, dither: QuantizeDither::None };
+        let outcome = run_general(&setting, &sheet());
+        assert!(matches!(outcome.export, Export::Image));
+        assert_eq!(outcome.palette.len(), 1);
+        assert!(!outcome.palette[0].transparent);
+        assert!(outcome.palette[0].colors.len() <= 4);
+        for pixel in outcome.preview.pixels() {
+            assert!(outcome.palette[0].colors.contains(&Rgb::new(pixel[0], pixel[1], pixel[2])));
+        }
+    }
+
+    #[test]
+    fn palette_view_keeps_snes_subpalette_indices_and_transparency() {
+        let setting = Snes { depth: SnesDepth::Bpp2, palettes: 2, colors: 3,
+            dither: QuantizeDither::None, auto_pct: 0, extra_8bpp: 0 };
+        let outcome = run_snes(&setting, &sheet(), [8, 8], &[], 0);
+        let Export::Indexed { palette, .. } = &outcome.export else { panic!("Expected indexed output") };
+        assert!(!outcome.palette.is_empty());
+        for (i, group) in outcome.palette.iter().enumerate() {
+            assert_eq!(group.first, i * 4);
+            assert!(group.transparent);
+            assert!(group.colors.len() <= 4);
+            for (offset, color) in group.colors.iter().enumerate().skip(1) {
+                assert_eq!(*color, palette[group.first + offset]);
+            }
         }
     }
 

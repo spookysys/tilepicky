@@ -433,6 +433,10 @@ Choose one option from **Color reduction method**. Its settings appear under a s
 **Palettes** controls the number of separate SNES palettes. Each SNES palette always reserves index 0 for transparency.
 RGBA formats preserve alpha separately; their palette limit counts RGB colors, as the panel explains.
 
+**Palette preview** shows the computed colors, grouped by SNES palette when applicable.
+`T` marks a transparent entry. Hover over a swatch for its index, hex value, and RGB values.
+Click a color to copy its hex value. Reduce color depth does not create a palette.
+
 - **SNES** uses tile palettes and hardware color limits, as described below.
 - **Reduce color depth** reduces each pixel's color precision without a palette. Image dimensions stay the same.
   Choose `rgb565`, `rgba5658`, or `rgb233`.
