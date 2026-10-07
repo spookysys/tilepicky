@@ -141,6 +141,7 @@ impl App {
             ("Label meaning", settings::SearchIn { text_embeddings: true, ..base }),
         ];
         let mut open = None;
+        let mut rebuild = None;
         ui.columns(3, |columns| {
             for (column, (title, search)) in columns.iter_mut().zip(sources) {
                 column.strong(title);
@@ -170,7 +171,25 @@ impl App {
                         }
                         continue;
                     }
-                    if vector.is_none() { column.weak("Waiting for a compatible index and query vector."); continue; }
+                    let chosen = if search.embeddings { self.settings.ai.chosen_embed() } else { self.settings.ai.chosen_text_embed() };
+                    let (saved_model, saved_provider) = if search.embeddings {
+                        (&self.library.index.embed_model, &self.library.index.embed_provider)
+                    } else { (&self.library.index.text_embed_model, &self.library.index.text_embed_provider) };
+                    let Some((provider, model)) = chosen else {
+                        column.label("Choose an embedding model in AI setup.");
+                        if column.button("AI setup...").clicked() { self.settings_request = true; }
+                        continue;
+                    };
+                    if count == 0 || saved_model != &model.id || saved_provider != &crate::embed::identity(provider) {
+                        if count == 0 { column.label("No current index is available for this source."); }
+                        else {
+                            column.label("The saved index does not match the selected model or provider.");
+                            column.small(format!("Saved model: {saved_model}. Selected model: {}.", model.id));
+                        }
+                        if column.button("Review index generation...").clicked() { rebuild = Some(search.embeddings); }
+                        continue;
+                    }
+                    if vector.is_none() { column.weak("Preparing the search query..."); continue; }
                 }
                 let results = self.library.index.ranked(&self.qwords, search,
                     self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
@@ -183,6 +202,11 @@ impl App {
             }
         });
         if let Some(i) = open { self.open_library(ui.ctx(), i); }
+        if let Some(images) = rebuild {
+            self.open_improve();
+            self.embed_images = images;
+            self.embed_text = !images;
+        }
     }
 
     pub(super) fn workflow_windows(&mut self, ctx: &egui::Context) {
@@ -196,7 +220,10 @@ impl App {
         let mut open = true;
         let mut action = None;
         egui::Window::new("Improve search").open(&mut open).default_width(480.0).vscroll(true).show(ctx, |ui| {
-            ui.heading(format!("{} selected sheets", self.improve_rels.len()));
+            let entire = self.improve_rels.len() == self.library.index.entries.len();
+            ui.heading(if entire { format!("Entire library: {} sheets", self.improve_rels.len()) }
+                else { format!("Selected sheets: {}", self.improve_rels.len()) });
+            if entire { ui.small("Search filters do not limit this scope. Select checkboxes to choose specific sheets."); }
             egui::CollapsingHeader::new("Review scope").show(ui, |ui| {
                 for rel in &self.improve_rels { ui.label(rel); }
             });
@@ -224,7 +251,7 @@ impl App {
             if self.improve_rels.is_empty() { self.status = "Select at least one sheet.".into(); return; }
             match action {
                 0 if self.improve_rels.len() > 1 => {
-                    self.library_batch.choose(self.improve_rels.iter().cloned().collect(), format!("{} selected sheets", self.improve_rels.len()));
+                    self.library_batch.choose(self.improve_rels.iter().cloned().collect(), format!("Selected sheets: {}", self.improve_rels.len()));
                     self.ai_panel = true;
                 }
                 0 | 3 => {
