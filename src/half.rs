@@ -110,6 +110,15 @@ impl Half {
         let e = &self.index.entries[i];
         let mut s = Sheet::open(ctx, &self.index.root, &e.rel, self.inherited_tile(), e.side.clone())?;
         s.library = self.library;
+        // The Tiled tileset beside a project image holds its tile properties.
+        // A file this tool cannot read still opens the sheet: the panel shows
+        // the error, and a save leaves that file alone.
+        if !self.library {
+            match crate::tileset::load(&self.index.root, &e.rel) {
+                Ok(props) => s.props = props,
+                Err(error) => s.props_error = Some(error),
+            }
+        }
         if let Some(prev) = &self.sheet {
             s.zoom = prev.zoom;
         }

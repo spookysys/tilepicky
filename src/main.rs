@@ -26,6 +26,7 @@ mod labels;
 #[allow(dead_code)]
 mod quant;
 mod quant_panel;
+mod props_panel;
 mod bucket;
 mod batch;
 mod storage;
@@ -34,6 +35,7 @@ mod half;
 mod settings;
 mod sheet;
 mod sidecar;
+mod tileset;
 mod tree;
 
 use eframe::egui::{self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle, Vec2};
@@ -237,6 +239,8 @@ struct App {
     /// The color quantization panel: its working setting, target, and the
     /// per-tile pins, plus the cached preview and the paint tool.
     quant_panel: bool,
+    /// The tile-properties panel for Tiled.
+    props_panel: bool,
     quant_open_rel: Option<String>,
     quant: sidecar::Quantize,
     quant_target: Option<sidecar::QuantizeTarget>,
@@ -526,6 +530,7 @@ impl App {
             legend_prompt: false,
             project_eye: false,
             quant_panel: false,
+            props_panel: false,
             quant_open_rel: None,
             quant: quant_panel::default_setting(),
             quant_target: None,
@@ -1099,6 +1104,11 @@ impl App {
             Ok(()) => {
                 self.tree_cursor = Some(i);
                 self.active = Panel::Project;
+                // A tileset this tool cannot read still opens the image. The
+                // status says so once; the panel explains it in full.
+                if let Some(error) = self.project.sheet.as_ref().and_then(|s| s.props_error.clone()) {
+                    self.status = format!("tile properties: {error}");
+                }
             }
             Err(err) => self.status = err,
         }
@@ -1613,6 +1623,9 @@ impl App {
         if in_half && self.active == Panel::Project && key(Modifiers::NONE, Key::E) {
             self.project_eye = !self.project_eye;
         }
+        if in_half && self.active == Panel::Project && key(Modifiers::NONE, Key::P) {
+            self.props_panel = !self.props_panel;
+        }
         // The arrows move the selection of the sheet that holds the focus.
         // Shift walks one corner and keeps the other; Ctrl steps from one
         // block of filled cells to the next; Alt walks the whole selection.
@@ -1816,6 +1829,7 @@ impl App {
         ai: Option<&mut bool>,
         eye: Option<&mut bool>,
         quant: Option<&mut bool>,
+        props: Option<&mut bool>,
     ) -> (Option<Grid>, bool) {
         // The fields read the sheet and the tail takes it, so the numbers
         // the fields show are read here, before the tail borrows it.
@@ -1868,15 +1882,16 @@ impl App {
                 ui.weak(format!("{zoom}x")).on_hover_text(sel.unwrap_or_else(|| "No tile selection".into()));
                 new_grid
             },
-            |ui| Self::header_tail(ui, sheet, ai, eye, quant, name, cell),
+            |ui| Self::header_tail(ui, sheet, ai, eye, quant, props, name, cell),
         )
     }
 
     /// The right end of a header: the buttons that open the side panels,
     /// then the name of the sheet and the cell under the pointer. The two
     /// texts are truncated: a long name can never push the fields off screen.
-    /// Returns whether one of the three buttons was clicked.
-    fn header_tail(ui: &mut egui::Ui, mut sheet: Option<&mut Sheet>, ai: Option<&mut bool>, eye: Option<&mut bool>, quant: Option<&mut bool>, name: String, cell: Option<String>) -> bool {
+    /// Returns whether one of the buttons was clicked.
+    #[allow(clippy::too_many_arguments)]
+    fn header_tail(ui: &mut egui::Ui, mut sheet: Option<&mut Sheet>, ai: Option<&mut bool>, eye: Option<&mut bool>, quant: Option<&mut bool>, props: Option<&mut bool>, name: String, cell: Option<String>) -> bool {
         let mut clicked = false;
         // The buttons draw from the right, so they are kept here and become
         // stops from the left, in the order you read them.
@@ -1909,6 +1924,14 @@ impl App {
                 let r = ui.add_enabled(open, egui::Button::new("🎨").small().selected(*quant)).on_hover_text("color quantization");
                 if r.clicked() {
                     *quant = !*quant;
+                    clicked = true;
+                }
+                here.push(r);
+            }
+            if let Some(props) = props {
+                let r = ui.add_enabled(open, egui::Button::new("🏷").small().selected(*props)).on_hover_text("tile properties for Tiled (P)");
+                if r.clicked() {
+                    *props = !*props;
                     clicked = true;
                 }
                 here.push(r);
@@ -2529,7 +2552,7 @@ impl App {
             ui.horizontal(|ui| {
                 let live = keys == (Panel::Library, Spot::Sheet);
                 let clicked;
-                (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), None, None, None);
+                (out.grid, clicked) = Self::sheet_header(ui, "Source", live, true, self.library.sheet.as_mut(), None, None, None, None);
                 // A header button does not keep the keys: they go to the grid.
                 if clicked {
                     self.active = Panel::Library;
@@ -2578,7 +2601,7 @@ impl App {
         set_pane(ui, (Panel::Project, Spot::Sheet));
         let live = keys == (Panel::Project, Spot::Sheet);
         let clicked = Self::sheet_toolbar(ui, "canvas toolbar", |ui| {
-            let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye), Some(&mut self.quant_panel));
+            let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye), Some(&mut self.quant_panel), Some(&mut self.props_panel));
             out.grid = grid; clicked
         });
         if clicked {
@@ -2612,6 +2635,12 @@ impl App {
                 egui::Panel::right("my animation").resizable(true).default_size(220.0).show(ui, |ui| {
                     set_pane(ui, (Panel::Project, Spot::Side));
                     out.anim = Self::animation_panel(ui, s, false, keys == (Panel::Project, Spot::Side));
+                });
+            }
+            if self.props_panel {
+                egui::Panel::right("tile properties").resizable(true).default_size(300.0).show(ui, |ui| {
+                    set_pane(ui, (Panel::Project, Spot::Side));
+                    props_panel::show(ui, s, keys == (Panel::Project, Spot::Side));
                 });
             }
             set_pane(ui, (Panel::Project, Spot::Sheet));
@@ -3095,7 +3124,7 @@ impl App {
                          Ctrl+Tab: next pane | Tab: next control\n\
                          Ctrl+F: search | +/- or Ctrl+wheel: zoom\n\
                          Ctrl+Z/Y: undo/redo | Ctrl+S: save | Ctrl+T: trim\n\
-                         A: animation | M: store/remove | E: inspect{ai_key}\n\
+                         A: animation | M: store/remove | E: inspect | P: tile properties{ai_key}\n\
                          Right-click: library menu/batch; project clear/delete\n\
                          Ctrl+,: settings"
                     );

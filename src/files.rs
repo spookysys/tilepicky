@@ -83,34 +83,94 @@ pub fn relocate(root: &Path, old: &str, new: &str, copy: bool) -> Result<(), Str
     sidecar::load_book(root)?;
     let directory = root.join(old).is_dir();
     if directory && copy { return Err("Copy folders one file at a time.".into()); }
+    // The Tiled tileset beside an image travels with it, so a rename never
+    // leaves a `.tsj` behind. A folder carries its own.
+    let old_tsj = crate::tileset::path(root, old);
+    let new_tsj = crate::tileset::path(root, new);
+    let tsj = !directory && old_tsj.is_file();
+    if tsj && new_tsj.exists() {
+        return Err(format!("{} exists", new_tsj.strip_prefix(root).unwrap_or(&new_tsj).display()));
+    }
     if let Some(parent) = root.join(new).parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
     if copy { std::fs::copy(root.join(old), root.join(new)).map_err(|e| e.to_string())?; }
     else { std::fs::rename(root.join(old), root.join(new)).map_err(|e| e.to_string())?; }
-    let result = if directory { sidecar::move_prefix(root, old, new) } else { sidecar::move_entry(root, old, new, copy) };
-    if let Err(error) = result {
-        let rollback = if copy {
+    // Puts the image back, or says why the two paths stay.
+    let undo_image = || -> std::io::Result<()> {
+        if copy {
             std::fs::remove_file(root.join(new))
         } else if root.join(old).try_exists().unwrap_or(true) {
             Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "the original path exists; both paths were kept"))
         } else {
             std::fs::rename(root.join(new), root.join(old))
+        }
+    };
+    let failed = |error: String, undo: std::io::Result<()>| -> String {
+        match undo {
+            Ok(()) => error,
+            Err(undo) => format!("{error}. Cannot restore {old}: {undo}"),
+        }
+    };
+    if tsj {
+        // Write the tileset under its new name and point it at the new image
+        // before the old one goes. A failure leaves the pair as it was.
+        let step = match std::fs::copy(&old_tsj, &new_tsj) {
+            Ok(_) => crate::tileset::retarget(root, new),
+            Err(e) => Err(format!("{}: {e}", new_tsj.display())),
         };
-        return match rollback {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(format!("{error}. Cannot restore {old}: {rollback}")),
+        if let Err(error) = step {
+            let _ = std::fs::remove_file(&new_tsj);
+            let undo = undo_image();
+            return Err(failed(error, undo));
+        }
+        if !copy && let Err(error) = std::fs::remove_file(&old_tsj) {
+            let _ = std::fs::remove_file(&new_tsj);
+            let undo = undo_image();
+            return Err(failed(format!("{}: {error}", old_tsj.display()), undo));
+        }
+    }
+    let result = if directory { sidecar::move_prefix(root, old, new) } else { sidecar::move_entry(root, old, new, copy) };
+    if let Err(error) = result {
+        let undo_tsj: Result<(), String> = if !tsj {
+            Ok(())
+        } else if copy {
+            remove_if_present(&new_tsj).map_err(|e| e.to_string())
+        } else {
+            std::fs::rename(&new_tsj, &old_tsj).map_err(|e| e.to_string())
+                .and_then(|()| crate::tileset::retarget(root, old))
         };
+        let undo_image = undo_image().map_err(|e| e.to_string());
+        let mut message = error;
+        for (what, undo) in [(old_tsj.display().to_string(), undo_tsj), (old.to_string(), undo_image)] {
+            if let Err(undo) = undo {
+                message = format!("{message}. Cannot restore {what}: {undo}");
+            }
+        }
+        return Err(message);
     }
     Ok(())
 }
 
-/// Deletes files and folders. The book forgets what went, even when a later
-/// one of them fails.
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Deletes files and folders, each image with its Tiled tileset. The book
+/// forgets what went, even when a later one of them fails.
 pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
     sidecar::update_book(root, |book| {
         // Keep completed deletions even when a later file cannot be removed.
         Ok(rels.iter().try_for_each(|rel| {
             let path = root.join(rel);
-            if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }.map_err(|e| format!("{rel}: {e}"))?;
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).map_err(|e| format!("{rel}: {e}"))?;
+            } else {
+                std::fs::remove_file(&path).map_err(|e| format!("{rel}: {e}"))?;
+                let tsj = crate::tileset::path(root, rel);
+                remove_if_present(&tsj).map_err(|e| format!("{}: {e}", tsj.display()))?;
+            }
             book.sheets.retain(|key, _| key != rel && !key.starts_with(&format!("{rel}/")));
             sidecar::forget_quantize(&mut book.quantize, rel);
             Ok(())
@@ -241,6 +301,36 @@ mod tests {
         assert_eq!(sidecar::load_book(&dir.0).unwrap().sheets["plants/oak.png"], side);
         remove(&dir.0, &["plants".into()]).unwrap();
         assert!(sidecar::load_book(&dir.0).unwrap().sheets.is_empty());
+    }
+
+    #[test]
+    fn a_tileset_moves_copies_and_goes_with_its_image() {
+        let dir = Folder::new();
+        std::fs::write(dir.0.join("tree.png"), b"fixture").unwrap();
+        let grid = crate::tileset::Grid { image: [32, 32], tile: [16, 16], gap: [0, 0], offset: [0, 0], cols: 2, rows: 2 };
+        let mut props = crate::tileset::Props::default();
+        props.set(&[1], "walkable", crate::tileset::Prop::Bool(true));
+        crate::tileset::write(&dir.0, "tree.png", grid, &props).unwrap();
+        sidecar::store_entry(&dir.0, "tree.png", &Sidecar { tile: Some(Pair::of([16, 16])), ..Default::default() }).unwrap();
+
+        relocate(&dir.0, "tree.png", "oak.png", false).unwrap();
+        assert!(!dir.0.join("tree.tsj").exists());
+        assert_eq!(crate::tileset::load(&dir.0, "oak.png").unwrap(), props);
+        let file: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.0.join("oak.tsj")).unwrap()).unwrap();
+        assert_eq!(file["image"], "oak.png");
+        assert_eq!(sidecar::load_book(&dir.0).unwrap().sheets["oak.png"].tile, Some(Pair::of([16, 16])));
+
+        relocate(&dir.0, "oak.png", "copy.png", true).unwrap();
+        assert!(dir.0.join("oak.tsj").is_file(), "the original keeps its tileset");
+        assert_eq!(crate::tileset::load(&dir.0, "copy.png").unwrap(), props);
+
+        remove(&dir.0, &["copy.png".into()]).unwrap();
+        assert!(!dir.0.join("copy.tsj").exists());
+        assert!(dir.0.join("oak.tsj").is_file());
+
+        std::fs::write(dir.0.join("other.tsj"), b"{}").unwrap();
+        assert!(relocate(&dir.0, "oak.png", "other.png", false).unwrap_err().contains("other.tsj exists"));
+        assert!(dir.0.join("oak.png").is_file() && dir.0.join("oak.tsj").is_file(), "a refused move touches nothing");
     }
 
     #[test]

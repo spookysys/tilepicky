@@ -568,6 +568,12 @@ pub struct Sheet {
     pub img: RgbaImage,
     /// The book entry: grid, origins, animations. Saved with the sheet.
     pub side: Sidecar,
+    /// The Tiled tileset beside the image: the properties of each tile, as
+    /// Tiled reads them. Only a project sheet has one.
+    pub props: crate::tileset::Props,
+    /// Why the tileset beside the image could not be read. A save then leaves
+    /// that file as it is, so a mistake in it costs no property.
+    pub props_error: Option<String>,
     chunks: Vec<(Rect, TextureHandle)>,
     pub sel: Sel,
     anchor: Option<(u32, u32)>,
@@ -755,6 +761,8 @@ impl Sheet {
             last_click: None,
             img,
             side,
+            props: crate::tileset::Props::default(),
+            props_error: None,
             chunks: Vec::new(),
             sel: Sel::default(),
             anchor: None,
@@ -803,6 +811,22 @@ impl Sheet {
     }
     pub fn rows(&self) -> u32 {
         span(self.img.height(), self.offset[1], self.gap[1], self.pitch()[1])
+    }
+    /// The id Tiled gives this cell: `row * columns + column`, counted over
+    /// the whole sheet.
+    pub fn tile_id(&self, (x, y): (u32, u32)) -> u32 {
+        y * self.cols() + x
+    }
+    /// The grid as the Tiled tileset beside the image states it.
+    pub fn tileset_grid(&self) -> crate::tileset::Grid {
+        crate::tileset::Grid {
+            image: [self.img.width(), self.img.height()],
+            tile: self.tile,
+            gap: self.gap,
+            offset: self.offset,
+            cols: self.cols(),
+            rows: self.rows(),
+        }
     }
     /// The image position of a cell's top left pixel. Negative before the
     /// image edge, where the offset is negative.
@@ -2151,6 +2175,20 @@ impl Sheet {
             return Err(format!("{}: a tilesheet saves as a PNG, which keeps every pixel and the alpha", self.rel));
         }
         sidecar::load_book(&self.dir)?;
+        // A project sheet writes the Tiled tileset beside its image when it
+        // has properties or already has a file there. What cannot be written
+        // is refused before the image, so one save never leaves half its
+        // files on disk.
+        let tsj = !self.library && !self.rel.is_empty()
+            && (!self.props.is_empty() || crate::tileset::path(&self.dir, &self.rel).is_file());
+        if tsj {
+            if let Some(error) = &self.props_error {
+                return Err(format!("The sheet is not saved. {error}"));
+            }
+            if let Err(reason) = crate::tileset::check(self.tileset_grid()) {
+                return Err(format!("The sheet is not saved. {reason}"));
+            }
+        }
         // The image is written whole or not at all: a crash halfway must
         // not leave half a tilesheet.
         let path = self.dir.join(&self.rel);
@@ -2163,6 +2201,10 @@ impl Sheet {
         .map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
         self.side.tile = Some(Pair::of(self.tile));
         self.side.provenance = self.prov.extract();
+        if tsj {
+            crate::tileset::write(&self.dir, &self.rel, self.tileset_grid(), &self.props)
+                .map_err(|e| format!("The image is saved, but {e}"))?;
+        }
         self.save_entry()
     }
 
@@ -2278,6 +2320,38 @@ mod tests {
         let entry = book.sheets.get("map.png").cloned();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(entry.and_then(|e| e.tile).map(Pair::xy), Some([64, 48]));
+    }
+
+    /// The Tiled tileset lands with the image, and follows the sheet's grid.
+    /// No property means no file; a grid Tiled cannot hold, or a file this
+    /// tool cannot read, stops the save before the image is written.
+    #[test]
+    fn a_save_writes_the_tiled_tileset_beside_the_image() {
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "map.png", [8, 8], 2, 2);
+        sheet.save().unwrap();
+        assert!(!dir.0.join("map.tsj").exists(), "no properties, no tileset");
+        sheet.props.set(&[3], "solid", crate::tileset::Prop::Bool(true));
+        sheet.save().unwrap();
+        let file: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.0.join("map.tsj")).unwrap()).unwrap();
+        assert_eq!(file["image"], "map.png");
+        assert_eq!(file["tilewidth"], 8);
+        assert_eq!(file["columns"], 2);
+        assert_eq!(file["tilecount"], 4);
+        assert_eq!(crate::tileset::load(&dir.0, "map.png").unwrap().tiles[&3]["solid"], crate::tileset::Prop::Bool(true));
+
+        let mut cut = Sheet::new_empty(&ctx, &dir.0, "cut.png", [8, 8], 2, 2);
+        cut.set_grid(&ctx, [8, 8], [0, 0], [-2, 0]);
+        cut.props.set(&[0], "solid", crate::tileset::Prop::Bool(true));
+        let error = cut.save().unwrap_err();
+        assert!(error.contains("negative margin"), "{error}");
+        assert!(!dir.0.join("cut.png").exists(), "the image is not written either");
+
+        std::fs::write(dir.0.join("map.tsj"), b"{broken").unwrap();
+        sheet.props_error = Some("broken".into());
+        assert!(sheet.save().is_err());
+        assert_eq!(std::fs::read(dir.0.join("map.tsj")).unwrap(), b"{broken", "a file this tool cannot read is left alone");
     }
 
     /// A grid read off the pixels is written down at once, so it is read

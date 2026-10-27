@@ -13,7 +13,7 @@ Open a project sheet, search the library for the tiles you need, select a region
 Tilepicky organizes your work into two directories:
 
 - **Library**: Holds your collected sprite sheets. Tilepicky preserves the source images. It writes grids, animations, labels, and job state to `tilepicky.json`. Search indexes and job logs use separate files beside it.
-- **Project**: Holds the tilesheets you create and edit. Tilepicky writes output image files here, along with a project-specific `tilepicky.json`.
+- **Project**: Holds the tilesheets you create and edit. Tilepicky writes output image files here, along with a project-specific `tilepicky.json` and, when tiles have properties, a Tiled tileset beside the image.
 
 Use **Folders** to open or change the library and project folders. Both paths are stored in `~/.config/tilepicky/settings.json`.
 
@@ -484,6 +484,20 @@ All three methods offer dithering.
 Indexed output preserves the palette and pixel indices. Downsample output and formats with per-pixel alpha use RGBA PNG.
 A failed write preserves the previous output file. PNG does not store the target engine's tile arrangement.
 
+## Tile properties for Tiled
+
+The tag button in the tilesheet header opens the **Tile properties** panel. Press `P` to open or close it. The panel gives tiles the properties a game engine reads: a name, and a value of kind `string`, `int`, `float`, or `bool`.
+
+Tilepicky keeps them in a Tiled tileset file beside the image: `town.png` has `town.tsj`. Press `Ctrl+S` to write it. A save also updates the file's image name, tile size, and counts, so the file follows a changed grid. In Tiled, add the file to a map with **Map > Add Tileset...**, and the map reads its tile properties.
+
+Select tiles on the canvas, then add a property in the last row of the panel. An edit applies to every selected tile. When the selected tiles do not share a value, the panel marks the property `mixed` and shows the first value it finds. The ✖ button removes a property from the selected tiles. A tile id is `row * columns + column` over the whole sheet, as Tiled counts.
+
+The panel is offered for project sheets only. A sheet with no properties gets no file, unless it already has one.
+
+The file is the truth. Tilepicky reads it when the sheet opens, and keeps what the panel does not edit: top-level keys such as `editorsettings`, per-tile keys such as `probability`, and property kinds such as `color` or `file`. Tiled can change the same file, so open the sheet again to read those changes.
+
+Some grids cannot be written as a Tiled tileset: a negative margin, offsets that differ on the two axes, gaps that differ on the two axes, or no tiles. A save refuses such a sheet before it writes the image. A `.tsj` that Tilepicky cannot read stops the save as well, and the file stays as it is. The panel shows the error, and the status bar shows it when the sheet opens.
+
 ## Shortcuts
 
 ### Sheet operations
@@ -555,7 +569,7 @@ File trees accept the following mouse and keyboard actions:
 | Right-click folder | Context menu: new folder, rename, delete, reveal in file manager, copy path |
 | Right-click empty area | Context menu: new folder, refresh tree |
 
-Library files are read-only and cannot be moved, renamed, or deleted within Tilepicky. Moving project files updates references in `tilepicky.json`.
+Library files are read-only and cannot be moved, renamed, or deleted within Tilepicky. Moving project files updates references in `tilepicky.json`. The Tiled tileset of a project sheet (`.tsj`) moves, copies, and deletes with its image.
 
 ## Settings
 
