@@ -948,10 +948,19 @@ impl Panel {
         messages
     }
 
+    /// The first problem of the library job, for the status bar. It stays
+    /// until the job is retried or discarded, so it counts the failed sheets:
+    /// a reason alone reads like news at every start.
     pub fn attention(&self) -> Option<String> {
-        self.problems().first().map(|(message, _)| {
-            let provider = self.job.as_ref().map_or("AI", |job| job.provider.name.as_str());
-            format!("{provider}: {}", labels::problem(message).title)
+        let problems = self.problems();
+        let (message, sheets) = problems.first()?;
+        let provider = self.job.as_ref().map_or("AI", |job| job.provider.name.as_str());
+        let reason = format!("{provider}: {}", labels::problem(message).title);
+        // A job-wide problem comes first and stands alone; the sheets come last.
+        Some(match (*sheets, problems.iter().map(|(_, n)| n).sum::<usize>()) {
+            (0, _) => reason,
+            (_, 1) => format!("AI labels: 1 sheet failed. {reason}"),
+            (_, n) => format!("AI labels: {n} sheets failed. {reason}"),
         })
     }
 
@@ -1700,7 +1709,7 @@ mod tests {
         assert!(job.done());
         let panel = Panel { job: Some(files.journal()), ..Panel::default() };
         assert_eq!(panel.problems(), vec![(error.into(), 2)]);
-        assert_eq!(panel.attention().as_deref(), Some("test: Prepaid credits depleted"));
+        assert_eq!(panel.attention().as_deref(), Some("AI labels: 2 sheets failed. test: Prepaid credits depleted"));
         assert!(panel.status().unwrap().contains("Labeling failed"));
         assert_eq!(panel.job.as_ref().unwrap().outcomes(), [0, 2, 0, 0]);
     }

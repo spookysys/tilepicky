@@ -107,11 +107,24 @@ fn file() -> Option<PathBuf> {
 }
 
 /// `$XDG_CONFIG_HOME/tilepicky`, or the same under `~/.config`.
+#[cfg(not(test))]
 pub fn dir() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(dir.join("tilepicky"))
+}
+
+/// A test build never reaches the person's configuration: a UI test that
+/// clicks a setting saves it, with the test's temp folders as the library
+/// and the project. It uses `$TILEPICKY_TEST_CONFIG/tilepicky` when the
+/// interactive fixture names one, else a folder of its own for the run.
+#[cfg(test)]
+pub fn dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("TILEPICKY_TEST_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("tilepicky-test-config-{}", std::process::id())));
     Some(dir.join("tilepicky"))
 }
 

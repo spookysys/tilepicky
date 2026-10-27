@@ -209,7 +209,7 @@ The interactive pass covered:
 The pane uses stable job descriptions and separate saved, waiting, queued, and uncertain counts.
 Options for new labels remain collapsed. The Settings button remains in the status bar.
 
-Run the interactive fixture with an isolated `XDG_CONFIG_HOME`, a private X11 display, and `TILEPICKY_TEST_TRANSPORT` set to a loopback server:
+Run the interactive fixture with `TILEPICKY_TEST_CONFIG` set to a scratch configuration folder, a private X11 display, and `TILEPICKY_TEST_TRANSPORT` set to a loopback server. A test build reads its configuration from `$TILEPICKY_TEST_CONFIG/tilepicky`, never from `XDG_CONFIG_HOME` or `~/.config`:
 
 ```
 cargo test --features wgpu native_batch_fixture -- --ignored --nocapture

@@ -539,6 +539,7 @@ While dragging tiles:
   instead.
 
 Dragging tiles onto an empty project canvas creates a new tilesheet matching the source tile dimensions.
+A tilesheet that you name above the project tree takes the tile size that the project remembers. A project that remembers none takes the tile size of the open source sheet.
 
 To copy a whole sheet, drag its Library thumbnail into the Project tree.
 You can also hold a Library file-tree row, then drag it into the Project tree.

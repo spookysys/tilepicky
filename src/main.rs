@@ -79,7 +79,6 @@ use dialogs::{Damaged, NameFor, NamePrompt, Pending};
 use half::Half;
 use tree::TreeAction;
 
-/// A new tilesheet starts with this many cells.
 /// The sizes the tile field steps through when dragged. Typing allows any
 /// size, so the list stays short.
 const TILE_SIZES: [u32; 12] = [4, 8, 10, 12, 16, 24, 32, 48, 64, 128, 256, 512];
@@ -942,6 +941,20 @@ impl App {
         rels
     }
 
+    /// Makes the marked library sheets the target of the next library job.
+    /// One marked folder alone names the target, so the job dialog says
+    /// which folder it labels.
+    fn choose_marked_library(&mut self) {
+        let rels = self.marked_library_rels();
+        let count = rels.len();
+        let dirs: Vec<&String> = self.library_marked_dirs.iter().collect();
+        let name = match dirs.as_slice() {
+            [dir] if self.library_marked.is_empty() => format!("{dir} ({count} sheets)"),
+            _ => format!("{count} selected sheets"),
+        };
+        self.library_batch.choose(rels, name);
+    }
+
     /// The arrow keys move a cursor over the folders and files of the tree
     /// that holds them. Nothing opens on the way: Enter, or Space, opens the
     /// file the cursor stands on, and Right and Left unfold and fold the
@@ -1084,9 +1097,7 @@ impl App {
                 tree::Row::Dir(d) => { self.library_marked_dirs.insert(d.clone()); }
             }
         }
-        let rels = self.marked_library_rels();
-        let count = rels.len();
-        self.library_batch.choose(rels, format!("{count} selected sheets"));
+        self.choose_marked_library();
     }
 
     fn open_library(&mut self, ctx: &egui::Context, i: usize) {
@@ -1129,6 +1140,19 @@ impl App {
         Sheet::new_empty(ctx, &self.project.index.root, rel, tile, cols, rows)
     }
 
+    /// The tile size of a new, named tilesheet: the open tilesheet's, else
+    /// the one the project remembers. A project that remembers none takes
+    /// the source sheet's, so that the tiles you copy next fit one cell.
+    fn new_sheet_tile(&self) -> [u32; 2] {
+        if let Some(sheet) = &self.project.sheet {
+            return sheet.tile;
+        }
+        let book = sidecar::load_book(&self.project.index.root).ok().and_then(|book| book.tile);
+        book.or(self.settings.project.tile).map(Pair::xy)
+            .or(self.library.sheet.as_ref().map(|s| s.tile))
+            .unwrap_or(self.project.index.tile)
+    }
+
     fn create_project(&mut self, ctx: &egui::Context) {
         if self.new_name.trim().is_empty() {
             return;
@@ -1143,7 +1167,7 @@ impl App {
             self.status = format!("{rel} exists");
             return;
         }
-        let mut sheet = self.new_canvas(ctx, &rel, self.project.inherited_tile());
+        let mut sheet = self.new_canvas(ctx, &rel, self.new_sheet_tile());
         if let Err(e) = sheet.save() {
             self.status = e;
             return;
@@ -2806,9 +2830,7 @@ impl App {
             _ => {}
         }
         if selection_changed {
-            let rels = self.marked_library_rels();
-            let count = rels.len();
-            self.library_batch.choose(rels, format!("{count} selected sheets"));
+            self.choose_marked_library();
         }
     }
 
@@ -3989,7 +4011,7 @@ mod tests {
     fn native_batch_fixture() {
         use winit::platform::x11::EventLoopBuilderExtX11;
         assert!(std::env::var("TILEPICKY_TEST_TRANSPORT").is_ok());
-        assert!(std::env::var("XDG_CONFIG_HOME").is_ok());
+        assert!(std::env::var("TILEPICKY_TEST_CONFIG").is_ok());
         let (settings, damaged) = settings::Settings::load();
         let options = eframe::NativeOptions {
             renderer: default_renderer(),
@@ -4397,6 +4419,11 @@ mod tests {
         b.app.library_marked = ids.into_iter().collect();
         b.app.library_tree_action(&b.ctx, TreeAction::BatchMarked);
         assert_eq!(b.app.library_batch.choice.as_ref().unwrap().0.len(), 3);
+        // A click on one folder names it, as the folder's own menu does.
+        b.app.library_tree_action(&b.ctx, TreeAction::SelectDir("pack".into()));
+        assert_eq!(b.app.library_batch.choice.as_ref().unwrap().1, "pack (2 sheets)");
+        b.app.library_tree_action(&b.ctx, TreeAction::Toggle(0));
+        assert_eq!(b.app.library_batch.choice.as_ref().unwrap().1, "3 selected sheets");
     }
 
     /// A plain click on a file or a folder leaves only that item selected.
@@ -4648,6 +4675,24 @@ mod tests {
         assert_eq!(b.project_rel(), Some("pack/fresh.png"));
         assert_eq!(b.project_sel_rel(), Some("pack/fresh.png"));
         assert!(b.app.new_name.is_empty());
+    }
+
+    /// A project that remembers no tile size takes the source sheet's, and
+    /// one that remembers a size keeps it.
+    #[test]
+    fn a_new_sheet_takes_the_project_tile_else_the_source_tile() {
+        let mut b = bench(&["cave.png"], &[]);
+        b.app.library.open(&b.ctx, 0).unwrap();
+        b.app.library.sheet.as_mut().unwrap().tile = [16, 16];
+        b.app.new_name = "first".into();
+        b.app.create_project(&b.ctx);
+        assert_eq!(b.app.project.sheet.as_ref().map(|s| s.tile), Some([16, 16]));
+
+        b.app.project.sheet = None;
+        sidecar::store_tile(&b.project.0, [8, 8]).unwrap();
+        b.app.new_name = "second".into();
+        b.app.create_project(&b.ctx);
+        assert_eq!(b.app.project.sheet.as_ref().map(|s| s.tile), Some([8, 8]));
     }
 
     #[test]
