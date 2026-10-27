@@ -32,6 +32,7 @@ The probes exercised `labels::request`, provider routing, label transport, Gemin
 The embedding probes exercised the application input builder, request builder, transport, and vector validator.
 The first probes were direct application-module tests. A later native release UI pass tested the complete library job coordinator.
 Neither pass tested native provider batch jobs, object storage, cancellation billing, or a large library.
+The OpenRouter batch image probe below covers the OpenRouter batch path.
 A model catalogue entry does not establish access for an account. The real request can still fail.
 
 ## Native release UI validation
@@ -104,3 +105,33 @@ Rates checked before use:
 
 The temporary live test module was removed after validation. Normal tests cannot trigger these paid calls.
 Private test artifacts retain the synthetic images, response data, price snapshots, and the budget record.
+
+## OpenRouter batch image inputs
+
+Test date: 2026-10-16.
+
+The probe used one generated 8 x 8 PNG and six batches on `openai/gpt-4o-mini` and `mistralai/ministral-8b-2512`.
+No library sheet, label, or user file went to a provider.
+The saved AI configuration did not change.
+All six batches were deleted after the run, together with the two uploaded files.
+
+The question: can the OpenRouter Files API replace the bucket that hosts the images of a batch?
+
+| Image input | Result |
+| --- | --- |
+| `image_url` with a public `https` URL | Accepted. The batch completed with the caption "Blue". |
+| `image_url` with a `data:image/png;base64,` URL | Rejected: "Only public http(s) image URLs are supported in batch; base64/data-URI images, audio, video, and file content parts are rejected." |
+| `image_url` with a workspace `or_file_...` id | Rejected by the same check. |
+| Responses `input_image.file_id` with a provider `file-...` id from `POST /files?provider=openai` | Rejected: "Batch does not support this content; remove audio, video, file, or other non-text content parts." |
+
+The Files API cannot serve a batch.
+An uploaded workspace file has `downloadable: false`, answers `400` to `GET /files/{id}/content`, and has no public URL.
+The rejection comes after the `202`, as a batch `error`, and it fails every request in the batch.
+A rejected batch runs no request and reports no usage.
+Only a public URL works, so `src/batch/openrouter.rs` keeps its upload to object storage.
+
+The two Mistral batches completed and cost about USD 0.00002 together.
+The four rejected batches reported no usage.
+
+A batch that routes to OpenAI failed every request with `HTTP 400: Billing hard limit has been reached`.
+The image content passed batch validation; the failure came from the billing limit of the upstream account.
