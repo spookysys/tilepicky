@@ -237,8 +237,8 @@ This cannot be undone. Wait for labeling to finish or cancel it before you clear
 A batch keeps the tag list it started with, even if you change the list while it runs.
 
 With batch processing enabled, OpenRouter uses **Sheet storage** to upload images and submit batches that can run while Tilepicky is closed.
-OpenRouter and its model providers fetch those images through signed URLs. Tilepicky deletes the objects after a confirmed terminal result.
-An ambiguous submission keeps its objects, because accepted work may still need them. Configure a bucket lifecycle rule for eventual cleanup.
+OpenRouter and its model providers fetch those images from your bucket, a small service in `server/`. Tilepicky deletes the images after a confirmed terminal result.
+An ambiguous submission keeps its images, because accepted work may still need them. The cleanup command in `server/README.md` removes them later.
 The excluded-host list applies to ordinary requests. OpenRouter batch routing uses the account settings.
 
 With batch processing off, library jobs use concurrent requests to the captioning model. The app must remain open for these jobs.
@@ -563,9 +563,9 @@ Press `Ctrl+,` or click the gear icon on the status bar to open **AI setup**.
 **Captions and tags** and **Search embeddings** select models for new requests. Existing jobs keep their saved configuration.
 Enable batch processing only when you want a separate native batch configuration.
 
-Configure **Sheet storage** on the OpenRouter connection to use OpenRouter batch processing. The fields are the S3 endpoint (host only, no path), region, bucket, access key, and a path-style switch for MinIO. The secret key sits with the API keys, readable by your user alone. The bucket may stay private: Tilepicky hands OpenRouter a signed URL for each sheet. Any S3-compatible store works, for example Cloudflare R2, Backblaze B2, or MinIO. **Test connection** uploads one small object, fetches it through its signed URL, and deletes it, so a setup mistake shows here rather than mid-job.
+Configure **Sheet storage** on the OpenRouter connection to use OpenRouter batch processing. The two fields are the URL of your bucket and its token. The token sits with the API keys, readable by your user alone. `server/` holds the bucket: three PHP files and one image directory, with no database and no account. Any web host that serves PHP 8.1 or later can run it. **Test connection** uploads one small image, fetches it from its public URL, and deletes it, so a setup mistake shows here rather than mid-job.
 
-Tilepicky deletes each object as soon as its batch ends. Add a bucket lifecycle rule that deletes objects older than two days, to cover a crash after upload or a discarded job. Two days also matches the signed URL, which outlives the 24-hour batch window.
+Tilepicky deletes each image as soon as its batch ends. `server/README.md` shows a `find` command for a cron job, to remove the images of a crash or a discarded job.
 
 If the reply to a batch submission is lost, Tilepicky does not send that batch again, because OpenRouter offers no client reference to find it. Those sheets end with an error. Retrying them can bill twice.
 
@@ -584,15 +584,11 @@ Settings are stored in `~/.config/tilepicky/settings.json`.
 
 ### Setting up a bucket
 
-Use an S3-compatible object store. Check its current storage, request, and transfer prices before creating a bucket.
+The bucket is the small PHP service in `server/`. `server/README.md` tells you how to install it and how to test it. It needs PHP 8.1 or later and one writable directory.
 
-The store must be reachable from the internet, because OpenRouter fetches the signed URL. A server reachable only from your machine can pass **Test connection**, but OpenRouter cannot fetch its images.
+The bucket must be reachable from the internet, because OpenRouter fetches its image URLs. A server reachable only from your machine can pass **Test connection**, but OpenRouter cannot fetch its images.
 
-1. Make an account, enable the object store, and create a bucket.
-2. Create an API token scoped to that one bucket, read and write objects. It gives an access key ID and a secret access key.
-3. Copy the S3 endpoint. For R2 it is `https://<account id>.r2.cloudflarestorage.com`, and the region is `auto`.
-4. In **Sheet storage**, tick it and fill endpoint, region, bucket, and access key. Put the secret in the secret key field; it is kept in `keys.json`, readable by your user alone. Leave path-style off for R2 and turn it on for MinIO.
-5. Click **Test connection**. Then label a small library to prove the path, and set the bucket lifecycle rule described above.
+In **Sheet storage**, tick it and fill in the bucket URL and the token from `config.php`. The token is kept in `keys.json`, readable by your user alone.
 
 ## Provenance tracking
 

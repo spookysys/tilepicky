@@ -80,14 +80,14 @@ pub struct Provider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip: Option<Vec<String>>,
     /// Where to upload sheets so a batch can fetch them as public URLs. Only
-    /// OpenAI-style providers use it, and only for a library job.
+    /// OpenRouter uses it, and only for a library job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub store: Option<crate::s3::Store>,
+    pub bucket: Option<crate::bucket::Bucket>,
 }
 
-/// The `keys.json` name for a provider's object-storage secret. It is separate
-/// from the provider key, so an empty one is dropped on save.
-pub fn s3_secret_name(provider: &str) -> String { format!("{provider} (S3 secret)") }
+/// The `keys.json` name for a provider's bucket token. It is separate from the
+/// provider key, so an empty one is dropped on save.
+pub fn bucket_token_name(provider: &str) -> String { format!("{provider} (bucket token)") }
 
 /// Where a provider's key comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +109,7 @@ impl Provider {
 
     fn new(name: &str, kind: Kind) -> Self {
         let (url, env) = kind.defaults();
-        Provider { name: name.into(), kind, skip: None, store: None, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
+        Provider { name: name.into(), kind, skip: None, bucket: None, url: url.into(), key_env: env.iter().map(|s| s.to_string()).collect() }
     }
 
     pub fn is_openrouter(&self) -> bool {
@@ -118,7 +118,7 @@ impl Provider {
             .is_some_and(|url| url.host().is_some_and(|host| host.eq_ignore_ascii_case("openrouter.ai")))
     }
 
-    pub fn uses_batch_storage(&self) -> bool { self.is_openrouter() && self.store.is_some() }
+    pub fn uses_batch_storage(&self) -> bool { self.is_openrouter() && self.bucket.is_some() }
 
     pub fn skipped(&self) -> Vec<String> {
         self.skip.clone().unwrap_or_else(|| if self.is_openrouter() { vec!["phala".into()] } else { vec![] })
@@ -143,10 +143,10 @@ impl Provider {
         }
     }
 
-    /// The typed object-storage secret, if any. It never comes from the
-    /// provider's key or its environment variables.
-    pub fn store_secret(&self, keys: &Keys) -> Option<String> {
-        keys.get(&s3_secret_name(&self.name)).map(str::to_string)
+    /// The typed bucket token, if any. It never comes from the provider's key
+    /// or its environment variables.
+    pub fn bucket_token(&self, keys: &Keys) -> Option<String> {
+        keys.get(&bucket_token_name(&self.name)).map(str::to_string)
     }
 
     pub fn key_source(&self, keys: &Keys) -> KeySource {
@@ -523,7 +523,7 @@ impl Keys {
     /// The key follows a provider that changes its name.
     fn rename(&mut self, old: &str, new: &str) {
         if let Some(v) = self.0.remove(old) { self.0.insert(new.to_string(), v); }
-        if let Some(v) = self.0.remove(&s3_secret_name(old)) { self.0.insert(s3_secret_name(new), v); }
+        if let Some(v) = self.0.remove(&bucket_token_name(old)) { self.0.insert(bucket_token_name(new), v); }
     }
 }
 
@@ -745,7 +745,7 @@ fn providers_ui(
                     }
                 }
                 keys.rename(&old, &p.name);
-                keys.rename(&s3_secret_name(&old), &s3_secret_name(&p.name));
+                keys.rename(&bucket_token_name(&old), &bucket_token_name(&p.name));
             }
             ui.end_row();
             ui.label("API type");
@@ -793,44 +793,36 @@ fn providers_ui(
             ui.end_row();
             if p.is_openrouter() {
                 ui.label("Sheet storage");
-                let mut on = p.store.is_some();
+                let mut on = p.bucket.is_some();
                 if ui.checkbox(&mut on, "Upload sheets so a batch can fetch them").changed() {
-                    p.store = on.then(crate::s3::Store::default);
+                    p.bucket = on.then(crate::bucket::Bucket::default);
                 }
                 ui.end_row();
-                let secret = p.store_secret(keys);
-                let has_secret = secret.is_some();
-                if let Some(store) = &mut p.store {
-                    ui.label("");
-                    ui.small("Batch routing uses your OpenRouter account settings. The excluded hosts above apply to ordinary requests only.");
+                let token = p.bucket_token(keys);
+                let has_token = token.is_some();
+                if let Some(bucket) = &mut p.bucket {
+                    ui.label("Bucket URL");
+                    ui.add(egui::TextEdit::singleline(&mut bucket.url)
+                        .hint_text("https://example.org/bucket").desired_width(f32::INFINITY));
                     ui.end_row();
-                    for (label, value) in [("Endpoint", &mut store.endpoint), ("Region", &mut store.region),
-                        ("Bucket", &mut store.bucket), ("Access key", &mut store.access_key)] {
-                        ui.label(label);
-                        ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
-                        ui.end_row();
-                    }
-                    ui.label("");
-                    ui.checkbox(&mut store.path_style, "Path-style URLs (MinIO)");
-                    ui.end_row();
-                    ui.label("Secret key");
-                    ui.add(egui::TextEdit::singleline(keys.entry(&s3_secret_name(&p.name))).password(true)
-                        .hint_text("Secret access key").desired_width(f32::INFINITY));
+                    ui.label("Token");
+                    ui.add(egui::TextEdit::singleline(keys.entry(&bucket_token_name(&p.name))).password(true)
+                        .hint_text("The token in the bucket's config.php").desired_width(f32::INFINITY));
                     ui.end_row();
                     ui.label("");
-                    ui.weak(if has_secret { "The secret key is set" } else { "No secret key yet" });
+                    ui.weak(if has_token { "The token is set" } else { "No token yet" });
                     ui.end_row();
                     ui.label("");
-                    ui.small("Tilepicky deletes each object when its batch ends. Add a bucket rule to delete objects older than two days, for a crash or a discarded job.");
+                    ui.small("The bucket is the small PHP service in `server/`. Put it on a web host, and give tilepicky its URL and token.");
                     ui.end_row();
                     ui.label("");
-                    let test_id = egui::Id::new(("s3 test", &p.name));
+                    let test_id = egui::Id::new(("bucket test", &p.name));
                     let slot = ui.data_mut(|d| d.get_temp::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id));
                     if let Some(slot) = slot {
                         match slot.lock().unwrap().as_ref() {
                             None => { ui.weak("Testing the connection..."); ui.ctx().request_repaint_after(std::time::Duration::from_millis(250)); }
                             Some(Ok(())) => {
-                                ui.weak("Connection ok: upload, signed URL, and delete all work.");
+                                ui.weak("Connection ok: upload, fetch, and delete all work.");
                             }
                             Some(Err(error)) => {
                                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -839,14 +831,14 @@ fn providers_ui(
                     }
                     let running = ui.data_mut(|d| d.get_temp::<std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>>(test_id))
                         .is_some_and(|slot| slot.lock().unwrap().is_none());
-                    if ui.add_enabled(has_secret && !running, egui::Button::new("Test connection")).clicked()
-                        && let Some(secret) = secret.clone() {
+                    if ui.add_enabled(has_token && !running, egui::Button::new("Test connection")).clicked()
+                        && let Some(token) = token.clone() {
                         let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
                         ui.data_mut(|d| d.insert_temp(test_id, slot.clone()));
-                        let store = store.clone();
+                        let bucket = bucket.clone();
                         let ctx = ui.ctx().clone();
                         std::thread::spawn(move || {
-                            *slot.lock().unwrap() = Some(crate::s3::self_test(store, secret));
+                            *slot.lock().unwrap() = Some(crate::bucket::self_test(bucket, token));
                             ctx.request_repaint();
                         });
                     }
@@ -1179,7 +1171,7 @@ mod tests {
     #[test]
     fn generic_endpoints_do_not_use_openrouter_batches() {
         let mut provider = Provider::new("Custom", Kind::OpenAi);
-        provider.store = Some(crate::s3::Store::default());
+        provider.bucket = Some(crate::bucket::Bucket::default());
         assert!(!provider.uses_batch_storage());
         assert_eq!(method(&provider), "Several sheets at a time");
     }

@@ -128,7 +128,7 @@ The Files API cannot serve a batch.
 An uploaded workspace file has `downloadable: false`, answers `400` to `GET /files/{id}/content`, and has no public URL.
 The rejection comes after the `202`, as a batch `error`, and it fails every request in the batch.
 A rejected batch runs no request and reports no usage.
-Only a public URL works, so `src/batch/openrouter.rs` keeps its upload to object storage.
+Only a public URL works, so `src/batch/openrouter.rs` keeps its upload to the bucket in `server/`.
 
 The two Mistral batches completed and cost about USD 0.00002 together.
 The four rejected batches reported no usage.

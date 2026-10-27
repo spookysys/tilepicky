@@ -26,7 +26,7 @@ mod labels;
 #[allow(dead_code)]
 mod quant;
 mod quant_panel;
-mod s3;
+mod bucket;
 mod batch;
 mod storage;
 mod files;

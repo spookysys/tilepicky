@@ -188,7 +188,9 @@ struct View {
 fn supports_task(provider: &Provider, task: Task) -> bool {
     match task {
         Task::Tags => true,
-        Task::Batch => provider.kind == Kind::Gemini || provider.is_openrouter(),
+        // An OpenAI-style provider batches through OpenRouter, which needs a
+        // bucket filled in; Gemini batches on its own.
+        Task::Batch => provider.kind == Kind::Gemini || provider.uses_batch_storage(),
         Task::Search | Task::Text => provider.kind == Kind::OpenAi,
     }
 }
@@ -203,7 +205,7 @@ fn select(ai: &mut Ai, provider: &str, id: &str, task: Task) -> Result<(), Strin
     if id.is_empty() { return Err("Enter a model ID.".into()); }
     let connection = ai.providers.iter().find(|p| p.name == provider).ok_or("Choose a provider first.")?;
     if task == Task::Batch && !supports_task(connection, task) {
-        return Err("Provider batch jobs require Google or OpenRouter. OpenRouter also needs object storage in Connections.".into());
+        return Err("Batch jobs require Google, or OpenRouter with a bucket filled in under its provider.".into());
     }
     if matches!(task, Task::Search | Task::Text) && connection.kind != Kind::OpenAi {
         return Err("Search embeddings require an OpenAI-compatible embedding endpoint.".into());
@@ -413,7 +415,7 @@ mod tests {
         assert!(!supports_task(&google, Task::Text));
         ai.providers.push(provider);
         let original = ai.library.clone();
-        assert!(select(&mut ai, "Custom", "model", Task::Batch).unwrap_err().contains("require Google or OpenRouter"));
+        assert!(select(&mut ai, "Custom", "model", Task::Batch).unwrap_err().contains("Batch jobs require Google"));
         assert_eq!(ai.library, original);
         assert!(!ai.models.iter().any(|m| m.provider == "Custom"));
     }

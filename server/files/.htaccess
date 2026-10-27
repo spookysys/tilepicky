@@ -1,0 +1,5 @@
+# The images only. No file here may run as a script, whatever it is called.
+Options -Indexes -ExecCGI
+<FilesMatch "\.(?:php|phtml|phar|pl|py|cgi|sh)$">
+    Require all denied
+</FilesMatch>

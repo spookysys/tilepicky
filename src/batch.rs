@@ -2,7 +2,7 @@
 //! One library job: selected sheets, each sent as the request that
 //! Label with AI sends. Google's Gemini API takes them as a batch. An
 //! OpenAI-style endpoint takes them as an OpenRouter batch when the provider
-//! has object storage; without it, several ordinary requests run at once.
+//! has a bucket; without it, several ordinary requests run at once.
 //!
 //! The library book holds the job state, so that a batch
 //! continues after a restart. It never holds a key. The state of a sheet:
@@ -173,8 +173,8 @@ pub struct Job {
     estimate: Option<cost::Estimate>,
     #[serde(default)]
     usage: cost::Usage,
-    /// The object storage for this run. It holds the secret, so it is never
-    /// saved with the job.
+    /// The bucket for this run. It holds the token, so it is never saved
+    /// with the job.
     #[serde(skip)]
     objects: Option<std::sync::Arc<dyn openrouter::Objects>>,
 }
@@ -1020,10 +1020,10 @@ impl Panel {
         }
         if let Some(job) = &self.job {
             let key = job.provider.key(keys).unwrap_or_default();
-            let secret = job.provider.store_secret(keys);
+            let bucket_token = job.provider.bucket_token(keys);
             if !single_running && self.runner.is_none() && self.storage_error.is_empty() && !job.done() && let Some(lock) = &self.lock {
                 self.key = key.clone();
-                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), key, secret, lock.clone(), ctx.clone(), self.log.clone().unwrap()));
+                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), key, bucket_token, lock.clone(), ctx.clone(), self.log.clone().unwrap()));
             } else if key != self.key {
                 self.key = key.clone(); self.command(runner::Command::Key(key));
             }
@@ -1301,7 +1301,7 @@ impl Panel {
             }
         }
         if ai.batch_enabled() && configured.is_some_and(|(p, _)| p.kind != Kind::Gemini && !p.uses_batch_storage()) {
-            ui.label("Provider batches need Google or OpenRouter with object storage. Configure them in AI setup.");
+            ui.label("Provider batches need Google or OpenRouter with a bucket. Configure them in AI setup.");
         }
         for (text, scope) in [
             (if target.is_some() { "Label unlabeled in selection..." } else { "Label unlabeled sheets..." }, Scope::Unlabeled),
@@ -1340,7 +1340,7 @@ impl Panel {
     fn start_retry(&mut self, command: runner::Command, ctx: &eframe::egui::Context, keys: &crate::ai::Keys) {
         if self.runner.is_none() && let (Some(job), Some(lock)) = (&self.job, &self.lock) {
             self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(),
-                job.provider.key(keys).unwrap_or_default(), job.provider.store_secret(keys), lock.clone(), ctx.clone(), self.log.clone().unwrap()));
+                job.provider.key(keys).unwrap_or_default(), job.provider.bucket_token(keys), lock.clone(), ctx.clone(), self.log.clone().unwrap()));
         }
         self.command(command);
     }
@@ -1464,7 +1464,7 @@ mod tests {
     }
     impl Drop for Files { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.base); } }
     pub(super) fn provider(kind: Kind) -> Provider {
-        Provider { name: "test".into(), kind, skip: None, store: None, key_env: vec![], url: match kind {
+        Provider { name: "test".into(), kind, skip: None, bucket: None, key_env: vec![], url: match kind {
             Kind::Gemini => "https://generativelanguage.googleapis.com/v1beta".into(),
             Kind::OpenAi => "https://openrouter.ai/api/v1".into(),
         } }

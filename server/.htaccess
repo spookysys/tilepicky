@@ -1,0 +1,5 @@
+# The bucket answers through its three PHP files only.
+Options -Indexes
+<FilesMatch "^(?:config|bucket)\.php$">
+    Require all denied
+</FilesMatch>

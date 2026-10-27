@@ -26,6 +26,9 @@ Each file under `src/` opens with a comment that says what it owns.
   grid at all, a mockup or a title screen, needs its `kind` set by hand:
   the app has no way to say so.
 - `cargo clippy --all-targets` runs clean.
+- `server/` is the PHP bucket that hosts the images of an OpenRouter batch.
+  Cargo does not build it; `server/README.md` says how to run it, how to test
+  it, and what the API is. `src/bucket.rs` is the client for it.
 - The tree is not rustfmt-clean. Do not run `cargo fmt` on a whole file.
   Keep a line at 160 columns or less, as `rustfmt.toml` says.
 

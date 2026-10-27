@@ -93,7 +93,7 @@ impl Runner {
         if let Some(thread) = self.thread.take() { let _ = thread.join(); }
     }
     pub fn command(&self, command: Command) { let _ = self.commands.send(command); }
-    pub fn start(job: Job, root: PathBuf, key: String, secret: Option<String>, lock: Arc<std::fs::File>, ctx: egui::Context, log: crate::ai_log::Log) -> Self {
+    pub fn start(job: Job, root: PathBuf, key: String, bucket_token: Option<String>, lock: Arc<std::fs::File>, ctx: egui::Context, log: crate::ai_log::Log) -> Self {
         let (tx, events) = mpsc::channel();
         let (commands, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -112,13 +112,13 @@ impl Runner {
             if coordinator.job.uses_batches() && coordinator.job.provider.uses_batch_storage() { openrouter::close_unconfirmed(&mut coordinator.job); }
             coordinator.job.poll_ms = coordinator.job.next_poll();
             if coordinator.job.uses_batches() && coordinator.job.provider.uses_batch_storage()
-                && let Some(store) = coordinator.job.provider.store.clone() {
-                match secret {
-                    Some(secret) => match crate::s3::Client::new(store, secret) {
+                && let Some(bucket) = coordinator.job.provider.bucket.clone() {
+                match bucket_token {
+                    Some(token) => match crate::bucket::Client::new(&bucket, token) {
                         Ok(client) => coordinator.job.objects = Some(Arc::new(openrouter::Storage::new(client))),
                         Err(error) => coordinator.job.issue("upload", error, now_ms()),
                     },
-                    None => coordinator.job.issue("upload", "No object-storage secret key is set for this provider.".into(), now_ms()),
+                    None => coordinator.job.issue("upload", "No bucket token is set for this provider.".into(), now_ms()),
                 }
             }
             let mut key = key;
@@ -520,7 +520,7 @@ mod tests {
             Self { folder, root, dir }
         }
         fn job(&self) -> Job {
-            let provider = Provider { name: "test".into(), kind: Kind::Gemini, skip: None, store: None, key_env: vec![],
+            let provider = Provider { name: "test".into(), kind: Kind::Gemini, skip: None, bucket: None, key_env: vec![],
                 url: "https://example.invalid/v1beta".into() };
             prepare(&Index::scan(&self.root, [16, 16]), provider, "test".into(), Scope::Unlabeled).unwrap()
         }
@@ -610,11 +610,11 @@ mod tests {
     }
 
     #[test]
-    fn disabled_batches_ignore_configured_object_storage() {
+    fn disabled_batches_ignore_a_configured_bucket() {
         let f = Fixture::new();
         let mut job = f.job();
         job.provider = super::super::tests::provider(Kind::OpenAi);
-        job.provider.store = Some(crate::s3::Store::default());
+        job.provider.bucket = Some(crate::bucket::Bucket::default());
         job.native_batch = false;
         assert!(!job.uses_batches());
         assert_eq!(job.operation(), Operation::Label);

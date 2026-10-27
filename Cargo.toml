@@ -7,7 +7,7 @@ repository = "https://github.com/spookysys/tilepicky"
 license = "GPL-3.0-only"
 keywords = ["tiles", "sprites", "tilesheet", "pixel-art", "egui"]
 categories = ["game-development", "multimedia::images"]
-include = ["src/**", "icon.png", "README.md", "docs/**", "LICENSE"]
+include = ["src/**", "server/**", "icon.png", "README.md", "docs/**", "LICENSE"]
 
 [features]
 # wgpu is the other half of the compile time. OpenGL draws this tool just
@@ -19,7 +19,6 @@ wgpu = ["eframe/wgpu"]
 base64 = "0.23.1"
 ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
 sha2 = "0.10.9"
-hmac = "0.12.1"
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp", "tga"] }
 png = "0.18.1"

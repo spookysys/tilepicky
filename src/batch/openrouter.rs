@@ -1,42 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The OpenRouter batch path: upload each sheet, hand the provider a URL,
-//! submit, poll, and delete the objects again. OpenRouter batch images are
-//! URL-only, so the tool hosts them in an S3-compatible bucket meantime.
+//! submit, poll, and delete the images again. OpenRouter batch images are
+//! URL-only, so the tool hosts them in its own bucket meantime.
 
 use super::*;
 
-/// The object-storage side of a batch. A test supplies its own.
+/// The storage side of a batch. A test supplies its own.
 pub trait Objects: std::marker::Send + Sync {
-    /// Uploads one PNG and returns a URL the provider can fetch.
-    fn upload(&self, key: &str, png: &[u8]) -> Result<String, String>;
-    /// Deletes one uploaded object. A failure remains visible in the job.
+    /// Uploads one PNG and answers the key the bucket gave it and the URL the
+    /// provider can fetch.
+    fn upload(&self, png: &[u8]) -> Result<(String, String), String>;
+    /// Deletes one uploaded image. A failure remains visible in the job.
     fn delete(&self, key: &str) -> Result<(), String>;
 }
 
-/// Object storage over the S3 client.
-pub struct Storage(crate::s3::Client);
+/// The bucket service in `server/`.
+pub struct Storage(crate::bucket::Client);
 impl Storage {
-    pub fn new(client: crate::s3::Client) -> Self { Self(client) }
+    pub fn new(client: crate::bucket::Client) -> Self { Self(client) }
 }
 impl Objects for Storage {
-    fn upload(&self, key: &str, png: &[u8]) -> Result<String, String> {
-        let url = self.0.presigned_get(key, URL_SECONDS)?;
-        self.0.put(key, png, "image/png")?;
-        Ok(url)
-    }
+    fn upload(&self, png: &[u8]) -> Result<(String, String), String> { self.0.upload(png) }
     fn delete(&self, key: &str) -> Result<(), String> { self.0.delete(key) }
-}
-
-/// The lifetime of a sheet URL, and the age a bucket lifecycle rule should
-/// delete objects at. The batch window is 24 hours.
-const URL_SECONDS: u64 = 2 * 24 * 60 * 60;
-
-/// Each upload has its own key, including identical images in other jobs.
-fn object_key() -> String {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("tilepicky/{}-{stamp}-{sequence}.png", std::process::id())
 }
 
 fn batch_body(model: &str, requests: &[(usize, Value)]) -> Value {
@@ -46,13 +31,13 @@ fn batch_body(model: &str, requests: &[(usize, Value)]) -> Value {
 
 /// Uploads the next sheets and submits them as one OpenRouter batch.
 pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), String> {
-    let Some(objects) = job.objects.clone() else { return Err("Object storage is not set for this provider.".into()) };
+    let Some(objects) = job.objects.clone() else { return Err("The bucket is not set for this provider.".into()) };
     let book = crate::sidecar::load_book(root)?;
     let (mut requests, mut taken) = (Vec::new(), Vec::new());
     for i in 0..job.sheets.len() {
         if job.sheets[i].taken { continue; }
         if requests.len() == MAX_REQUESTS { break; }
-        // A failed cleanup must not lose its key or create another object.
+        // A failed cleanup must not lose its key or upload a second image.
         if let Err(error) = delete_sheet(job, i, objects.as_ref()) {
             job.sheets[i].error = error;
             job.sheets[i].taken = true;
@@ -68,18 +53,17 @@ pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), 
         let encoded = body["messages"][1]["content"][1]["image_url"]["url"].as_str()
             .and_then(|url| url.strip_prefix("data:image/png;base64,")).ok_or("The request has no PNG image.")?;
         let png = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| "The request image is invalid.")?;
-        let object = object_key();
-        job.sheets[i].stored = Some(object.clone());
-        let url = match objects.upload(&object, &png) {
-            Ok(url) => url,
+        let (stored, url) = match objects.upload(&png) {
+            Ok(pair) => pair,
             Err(error) => {
-                // A failed PUT can still have stored the object upstream.
-                let cleanup = delete_sheet(job, i, objects.as_ref()).err();
-                job.sheets[i].error = cleanup.map_or(error.clone(), |cleanup| format!("{error} {cleanup}"));
+                // The bucket names the image, so a failed upload leaves no key
+                // to delete. The bucket's own cleanup takes anything it wrote.
+                job.sheets[i].error = error;
                 job.sheets[i].taken = true;
                 continue;
             }
         };
+        job.sheets[i].stored = Some(stored);
         body["messages"][1]["content"][1]["image_url"]["url"] = json!(url);
         requests.push((i, body));
         taken.push(i);
@@ -90,7 +74,7 @@ pub fn submit(job: &mut Job, root: &Path, dir: &Path, send: Send) -> Result<(), 
     job.save(dir)?;
     let group = job.groups.len() - 1;
     crate::ai_log::event("batch_submit", json!({"provider":job.provider.name, "model":job.model, "sheets":taken.len(),
-        "detail":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel, "object":job.sheets[*i].stored})).collect::<Vec<_>>()}));
+        "detail":requests.iter().map(|(i, _)| json!({"id":key(*i), "sheet":job.sheets[*i].rel, "image":job.sheets[*i].stored})).collect::<Vec<_>>()}));
     match send("batches", Some(&batch_body(&job.model.clone(), &requests))) {
         Ok(response) => match response["id"].as_str() {
             Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) => {
@@ -137,35 +121,35 @@ pub fn close_unconfirmed(job: &mut Job) {
     }
 }
 
-/// Removes an object before its sheet can upload another one.
+/// Removes an image before its sheet can upload another one.
 fn delete_sheet(job: &mut Job, sheet: usize, objects: &dyn Objects) -> Result<(), String> {
-    let Some(object) = job.sheets[sheet].stored.clone() else { return Ok(()) };
-    match objects.delete(&object) {
+    let Some(stored) = job.sheets[sheet].stored.clone() else { return Ok(()) };
+    match objects.delete(&stored) {
         Ok(()) => {
             job.sheets[sheet].stored = None;
             if job.sheets.iter().all(|sheet| sheet.stored.is_none()) { job.issues.remove("cleanup"); }
             Ok(())
         }
         Err(error) => {
-            let message = format!("{object}: {error}");
+            let message = format!("{stored}: {error}");
             let previous = job.issues.get("cleanup").map(|i| i.message.clone()).unwrap_or_default();
-            if !previous.contains(&object) {
-                job.issue("cleanup", format!("{previous}\nRemove this uploaded object from your bucket, or let its lifecycle rule remove it:\n{message}"),
+            if !previous.contains(&stored) {
+                job.issue("cleanup", format!("{previous}\nRemove this image from the bucket, or let the cron job in server/README.md remove it:\n{message}"),
                     now_ms());
             }
-            Err(format!("Object cleanup must finish before another upload: {message}"))
+            Err(format!("The bucket cleanup must finish before another upload: {message}"))
         }
     }
 }
 
-/// Deletes the objects of a group and clears only successfully removed keys.
+/// Deletes the images of a group and clears only successfully removed keys.
 fn delete_group(job: &mut Job, group: usize) {
     let Some(objects) = job.objects.clone() else { return };
     for sheet in job.groups[group].sheets.clone() { let _ = delete_sheet(job, sheet, objects.as_ref()); }
 }
 
 /// OpenRouter has no cancel call. The batch may still finish upstream, so the
-/// tool stops waiting, lets go of the objects, and marks the sheets cancelled.
+/// tool stops waiting, deletes the images, and marks the sheets cancelled.
 pub fn cancel(job: &mut Job, dir: &Path) -> Result<(), String> {
     let mut left = false;
     for i in 0..job.groups.len() {
@@ -228,9 +212,11 @@ mod tests {
 
     struct Fake { uploaded: Mutex<Vec<String>>, deleted: Mutex<Vec<String>> }
     impl Objects for Fake {
-        fn upload(&self, key: &str, _png: &[u8]) -> Result<String, String> {
-            self.uploaded.lock().unwrap().push(key.to_string());
-            Ok(format!("https://example.test/{key}"))
+        fn upload(&self, _png: &[u8]) -> Result<(String, String), String> {
+            let mut uploaded = self.uploaded.lock().unwrap();
+            let key = format!("test-{}.png", uploaded.len() + 1);
+            uploaded.push(key.clone());
+            Ok((key.clone(), format!("https://example.test/files/{key}")))
         }
         fn delete(&self, key: &str) -> Result<(), String> { self.deleted.lock().unwrap().push(key.to_string()); Ok(()) }
     }
@@ -239,8 +225,9 @@ mod tests {
     fn a_rejected_submission_cannot_upload_again_while_cleanup_fails() {
         struct Leaky { uploads: Mutex<usize> }
         impl Objects for Leaky {
-            fn upload(&self, _: &str, _: &[u8]) -> Result<String, String> {
-                *self.uploads.lock().unwrap() += 1; Ok("https://example.test/image.png".into())
+            fn upload(&self, _: &[u8]) -> Result<(String, String), String> {
+                *self.uploads.lock().unwrap() += 1;
+                Ok(("test.png".into(), "https://example.test/files/test.png".into()))
             }
             fn delete(&self, _: &str) -> Result<(), String> { Err("HTTP 403".into()) }
         }
@@ -259,22 +246,22 @@ mod tests {
     }
 
     #[test]
-    fn failed_cleanup_keeps_the_object_key_and_explains_how_to_remove_it() {
+    fn failed_cleanup_keeps_the_key_and_explains_how_to_remove_it() {
         struct CannotDelete;
         impl Objects for CannotDelete {
-            fn upload(&self, _: &str, _: &[u8]) -> Result<String, String> { unreachable!() }
+            fn upload(&self, _: &[u8]) -> Result<(String, String), String> { unreachable!() }
             fn delete(&self, _: &str) -> Result<(), String> { Err("HTTP 403".into()) }
         }
         let dir = crate::storage::tests::Folder::new();
         RgbaImage::new(2, 2).save(dir.0.join("a.png")).unwrap();
         let mut job = prepare(&crate::index::Index::scan(&dir.0, [16, 16]),
             crate::batch::tests::provider(Kind::OpenAi), "test".into(), Scope::Unlabeled).unwrap();
-        job.sheets[0].stored = Some("tilepicky/test.png".into());
+        job.sheets[0].stored = Some("0123456789abcdef0123456789abcdef.png".into());
         job.objects = Some(Arc::new(CannotDelete));
         job.groups.push(Group { sheets: vec![0], remote: Remote::Done, recovery: None, tracking: Tracking::default() });
         delete_group(&mut job, 0);
-        assert_eq!(job.sheets[0].stored.as_deref(), Some("tilepicky/test.png"));
-        assert!(job.issues["cleanup"].message.contains("tilepicky/test.png: HTTP 403"));
+        assert_eq!(job.sheets[0].stored.as_deref(), Some("0123456789abcdef0123456789abcdef.png"));
+        assert!(job.issues["cleanup"].message.contains("0123456789abcdef0123456789abcdef.png: HTTP 403"));
         job.save(&dir.0).unwrap();
         assert!(Job::load(&dir.0).unwrap().unwrap().issues.contains_key("cleanup"));
     }
@@ -296,11 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn each_upload_owns_a_different_object() {
-        assert_ne!(object_key(), object_key());
-    }
-
-    #[test]
     fn a_restart_closes_an_unconfirmed_submission_without_resending() {
         let dir = crate::storage::tests::Folder::new();
         let mut job = prepare(&crate::index::Index::scan(&dir.0, [16, 16]),
@@ -311,7 +293,7 @@ mod tests {
     }
 
     /// Upload, submit, poll a finished batch, save the labels, delete the
-    /// objects. No network.
+    /// images. No network.
     #[test]
     fn an_openrouter_batch_uploads_submits_polls_and_deletes() {
         let dir = crate::storage::tests::Folder::new();
@@ -319,8 +301,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])).save(root.join("sheet.png")).unwrap();
         let mut provider = crate::batch::tests::provider(Kind::OpenAi);
-        provider.store = Some(crate::s3::Store { endpoint: "https://example.test".into(), region: "auto".into(),
-            bucket: "b".into(), access_key: "k".into(), path_style: false });
+        provider.bucket = Some(crate::bucket::Bucket { url: "https://example.test/bucket".into() });
         let mut job = crate::batch::prepare(&crate::index::Index::scan(&root, [16, 16]), provider,
             "openai/gpt-5-nano".into(), crate::batch::Scope::Unlabeled).unwrap();
         let fake = Arc::new(Fake { uploaded: Mutex::new(Vec::new()), deleted: Mutex::new(Vec::new()) });
@@ -353,7 +334,7 @@ mod tests {
     }
 
     /// A submit whose reply is lost does not send the batch again. The sheets
-    /// end with a reason. Objects stay until the bucket lifecycle removes them.
+    /// end with a reason. The images stay until something removes them.
     #[test]
     fn a_lost_submit_reply_does_not_resend_the_batch() {
         let dir = crate::storage::tests::Folder::new();
@@ -361,8 +342,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])).save(root.join("sheet.png")).unwrap();
         let mut provider = crate::batch::tests::provider(Kind::OpenAi);
-        provider.store = Some(crate::s3::Store { endpoint: "https://example.test".into(), region: "auto".into(),
-            bucket: "b".into(), access_key: "k".into(), path_style: false });
+        provider.bucket = Some(crate::bucket::Bucket { url: "https://example.test/bucket".into() });
         let mut job = crate::batch::prepare(&crate::index::Index::scan(&root, [16, 16]), provider,
             "openai/gpt-5-nano".into(), crate::batch::Scope::Unlabeled).unwrap();
         let fake = Arc::new(Fake { uploaded: Mutex::new(Vec::new()), deleted: Mutex::new(Vec::new()) });
