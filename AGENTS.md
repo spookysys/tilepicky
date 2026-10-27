@@ -5,20 +5,19 @@ Visibility: publishable
 A desktop tool in Rust on egui/eframe: browse sprite sheets, search them,
 and copy tiles into tilesheets of your own. `README.md` is the document for
 the person who uses the tool; this file is for an agent that works on it.
+Each file under `src/` opens with a comment that says what it owns.
 
 ## Build, run, test
 
 - `cargo run --release -- [<library dir> [<project dir>]]` starts the tool.
-  Builds without the `wgpu` feature use OpenGL. Builds with it use WGPU by default.
-  `--glow` selects OpenGL; `--wgpu` selects WGPU when available.
-- `cargo test` runs the unit tests. Most write their own files under the
-  temp dir. One reads the real packs: `the_real_packs_read_as_they_did`
-  checks `src/detect.rs` against `tools/grid-cases.json`, and skips every
-  case whose file is not on this machine, so it passes where the packs are
-  missing. A case marked `pass` must keep passing; turning a `fail` into a
-  `pass` is the work.
+  `README.md` says which build draws with what.
+- `cargo test` runs the unit tests. `the_real_packs_read_as_they_did`
+  checks `src/detect.rs` against `tools/grid-cases.json` and skips every case
+  whose file is not on this machine. A case marked `pass` must keep passing;
+  turning a `fail` into a `pass` is the work.
 - To grow that suite, set the grid of a sheet in the app, which writes it
-  into the book of its folder, and then fold the books into the cases:
+  into the folder's book (`tilepicky.json`), and then fold the books into the
+  cases:
 
       TILEPICKY_SYNC_CASES=assets,mytilesheets cargo test sync_the_cases -- --nocapture
 
@@ -30,157 +29,15 @@ the person who uses the tool; this file is for an agent that works on it.
 - The tree is not rustfmt-clean. Do not run `cargo fmt` on a whole file.
   Keep a line at 160 columns or less, as `rustfmt.toml` says.
 
-## Where things are
-
-- `src/workspace.rs`: Library and Build navigation, the sheet inspector, search comparison, and scoped Improve search actions.
-- `src/gallery.rs`: virtual thumbnail rows and a bounded worker/cache for image previews.
-- `src/ai_catalog.rs`: provider model discovery, capability filters, shortlist, and private offline cache.
-- `src/main.rs`: the app: the panels, the headers, the keys, the popups,
-  and the drag of a block between the panels. The status bar shows label progress.
-- `src/half.rs`: one half of the window, the library or the project: its
-  folder, its tree, the sheet open from it, and where the keys stand.
-- `src/dialogs.rs`: the dialogs that ask first: names, deletions, unsaved
-  changes, the removal of a label, the legend, and a damaged settings or
-  keys file. The AI label popup also lives here.
-- `src/sheet.rs`: one sheet on screen: the grid, the selection, the copy
-  and paste, the provenance map, the eye mode, and the animations.
-- `src/files.rs`: project file operations, separate from the UI.
-- `src/storage.rs`: strict JSON reads and complete-file replacement.
-- `src/sidecar.rs`: `tilepicky.json`, the book of a folder: each sheet's
-  grid, pixel origins, animations, and AI label, plus the color quantization
-  groups of a project.
-- `src/index.rs`: the scan of a folder, and the search of names, captions,
-  tags, and embeddings. The word search is local and synchronous; a semantic
-  match uses a query vector that a worker made.
-- `src/embed.rs`: image embeddings in `embeddings.json` and independent caption/tag embeddings in `embeddings-text.json`.
-  Image input excludes labels. Each store records its model, provider identity, and source hashes.
-  Generation checks replies and saves completed batches. Both indexes share a model unless a caption model override is set.
-  Each source has a bounded query worker and explicit retry.
-- `src/detect.rs`: reads the tile size of a sheet that the book does not know.
-- `src/quant/`: the color quantizer, a vendored port of SuperFamiconv 0.12's
-  incremental tile-aware quantizer. It holds the SNES palettes, the dithers,
-  the mixed 4bpp/8bpp depth, and the indexed-PNG export. `quantette` builds
-  the general palettes.
-- `src/quant_panel.rs`: the Color quantization side panel of the project. It
-  holds the working setting, the group cache, the preview, the tile-depth
-  paint tool, and the export. Workers compute previews and save captured export results.
-  The setting itself lives in the project book. SNES groups require matching grids without gaps or offsets.
-- `src/tree.rs`: the file trees of the left column.
-- `src/settings.rs`: `~/.config/tilepicky/settings.json`.
-- `src/ai.rs`: AI providers, models, private keys (`keys.json`, mode 0600),
-  and their settings page. OpenRouter requests use the provider skip list.
-  An OpenAI-style provider may carry an S3 object store for batch uploads, and
-  the matching `(S3 secret)` entry in `keys.json`.
-  A model is a chat model, with the scopes it serves, or an embedding model.
-  Captions and tags assigns one model to both scopes. Optional batch processing reveals a separate batch model.
-  Single-sheet labeling uses Google Gemini or an OpenAI-compatible endpoint.
-  Without batch processing, library jobs send concurrent requests through the captioning model, including on Google.
-  With batch processing, jobs use the batch model through Google or OpenRouter with object storage.
-  Each model retains its own concurrency limit. Task-specific model catalogues open from each model picker.
-- `src/s3.rs`: a small S3-compatible client for one bucket: put, delete, and a
-  presigned GET, signed with AWS Signature Version 4, host style or path style.
-- `src/ai_log.rs`: diagnostics scoped to each job, with key and image redaction.
-  Each library has one current log file for either job type. New jobs replace it; exit removes it after completion.
-  Only one labeling job runs at a time. An outstanding batch blocks single-sheet requests.
-- `src/gemini.rs`: shared Gemini request conversion and response validation for both job scopes.
-- `src/labels.rs`: one labeling request per sheet, the library's tag list
-  and free-tag count in its prompt, and the checks on the reply. GIFs send their first frame. Label with AI sends it from a worker
-  thread; to cancel, drop the `Run`. Save guards preserve newer local changes. Tests use fake responses.
-- `src/batch.rs`: library batches: through the Gemini batch API (several batches
-  at once), or through OpenRouter's batch API when the provider has object
-  storage (each sheet is uploaded and handed over as a signed URL). With batch processing off,
-  it sends concurrent requests to the captioning model through Google or an OpenAI-compatible endpoint.
-  An unsupported batch configuration blocks submission. It also displays job snapshots and saves labels from the UI thread.
-- `src/batch/openrouter.rs`: the OpenRouter batch path: upload each sheet,
-  build the batch, poll it, save the labels, and delete the objects. OpenRouter
-  has no client reference, so a submit whose reply is lost ends those sheets
-  with an error instead of sending the batch again.
-- `src/batch/runner.rs`: one coordinator owns the job journal under a file lock.
-  It performs network operations and waits for the UI to acknowledge library writes.
-  A submission is saved with its reference before it goes out; a lookup resumes one Google never received.
-  The model's concurrency bounds requests, or batches, in flight.
-  User pause and cancel requests persist in the library book before the coordinator applies them.
-  Tests use fake transports and explicit times. The native UI fixture uses a loopback provider in a test build only.
-
-- `src/batch/cost.rs`: local token estimates and library cost ranges, with provider price sources and saved usage.
-- `src/batch/store.rs`: one job and its commands in the root book, with migration from older configuration journals.
-  `sidecar::update_book` locks each read-modify-write operation for batch state, labels, and grid metadata.
-
 ## Folders that stay local
 
-`assets/` holds a sample library, `mytiles/` and `mytilesheets/` hold the
-user's tilesheets, and `tools/` holds scripts. All four are gitignored, and
-so are `private/` and `worktrees/`; see the `git-repo-layout` skill.
+`assets/` holds a sample library. `mytiles/`, `mytilemaps/` and
+`mytilesheets/` are working folders; `mytiles/` is the scratch one, and its
+names show in every screenshot. `tools/` holds scripts and stays ignored,
+except `tools/grid-cases.json`, which the grid test reads. `private/` and
+`worktrees/` come from the `git-repo-layout` skill.
 
-## How to write here
+## Media
 
-Comments, the README, and commit messages follow the global `AGENTS.md`:
-short sentences, the active voice, one word for one meaning. Text that a
-file already holds keeps its voice. Name the files in every commit.
-
-## Recording a screencast for the README
-
-The pictures in `README.md` are GIFs in `media/`, 1000 px wide. Record them on
-a display of your own, never on the user's: your synthesized keys land on
-whatever window has the focus, and the user may be working. A private display
-also gives the same window size and the same result every time.
-
-You need `Xvfb`, `openbox`, `ffmpeg` and `python-xlib`. The driver scripts
-live in the session scratchpad under `ui/`, and the venv one level above
-them, in the scratchpad itself.
-
-```
-Xvfb :77 -screen 0 1520x1030x24 -nolisten tcp &
-DISPLAY=:77 openbox &
-env -u WAYLAND_DISPLAY DISPLAY=:77 WINIT_X11_SCALE_FACTOR=1 ./target/release/tilepicky &
-```
-
-Four things that each cost an hour to find out:
-
-- **Unset `WAYLAND_DISPLAY`.** winit 0.29 removed `WINIT_UNIX_BACKEND`, and
-  it now picks Wayland whenever that variable is set, whatever `DISPLAY`
-  says. The window opens on the user's screen instead of yours.
-- **`WINIT_X11_SCALE_FACTOR=1`** makes the app draw one pixel per point. On a
-  scaled display it draws at 1.8, and the text is unreadable once the capture
-  is scaled down to 1000 px.
-- **`ffmpeg -f x11grab` reads the root window.** On the user's Wayland
-  session that gives a black rectangle, because XWayland windows are
-  redirected. On Xvfb nothing composites, so it works.
-- **openbox draws the title bar**, which carries the name and the version.
-  Its frame has no name of its own: find it as the parent of the app window,
-  not by searching for the title.
-
-Frame it narrow. A window wider than its content leaves half the picture
-empty, and the README shows the picture about 880 px wide, so everything in
-it shrinks. Around 900 by 930 fits the two panels with little waste. Zoom a
-sheet until it fills its panel, and show a different pack in each picture:
-two captures of the same tiles are one capture.
-
-Decide the take before you film it. Say what a reader should think when
-they see it, and build a project that makes them think it: the tool picks
-tiles out of a pack into a tilesheet of your own, so the film pulls a whole
-house out of a packed sheet and plants two trees beside it. Paste replaces
-pixels, it does not blend them, so a transparent sprite dropped on a filled
-tile leaves a hole; a sheet that fills up reads as work, a map with holes in
-it reads as a broken tilesheet. Caption the keys: a film of a keyboard with
-no keys in it looks the same as a film of a mouse.
-
-Drive the app with XTEST through python-xlib. Stop the instance you started
-last: the driver takes the first window it finds that is named Tilepicky, so
-a stray one takes every key while the screenshot shows the window on top of
-it. Prepare the state off camera and record only the part worth watching. Do not count the rows of a tree: the
-keys arrive on the file that is open, else on the first row, so a count from
-the top opens the wrong file as soon as a file is open. Walk to the end,
-where the cursor stops, and step back from there.
-
-```
-DISPLAY=:77 ffmpeg -y -f x11grab -draw_mouse 0 -framerate 15 \
-  -video_size <w>x<h> -i :77.0+<x>,<y> -t 22 demo.mp4
-ffmpeg -i demo.mp4 -vf "fps=10,scale=1000:-1:flags=lanczos,split[a][b];\
-[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=3" \
-  -loop 0 media/<name>.gif
-```
-
-Point the project folder at something tidy first. `mytilesheets/` holds a
-small, well named set for this; `mytiles/` is a scratch folder and its names
-show in every frame.
+`media/*.gif` are the README pictures, up to 1000 px wide. `docs/screencast.md`
+says how to record them.
