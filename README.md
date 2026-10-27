@@ -250,12 +250,13 @@ Invalid label replies can retry up to three times. Cancelling a job stops new re
 
 
 Google batch requests require an API key from a project with billing enabled. The Free tier does not support batches.
-Tilepicky offers `gemini-flash-latest` for both scopes. This alias follows Google's latest Flash release, which can change.
+Tilepicky offers `gemini-flash-latest` as an instant and as a batch model. This alias follows Google's latest Flash release, which can change.
 The previously shipped Google default migrates to this alias. Existing jobs keep their saved model.
-Choose one captioning model for single sheets and library tagging.
-With **Enable batch processing** off, library tagging sends concurrent requests to that model, including on Google.
+A saved model is an instant model, a batch model, or an embedding model.
+One provider and model ID can hold an instant and a batch entry.
 Each model remembers its **Maximum concurrent requests** limit.
-Enable batch processing to select a separate batch model and its concurrency limit.
+With **Enable batch processing** off, library tagging sends concurrent requests to the instant model, including on Google.
+Enable batch processing to select a batch model and its concurrency limit.
 Native batches require Google or OpenRouter with sheet storage. Existing jobs keep their saved model and transport.
 Choose a captioning model that accepts images. Embedding models make vectors for search.
 Failures show their cause and a next step beside the job status. Billing errors link to Google billing when applicable.
@@ -306,7 +307,7 @@ Saved labels stay. **Rerun all...** also replaces existing labels.
 
 ### Model discovery
 
-**AI setup...** assigns models to tasks. Choosing **Captions and tags** sets the model for single-sheet and library requests.
+**AI setup...** assigns models to tasks. Choosing **Captions and tags** sets the instant model for single-sheet requests.
 Each task has one model picker. Its **Browse models...** button opens the provider catalogue for that task.
 **Enable batch processing** reveals an optional batch model. Provider connections appear above the task settings.
 

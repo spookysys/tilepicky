@@ -553,7 +553,7 @@ mod tests {
             RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255])).save(f.root.join(name)).unwrap();
         }
         let mut job = prepare(&Index::scan(&f.root, [16, 16]), super::super::tests::provider(Kind::OpenAi),
-            "test:batch".into(), Scope::Unlabeled).unwrap();
+            "test".into(), Scope::Unlabeled).unwrap();
         job.concurrency = 4;
         let flight = job.concurrency as usize;
         assert!(job.sheets.len() >= flight);

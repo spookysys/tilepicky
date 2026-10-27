@@ -343,7 +343,7 @@ pub fn prepare_of(index: &Index, provider: Provider, model: String, scope: Scope
     let open = index.entries.iter().filter(|e| keep(e) && (all || e.side.label.is_none()));
     Ok(Job {
         log_id: crate::ai_log::id(),
-        provider, native_batch: true, model: model.trim_end_matches(":batch").into(), concurrency: crate::ai::DEFAULT_CONCURRENCY,
+        provider, native_batch: true, model, concurrency: crate::ai::DEFAULT_CONCURRENCY,
         groups: vec![], skipped: if all { 0 } else { labeled },
         replacing: if all { labeled } else { 0 }, tag_list: index.tag_list.clone(), free_tags: index.free_tags,
         prompt: Some(labels::prompt(&index.tag_list, index.free_tags)),
@@ -1138,10 +1138,10 @@ impl Panel {
             ui.small(job.method());
             if let Some((provider, model)) = configured
                 && (provider.name != job.provider.name || provider.kind != job.provider.kind || provider.url != job.provider.url
-                    || model.id.trim_end_matches(":batch") != job.model.trim_end_matches(":batch")
+                    || model.id != job.model
                     || ai.batch_enabled() != job.uses_batches()) {
                 ui.group(|ui| {
-                    ui.label(format!("Settings select {} / {} for new jobs.", provider.name, model.id.trim_end_matches(":batch")));
+                    ui.label(format!("Settings select {} / {} for new jobs.", provider.name, model.id));
                     ui.label("This saved job keeps its original model and processing mode, including resume and retry.");
                     ui.label(if job.done() {
                         "Start a new library job below to use the selected model."
@@ -1287,7 +1287,7 @@ impl Panel {
             });
         }
         if let Some((provider, model)) = configured {
-            ui.label(format!("{} / {}", provider.name, model.id.trim_end_matches(":batch")));
+            ui.label(format!("{} / {}", provider.name, model.id));
             ui.small(if ai.batch_enabled() { crate::ai::method(provider) } else { "Concurrent requests" });
         }
         ui.label(format!("{done} of {total} sheets have usable labels"));
@@ -1455,7 +1455,7 @@ mod tests {
             Self { base, root, spool }
         }
         fn prepare(&self, kind: Kind) -> Job {
-            prepare(&Index::scan(&self.root, [16, 16]), provider(kind), "test:batch".into(), Scope::Unlabeled).unwrap()
+            prepare(&Index::scan(&self.root, [16, 16]), provider(kind), "test".into(), Scope::Unlabeled).unwrap()
         }
         fn advance(&self, job: Job, send: impl FnMut(&str, Option<&Value>) -> Result<Value, Failure>) -> (Job, Result<(), String>) {
             advance(job, &self.root, &self.spool, send)
@@ -1546,9 +1546,9 @@ mod tests {
         RgbaImage::from_pixel(8, 4, Rgba([1, 2, 3, 255])).save(files.root.join("top.png")).unwrap();
         let index = Index::scan(&files.root, [16, 16]);
         let only: BTreeSet<String> = ["folder/sheet.png".to_string()].into_iter().collect();
-        let job = prepare_of(&index, provider(Kind::Gemini), "test:batch".into(), Scope::Unlabeled, Some(&only)).unwrap();
+        let job = prepare_of(&index, provider(Kind::Gemini), "test".into(), Scope::Unlabeled, Some(&only)).unwrap();
         assert_eq!(job.sheets.iter().map(|s| s.rel.as_str()).collect::<Vec<_>>(), ["folder/sheet.png"]);
-        let whole = prepare(&index, provider(Kind::Gemini), "test:batch".into(), Scope::Unlabeled).unwrap();
+        let whole = prepare(&index, provider(Kind::Gemini), "test".into(), Scope::Unlabeled).unwrap();
         assert_eq!(whole.sheets.len(), 2);
     }
 
@@ -1769,7 +1769,7 @@ mod tests {
         let old = labels::response(&completion(labeled("Old")), &[]).unwrap().into_label("test", "test", &[]);
         crate::sidecar::store_labels(&files.root, [("folder/sheet.png", Some(old.clone()))]).unwrap();
         let index = Index::scan(&files.root, [16, 16]);
-        let job = prepare(&index, provider(Kind::OpenAi), "test:batch".into(), Scope::All).unwrap();
+        let job = prepare(&index, provider(Kind::OpenAi), "test".into(), Scope::All).unwrap();
         assert_eq!((job.sheets.len(), job.skipped, job.replacing), (1, 0, 1));
         assert_eq!(crate::sidecar::load_book(&files.root).unwrap().sheets["folder/sheet.png"].label, Some(old.clone()));
         let (failed, _) = files.advance(job.clone(), |_, _| Err(Failure::Status(400, String::new())));

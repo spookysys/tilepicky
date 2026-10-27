@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Model discovery never changes a saved model choice. Provider metadata describes
 //! compatibility, not the quality of captions for sprite sheets.
-use super::{Ai, Keys, Kind, Model, Provider, Role, DEFAULT_CONCURRENCY};
+use super::{Ai, Keys, Kind, Mode, Model, Provider, Role, DEFAULT_CONCURRENCY};
 use eframe::egui;
 use serde_json::Value;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,9 @@ fn parse(value: &Value, kind: Kind, embeddings: bool) -> Result<Vec<Entry>, Stri
     for item in list {
         let raw_id = item.get(if kind == Kind::Gemini { "name" } else { "id" }).and_then(Value::as_str).unwrap_or("");
         let id = if kind == Kind::Gemini { raw_id.strip_prefix("models/").unwrap_or(raw_id) } else { raw_id };
-        if id.trim().is_empty() || id.len() > 512 { continue; }
+        // OpenRouter lists a `:batch` catalogue entry beside each model, but
+        // its Batch API takes the base slug, so the entry only confuses.
+        if id.trim().is_empty() || id.len() > 512 || id.contains(":batch") { continue; }
         let name = item.get(if kind == Kind::Gemini { "displayName" } else { "name" }).and_then(Value::as_str).unwrap_or(id);
         let (tags, search, text, unknown) = if kind == Kind::Gemini {
             let methods = strings(item, "supportedGenerationMethods");
@@ -211,22 +213,17 @@ fn select(ai: &mut Ai, provider: &str, id: &str, task: Task) -> Result<(), Strin
         return Err("Search embeddings require an OpenAI-compatible embedding endpoint.".into());
     }
     let role = match task {
-        Task::Tags | Task::Batch => Role::Chat { single: true, library: true, concurrency: DEFAULT_CONCURRENCY },
+        Task::Tags => Role::Chat { mode: Mode::Instant, concurrency: DEFAULT_CONCURRENCY },
+        Task::Batch => Role::Chat { mode: Mode::Batch, concurrency: DEFAULT_CONCURRENCY },
         Task::Search | Task::Text => Role::Embed,
     };
     let model = Model { provider: provider.to_owned(), id: id.to_owned(), role };
     let reference = model.reference();
-    if let Some(existing) = ai.models.iter_mut().find(|m| m.is(&reference)) {
-        if existing.is_embed() != matches!(task, Task::Search | Task::Text) {
-            return Err("This model is already configured for another kind of task. Check its role in Advanced connections and models.".into());
-        }
-        if matches!(task, Task::Tags | Task::Batch) {
-            let concurrency = existing.concurrency().unwrap_or(DEFAULT_CONCURRENCY);
-            existing.role = Role::Chat { single: true, library: true, concurrency };
-        } else { existing.role = role; }
-    } else { ai.models.push(model); }
+    // The same provider and ID may hold an instant and a batch entry, and an
+    // embedding entry beside them; only an entry of this role is left alone.
+    if !ai.models.iter().any(|m| m.same(&model)) { ai.models.push(model); }
     match task {
-        Task::Tags => { ai.single = Some(reference); },
+        Task::Tags => ai.single = Some(reference),
         Task::Batch => ai.library = Some(reference),
         Task::Search => ai.embed = Some(reference),
         Task::Text => ai.text_embed = Some(reference),
@@ -374,8 +371,11 @@ mod tests {
         assert_eq!(ai.embed, original_image);
         assert_eq!(ai.single, original_tags);
         assert_eq!(ai.chosen_text_embed().unwrap().1.id, "text-only");
-        assert!(select(&mut ai, "OpenRouter", "text-only", Task::Tags).is_err());
-        assert_eq!(ai.single, original_tags);
+        // The same provider and ID may hold a caption model beside the text model.
+        select(&mut ai, "OpenRouter", "text-only", Task::Tags).unwrap();
+        assert_eq!(ai.single.as_ref().unwrap().model, "text-only");
+        assert_eq!(ai.models.iter().filter(|m| m.id == "text-only").count(), 2);
+        assert_eq!(ai.chosen_text_embed().unwrap().1.id, "text-only");
     }
 
     #[test]
