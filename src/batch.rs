@@ -582,7 +582,10 @@ pub fn advance(job: Job, root: &Path, dir: &Path, mut send: impl FnMut(&str, Opt
 fn advance_operation(mut job: Job, root: &Path, dir: &Path, operation: Operation, send: Send) -> (Job, Result<(), String>) {
     let result = match operation {
         Operation::Label => { job.release_groups(); one(&mut job, root, dir, send) }
-        Operation::Poll => { job.poll_next = false; if job.provider.kind == Kind::OpenAi { openrouter::poll(&mut job, dir, send) } else { poll(&mut job, dir, send) } }
+        Operation::Poll => {
+            job.poll_next = false;
+            if job.provider.kind == Kind::OpenAi { openrouter::poll(&mut job, dir, send) } else { poll(&mut job, dir, send) }
+        }
         Operation::Recover => { job.poll_next = true; job.submit_next = true; recover(&mut job, dir, send) }
         Operation::Submit => { job.poll_next = true; job.submit_next = false;
             if job.provider.kind == Kind::OpenAi { openrouter::submit(&mut job, root, dir, send) } else { submit(&mut job, root, dir, send) } }
@@ -1032,7 +1035,8 @@ impl Panel {
             let bucket_token = job.provider.bucket_token(keys);
             if !single_running && self.runner.is_none() && self.storage_error.is_empty() && !job.done() && let Some(lock) = &self.lock {
                 self.key = key.clone();
-                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), key, bucket_token, lock.clone(), ctx.clone(), self.log.clone().unwrap()));
+                self.runner = Some(runner::Runner::start(job.clone(), self.root.clone(), key, bucket_token, lock.clone(), ctx.clone(),
+                    self.log.clone().unwrap()));
             } else if key != self.key {
                 self.key = key.clone(); self.command(runner::Command::Key(key));
             }

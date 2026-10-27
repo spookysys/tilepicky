@@ -1915,7 +1915,16 @@ impl App {
     /// texts are truncated: a long name can never push the fields off screen.
     /// Returns whether one of the buttons was clicked.
     #[allow(clippy::too_many_arguments)]
-    fn header_tail(ui: &mut egui::Ui, mut sheet: Option<&mut Sheet>, ai: Option<&mut bool>, eye: Option<&mut bool>, quant: Option<&mut bool>, props: Option<&mut bool>, name: String, cell: Option<String>) -> bool {
+    fn header_tail(
+        ui: &mut egui::Ui,
+        mut sheet: Option<&mut Sheet>,
+        ai: Option<&mut bool>,
+        eye: Option<&mut bool>,
+        quant: Option<&mut bool>,
+        props: Option<&mut bool>,
+        name: String,
+        cell: Option<String>,
+    ) -> bool {
         let mut clicked = false;
         // The buttons draw from the right, so they are kept here and become
         // stops from the left, in the order you read them.
@@ -2625,7 +2634,8 @@ impl App {
         set_pane(ui, (Panel::Project, Spot::Sheet));
         let live = keys == (Panel::Project, Spot::Sheet);
         let clicked = Self::sheet_toolbar(ui, "canvas toolbar", |ui| {
-            let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None, Some(&mut self.project_eye), Some(&mut self.quant_panel), Some(&mut self.props_panel));
+            let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None,
+                Some(&mut self.project_eye), Some(&mut self.quant_panel), Some(&mut self.props_panel));
             out.grid = grid; clicked
         });
         if clicked {

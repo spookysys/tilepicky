@@ -93,7 +93,8 @@ impl Runner {
         if let Some(thread) = self.thread.take() { let _ = thread.join(); }
     }
     pub fn command(&self, command: Command) { let _ = self.commands.send(command); }
-    pub fn start(job: Job, root: PathBuf, key: String, bucket_token: Option<String>, lock: Arc<std::fs::File>, ctx: egui::Context, log: crate::ai_log::Log) -> Self {
+    pub fn start(job: Job, root: PathBuf, key: String, bucket_token: Option<String>, lock: Arc<std::fs::File>, ctx: egui::Context,
+        log: crate::ai_log::Log) -> Self {
         let (tx, events) = mpsc::channel();
         let (commands, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
