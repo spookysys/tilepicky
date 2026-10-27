@@ -440,6 +440,23 @@ pub fn response(value: &Value, list: &[String]) -> Result<Reply, String> {
         } else { return Err(INVALID.into()); };
         value["listed"] = Value::Object(named);
     }
+    // Gemini can answer a tag beside `listed` instead of inside it. A requested
+    // tag name with a true or false answer is unambiguous; other keys stay refused.
+    if let Some(object) = value.as_object_mut() {
+        let names = Reply::usable(list);
+        let beside: Vec<String> = object.iter()
+            .filter(|(key, answer)| answer.is_boolean() && names.contains(&key.as_str())
+                && !["status", "caption", "tags", "listed"].contains(&key.as_str()))
+            .map(|(key, _)| key.clone()).collect();
+        let beside: Vec<(String, Value)> = beside.iter().filter_map(|key| object.remove_entry(key)).collect();
+        if !beside.is_empty() {
+            let Some(listed) = object.entry("listed").or_insert_with(|| json!({})).as_object_mut() else { return Err(INVALID.into()) };
+            for (key, answer) in beside {
+                if listed.get(&key).is_some_and(|known| *known != answer) { return Err(INVALID.into()); }
+                listed.insert(key, answer);
+            }
+        }
+    }
     // Some endpoints omit status for a caption. The normal refusal and content checks still apply.
     if value.get("status").is_none() && value["caption"].as_str().is_some_and(|s| !s.trim().is_empty()) {
         value["status"] = json!("labeled");
@@ -649,6 +666,27 @@ pub mod tests {
         let value = json!({"status":"labeled", "caption":"Dungeon sprites", "tags":["pixel art"], "listed":[false,true,true]});
         let label = response(&completion(value), &list).unwrap().into_label("test", "test", &list);
         assert_eq!(label.tags, ["character", "indoor", "pixel art"]);
+    }
+
+    /// A Google library job lost two sheets to a reply with `NPC` beside
+    /// `listed`. Such an answer joins `listed`; a clash or a stranger does not.
+    #[test]
+    fn a_tag_answer_beside_listed_joins_it() {
+        let list = vec!["character".into(), "NPC".into(), "UI".into()];
+        for value in [
+            json!({"status":"labeled", "caption":"Villagers", "tags":["pixel art"], "listed":{"character":true, "UI":false}, "NPC":true}),
+            json!({"status":"labeled", "caption":"Villagers", "tags":["pixel art"], "character":true, "NPC":true, "UI":false}),
+        ] {
+            let label = response(&completion(value), &list).unwrap().into_label("test", "test", &list);
+            assert_eq!(label.tags, ["character", "NPC", "pixel art"]);
+        }
+        for value in [
+            json!({"status":"labeled", "caption":"Villagers", "tags":[], "listed":{"NPC":false}, "NPC":true}),
+            json!({"status":"labeled", "caption":"Villagers", "tags":[], "listed":{}, "hero":true}),
+            json!({"status":"labeled", "caption":"Villagers", "tags":[], "listed":{}, "NPC":"yes"}),
+        ] {
+            assert!(response(&completion(value), &list).is_err());
+        }
     }
 
     #[test]
