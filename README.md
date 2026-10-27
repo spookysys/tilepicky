@@ -58,8 +58,8 @@ Use the top bar to switch between two workspaces:
 - **Library** shows sheet thumbnails, a folder tree, search, and a selected-sheet inspector.
   Click a thumbnail to inspect it. Use its checkbox to select it for an AI task.
   **Without tags** shows sheets that have no saved label.
-- **Build** places the source sheet beside the project canvas. Narrow windows stack the canvases.
-  The file trees remain available beside the canvases. **Use in tilesheet** opens Build with the inspected source.
+- **Build** stacks the source sheet above the project canvas. Drag the divider between them to change how they share the height.
+  The file trees keep their column at the left. **Use in tilesheet** opens Build with the inspected source.
 
 Switching workspaces keeps open sheets, selections, zoom, and unsaved project changes.
 Project edit shortcuts operate only in Build. Saving remains available in both workspaces.

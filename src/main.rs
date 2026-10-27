@@ -3312,14 +3312,18 @@ impl App {
             self.library_workspace(ui);
             (PanelOut::default(), PanelOut::default())
         } else {
-            let width = ui.available_width();
-            let library_out = if width >= 700.0 {
-                egui::Panel::left("build source").resizable(true).default_size(width * 0.48)
-                    .size_range(220.0..=width * 0.75).show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner
-            } else {
-                egui::Panel::top("build source stacked").resizable(true).default_size(ui.available_height() * self.split)
-                    .show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner
-            };
+            // The split is kept as a fraction of the height, so that it stays in
+            // place when the window changes size. The panel state is written from
+            // it each frame and read back after the user drags the divider.
+            let total = ui.available_height();
+            let panel_id = Id::new("build source");
+            let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), total * self.split));
+            ctx.data_mut(|d| d.insert_persisted(panel_id, egui::PanelState { outer_rect: rect }));
+            let library_out =
+                egui::Panel::top("build source").resizable(true).show(ui, |ui| self.library_panel(ctx, ui, keys, dragging)).inner;
+            if let Some(state) = egui::PanelState::load(ctx, panel_id) && total > 0.0 {
+                self.split = (state.outer_rect.height() / total).clamp(0.1, 0.9);
+            }
             let project_out = egui::CentralPanel::default().show(ui, |ui| self.project_panel(ctx, ui, keys, dragging)).inner;
             (library_out, project_out)
         };
