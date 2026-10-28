@@ -509,7 +509,9 @@ impl App {
             settings,
             keys,
             ai_panel: false,
-            workspace: workspace::Workspace::Library,
+            // The tool opens on the working split: the library on top, the
+            // tilesheet below. The library grid is one click away.
+            workspace: workspace::Workspace::Build,
             gallery: gallery::Gallery::default(),
             compare_search: false,
             improve_open: false,

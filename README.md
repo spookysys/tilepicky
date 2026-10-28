@@ -61,6 +61,10 @@ Use the top bar to switch between two workspaces:
 - **Build** stacks the source sheet above the project canvas. Drag the divider between them to change how they share the height.
   The file trees keep their column at the left. **Use in tilesheet** opens Build with the inspected source.
 
+The tool opens in Build, with the library and project folders from the last
+run. If a folder has not been chosen, its tree stays empty; right-click the
+tree to choose one.
+
 Switching workspaces keeps open sheets, selections, zoom, and unsaved project changes.
 Project edit shortcuts operate only in Build. Saving remains available in both workspaces.
 **Colors and export...** opens the existing palette, preview, and export tools for the project.
