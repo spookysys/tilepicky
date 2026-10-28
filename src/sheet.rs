@@ -219,6 +219,7 @@ fn snap_far(a: u32, c: u32, f: u32, last: u32) -> u32 {
 /// a sheet can be many megabytes, so those steps travel light.
 struct Step {
     side: Sidecar,
+    props: crate::tileset::Props,
     grid: ([u32; 2], [u32; 2], [i32; 2]),
     pixels: Option<(RgbaImage, ProvMap)>,
     /// The step changed the grid and nothing else. A drag over the tile
@@ -226,6 +227,7 @@ struct Step {
     /// collapses into the first: undo returns to the grid you had before you
     /// began, not to the step before last.
     grid_only: bool,
+    property_edit: Option<(Vec<u32>, String)>,
 }
 
 /// A block of frames that is not stored: the selection, played with one
@@ -522,6 +524,7 @@ pub struct Block {
     pub mask: Vec<bool>,
     /// Stored animations that lie inside the block, relative to its top-left.
     pub animations: Vec<Animation>,
+    pub props: crate::tileset::Props,
 }
 
 impl Block {
@@ -543,6 +546,8 @@ struct CanvasDrag {
     img: RgbaImage,
     prov: ProvMap,
     side: Sidecar,
+    props: crate::tileset::Props,
+    cols: u32,
 }
 
 pub struct Sheet {
@@ -1153,6 +1158,14 @@ impl Sheet {
                     }
                 }
             }
+            if !library && tile_px.min_elem() >= 12.0 {
+                for id in self.props.ids() {
+                    let cell = cell_rect(id % self.cols(), id / self.cols());
+                    let dot = cell.right_top() + Vec2::new(-4.0, 4.0);
+                    painter.circle_filled(dot, 3.0, Color32::BLACK);
+                    painter.circle_filled(dot, 2.0, Color32::from_rgb(100, 235, 220));
+                }
+            }
             if !self.quant_pins.is_empty() {
                 let cols = self.cols().max(1);
                 for (i, &pinned) in self.quant_pins.iter().enumerate() {
@@ -1367,6 +1380,8 @@ impl Sheet {
                             img: self.img.clone(),
                             prov: self.prov.clone(),
                             side: self.side.clone(),
+                            props: self.props.clone(),
+                            cols: self.cols(),
                         });
                         self.dirty = true;
                     } else if let Some((ex, ey)) = edges {
@@ -1404,7 +1419,7 @@ impl Sheet {
                 if let Some(d) = self.canvas_resize.take() {
                     // The whole drag is one undo step: the canvas before it.
                     let grid = (self.tile, self.gap, self.offset);
-                    self.push_undo(Step { side: d.side, grid, pixels: Some((d.img, d.prov)), grid_only: false });
+                    self.push_undo(Step { side: d.side, props: d.props, grid, pixels: Some((d.img, d.prov)), grid_only: false, property_edit: None });
                     event.resized = true;
                 }
             }
@@ -1573,7 +1588,12 @@ impl Sheet {
             })
             .map(|a| a.shifted(-px0, -py0))
             .collect();
-        Some(Block { tile: self.tile, cols: b.cols(), rows: b.rows(), img, prov, mask, animations })
+        let cols = self.cols();
+        let props = self.props.remap(|id| {
+            let (x, y) = (id % cols, id / cols);
+            sel.contains((x, y)).then(|| (y - b.y0) * b.cols() + x - b.x0)
+        });
+        Some(Block { tile: self.tile, cols: b.cols(), rows: b.rows(), img, prov, mask, animations, props })
     }
 
     /// Whether the selected cells differ between any two frames.
@@ -1631,7 +1651,7 @@ impl Sheet {
             }
         }
         let animations = vec![Animation { px: [0, 0], frame: [fw, fh], frames: Pair::strip([n, 1]), ms: self.frame_ms.max(20) }];
-        Some(Block { tile: self.tile, cols, rows: b.rows(), img, prov, mask, animations })
+        Some(Block { tile: self.tile, cols, rows: b.rows(), img, prov, mask, animations, props: Default::default() })
     }
 
     /// The sheet as it stands, to come back to. `pixels` says whether the
@@ -1639,10 +1659,36 @@ impl Sheet {
     fn step(&self, pixels: bool) -> Step {
         Step {
             side: self.side.clone(),
+            props: self.props.clone(),
             grid: (self.tile, self.gap, self.offset),
             pixels: pixels.then(|| (self.img.clone(), self.prov.clone())),
             grid_only: false,
+            property_edit: None,
         }
+    }
+
+    /// Property edits share the same history as pixel edits.
+    pub fn set_property(&mut self, ids: &[u32], name: &str, value: crate::tileset::Prop) {
+        if self.props.common(ids, name).as_ref() == Some(&value) { return; }
+        let edit = (ids.to_vec(), name.to_string());
+        if !self.undo.last().is_some_and(|step| step.property_edit.as_ref() == Some(&edit)) {
+            let mut step = self.step(false);
+            step.property_edit = Some(edit);
+            self.push_undo(step);
+        }
+        self.props.set(ids, name, value);
+        self.redo.clear();
+        self.dirty = true;
+    }
+
+    pub fn end_property_edit(&mut self) {
+        if let Some(step) = self.undo.last_mut() { step.property_edit = None; }
+    }
+
+    pub fn remove_property(&mut self, ids: &[u32], name: &str) {
+        if self.props.sample(ids, name).is_none() { return; }
+        self.snapshot_book();
+        self.props.remove(ids, name);
     }
 
     /// Keeps the sheet as it stands, before something rewrites its pixels.
@@ -1673,6 +1719,7 @@ impl Sheet {
         // The label belongs to the last labeling operation, not to the edit history.
         step.side.label = self.side.label.take();
         self.side = step.side;
+        self.props = step.props;
         (self.tile, self.gap, self.offset) = step.grid;
         if let Some((img, prov)) = step.pixels {
             self.img = img;
@@ -1690,7 +1737,9 @@ impl Sheet {
         if cols <= self.cols() && rows <= self.rows() {
             return;
         }
-        let (w, h) = self.img_size_for(cols.max(self.cols()), rows.max(self.rows()));
+        let (cols, rows) = (cols.max(self.cols()), rows.max(self.rows()));
+        self.props = self.props.resized(self.cols(), cols, rows);
+        let (w, h) = self.img_size_for(cols, rows);
         let mut img = RgbaImage::new(w, h);
         image::imageops::replace(&mut img, &self.img, 0, 0);
         self.img = img;
@@ -1749,6 +1798,14 @@ impl Sheet {
                         self.prov.set(ix, iy, idx);
                     }
                 }
+                if !blend {
+                    let id = self.tile_id((x, y));
+                    if self.tile == block.tile {
+                        self.props.copy_tile(id, &block.props, j * block.cols + i);
+                    } else {
+                        self.props.clear_tile(id);
+                    }
+                }
                 sel.toggle((x, y));
             }
         }
@@ -1765,6 +1822,7 @@ impl Sheet {
     fn clear_cells(&mut self, s: &Sel) {
         let [tw, th] = self.tile;
         for (x, y) in s.iter() {
+            self.props.clear_tile(self.tile_id((x, y)));
             let (ix0, iy0, _, _) = self.cell_img_rect(x, y);
             for py in 0..th {
                 for px in 0..tw {
@@ -1781,18 +1839,21 @@ impl Sheet {
         self.side.animations.retain(|a| !rects.iter().any(|r| a.px_overlaps(*r)));
     }
 
-    pub fn paste(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) {
-        self.paste_mode(ctx, at, block, false);
+    pub fn paste(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) -> Result<(), String> {
+        self.paste_mode(ctx, at, block, false)
     }
 
     /// Pastes the block over what is already there: each source pixel that is
     /// not fully transparent is laid on the pixel beneath it, and a
     /// transparent one lets the sheet show through. One undo step.
-    pub fn paste_overlay(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) {
-        self.paste_mode(ctx, at, block, true);
+    pub fn paste_overlay(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) -> Result<(), String> {
+        self.paste_mode(ctx, at, block, true)
     }
 
-    fn paste_mode(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block, blend: bool) {
+    fn paste_mode(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block, blend: bool) -> Result<(), String> {
+        if !blend && self.tile != block.tile && !block.props.is_empty() {
+            return Err("Tiles with properties need the same tile size in both sheets. The paste was cancelled.".into());
+        }
         self.snapshot();
         let before = self.img.dimensions();
         self.put(at, block, blend);
@@ -1803,6 +1864,7 @@ impl Sheet {
             let (x0, y0, _, _) = self.cell_img_rect(at.0, at.1);
             self.upload_region(x0, y0, x0 + bw.div_ceil(self.tile[0]) * self.tile[0], y0 + bh.div_ceil(self.tile[1]) * self.tile[1]);
         }
+        Ok(())
     }
 
     /// Clears `from`, then puts the block at `at`: one undo step.
@@ -2079,6 +2141,7 @@ impl Sheet {
         if (tile, gap, offset) == (self.tile, self.gap, self.offset) {
             return false;
         }
+        if !self.props.is_empty() || self.props_error.is_some() { return false; }
         // A run of grid changes is one step back, not one for each.
         if !self.undo.last().is_some_and(|s| s.grid_only) {
             let mut step = self.step(false);
@@ -2109,6 +2172,7 @@ impl Sheet {
         let keep = image::imageops::crop_imm(&base.img, 0, 0, w.min(base.img.width()), h.min(base.img.height()));
         image::imageops::replace(&mut img, &*keep, 0, 0);
         let prov = base.prov.resized(w, h);
+        let props = base.props.resized(base.cols, cols, rows);
         let animations = base
             .side
             .animations
@@ -2121,6 +2185,7 @@ impl Sheet {
             .collect();
         self.img = img;
         self.prov = prov;
+        self.props = props;
         self.side.animations = animations;
         self.sel = Sel::default();
         self.upload(ctx);
@@ -2130,9 +2195,11 @@ impl Sheet {
     /// one cell stays.
     pub fn trim(&mut self, ctx: &egui::Context) {
         let [tw, th] = self.tile;
+        let property_ids = self.props.ids();
         let used = |x: u32, y: u32| {
             let (ix0, iy0, ix1, iy1) = self.cell_img_rect(x, y);
-            self.prov.any_in(ix0, iy0, ix1, iy1)
+            property_ids.contains(&self.tile_id((x, y)))
+                || self.prov.any_in(ix0, iy0, ix1, iy1)
                 || (0..th).any(|py| {
                     (0..tw).any(|px| {
                         let (ix, iy) = (ix0 + px, iy0 + py);
@@ -2161,6 +2228,7 @@ impl Sheet {
             return;
         }
         self.snapshot();
+        self.props = self.props.resized(cols, new_cols, new_rows);
         let (w, h) = self.img_size_for(new_cols, new_rows);
         self.img = image::imageops::crop_imm(&self.img, 0, 0, w, h).to_image();
         self.prov = self.prov.resized(self.img.width(), self.img.height());
@@ -2175,12 +2243,10 @@ impl Sheet {
             return Err(format!("{}: a tilesheet saves as a PNG, which keeps every pixel and the alpha", self.rel));
         }
         sidecar::load_book(&self.dir)?;
-        // A project sheet writes the Tiled tileset beside its image when it
-        // has properties or already has a file there. What cannot be written
-        // is refused before the image, so one save never leaves half its
-        // files on disk.
+        // Validate the tileset before writing the image. Each file is replaced
+        // atomically, but a disk failure can still interrupt the set of writes.
         let tsj = !self.library && !self.rel.is_empty()
-            && (!self.props.is_empty() || crate::tileset::path(&self.dir, &self.rel).is_file());
+            && (self.props.needs_file() || crate::tileset::path(&self.dir, &self.rel).is_file());
         if tsj {
             if let Some(error) = &self.props_error {
                 return Err(format!("The sheet is not saved. {error}"));
@@ -2189,6 +2255,7 @@ impl Sheet {
                 return Err(format!("The sheet is not saved. {reason}"));
             }
         }
+        let tileset = if tsj { Some(crate::tileset::prepare(&self.dir, &self.rel, self.tileset_grid(), &self.props)?) } else { None };
         // The image is written whole or not at all: a crash halfway must
         // not leave half a tilesheet.
         let path = self.dir.join(&self.rel);
@@ -2201,8 +2268,8 @@ impl Sheet {
         .map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
         self.side.tile = Some(Pair::of(self.tile));
         self.side.provenance = self.prov.extract();
-        if tsj {
-            crate::tileset::write(&self.dir, &self.rel, self.tileset_grid(), &self.props)
+        if let Some(tileset) = tileset {
+            crate::storage::write(&crate::tileset::path(&self.dir, &self.rel), &tileset)
                 .map_err(|e| format!("The image is saved, but {e}"))?;
         }
         self.save_entry()
@@ -2220,6 +2287,7 @@ impl Sheet {
         self.side.read = false;
         self.side.label = sidecar::store_layout(&self.dir, &self.rel, &side)?;
         self.dirty = false;
+        self.end_property_edit();
         Ok(())
     }
 }
@@ -2320,6 +2388,152 @@ mod tests {
         let entry = book.sheets.get("map.png").cloned();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(entry.and_then(|e| e.tile).map(Pair::xy), Some([64, 48]));
+    }
+
+    #[test]
+    fn tile_properties_follow_moves_growth_clear_and_undo() {
+        use crate::tileset::Prop;
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "map.png", [8, 8], 2, 2);
+        sheet.props.set(&[2], "terrain", Prop::Str("grass".into()));
+        sheet.sel = Sel::rect((0, 1), (0, 1));
+        let block = sheet.copy().unwrap();
+        sheet.move_block(&ctx, &sheet.sel.clone(), (2, 1), &block);
+        assert_eq!(sheet.props.common(&[5], "terrain"), Some(Prop::Str("grass".into())));
+        assert_eq!(sheet.props.common(&[3], "terrain"), None);
+        sheet.undo(&ctx);
+        assert_eq!(sheet.cols(), 2);
+        assert_eq!(sheet.props.common(&[2], "terrain"), Some(Prop::Str("grass".into())));
+        sheet.redo(&ctx);
+        sheet.sel = Sel::rect((2, 1), (2, 1));
+        sheet.clear_selection();
+        assert!(sheet.props.is_empty());
+        sheet.undo(&ctx);
+        sheet.save().unwrap();
+        assert_eq!(crate::tileset::load(&dir.0, "map.png").unwrap().common(&[5], "terrain"), Some(Prop::Str("grass".into())));
+    }
+
+    #[test]
+    fn property_edits_undo_together_and_keep_pixels() {
+        use crate::tileset::Prop;
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "map.png", [8, 8], 2, 2);
+        let before = sheet.img.clone();
+        sheet.set_property(&[0, 3], "terrain", Prop::Str("g".into()));
+        sheet.set_property(&[0, 3], "terrain", Prop::Str("grass".into()));
+        sheet.end_property_edit();
+        sheet.undo(&ctx);
+        assert!(sheet.props.is_empty());
+        sheet.redo(&ctx);
+        assert_eq!(sheet.props.common(&[0, 3], "terrain"), Some(Prop::Str("grass".into())));
+        sheet.remove_property(&[3], "terrain");
+        assert_eq!(sheet.props.common(&[0, 3], "terrain"), None);
+        sheet.undo(&ctx);
+        assert_eq!(sheet.props.common(&[0, 3], "terrain"), Some(Prop::Str("grass".into())));
+        assert_eq!(sheet.img, before);
+    }
+
+    #[test]
+    fn copied_properties_replace_but_merged_pixels_keep_destination_properties() {
+        use crate::tileset::Prop;
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut source = Sheet::new_empty(&ctx, &dir.0, "source.png", [8, 8], 2, 1);
+        source.img.put_pixel(0, 0, Rgba([255, 0, 0, 128]));
+        source.props.set(&[0], "kind", Prop::Str("flower".into()));
+        source.sel = Sel::rect((0, 0), (0, 0));
+        let block = source.copy().unwrap();
+        let mut dest = Sheet::new_empty(&ctx, &dir.0, "map.png", [8, 8], 2, 2);
+        dest.img.put_pixel(0, 0, Rgba([0, 255, 0, 255]));
+        dest.props.set(&[0], "kind", Prop::Str("ground".into()));
+        dest.props.set(&[2], "solid", Prop::Bool(true));
+        dest.paste_overlay(&ctx, (0, 0), &block).unwrap();
+        assert_eq!(dest.props.common(&[0], "kind"), Some(Prop::Str("ground".into())));
+        assert_eq!(*dest.img.get_pixel(0, 0), Rgba([128, 127, 0, 255]));
+        dest.paste(&ctx, (2, 0), &block).unwrap();
+        assert_eq!(dest.props.common(&[2], "kind"), Some(Prop::Str("flower".into())));
+        assert_eq!(dest.props.common(&[3], "solid"), Some(Prop::Bool(true)), "growth retains cell coordinates");
+        source.sel = Sel::rect((1, 0), (1, 0));
+        dest.paste(&ctx, (2, 0), &source.copy().unwrap()).unwrap();
+        assert_eq!(dest.props.common(&[2], "kind"), None, "replacing with an unannotated tile clears old properties");
+        let mut large = Sheet::new_empty(&ctx, &dir.0, "large.png", [16, 16], 1, 1);
+        assert!(large.paste(&ctx, (0, 0), &block).is_err());
+        assert!(!large.dirty);
+        assert!(large.props.is_empty());
+    }
+
+    #[test]
+    fn sparse_swaps_keep_properties_with_their_tiles() {
+        use crate::tileset::Prop;
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "map.png", [8, 8], 6, 1);
+        for id in 0..6 { sheet.props.set(&[id], "cost", Prop::Int(id as i64)); }
+        sheet.sel.toggle((0, 0));
+        sheet.sel.toggle((2, 0));
+        let block = sheet.copy().unwrap();
+        sheet.swap_block(&ctx, &sheet.sel.clone(), (3, 0), &block);
+        for (id, value) in [3, 1, 5, 0, 4, 2].into_iter().enumerate() {
+            assert_eq!(sheet.props.common(&[id as u32], "cost"), Some(Prop::Int(value)));
+        }
+        sheet.undo(&ctx);
+        for id in 0..6 { assert_eq!(sheet.props.common(&[id], "cost"), Some(Prop::Int(id as i64))); }
+    }
+
+    #[test]
+    fn property_coordinates_survive_trim_and_canvas_resize() {
+        use crate::tileset::Prop;
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "map.png", [8, 8], 4, 3);
+        sheet.props.set(&[5], "solid", Prop::Bool(true));
+        sheet.trim(&ctx);
+        assert_eq!((sheet.cols(), sheet.rows()), (2, 2), "a transparent tile with metadata is not empty");
+        assert_eq!(sheet.props.common(&[3], "solid"), Some(Prop::Bool(true)));
+        sheet.undo(&ctx);
+        assert_eq!(sheet.props.common(&[5], "solid"), Some(Prop::Bool(true)));
+        sheet.canvas_resize = Some(CanvasDrag {
+            wh: (true, true), img: sheet.img.clone(), prov: sheet.prov.clone(),
+            side: sheet.side.clone(), props: sheet.props.clone(), cols: sheet.cols(),
+        });
+        sheet.set_size(&ctx, 1, 1);
+        assert!(sheet.props.is_empty());
+        sheet.set_size(&ctx, 3, 3);
+        assert_eq!(sheet.props.common(&[4], "solid"), Some(Prop::Bool(true)), "expanding the same drag restores metadata");
+        assert!(!sheet.set_grid(&ctx, [16, 16], [0, 0], [0, 0]));
+        assert_eq!(sheet.tile, [8, 8]);
+    }
+
+    #[test]
+    fn save_as_keeps_tiled_fields_and_invalid_tilesets_stop_before_pixels() {
+        use crate::tileset::Prop;
+        let ctx = egui::Context::default();
+        let dir = crate::storage::tests::Folder::new();
+        let mut sheet = Sheet::new_empty(&ctx, &dir.0, "map.png", [8, 8], 2, 2);
+        sheet.props.set(&[2], "solid", Prop::Bool(true));
+        sheet.save().unwrap();
+        let path = dir.0.join("map.tsj");
+        let mut data: serde_json::Value = crate::storage::read(&path).unwrap();
+        data["editorsettings"] = serde_json::json!({"export": {"target":"map.json"}});
+        data["tiles"][0]["probability"] = serde_json::json!(0.25);
+        crate::storage::write(&path, &data).unwrap();
+        sheet.props = crate::tileset::load(&dir.0, "map.png").unwrap();
+        sheet.sel = Sel::rect((0, 1), (0, 1));
+        sheet.move_block(&ctx, &sheet.sel.clone(), (1, 0), &sheet.copy().unwrap());
+        sheet.rel = "copy.png".into();
+        sheet.save().unwrap();
+        let copied: serde_json::Value = crate::storage::read(&dir.0.join("copy.tsj")).unwrap();
+        assert_eq!(copied["image"], "copy.png");
+        assert_eq!(copied["editorsettings"], data["editorsettings"]);
+        assert_eq!(copied["tiles"][0]["id"], 1);
+        assert_eq!(copied["tiles"][0]["probability"], 0.25);
+        let pixels = std::fs::read(dir.0.join("copy.png")).unwrap();
+        std::fs::write(dir.0.join("copy.tsj"), b"{broken").unwrap();
+        sheet.img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        assert!(sheet.save().is_err());
+        assert_eq!(std::fs::read(dir.0.join("copy.png")).unwrap(), pixels);
     }
 
     /// The Tiled tileset lands with the image, and follows the sheet's grid.
@@ -2564,7 +2778,7 @@ mod prov_tests {
         assert!(untraced.prov.sources.is_empty());
         let traced = sheet.copy_sel(&Sel::rect((1, 0), (1, 0))).unwrap();
         assert_eq!(traced.prov.get(0, 0), Some("pack/tree.png"));
-        sheet.paste(&ctx, (2, 2), &untraced);
+        sheet.paste(&ctx, (2, 2), &untraced).unwrap();
         sheet.save().unwrap();
         let book = sidecar::load_book(&dir.0).unwrap();
         let sources: Vec<_> = book.sheets["mine.png"].provenance.iter().map(|p| p.source.as_str()).collect();
@@ -2592,7 +2806,7 @@ mod prov_tests {
         sprite.img.put_pixel(1, 0, Rgba([255, 0, 0, 128]));
         let block = sprite.copy_sel(&Sel::rect((0, 0), (0, 0))).unwrap();
 
-        grass.paste_overlay(&ctx, (0, 0), &block);
+        grass.paste_overlay(&ctx, (0, 0), &block).unwrap();
         assert_eq!(*grass.img.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
         assert_eq!(*grass.img.get_pixel(1, 0), Rgba([128, 100, 0, 255]));
         // A transparent source pixel leaves the pixel and its source alone.

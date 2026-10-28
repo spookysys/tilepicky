@@ -115,7 +115,7 @@ impl App {
         };
         let sheet = self.project.sheet.as_mut().ok_or("No project canvas is open.")?;
         let overlay = ctx.input(|i| i.modifiers.shift && !i.modifiers.alt);
-        if overlay { sheet.paste_overlay(ctx, at, &block); } else { sheet.paste(ctx, at, &block); }
+        if overlay { sheet.paste_overlay(ctx, at, &block)?; } else { sheet.paste(ctx, at, &block)?; }
         self.active = Panel::Project;
         self.pane = (Panel::Project, crate::Spot::Sheet);
         ctx.memory_mut(|memory| memory.request_focus(crate::project_id()));

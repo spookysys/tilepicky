@@ -188,9 +188,17 @@ impl App {
         egui::Modal::new(Id::new("name dialog")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading(&prompt.title);
-            let r = ui.add(egui::TextEdit::singleline(&mut prompt.value).desired_width(f32::INFINITY));
+            let mut text = egui::TextEdit::singleline(&mut prompt.value).desired_width(f32::INFINITY).show(ui);
+            let r = &text.response;
             if prompt.focus {
                 r.request_focus();
+                // Select the stem, keeping its extension ready for the new name.
+                let file = matches!(&prompt.what, NameFor::SaveAs | NameFor::RenameFile(_) | NameFor::DuplicateFile(_));
+                let end = if file { prompt.value.rfind('.').unwrap_or(prompt.value.len()) } else { prompt.value.len() };
+                let count = prompt.value[..end].chars().count();
+                text.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0), egui::text::CCursor::new(count))));
+                text.state.store(ui.ctx(), r.id);
                 prompt.focus = false;
             }
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {

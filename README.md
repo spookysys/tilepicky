@@ -488,15 +488,33 @@ A failed write preserves the previous output file. PNG does not store the target
 
 The tag button in the tilesheet header opens the **Tile properties** panel. Press `P` to open or close it. The panel gives tiles the properties a game engine reads: a name, and a value of kind `string`, `int`, `float`, or `bool`.
 
-Tilepicky keeps them in a Tiled tileset file beside the image: `town.png` has `town.tsj`. Press `Ctrl+S` to write it. A save also updates the file's image name, tile size, and counts, so the file follows a changed grid. In Tiled, add the file to a map with **Map > Add Tileset...**, and the map reads its tile properties.
+Tilepicky stores properties in a Tiled tileset beside the image: `town.png` has `town.tsj`.
+Press `Ctrl+S` to save both files. In Tiled, use **Map > Add Tileset...** to add the `.tsj` to a map.
 
-Select tiles on the canvas, then add a property in the last row of the panel. An edit applies to every selected tile. When the selected tiles do not share a value, the panel marks the property `mixed` and shows the first value it finds. The ✖ button removes a property from the selected tiles. A tile id is `row * columns + column` over the whole sheet, as Tiled counts.
+Select tiles, then add a property in the panel's last row. Each edit applies to every selected tile.
+A `mixed` label means the selected tiles have different values or some have no value.
+The remove button deletes the property from the selected tiles. A turquoise dot marks each tile with metadata.
+Undo and Redo restore property edits together with pixel edits. Inspect mode disables property editing.
 
-The panel is offered for project sheets only. A sheet with no properties gets no file, unless it already has one.
+Copy, cut, move, swap, and delete carry tile properties with the pixels.
+A normal paste replaces the destination metadata. **Shift-drag merges pixels and keeps the destination metadata.**
+Tiles with metadata require matching tile sizes for a normal paste. Pixel-only blocks can still use different tile sizes.
+Canvas resizing updates tile IDs without changing cell coordinates. Trim keeps transparent tiles that have metadata.
+Existing maps reference tile IDs. After rearranging a sheet already used in a map, update that map in Tiled.
 
-The file is the truth. Tilepicky reads it when the sheet opens, and keeps what the panel does not edit: top-level keys such as `editorsettings`, per-tile keys such as `probability`, and property kinds such as `color` or `file`. Tiled can change the same file, so open the sheet again to read those changes.
+Set the grid before assigning properties. Tilepicky refuses grid changes while tiles have metadata, because they could assign metadata to different pixels.
+Remove the metadata first if you need a different grid. Tiled can remove fields that this panel cannot edit.
 
-Some grids cannot be written as a Tiled tileset: a negative margin, offsets that differ on the two axes, gaps that differ on the two axes, or no tiles. A save refuses such a sheet before it writes the image. A `.tsj` that Tilepicky cannot read stops the save as well, and the file stays as it is. The panel shows the error, and the status bar shows it when the sheet opens.
+The `.tsj` is the authoritative file. Tilepicky reads it when you open the sheet.
+It preserves fields the panel cannot edit, including `editorsettings`, `probability`, and properties of kind `color` or `file`.
+Save As preserves these fields and writes a separate tileset for the new image.
+Reopen the sheet after editing its tileset in Tiled. Do not edit the same tileset in both applications at once.
+A new sheet without metadata needs no tileset file. An existing tileset remains when its last property is removed.
+
+Tiled cannot represent negative margins, unequal offsets, or unequal gaps on the two axes.
+Tilepicky checks the grid and reads the destination tileset before writing the image.
+An invalid tileset stops the save and remains unchanged. The panel shows the error.
+Each file is replaced atomically. A disk failure can still interrupt a save between files; the error identifies the incomplete write.
 
 ## Shortcuts
 

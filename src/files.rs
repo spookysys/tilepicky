@@ -315,14 +315,14 @@ mod tests {
 
         relocate(&dir.0, "tree.png", "oak.png", false).unwrap();
         assert!(!dir.0.join("tree.tsj").exists());
-        assert_eq!(crate::tileset::load(&dir.0, "oak.png").unwrap(), props);
+        assert_eq!(crate::tileset::load(&dir.0, "oak.png").unwrap().tiles, props.tiles);
         let file: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.0.join("oak.tsj")).unwrap()).unwrap();
         assert_eq!(file["image"], "oak.png");
         assert_eq!(sidecar::load_book(&dir.0).unwrap().sheets["oak.png"].tile, Some(Pair::of([16, 16])));
 
         relocate(&dir.0, "oak.png", "copy.png", true).unwrap();
         assert!(dir.0.join("oak.tsj").is_file(), "the original keeps its tileset");
-        assert_eq!(crate::tileset::load(&dir.0, "copy.png").unwrap(), props);
+        assert_eq!(crate::tileset::load(&dir.0, "copy.png").unwrap().tiles, props.tiles);
 
         remove(&dir.0, &["copy.png".into()]).unwrap();
         assert!(!dir.0.join("copy.tsj").exists());

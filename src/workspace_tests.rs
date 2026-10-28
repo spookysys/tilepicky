@@ -51,7 +51,7 @@ fn library_shortcuts_leave_the_hidden_project_unchanged() {
         for workspace in [workspace::Workspace::Library, workspace::Workspace::Build] {
             let mut f = fixture();
             // Give Undo a real edit to reverse, and leave transparent borders for Trim.
-            f.app.project.sheet.as_mut().unwrap().paste(&f.ctx, (0, 0), f.app.clip.as_ref().unwrap());
+            f.app.project.sheet.as_mut().unwrap().paste(&f.ctx, (0, 0), f.app.clip.as_ref().unwrap()).unwrap();
             f.app.clip.as_mut().unwrap().img.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
             let before = f.app.project.sheet.as_ref().unwrap().img.clone();
             let dirty = f.app.project.sheet.as_ref().unwrap().dirty;

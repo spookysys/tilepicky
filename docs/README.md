@@ -6,11 +6,14 @@ The [repository guide](../AGENTS.md) describes the source layout and build check
 ## Saved data
 
 - [Metadata format](tilepicky-json.md): grids, labels, animations, quantization groups, and tile depth pins.
+- [Tiled tilesets](../README.md#tile-properties-for-tiled): property editing, movement, and saves.
 - [Independent search sources](label-with-ai-one-operation.md): word search, image vectors, and caption vectors.
 
 ## Current test reports
 
-The [structured play-test report](playtest-plan.md) records the completed UI cases and fixes.
+The [tilesheet-to-Tiled workflow report](tileset-workflow-results.md) covers the October 28 property editing and save checks.
+The [open issues](issues.md) separate confirmed limits from earlier findings that still need verification.
+The [structured play-test report](playtest-plan.md) records the October 7 UI cases and fixes.
 These reports include native interaction and screenshot inspection:
 
 - [Editing, transfers, grids, and palettes](playtest-workflow-results.md).

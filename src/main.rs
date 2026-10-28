@@ -1297,6 +1297,9 @@ impl App {
             }
             NameFor::SaveAs => {
                 let rel = files::normalize_name(name, Some(".png")).ok_or("that is not a usable name")?;
+                if crate::tileset::path(&root, &rel).exists() {
+                    return Err(format!("{} exists", crate::tileset::file_name(&rel).display()));
+                }
                 if root.join(&rel).exists() {
                     return Err(format!("{rel} exists"));
                 }
@@ -1599,7 +1602,7 @@ impl App {
         }
         if in_half && !project_eye && (paste || key(cmd, Key::V)) && let (Some(block), Some(sheet)) = (&self.clip, &mut self.project.sheet) {
             let at = sheet.sel.origin().unwrap_or((0, 0));
-            sheet.paste(ctx, at, block);
+            if let Err(error) = sheet.paste(ctx, at, block) { self.status = error; }
             self.active = Panel::Project;
             self.after_edit();
         }
@@ -1809,8 +1812,12 @@ impl App {
         // dragged selection keeps following its block.
         let keep = (!drag.from_selection || drag.from == Panel::Library).then(|| sheet.sel.clone());
         match action {
-            DropAction::Blend => sheet.paste_overlay(ctx, at, &drag.block),
-            DropAction::Copy => sheet.paste(ctx, at, &drag.block),
+            DropAction::Blend => {
+                if let Err(error) = sheet.paste_overlay(ctx, at, &drag.block) { self.status = error; return; }
+            }
+            DropAction::Copy => {
+                if let Err(error) = sheet.paste(ctx, at, &drag.block) { self.status = error; return; }
+            }
             DropAction::Swap | DropAction::Move if Some(at) == drag.origin.origin() => return,
             DropAction::Swap => sheet.swap_block(ctx, &drag.origin, at, &drag.block),
             DropAction::Move => sheet.move_block(ctx, &drag.origin, at, &drag.block),
@@ -2279,9 +2286,12 @@ impl App {
         let Some(sheet) = self.sheet_mut(panel) else {
             return;
         };
-        if !sheet.set_grid(ctx, t, gap, offset) {
+        if (t, gap, offset) != (sheet.tile, sheet.gap, sheet.offset)
+            && (!sheet.props.is_empty() || sheet.props_error.is_some()) {
+            self.status = "The grid stays fixed while tiles have properties. Remove the properties before changing the grid.".into();
             return;
         }
+        if !sheet.set_grid(ctx, t, gap, offset) { return; }
         let cleared = if panel == Panel::Project {
             match self.quant_clear_grid_pins() {
                 Ok(cleared) => cleared,
@@ -2674,7 +2684,8 @@ impl App {
             if self.props_panel {
                 egui::Panel::right("tile properties").resizable(true).default_size(300.0).show(ui, |ui| {
                     set_pane(ui, (Panel::Project, Spot::Side));
-                    props_panel::show(ui, s, keys == (Panel::Project, Spot::Side));
+                    if eye { ui.weak("Turn off Inspect mode to edit properties."); }
+                    ui.add_enabled_ui(!eye, |ui| props_panel::show(ui, s, keys == (Panel::Project, Spot::Side)));
                 });
             }
             set_pane(ui, (Panel::Project, Spot::Sheet));

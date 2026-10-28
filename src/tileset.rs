@@ -20,6 +20,10 @@ const VERSION: &str = "1.10";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Props {
     pub tiles: BTreeMap<u32, BTreeMap<String, Prop>>,
+    /// Per-tile fields that the property panel cannot edit.
+    extra: BTreeMap<u32, Map<String, Value>>,
+    /// Tileset fields to preserve when Save As creates a new file.
+    fields: Map<String, Value>,
 }
 
 /// One property value. The kind belongs to the value, so a property cannot
@@ -104,7 +108,55 @@ impl Prop {
 impl Props {
     /// Whether no tile has a property.
     pub fn is_empty(&self) -> bool {
-        self.tiles.is_empty()
+        self.tiles.is_empty() && self.extra.is_empty()
+    }
+
+    pub fn needs_file(&self) -> bool { !self.is_empty() || !self.fields.is_empty() }
+
+    pub fn ids(&self) -> BTreeSet<u32> {
+        self.tiles.keys().chain(self.extra.keys()).copied().collect()
+    }
+
+    /// Copies tile metadata to new ids. An omitted id has no destination.
+    pub fn remap(&self, map: impl Fn(u32) -> Option<u32>) -> Self {
+        let mut out = Self { fields: self.fields.clone(), ..Self::default() };
+        for (&id, values) in &self.tiles {
+            if let Some(to) = map(id) { out.tiles.insert(to, values.clone()); }
+        }
+        for (&id, fields) in &self.extra {
+            if let Some(to) = map(id) {
+                let mut fields = fields.clone();
+                if let Some(frames) = fields.get_mut("animation").and_then(Value::as_array_mut) {
+                    for frame in frames {
+                        if let Some(id) = frame.get("tileid").and_then(Value::as_u64)
+                            && let Some(to) = map(id as u32) {
+                            frame["tileid"] = json!(to);
+                        }
+                    }
+                }
+                out.extra.insert(to, fields);
+            }
+        }
+        out
+    }
+
+    /// Keeps cell coordinates when the canvas width changes.
+    pub fn resized(&self, old_cols: u32, cols: u32, rows: u32) -> Self {
+        self.remap(|id| {
+            let (x, y) = (id % old_cols, id / old_cols);
+            (x < cols && y < rows).then_some(y * cols + x)
+        })
+    }
+
+    pub fn clear_tile(&mut self, id: u32) {
+        self.tiles.remove(&id);
+        self.extra.remove(&id);
+    }
+
+    pub fn copy_tile(&mut self, id: u32, source: &Self, from: u32) {
+        self.clear_tile(id);
+        if let Some(values) = source.tiles.get(&from) { self.tiles.insert(id, values.clone()); }
+        if let Some(fields) = source.extra.get(&from) { self.extra.insert(id, fields.clone()); }
     }
 
     /// Every property name that any of these tiles has.
@@ -145,11 +197,17 @@ impl Props {
     }
 
     fn from_tileset(root: &Map<String, Value>) -> Props {
-        let mut props = Props::default();
+        let mut props = Props { fields: root.clone(), ..Props::default() };
+        props.fields.remove("tiles");
         for tile in root.get("tiles").and_then(Value::as_array).into_iter().flatten() {
             let Some(id) = tile.get("id").and_then(Value::as_u64) else { continue };
-            let Some(list) = tile.get("properties").and_then(Value::as_array) else { continue };
-            for p in list {
+            let mut extra = tile.as_object().cloned().unwrap_or_default();
+            extra.remove("id");
+            let list = extra.remove("properties").and_then(|v| v.as_array().cloned()).unwrap_or_default();
+            let kept: Vec<_> = list.iter().filter(|p| Prop::read(p).is_none()).cloned().collect();
+            if !kept.is_empty() { extra.insert("properties".into(), Value::Array(kept)); }
+            if !extra.is_empty() { props.extra.insert(id as u32, extra); }
+            for p in &list {
                 let Some(name) = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) else { continue };
                 if let Some(prop) = Prop::read(p) {
                     props.tiles.entry(id as u32).or_default().insert(name.to_string(), prop);
@@ -217,13 +275,19 @@ pub fn load(dir: &Path, rel: &str) -> Result<Props, String> {
 /// Writes the tileset beside the image, keeping what Tiled put there and
 /// this tool does not read. The grid is rewritten from the sheet, so the
 /// file always describes the image as it is now.
+#[cfg(test)]
 pub fn write(dir: &Path, rel: &str, grid: Grid, props: &Props) -> Result<(), String> {
+    crate::storage::write(&path(dir, rel), &prepare(dir, rel, grid, props)?)
+}
+
+/// Reads and validates the destination before the caller writes the image.
+pub fn prepare(dir: &Path, rel: &str, grid: Grid, props: &Props) -> Result<Value, String> {
     check(grid)?;
     let path = path(dir, rel);
     let stem = Path::new(rel).file_stem().and_then(|s| s.to_str()).unwrap_or("tiles").to_string();
     let image = Path::new(rel).file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
     let mut root = match crate::storage::read::<Value>(&path)? {
-        Value::Null => Map::new(),
+        Value::Null => props.fields.clone(),
         Value::Object(map) => map,
         _ => return Err(format!("{} is not a Tiled tileset: its top level is not an object.", path.display())),
     };
@@ -240,36 +304,22 @@ pub fn write(dir: &Path, rel: &str, grid: Grid, props: &Props) -> Result<(), Str
     root.insert("image".into(), json!(image));
     root.insert("imagewidth".into(), json!(grid.image[0]));
     root.insert("imageheight".into(), json!(grid.image[1]));
-    let tiles = tiles_json(root.remove("tiles"), grid, props);
+    let tiles = tiles_json(grid, props);
     if tiles.is_empty() {
         root.remove("tiles");
     } else {
         root.insert("tiles".into(), Value::Array(tiles));
     }
-    crate::storage::write(&path, &Value::Object(root))
+    Ok(Value::Object(root))
 }
 
-/// The `tiles` array of the file: the old entries, less the properties this
-/// tool owns, plus the properties of the book. An entry that is left with
-/// nothing goes, and so does an id past the last tile of the image.
-fn tiles_json(old: Option<Value>, grid: Grid, props: &Props) -> Vec<Value> {
+/// Writes the current tile metadata, including fields the panel cannot edit.
+fn tiles_json(grid: Grid, props: &Props) -> Vec<Value> {
     let count = grid.cols as u64 * grid.rows as u64;
-    let mut kept: BTreeMap<u64, Map<String, Value>> = BTreeMap::new();
-    for tile in old.and_then(|v| v.as_array().cloned()).unwrap_or_default() {
-        let Some(id) = tile.get("id").and_then(Value::as_u64) else { continue };
-        if id >= count {
-            continue;
-        }
-        if let Some(mut object) = tile.as_object().cloned() {
-            object.remove("id");
-            kept.insert(id, object);
-        }
-    }
-    let mut ids: BTreeSet<u64> = kept.keys().copied().collect();
-    ids.extend(props.tiles.keys().map(|&id| id as u64).filter(|id| *id < count));
+    let ids: Vec<_> = props.ids().into_iter().filter(|&id| (id as u64) < count).collect();
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        let mut tile = kept.remove(&id).unwrap_or_default();
+        let mut tile = props.extra.get(&id).cloned().unwrap_or_default();
         let mut list: Vec<Value> = tile
             .remove("properties")
             .and_then(|v| v.as_array().cloned())
@@ -277,7 +327,7 @@ fn tiles_json(old: Option<Value>, grid: Grid, props: &Props) -> Vec<Value> {
             .into_iter()
             .filter(|p| Prop::read(p).is_none())
             .collect();
-        if let Some(mine) = props.tiles.get(&(id as u32)) {
+        if let Some(mine) = props.tiles.get(&id) {
             list.extend(mine.iter().map(|(name, prop)| prop.json(name)));
         }
         if !list.is_empty() {
@@ -340,7 +390,7 @@ mod tests {
         assert_eq!(file["tiles"][0]["properties"][0]["name"], "walkable");
         assert_eq!(file["tiles"][0]["properties"][0]["type"], "bool");
         assert_eq!(file["tiles"][0]["properties"][0]["value"], true);
-        assert_eq!(load(&dir.0, "tiles.png").unwrap(), props);
+        assert_eq!(load(&dir.0, "tiles.png").unwrap().tiles, props.tiles);
     }
 
     #[test]
@@ -386,7 +436,7 @@ mod tests {
         write(&dir.0, "tiles.png", grid(2, 2), &props).unwrap();
         let file = read(&dir.0, "tiles.tsj");
         assert!(file.get("tiles").is_none(), "no properties means no tiles array");
-        assert_eq!(load(&dir.0, "tiles.png").unwrap(), Props::default());
+        assert!(load(&dir.0, "tiles.png").unwrap().is_empty());
     }
 
     #[test]

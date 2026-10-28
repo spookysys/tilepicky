@@ -24,6 +24,7 @@ pub fn show(ui: &mut egui::Ui, sheet: &mut Sheet, keys: bool) {
             let file = tileset::file_name(&sheet.rel);
             ui.weak(file.display().to_string()).on_hover_text("The Tiled tileset beside the image. Tiled reads it; Tilepicky writes it on save.");
         }
+        ui.weak("A turquoise dot marks a tile with properties. Undo restores property edits.");
         ui.separator();
         // A file this tool cannot read, or a grid Tiled cannot state, leaves
         // nothing to edit: a change could not reach the disk.
@@ -51,7 +52,6 @@ pub fn show(ui: &mut egui::Ui, sheet: &mut Sheet, keys: bool) {
         }
         ui.add_space(4.0);
         let names: Vec<String> = sheet.props.names(&ids).into_iter().collect();
-        let mut changed = false;
         let mut removed = None;
         for name in &names {
             let sample = sheet.props.sample(&ids, name);
@@ -78,20 +78,18 @@ pub fn show(ui: &mut egui::Ui, sheet: &mut Sheet, keys: bool) {
                 if let Some(prop) = &sample
                     && let Some(value) = value_editor(ui, prop)
                 {
-                    sheet.props.set(&ids, name, value);
-                    changed = true;
+                    sheet.set_property(&ids, name, value);
                 }
             });
             ui.add_space(6.0);
         }
         if let Some(name) = removed {
-            sheet.props.remove(&ids, &name);
-            changed = true;
+            sheet.remove_property(&ids, &name);
         }
         ui.add_space(4.0);
-        add_row(ui, sheet, &ids, &names, &mut changed);
-        if changed {
-            sheet.dirty = true;
+        add_row(ui, sheet, &ids, &names);
+        if !ui.ctx().egui_wants_keyboard_input() && !ui.input(|i| i.pointer.any_down()) {
+            sheet.end_property_edit();
         }
     });
 }
@@ -124,7 +122,7 @@ fn value_editor(ui: &mut egui::Ui, prop: &Prop) -> Option<Prop> {
 
 /// The name field, the kind, and the button that give one more property to
 /// the selection.
-fn add_row(ui: &mut egui::Ui, sheet: &mut Sheet, ids: &[u32], names: &[String], changed: &mut bool) {
+fn add_row(ui: &mut egui::Ui, sheet: &mut Sheet, ids: &[u32], names: &[String]) {
     let state = egui::Id::new("tile property to add");
     let mut new = ui.data(|d| d.get_temp::<NewProp>(state).unwrap_or_default());
     let taken = names.iter().any(|n| n.as_str() == new.name.trim());
@@ -137,9 +135,8 @@ fn add_row(ui: &mut egui::Ui, sheet: &mut Sheet, ids: &[u32], names: &[String], 
         });
         let name = new.name.trim().to_string();
         if ui.add_enabled(!name.is_empty() && !taken, egui::Button::new("Add")).on_hover_text("give this property to the selected tiles").clicked() {
-            sheet.props.set(ids, &name, new.kind.start());
+            sheet.set_property(ids, &name, new.kind.start());
             new.name.clear();
-            *changed = true;
         }
     });
     if taken && !new.name.trim().is_empty() {
