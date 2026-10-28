@@ -13,9 +13,10 @@ pub struct Imported {
 }
 
 /// Copies a library sheet and its metadata into an existing project folder.
-/// `tileset` is the Tiled tileset that describes the sheet in the library. A
-/// TSJ travels with the copy, under the copied image's name. Its grid outranks
-/// what the pixels say, and a grid that a person set outranks them both.
+/// `tileset` is the Tiled tileset that describes the sheet in the library.
+/// The tileset travels with the copy, under the copied image's name, in the
+/// form it came in. Its grid outranks what the pixels say, and a grid that a
+/// person set outranks them both.
 pub fn import_sheet(
     library: &Path, project: &Path, source_rel: &str, target_dir: &str, default_tile: [u32; 2],
     tileset: Option<&crate::tiled::Tiled>,
@@ -58,16 +59,17 @@ pub fn import_sheet(
     if side.provenance.is_empty() {
         side.provenance.push(sidecar::Provenance { source: source_rel.into(), rects: vec![[0, 0, image.width(), image.height()]] });
     }
-    // A TSJ travels, so the project keeps the tile data. A TSX stays behind:
-    // this tool does not convert yet, and two tilesets for one image is the
-    // state it never writes.
-    let carried = tileset.filter(|t| t.format == crate::tiled::Format::Tsj);
-    let carried_bytes = match carried {
-        Some(t) => Some(std::fs::read(library.join(&t.file)).map_err(|e| format!("{}: {e}", t.file))?),
+    // The tileset travels in the form it came in. A TSJ keeps every field
+    // because the copy rewrites only `image`. A TSX keeps every field because
+    // the copy rewrites one attribute and leaves the rest of the bytes alone.
+    // Converting the XML to JSON here would drop the wang sets, terrains, and
+    // transformations that the reader does not model.
+    let carried = match tileset {
+        Some(t) => Some((t.format, std::fs::read(library.join(&t.file)).map_err(|e| format!("{}: {e}", t.file))?)),
         None => None,
     };
     let note = tileset.filter(|t| t.format == crate::tiled::Format::Tsx).map(|t| format!(
-        "{} is a TSX file, and this tool does not convert it yet, so it stayed in the library.", t.file));
+        "{} travelled beside the copy. Tiled reads it; Tilepicky writes TSJ only, so the tile panel does not edit it.", t.file));
     let name = Path::new(source_rel).file_name().and_then(|n| n.to_str()).ok_or("Invalid sheet name")?;
     let stem = Path::new(name).file_stem().and_then(|n| n.to_str()).ok_or("Invalid sheet name")?;
     let ext = Path::new(name).extension().and_then(|n| n.to_str()).map(|s| format!(".{s}")).unwrap_or_default();
@@ -78,10 +80,16 @@ pub fn import_sheet(
             let rel = if target_dir.is_empty() { name.clone() } else { format!("{target_dir}/{name}") };
             if book.sheets.contains_key(&rel) { continue; }
             let path = target.join(&name);
-            // The tileset takes the image's name. One already there means the
-            // name is taken: a copy never overwrites a tileset.
-            let tsj = carried.is_some().then(|| project.join(crate::tileset::file_name(&rel)));
-            if tsj.as_ref().is_some_and(|p| p.exists()) { continue; }
+            // The tileset takes the image's name. Either extension at that
+            // name means the name is taken: a copy never gives one image two
+            // tilesets.
+            let tsj = project.join(Path::new(&rel).with_extension("tsj"));
+            let tsx = project.join(Path::new(&rel).with_extension("tsx"));
+            if carried.is_some() && (tsj.exists() || tsx.exists()) { continue; }
+            let tileset_path = carried.as_ref().map(|(format, _)| match format {
+                crate::tiled::Format::Tsj => tsj,
+                crate::tiled::Format::Tsx => tsx,
+            });
             let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -89,8 +97,12 @@ pub fn import_sheet(
             };
             created.push(path.clone());
             file.write_all(&bytes).and_then(|()| file.sync_all()).map_err(|e| e.to_string())?;
-            if let (Some(tsj), Some(bytes)) = (tsj, &carried_bytes) {
-                let mut out = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tsj) {
+            if let (Some(out_path), Some((format, bytes))) = (tileset_path, &carried) {
+                let out_bytes = match format {
+                    crate::tiled::Format::Tsj => bytes.clone(),
+                    crate::tiled::Format::Tsx => crate::tiled::retarget_tsx(bytes, &name)?,
+                };
+                let mut out = match std::fs::OpenOptions::new().write(true).create_new(true).open(&out_path) {
                     Ok(out) => out,
                     // Another program took the pair's name. Try the next one.
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -98,11 +110,13 @@ pub fn import_sheet(
                         created.pop();
                         continue;
                     }
-                    Err(error) => return Err(format!("{}: {error}", tsj.display())),
+                    Err(error) => return Err(format!("{}: {error}", out_path.display())),
                 };
-                created.push(tsj.clone());
-                out.write_all(bytes).and_then(|()| out.sync_all()).map_err(|e| format!("{}: {e}", tsj.display()))?;
-                crate::tileset::retarget(&project, &rel)?;
+                created.push(out_path.clone());
+                out.write_all(&out_bytes).and_then(|()| out.sync_all()).map_err(|e| format!("{}: {e}", out_path.display()))?;
+                if *format == crate::tiled::Format::Tsj {
+                    crate::tileset::retarget(&project, &rel)?;
+                }
             }
             book.sheets.insert(rel.clone(), side.clone());
             return Ok(rel);
@@ -136,13 +150,26 @@ pub fn relocate(root: &Path, old: &str, new: &str, copy: bool) -> Result<(), Str
     sidecar::load_book(root)?;
     let directory = root.join(old).is_dir();
     if directory && copy { return Err("Copy folders one file at a time.".into()); }
-    // The Tiled tileset beside an image travels with it, so a rename never
-    // leaves a `.tsj` behind. A folder carries its own.
+    // The Tiled tileset beside an image travels with it, in the form it came
+    // in, so a rename never leaves the pair behind. A folder carries its own.
     let old_tsj = crate::tileset::path(root, old);
     let new_tsj = crate::tileset::path(root, new);
+    let old_tsx = root.join(Path::new(old).with_extension("tsx"));
+    let new_tsx = root.join(Path::new(new).with_extension("tsx"));
     let tsj = !directory && old_tsj.is_file();
-    if tsj && new_tsj.exists() {
-        return Err(format!("{} exists", new_tsj.strip_prefix(root).unwrap_or(&new_tsj).display()));
+    let tsx = !directory && old_tsx.is_file();
+    if tsj && tsx {
+        return Err(format!("{old} has a TSJ and a TSX. Move one of them first; two tilesets for one image is not a state this tool writes."));
+    }
+    let tileset = if tsj {
+        Some((old_tsj.clone(), new_tsj.clone(), true))
+    } else if tsx {
+        Some((old_tsx.clone(), new_tsx.clone(), false))
+    } else {
+        None
+    };
+    if let Some((_, new_path, _)) = &tileset && new_path.exists() {
+        return Err(format!("{} exists", new_path.strip_prefix(root).unwrap_or(new_path.as_path()).display()));
     }
     if let Some(parent) = root.join(new).parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
     if copy { std::fs::copy(root.join(old), root.join(new)).map_err(|e| e.to_string())?; }
@@ -163,40 +190,40 @@ pub fn relocate(root: &Path, old: &str, new: &str, copy: bool) -> Result<(), Str
             Err(undo) => format!("{error}. Cannot restore {old}: {undo}"),
         }
     };
-    if tsj {
+    if let Some((old_path, new_path, json)) = &tileset {
         // Write the tileset under its new name and point it at the new image
         // before the old one goes. A failure leaves the pair as it was.
-        let step = match std::fs::copy(&old_tsj, &new_tsj) {
-            Ok(_) => crate::tileset::retarget(root, new),
-            Err(e) => Err(format!("{}: {e}", new_tsj.display())),
+        let step = match std::fs::copy(old_path, new_path) {
+            Ok(_) => if *json { crate::tileset::retarget(root, new) } else { crate::tiled::retarget_tsx_file(root, new) },
+            Err(e) => Err(format!("{}: {e}", new_path.display())),
         };
         if let Err(error) = step {
-            let _ = std::fs::remove_file(&new_tsj);
+            let _ = std::fs::remove_file(new_path);
             let undo = undo_image();
             return Err(failed(error, undo));
         }
-        if !copy && let Err(error) = std::fs::remove_file(&old_tsj) {
-            let _ = std::fs::remove_file(&new_tsj);
+        if !copy && let Err(error) = std::fs::remove_file(old_path) {
+            let _ = std::fs::remove_file(new_path);
             let undo = undo_image();
-            return Err(failed(format!("{}: {error}", old_tsj.display()), undo));
+            return Err(failed(format!("{}: {error}", old_path.display()), undo));
         }
     }
     let result = if directory { sidecar::move_prefix(root, old, new) } else { sidecar::move_entry(root, old, new, copy) };
     if let Err(error) = result {
-        let undo_tsj: Result<(), String> = if !tsj {
-            Ok(())
-        } else if copy {
-            remove_if_present(&new_tsj).map_err(|e| e.to_string())
-        } else {
-            std::fs::rename(&new_tsj, &old_tsj).map_err(|e| e.to_string())
-                .and_then(|()| crate::tileset::retarget(root, old))
+        let undo_tileset: Result<(), String> = match &tileset {
+            None => Ok(()),
+            Some((_, new_path, _)) if copy => remove_if_present(new_path).map_err(|e| e.to_string()),
+            Some((old_path, new_path, json)) => std::fs::rename(new_path, old_path).map_err(|e| e.to_string())
+                .and_then(|()| if *json { crate::tileset::retarget(root, old) } else { crate::tiled::retarget_tsx_file(root, old) }),
         };
         let undo_image = undo_image().map_err(|e| e.to_string());
         let mut message = error;
-        for (what, undo) in [(old_tsj.display().to_string(), undo_tsj), (old.to_string(), undo_image)] {
-            if let Err(undo) = undo {
-                message = format!("{message}. Cannot restore {what}: {undo}");
-            }
+        if let Some((old_path, _, _)) = &tileset
+            && let Err(undo) = undo_tileset {
+            message = format!("{message}. Cannot restore {}: {undo}", old_path.display());
+        }
+        if let Err(undo) = undo_image {
+            message = format!("{message}. Cannot restore {old}: {undo}");
         }
         return Err(message);
     }
@@ -223,6 +250,8 @@ pub fn remove(root: &Path, rels: &[String]) -> Result<(), String> {
                 std::fs::remove_file(&path).map_err(|e| format!("{rel}: {e}"))?;
                 let tsj = crate::tileset::path(root, rel);
                 remove_if_present(&tsj).map_err(|e| format!("{}: {e}", tsj.display()))?;
+                let tsx = root.join(Path::new(rel).with_extension("tsx"));
+                remove_if_present(&tsx).map_err(|e| format!("{}: {e}", tsx.display()))?;
             }
             book.sheets.retain(|key, _| key != rel && !key.starts_with(&format!("{rel}/")));
             sidecar::forget_quantize(&mut book.quantize, rel);
@@ -324,10 +353,10 @@ mod tests {
         assert!(!library.0.join(sidecar::BOOK).exists());
     }
 
-    /// A TSJ travels with the copy and takes the copied image's name, and the
-    /// grid it states goes into the book. A TSX stays behind with a note.
+    /// A tileset travels with the copy and takes the copied image's name, and
+    /// the grid it states goes into the book. A TSX keeps every field.
     #[test]
-    fn a_copy_carries_its_tsj_and_leaves_a_tsx_behind() {
+    fn a_copy_carries_its_tsj_or_tsx() {
         let (library, project) = (Folder::new(), Folder::new());
         import_fixture(&library.0);
         std::fs::create_dir_all(library.0.join("Tiles")).unwrap();
@@ -358,16 +387,22 @@ mod tests {
         let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(project.0.join("tree.tsj")).unwrap()).unwrap();
         assert_eq!(kept["image"], "tree.png");
 
-        // An old XML tileset stays in the library, and the copy says so.
+        // An XML tileset travels too, and keeps the fields this reader does
+        // not model. The copy says that Tiled reads it, not this panel.
         std::fs::write(library.0.join("Tiles/tree.tsx"),
             r#"<tileset name="Tree" tilewidth="4" tileheight="8" columns="3" tilecount="6">
                  <image source="../pack/tree.png" width="16" height="16"/>
+                 <wangsets><wangset name="walls" type="corner" tile="-1"/></wangsets>
                </tileset>"#).unwrap();
         let old = crate::tiled::read(&library.0, "Tiles/tree.tsx").unwrap();
         let third = import_sheet(&library.0, &project.0, "pack/tree.png", "", [8, 8], Some(&old)).unwrap();
         assert_eq!(third.rel, "tree copy 2.png");
-        assert!(third.note.unwrap().contains("stayed in the library"));
+        assert!(third.note.unwrap().contains("travelled beside the copy"));
         assert!(!project.0.join("tree copy 2.tsj").exists());
+        let copied = std::fs::read_to_string(project.0.join("tree copy 2.tsx")).unwrap();
+        assert!(copied.contains(r#"<image source="tree copy 2.png""#), "{copied}");
+        assert!(copied.contains("<wangsets>"), "a field this reader does not model survives");
+        assert!(copied.contains(r#"name="Tree""#), "the rest of the file is byte for byte");
     }
 
     #[test]
@@ -432,6 +467,37 @@ mod tests {
         std::fs::write(dir.0.join("other.tsj"), b"{}").unwrap();
         assert!(relocate(&dir.0, "oak.png", "other.png", false).unwrap_err().contains("other.tsj exists"));
         assert!(dir.0.join("oak.png").is_file() && dir.0.join("oak.tsj").is_file(), "a refused move touches nothing");
+
+        std::fs::write(dir.0.join("oak.tsx"), b"<tileset/>").unwrap();
+        assert!(relocate(&dir.0, "oak.png", "third.png", false).unwrap_err().contains("has a TSJ and a TSX"));
+        assert!(dir.0.join("oak.png").is_file() && dir.0.join("oak.tsj").is_file());
+    }
+
+    #[test]
+    fn a_tsx_moves_copies_and_goes_with_its_image() {
+        let dir = Folder::new();
+        std::fs::write(dir.0.join("tree.png"), b"fixture").unwrap();
+        std::fs::write(dir.0.join("tree.tsx"),
+            r#"<tileset name="Tree" tilewidth="16" tileheight="16" columns="2" tilecount="4">
+                 <image source="tree.png" width="32" height="32"/>
+                 <wangsets><wangset name="walls" type="corner" tile="-1"/></wangsets>
+               </tileset>"#).unwrap();
+        sidecar::store_entry(&dir.0, "tree.png", &Sidecar { tile: Some(Pair::of([16, 16])), ..Default::default() }).unwrap();
+
+        relocate(&dir.0, "tree.png", "oak.png", false).unwrap();
+        assert!(!dir.0.join("tree.tsx").exists());
+        let moved = std::fs::read_to_string(dir.0.join("oak.tsx")).unwrap();
+        assert!(moved.contains(r#"<image source="oak.png""#), "{moved}");
+        assert!(moved.contains("<wangsets>"), "the fields this reader does not model travel too");
+
+        relocate(&dir.0, "oak.png", "copy.png", true).unwrap();
+        let copied = std::fs::read_to_string(dir.0.join("copy.tsx")).unwrap();
+        assert!(copied.contains(r#"<image source="copy.png""#), "{copied}");
+        assert_eq!(std::fs::read_to_string(dir.0.join("oak.tsx")).unwrap(), moved, "the original keeps its file");
+
+        remove(&dir.0, &["copy.png".into()]).unwrap();
+        assert!(!dir.0.join("copy.tsx").exists());
+        assert!(dir.0.join("oak.tsx").is_file());
     }
 
     #[test]

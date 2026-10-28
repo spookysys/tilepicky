@@ -2,8 +2,9 @@
 
 Status: phases 1 and 2 are implemented on 2026-10-28. That is the reader,
 the pairing, the grid precedence, the three filters, the copy fix, the
-read-only inspector, and the cross-links. Phase 3 and the later phases are
-proposals; each section below says which one it is.
+read-only inspector, and the cross-links. Phase 3 has begun: a copied `.tsx`
+travels with its image and keeps every field. The rest is a proposal; each
+section below says which one it is.
 
 The library shows the Tiled tilesets of a pack beside the images they use.
 A person can find a tileset, read its data, and copy it to a project.
@@ -227,9 +228,12 @@ because the pack uses attributes, nested `tile` elements, and entities in
 names.
 
 A `.tsj` that a copy carries keeps every field, because the copy moves the
-bytes and rewrites only `image`. A `.tsx` stays in the library, and the
-status line says so. Converting one is a separate action, with a backup.
-Two files with two grids for one image is the failure to avoid.
+bytes and rewrites only `image`. A `.tsx` travels the same way: the copy
+rewrites only the `image` attribute, so the fields this reader does not
+model survive. The project's tile panel reads `.tsj` only, so it leaves a
+copied `.tsx` read-only and the status line says why. Converting it on the
+way would drop wang sets, terrains, and transformations, and a second
+tileset beside one image is the failure to avoid.
 
 ### The pairing
 
@@ -276,6 +280,8 @@ sidecar is wrong.
 - Edit library tilesets in place. Inspect and copy, never fork a pack.
 - Evaluate wang or terrain rules. Show the data, do not paint with it.
 - Convert a format during a copy, or write a second tileset beside one.
+- Read a project `.tsx` in the tile panel. A copied `.tsx` is read-only
+  there.
 - Show embedded tilesets of a map as cards. That is a map object with a
   `firstgid`, not a sheet.
 
@@ -286,8 +292,9 @@ sidecar is wrong.
 2. Done (2026-10-28): the inspector tab, grid agreement and `Use the
    tileset grid`, data counts, the collection tile list and its links, the
    health block, and the cross-links with one step back.
-3. The rules for a project that has a `.tsx`: convert on request, or report
-   why not. The library reads both formats already.
+3. Partly done (2026-10-29): a copied `.tsx` travels without losing a field,
+   moves and deletes with its image, and the project's tile panel refuses
+   edits with the reason. Reading a project `.tsx` in that panel is the rest.
 4. Search words (`animated`, `collision`, `wang`, `collection`, class names,
    property names), the overlay marks, the tileset-level fields, and the map
    list.
@@ -298,8 +305,11 @@ sidecar is wrong.
 `files::import_sheet` copies the image bytes, the book entry, and the grid
 that the tileset states. A `.tsj` travels beside the copied image, under
 the copied image's name, and is retargeted to it. Properties, animations,
-and collision reach the project. A `.tsx` stays in the library, and the
-status line says so: this tool does not convert yet.
+and collision reach the project. A `.tsx` travels too, and the copy rewrites
+only its `image` attribute, so every field survives. It moves, copies, and
+deletes with its image, like a `.tsj`. The project's tile panel reads `.tsj`
+only: it refuses edits and says why, rather than write a second tileset
+beside the `.tsx`.
 
 A name that a tileset already holds is skipped, so a copy never overwrites
 a tileset. The image, the tileset, and the book entry are chosen together

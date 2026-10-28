@@ -33,7 +33,7 @@ pub fn show(ui: &mut egui::Ui, sheet: &mut Sheet, keys: bool) {
         // nothing to edit: a change could not reach the disk.
         if let Some(error) = &sheet.props_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
-            ui.weak("Saving is refused until the file reads. Fix it outside Tilepicky, then open the sheet again.");
+            ui.weak("Saving is refused. A broken file needs a fix outside Tilepicky; a TSX stays read-only here.");
             return;
         }
         if let Err(reason) = tileset::check(sheet.tileset_grid()) {

@@ -265,6 +265,15 @@ pub fn path(dir: &Path, rel: &str) -> PathBuf {
 /// save never writes over a file this tool did not understand.
 pub fn load(dir: &Path, rel: &str) -> Result<Props, String> {
     let path = path(dir, rel);
+    if !path.exists() {
+        // A copied TSX is the truth for Tiled, and this tool cannot write XML.
+        // Refuse the panel instead of writing a second tileset besides it.
+        let tsx = Path::new(rel).with_extension("tsx");
+        if dir.join(&tsx).is_file() {
+            return Err(format!("{} is a Tiled TSX. Tilepicky writes TSJ only, so this sheet's tile properties stay read-only here; edit the TSX in Tiled.",
+                tsx.display()));
+        }
+    }
     match crate::storage::read::<Value>(&path)? {
         Value::Null => Ok(Props::default()),
         Value::Object(map) => Ok(Props::from_tileset(&map)),
@@ -472,6 +481,18 @@ mod tests {
         assert!(load(&dir.0, "tiles.png").is_err());
         assert!(write(&dir.0, "tiles.png", grid(2, 2), &Props::default()).is_err());
         assert_eq!(std::fs::read(dir.0.join("tiles.tsj")).unwrap(), b"{broken");
+    }
+
+    /// A TSX beside the sheet is the truth for Tiled. The panel stays
+    /// read-only instead of writing a second tileset beside it.
+    #[test]
+    fn a_tsx_beside_the_sheet_makes_the_panel_read_only() {
+        let dir = Folder::new();
+        std::fs::write(dir.0.join("tiles.png"), b"").unwrap();
+        std::fs::write(dir.0.join("tiles.tsx"), b"<tileset/>").unwrap();
+        let error = load(&dir.0, "tiles.png").unwrap_err();
+        assert!(error.contains("writes TSJ only"), "{error}");
+        assert!(!dir.0.join("tiles.tsj").exists());
     }
 
     #[test]

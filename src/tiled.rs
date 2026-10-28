@@ -281,6 +281,102 @@ pub fn read(root: &Path, rel: &str) -> Result<Tiled, String> {
     Ok(tiled)
 }
 
+/// The bytes of a TSX with its top-level image pointed at `image`. A copy
+/// moves the tileset beside the copied image. Every other byte stays as it
+/// was, so the fields this reader does not model, such as wang sets and
+/// terrains, survive the copy.
+pub fn retarget_tsx(bytes: &[u8], image: &str) -> Result<Vec<u8>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("The TSX is not UTF-8: {e}"))?;
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(false);
+    let mut in_tile = false;
+    loop {
+        let start = reader.buffer_position() as usize;
+        let event = reader.read_event().map_err(|e| format!("The TSX cannot be read: {e}"))?;
+        let end = reader.buffer_position() as usize;
+        let mut top_image = false;
+        match &event {
+            Event::Start(e) => {
+                let name = e.name();
+                if name.as_ref() == "tile" { in_tile = true; }
+                top_image = name.as_ref() == "image" && !in_tile;
+            }
+            Event::Empty(e) => top_image = e.name().as_ref() == "image" && !in_tile,
+            Event::End(e) if e.name().as_ref() == "tile" => in_tile = false,
+            _ => {}
+        }
+        if top_image {
+            let raw = &text[start..end];
+            let at = raw.find('<').ok_or("The TSX image tag is not a tag.")?;
+            let (value_start, value_end) = source_span(&raw[at..])?;
+            let escaped = escape_attr(image);
+            let mut out = String::with_capacity(text.len() + escaped.len());
+            out.push_str(&text[..start + at + value_start]);
+            out.push_str(&escaped);
+            out.push_str(&text[start + at + value_end..]);
+            return Ok(out.into_bytes());
+        }
+        if matches!(&event, Event::Eof) { break; }
+    }
+    Err("The TSX states no image at the top level.".into())
+}
+
+/// Points the TSX beside `rel` at the image's current file name. A missing
+/// file is not an error: the caller moves a pair only when one is there.
+pub fn retarget_tsx_file(dir: &Path, rel: &str) -> Result<(), String> {
+    let path = dir.join(Path::new(rel).with_extension("tsx"));
+    if !path.is_file() { return Ok(()); }
+    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image = Path::new(rel).file_name().and_then(|s| s.to_str()).ok_or("Invalid sheet name")?;
+    let out = retarget_tsx(&bytes, image)?;
+    crate::storage::replace(&path, false, |file| std::io::Write::write_all(file, &out))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The span of the `source` value in one start tag. The parser has already
+/// accepted the document, so this reads the tag's attributes, not the file.
+fn source_span(tag: &str) -> Result<(usize, usize), String> {
+    let bytes = tag.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' && bytes[i] != b'>' { i += 1; }
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= bytes.len() || bytes[i] == b'/' || bytes[i] == b'>' { break; }
+        let key_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' && bytes[i] != b'/' && bytes[i] != b'>' { i += 1; }
+        let key = &tag[key_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= bytes.len() || bytes[i] != b'=' { continue; }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        let quote = *bytes.get(i).ok_or("The TSX image has an unfinished attribute.")?;
+        if quote != b'"' && quote != b'\'' { return Err("The TSX image has an attribute without quotes.".into()); }
+        i += 1;
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != quote { i += 1; }
+        if i >= bytes.len() { return Err("The TSX image has a value without its closing quote.".into()); }
+        if key == "source" { return Ok((value_start, i)); }
+        i += 1;
+    }
+    Err("The TSX image has no source.".into())
+}
+
+/// A file name as an XML attribute value.
+fn escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// A property value as the panel shows it: a string as itself, anything
 /// else as the JSON text Tiled wrote.
 fn value_text(value: &Value) -> String {
@@ -865,6 +961,30 @@ mod tests {
         let missing = resolve(&dir.0, "Tilesets/atlas.tsx", "../Props/none.png");
         assert_eq!(missing.rel, None);
         assert!(missing.problem.unwrap().contains("not there"));
+    }
+
+    /// A copied TSX changes only the image path, so the fields this reader
+    /// does not model survive the copy.
+    #[test]
+    fn a_copied_tsx_points_at_the_new_image_and_keeps_every_field() {
+        let text = r##"<?xml version="1.0" encoding="UTF-8"?>
+<tileset version="1.9" tiledversion="1.9.2" name="Fences &amp; walls" tilewidth="32" tileheight="32" tilecount="2" columns="2">
+ <image source="../../Tiles/fences &amp; walls.png" width="64" height="32"/>
+ <wangsets><wangset name="walls" type="corner" tile="-1"><wangcolor name="stone" color="#ff0000" tile="-1" probability="1"/></wangset></wangsets>
+ <tile id="0"><image source="single.png"/></tile>
+</tileset>"##;
+        let out = String::from_utf8(retarget_tsx(text.as_bytes(), "fences & walls copy.png").unwrap()).unwrap();
+        assert!(out.contains(r#"<image source="fences &amp; walls copy.png" width="64" height="32"/>"#), "{out}");
+        assert!(out.contains("<wangsets>"), "a field this reader does not model survives");
+        assert!(out.contains(r#"<image source="single.png"/>"#), "an image inside a tile is not the atlas image");
+        assert!(out.contains(r#"name="Fences &amp; walls""#), "the rest of the file is byte for byte");
+    }
+
+    #[test]
+    fn a_tsx_without_a_top_image_is_refused() {
+        let text = r#"<tileset name="c" tilewidth="8" tileheight="8" tilecount="1" columns="1">
+ <tile id="0"><image source="a.png"/></tile></tileset>"#;
+        assert!(retarget_tsx(text.as_bytes(), "b.png").is_err());
     }
 
     /// The pack that this feature was built against. It skips on a machine

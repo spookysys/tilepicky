@@ -511,6 +511,7 @@ Remove the metadata first if you need a different grid. Tiled can remove fields 
 
 The `.tsj` is the authoritative file. Tilepicky reads it when you open the sheet.
 It preserves fields the panel cannot edit, including `editorsettings`, `probability`, and properties of kind `color` or `file`.
+Tilepicky writes `.tsj` only. A `.tsx` beside a project sheet stays as Tiled wrote it, and the tile panel is read-only for that sheet.
 Save As preserves these fields and writes a separate tileset for the new image.
 Reopen the sheet after editing its tileset in Tiled. Do not edit the same tileset in both applications at once.
 A new sheet without metadata needs no tileset file. An existing tileset remains when its last property is removed.
@@ -604,6 +605,7 @@ A tilesheet that you name above the project tree takes the tile size that the pr
 To copy a whole sheet, drag its Library thumbnail into the Project tree.
 You can also hold a Library file-tree row, then drag it into the Project tree.
 Dropping onto a project folder copies the complete image file and its grid, labels, animations, and provenance.
+A `.tsj` or `.tsx` tileset from the library travels with the copy. A copied `.tsx` keeps every field, but the tile panel leaves it read-only because Tilepicky writes `.tsj` only; edit that file in Tiled.
 Existing files stay unchanged. Repeated copies receive names such as `sheet copy.png`.
 The inspector's **Copy sheet to project** button copies into the project root.
 
@@ -630,7 +632,7 @@ File trees accept the following mouse and keyboard actions:
 | Right-click folder | Context menu: new folder, rename, delete, reveal in file manager, copy path |
 | Right-click empty area | Context menu: new folder, refresh tree |
 
-Library files are read-only and cannot be moved, renamed, or deleted within Tilepicky. Moving project files updates references in `tilepicky.json`. The Tiled tileset of a project sheet (`.tsj`) moves, copies, and deletes with its image.
+Library files are read-only and cannot be moved, renamed, or deleted within Tilepicky. Moving project files updates references in `tilepicky.json`. The Tiled tileset of a project sheet (`.tsj` or `.tsx`) moves, copies, and deletes with its image.
 
 ## Settings
 
