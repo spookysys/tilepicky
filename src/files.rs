@@ -24,6 +24,8 @@ pub fn import_sheet(library: &Path, project: &Path, source_rel: &str, target_dir
     let bytes = std::fs::read(&source).map_err(|e| e.to_string())?;
     let image = image::load_from_memory(&bytes).map_err(|e| format!("Cannot read {source_rel}: {e}"))?.to_rgba8();
     let mut side = source_book.sheets.get(source_rel).cloned().unwrap_or_default();
+    side.used_in_maps = Some(false);
+    side.map_changes = None;
     if side.tile.is_none() {
         let (x, y) = crate::detect::grid(&image);
         let tile = [if x.tile == 0 { default_tile[0].max(1) } else { x.tile },
@@ -233,7 +235,9 @@ mod tests {
             assert_eq!(std::fs::read(project.0.join(expected)).unwrap(), std::fs::read(library.0.join("pack/tree.png")).unwrap());
             let mut copied = sidecar::load_book(&project.0).unwrap().sheets[expected].clone();
             assert_eq!(copied.provenance.remove(0), sidecar::Provenance { source: "pack/tree.png".into(), rects: vec![[0, 0, 16, 16]] });
-            assert_eq!(copied, side);
+            assert_eq!(copied.used_in_maps, Some(false));
+            assert!(copied.map_changes.is_none());
+            assert_eq!(copied, Sidecar { used_in_maps: Some(false), map_changes: None, ..side.clone() });
         }
         assert_eq!(std::fs::read(project.0.join("plants/tree.png")).unwrap(), b"keep");
         assert_eq!(std::fs::read(library.0.join(sidecar::BOOK)).unwrap(), source_book);

@@ -30,6 +30,7 @@ fn fixture() -> Fixture {
     app.library.open(&ctx, 0).unwrap();
     app.project.open(&ctx, 0).unwrap();
     app.project.sheet.as_mut().unwrap().tile = [16, 16];
+    app.project.sheet.as_mut().unwrap().side.used_in_maps = Some(false);
     app.library.sheet.as_mut().unwrap().tile = [16, 16];
     app.library.sheet.as_mut().unwrap().sel = Sel::rect((0, 0), (0, 0));
     app.project.sheet.as_mut().unwrap().sel = Sel::rect((0, 0), (0, 0));

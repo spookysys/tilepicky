@@ -26,7 +26,7 @@ mod labels;
 #[allow(dead_code)]
 mod quant;
 mod quant_panel;
-mod props_panel;
+mod tiled_panel;
 mod bucket;
 mod batch;
 mod storage;
@@ -36,6 +36,7 @@ mod settings;
 mod sheet;
 mod sidecar;
 mod tileset;
+mod map_changes;
 mod tree;
 
 use eframe::egui::{self, Color32, Id, Key, Modifiers, Pos2, Rect, TextureHandle, Vec2};
@@ -238,8 +239,8 @@ struct App {
     /// The color quantization panel: its working setting, target, and the
     /// per-tile pins, plus the cached preview and the paint tool.
     quant_panel: bool,
-    /// The tile-properties panel for Tiled.
-    props_panel: bool,
+    /// Tiled integration: tile properties and map changes.
+    tiled_panel: bool,
     quant_open_rel: Option<String>,
     quant: sidecar::Quantize,
     quant_target: Option<sidecar::QuantizeTarget>,
@@ -529,7 +530,7 @@ impl App {
             legend_prompt: false,
             project_eye: false,
             quant_panel: false,
-            props_panel: false,
+            tiled_panel: false,
             quant_open_rel: None,
             quant: quant_panel::default_setting(),
             quant_target: None,
@@ -1310,8 +1311,12 @@ impl App {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 let old = std::mem::replace(&mut sheet.rel, rel.clone());
+                let map_use = sheet.side.used_in_maps.replace(false);
+                let recording = sheet.side.map_changes.take();
                 if let Err(e) = sheet.save() {
                     sheet.rel = old;
+                    sheet.side.used_in_maps = map_use;
+                    sheet.side.map_changes = recording;
                     return Err(e);
                 }
                 self.status = format!("saved as {rel}");
@@ -1552,6 +1557,7 @@ impl App {
         } else if self.workspace == workspace::Workspace::Build && key(Modifiers::NONE, Key::Tab) {
             self.press_tab(ctx, 1);
         }
+        if self.project.sheet.as_ref().is_some_and(Sheet::map_dialog_open) { return; }
         // Typing beats every shortcut below.
         if ctx.text_edit_focused() {
             return;
@@ -1595,7 +1601,7 @@ impl App {
                 self.clip = Some(b);
                 // A cut clears the cells; only your tilesheet is editable.
                 if cut && self.active == Panel::Project && let Some(sheet) = &mut self.project.sheet {
-                    sheet.clear_selection();
+                    sheet.clear_selection(ctx);
                     self.after_edit();
                 }
             }
@@ -1632,7 +1638,7 @@ impl App {
         if in_half && self.active == Panel::Project && !project_eye
             && (key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace))
             && let Some(sheet) = &mut self.project.sheet {
-            sheet.clear_selection();
+            sheet.clear_selection(ctx);
             self.after_edit();
         }
         if in_half && !eye && key(cmd, Key::A) && let Some(s) = self.sheet_mut(self.active) {
@@ -1651,7 +1657,7 @@ impl App {
             self.project_eye = !self.project_eye;
         }
         if in_half && self.active == Panel::Project && key(Modifiers::NONE, Key::P) {
-            self.props_panel = !self.props_panel;
+            self.tiled_panel = !self.tiled_panel;
         }
         // The arrows move the selection of the sheet that holds the focus.
         // Shift walks one corner and keeps the other; Ctrl steps from one
@@ -1860,7 +1866,7 @@ impl App {
         ai: Option<&mut bool>,
         eye: Option<&mut bool>,
         quant: Option<&mut bool>,
-        props: Option<&mut bool>,
+        tiled: Option<&mut bool>,
     ) -> (Option<Grid>, bool) {
         // The fields read the sheet and the tail takes it, so the numbers
         // the fields show are read here, before the tail borrows it.
@@ -1913,7 +1919,7 @@ impl App {
                 ui.weak(format!("{zoom}x")).on_hover_text(sel.unwrap_or_else(|| "No tile selection".into()));
                 new_grid
             },
-            |ui| Self::header_tail(ui, sheet, ai, eye, quant, props, name, cell),
+            |ui| Self::header_tail(ui, sheet, ai, eye, quant, tiled, name, cell),
         )
     }
 
@@ -1928,7 +1934,7 @@ impl App {
         ai: Option<&mut bool>,
         eye: Option<&mut bool>,
         quant: Option<&mut bool>,
-        props: Option<&mut bool>,
+        tiled: Option<&mut bool>,
         name: String,
         cell: Option<String>,
     ) -> bool {
@@ -1968,10 +1974,10 @@ impl App {
                 }
                 here.push(r);
             }
-            if let Some(props) = props {
-                let r = ui.add_enabled(open, egui::Button::new("🏷").small().selected(*props)).on_hover_text("tile properties for Tiled (P)");
+            if let Some(tiled) = tiled {
+                let r = ui.add_enabled(open, egui::Button::new("🏷").small().selected(*tiled)).on_hover_text("Tiled integration (P)");
                 if r.clicked() {
-                    *props = !*props;
+                    *tiled = !*tiled;
                     clicked = true;
                 }
                 here.push(r);
@@ -2292,6 +2298,10 @@ impl App {
             return;
         }
         if !sheet.set_grid(ctx, t, gap, offset) { return; }
+        self.finish_grid_change(ctx, panel, (t, gap, offset));
+    }
+
+    fn finish_grid_change(&mut self, ctx: &egui::Context, panel: Panel, (t, gap, offset): Grid) {
         let cleared = if panel == Panel::Project {
             match self.quant_clear_grid_pins() {
                 Ok(cleared) => cleared,
@@ -2645,7 +2655,7 @@ impl App {
         let live = keys == (Panel::Project, Spot::Sheet);
         let clicked = Self::sheet_toolbar(ui, "canvas toolbar", |ui| {
             let (grid, clicked) = Self::sheet_header(ui, "Canvas", live, false, self.project.sheet.as_mut(), None,
-                Some(&mut self.project_eye), Some(&mut self.quant_panel), Some(&mut self.props_panel));
+                Some(&mut self.project_eye), Some(&mut self.quant_panel), Some(&mut self.tiled_panel));
             out.grid = grid; clicked
         });
         if clicked {
@@ -2681,11 +2691,11 @@ impl App {
                     out.anim = Self::animation_panel(ui, s, false, keys == (Panel::Project, Spot::Side));
                 });
             }
-            if self.props_panel {
-                egui::Panel::right("tile properties").resizable(true).default_size(300.0).show(ui, |ui| {
+            if self.tiled_panel {
+                egui::Panel::right("Tiled integration").resizable(true).default_size(300.0).show(ui, |ui| {
                     set_pane(ui, (Panel::Project, Spot::Side));
-                    if eye { ui.weak("Turn off Inspect mode to edit properties."); }
-                    ui.add_enabled_ui(!eye, |ui| props_panel::show(ui, s, keys == (Panel::Project, Spot::Side)));
+                    if eye { ui.weak("Turn off Inspect mode to edit Tiled settings."); }
+                    ui.add_enabled_ui(!eye, |ui| tiled_panel::show(ui, s, keys == (Panel::Project, Spot::Side)));
                 });
             }
             set_pane(ui, (Panel::Project, Spot::Sheet));
@@ -2698,7 +2708,7 @@ impl App {
             out.drag = ev.drag_block;
             out.quant_cell = ev.quant_cell;
             if ev.delete {
-                s.clear_selection();
+                s.clear_selection(ctx);
                 out.deleted = true;
             }
         } else {
@@ -3372,6 +3382,18 @@ impl App {
         if self.config_open && ctx.input(|i| i.viewport().close_requested()) {
             self.settings_save_result(self.settings.save(), self.keys.save());
             if !self.settings_error.is_empty() { ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose); }
+        }
+        let was_recording = self.project.sheet.as_ref().and_then(|s| s.side.map_changes.as_ref()).is_some_and(|r| r.enabled);
+        let map_before = self.project.sheet.as_ref().map(|s| (s.quant_revision, (s.tile, s.gap, s.offset)));
+        if let Some(sheet) = &mut self.project.sheet
+            && let Some(message) = sheet.map_dialogs(ctx) { self.status = message; }
+        if !was_recording && self.project.sheet.as_ref().and_then(|s| s.side.map_changes.as_ref()).is_some_and(|r| r.enabled) {
+            self.tiled_panel = true;
+        }
+        let map_after = self.project.sheet.as_ref().map(|s| (s.quant_revision, (s.tile, s.gap, s.offset)));
+        if let (Some(before), Some(after)) = (map_before, map_after) && before.0 != after.0 {
+            if before.1 != after.1 { self.finish_grid_change(ctx, Panel::Project, after.1); }
+            else { self.after_edit(); }
         }
         self.dialogs(ctx);
 
@@ -4140,6 +4162,7 @@ mod tests {
         use sidecar::TileDepth;
         let mut b = bench(&[], &["canvas.png"]);
         b.open_project("canvas.png");
+        b.app.project.sheet.as_mut().unwrap().side.used_in_maps = Some(false);
         b.app.project.sheet.as_mut().unwrap().set_grid(&b.ctx, [4, 4], [0, 0], [0, 0]);
         let original = b.app.project.sheet.as_ref().unwrap().img.clone();
         b.app.quant_paint((0, 0), Tool::Force4);

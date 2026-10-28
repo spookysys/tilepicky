@@ -11,6 +11,7 @@ The [repository guide](../AGENTS.md) describes the source layout and build check
 
 ## Current test reports
 
+The [map recording report](map-recording-results.md) covers the recording controls and explicit map updates.
 The [tilesheet-to-Tiled workflow report](tileset-workflow-results.md) covers the October 28 property editing and save checks.
 The [open issues](issues.md) separate confirmed limits from earlier findings that still need verification.
 The [structured play-test report](playtest-plan.md) records the October 7 UI cases and fixes.

@@ -512,6 +512,7 @@ impl ProvMap {
 }
 
 /// What Ctrl+C carries: pixels plus the origin of every cell.
+#[derive(Clone)]
 pub struct Block {
     /// The tile size of the sheet the block was copied from.
     pub tile: [u32; 2],
@@ -541,6 +542,7 @@ impl Block {
 /// makes the canvas smaller therefore does not lose the pixels: a step that
 /// makes it larger again gives them back.
 struct CanvasDrag {
+    dirty: bool,
     /// Which of width and height follow the pointer.
     wh: (bool, bool),
     img: RgbaImage,
@@ -550,7 +552,11 @@ struct CanvasDrag {
     cols: u32,
 }
 
+#[path = "map_edits.rs"]
+mod map_edits;
+
 pub struct Sheet {
+    map_ui: map_edits::MapUi,
     pub rel: String,
     /// A sheet of the library: a copy names it as the source of its cells.
     /// A tilesheet of the project only passes on the sources it carries.
@@ -741,7 +747,7 @@ impl Sheet {
         let img = RgbaImage::new(cols * tile[0], rows * tile[1]);
         // The tile size of a new sheet is chosen, not read: it goes in as an
         // entry, so nothing tries to find a grid in an empty picture.
-        let side = Sidecar { tile: Some(Pair::of(tile)), ..Sidecar::default() };
+        let side = Sidecar { tile: Some(Pair::of(tile)), used_in_maps: Some(false), ..Sidecar::default() };
         Self::from_image(ctx, dir, rel, tile, img, side)
     }
 
@@ -756,6 +762,7 @@ impl Sheet {
         let offset = clamp_offset(side.offset.map(Pair::xy).unwrap_or(found), tile, gap);
         let prov = ProvMap::from_side(img.width(), img.height(), &side.provenance);
         let mut s = Self {
+            map_ui: Default::default(),
             rel: rel.to_string(),
             library: false,
             dir: dir.to_path_buf(),
@@ -1376,6 +1383,7 @@ impl Sheet {
                         // The undo step goes on the stack when the drag ends;
                         // until then the copy is the base of every step.
                         self.canvas_resize = Some(CanvasDrag {
+                            dirty: self.dirty,
                             wh,
                             img: self.img.clone(),
                             prov: self.prov.clone(),
@@ -1418,8 +1426,14 @@ impl Sheet {
                 self.resize = None;
                 if let Some(d) = self.canvas_resize.take() {
                     // The whole drag is one undo step: the canvas before it.
-                    let grid = (self.tile, self.gap, self.offset);
-                    self.push_undo(Step { side: d.side, props: d.props, grid, pixels: Some((d.img, d.prov)), grid_only: false, property_edit: None });
+                    let size = (self.cols(), self.rows());
+                    self.img = d.img;
+                    self.prov = d.prov;
+                    self.side = d.side;
+                    self.props = d.props;
+                    self.dirty = d.dirty;
+                    self.upload(ui.ctx());
+                    self.resize_canvas(ui.ctx(), size.0, size.1);
                     event.resized = true;
                 }
             }
@@ -1718,6 +1732,12 @@ impl Sheet {
     fn restore(&mut self, ctx: &egui::Context, mut step: Step) {
         // The label belongs to the last labeling operation, not to the edit history.
         step.side.label = self.side.label.take();
+        // Map protection and update receipts describe user choices and files outside Undo.
+        step.side.used_in_maps = self.side.used_in_maps;
+        if let (Some(now), Some(then)) = (&self.side.map_changes, &mut step.side.map_changes) {
+            then.enabled = now.enabled;
+            then.updates = now.updates.clone();
+        }
         self.side = step.side;
         self.props = step.props;
         (self.tile, self.gap, self.offset) = step.grid;
@@ -1840,14 +1860,14 @@ impl Sheet {
     }
 
     pub fn paste(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) -> Result<(), String> {
-        self.paste_mode(ctx, at, block, false)
+        self.paste_guarded(ctx, at, block, false)
     }
 
     /// Pastes the block over what is already there: each source pixel that is
     /// not fully transparent is laid on the pixel beneath it, and a
     /// transparent one lets the sheet show through. One undo step.
     pub fn paste_overlay(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block) -> Result<(), String> {
-        self.paste_mode(ctx, at, block, true)
+        self.paste_guarded(ctx, at, block, true)
     }
 
     fn paste_mode(&mut self, ctx: &egui::Context, at: (u32, u32), block: &Block, blend: bool) -> Result<(), String> {
@@ -1868,7 +1888,7 @@ impl Sheet {
     }
 
     /// Clears `from`, then puts the block at `at`: one undo step.
-    pub fn move_block(&mut self, ctx: &egui::Context, from: &Sel, at: (u32, u32), block: &Block) {
+    fn move_block_raw(&mut self, ctx: &egui::Context, from: &Sel, at: (u32, u32), block: &Block) {
         self.snapshot();
         let before = self.img.dimensions();
         self.clear_cells(from);
@@ -1889,7 +1909,7 @@ impl Sheet {
 
     /// Exchanges the block with the cells it lands on: those cells travel
     /// back to the place the block came from. One undo step.
-    pub fn swap_block(&mut self, ctx: &egui::Context, from: &Sel, at: (u32, u32), block: &Block) {
+    fn swap_block_raw(&mut self, ctx: &egui::Context, from: &Sel, at: (u32, u32), block: &Block) {
         let Some(b) = from.bounds() else { return };
         // The cells the block covers when it lands, in its own shape.
         let mut there = Sel::default();
@@ -1901,7 +1921,7 @@ impl Sheet {
             }
         }
         let Some(other) = self.copy_sel(&there) else { return };
-        self.move_block(ctx, from, at, block);
+        self.move_block_raw(ctx, from, at, block);
         self.put((b.x0, b.y0), &other, false);
         let (x0, y0, _, _) = self.cell_img_rect(b.x0, b.y0);
         let (_, _, x1, y1) = self.cell_img_rect(b.x1, b.y1);
@@ -1910,7 +1930,7 @@ impl Sheet {
         self.sel = there;
     }
 
-    pub fn clear_selection(&mut self) {
+    fn clear_selection_raw(&mut self) {
         if self.sel.is_empty() {
             return;
         }
@@ -1925,6 +1945,7 @@ impl Sheet {
     }
 
     pub fn undo(&mut self, ctx: &egui::Context) {
+        if !self.map_history_allowed(false) { return; }
         if let Some(step) = self.undo.pop() {
             let now = self.step(step.pixels.is_some());
             self.redo.push(now);
@@ -1934,6 +1955,7 @@ impl Sheet {
 
     /// Takes a step that was taken back again.
     pub fn redo(&mut self, ctx: &egui::Context) {
+        if !self.map_history_allowed(true) { return; }
         if let Some(step) = self.redo.pop() {
             let now = self.step(step.pixels.is_some());
             self.undo.push(now);
@@ -2133,7 +2155,7 @@ impl Sheet {
     /// animations are pixel strips and never cared. Derived names are
     /// cleared until the indexer renames them at the new grid. Returns
     /// false when the grid stays as it was.
-    pub fn set_grid(&mut self, ctx: &egui::Context, tile: [u32; 2], gap: [u32; 2], offset: [i32; 2]) -> bool {
+    fn set_grid_raw(&mut self, ctx: &egui::Context, tile: [u32; 2], gap: [u32; 2], offset: [i32; 2]) -> bool {
         if tile[0] == 0 || tile[1] == 0 {
             return false;
         }
@@ -2193,7 +2215,7 @@ impl Sheet {
 
     /// Cuts empty columns on the right and empty rows at the bottom. At least
     /// one cell stays.
-    pub fn trim(&mut self, ctx: &egui::Context) {
+    fn trim_size(&self) -> Option<(u32, u32)> {
         let [tw, th] = self.tile;
         let property_ids = self.props.ids();
         let used = |x: u32, y: u32| {
@@ -2224,16 +2246,7 @@ impl Sheet {
             new_rows = new_rows.max(r.3.div_ceil(self.pitch()[1]));
         }
         let (new_cols, new_rows) = (new_cols.max(1), new_rows.max(1));
-        if new_cols == cols && new_rows == rows {
-            return;
-        }
-        self.snapshot();
-        self.props = self.props.resized(cols, new_cols, new_rows);
-        let (w, h) = self.img_size_for(new_cols, new_rows);
-        self.img = image::imageops::crop_imm(&self.img, 0, 0, w, h).to_image();
-        self.prov = self.prov.resized(self.img.width(), self.img.height());
-        self.sel = Sel::default();
-        self.upload(ctx);
+        (new_cols != cols || new_rows != rows).then_some((new_cols, new_rows))
     }
 
     /// Writes the image and the book entry. A tilesheet's entry always names
@@ -2246,7 +2259,7 @@ impl Sheet {
         // Validate the tileset before writing the image. Each file is replaced
         // atomically, but a disk failure can still interrupt the set of writes.
         let tsj = !self.library && !self.rel.is_empty()
-            && (self.props.needs_file() || crate::tileset::path(&self.dir, &self.rel).is_file());
+            && (self.side.used_in_maps == Some(true) || self.props.needs_file() || crate::tileset::path(&self.dir, &self.rel).is_file());
         if tsj {
             if let Some(error) = &self.props_error {
                 return Err(format!("The sheet is not saved. {error}"));
@@ -2407,7 +2420,7 @@ mod tests {
         assert_eq!(sheet.props.common(&[2], "terrain"), Some(Prop::Str("grass".into())));
         sheet.redo(&ctx);
         sheet.sel = Sel::rect((2, 1), (2, 1));
-        sheet.clear_selection();
+        sheet.clear_selection(&ctx);
         assert!(sheet.props.is_empty());
         sheet.undo(&ctx);
         sheet.save().unwrap();
@@ -2495,6 +2508,7 @@ mod tests {
         sheet.undo(&ctx);
         assert_eq!(sheet.props.common(&[5], "solid"), Some(Prop::Bool(true)));
         sheet.canvas_resize = Some(CanvasDrag {
+            dirty: sheet.dirty,
             wh: (true, true), img: sheet.img.clone(), prov: sheet.prov.clone(),
             side: sheet.side.clone(), props: sheet.props.clone(), cols: sheet.cols(),
         });
@@ -2589,6 +2603,7 @@ mod tests {
         let after_open = sidecar::load_book(&dir).unwrap().sheets.get("flat.png").cloned();
 
         let mut chosen = Sheet::open(&ctx, &dir, "flat.png", [8, 8], after_open.clone().unwrap()).unwrap();
+        chosen.side.used_in_maps = Some(false);
         chosen.set_grid(&ctx, [24, 24], [0, 0], [0, 0]);
         chosen.save_entry().unwrap();
         let after_choice = sidecar::load_book(&dir).unwrap().sheets.get("flat.png").cloned();

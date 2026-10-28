@@ -486,7 +486,7 @@ A failed write preserves the previous output file. PNG does not store the target
 
 ## Tile properties for Tiled
 
-The tag button in the tilesheet header opens the **Tile properties** panel. Press `P` to open or close it. The panel gives tiles the properties a game engine reads: a name, and a value of kind `string`, `int`, `float`, or `bool`.
+The tag button in the tilesheet header opens the **Tiled** side panel. Press `P` to open or close it. The panel gives tiles the properties a game engine reads: a name, and a value of kind `string`, `int`, `float`, or `bool`.
 
 Tilepicky stores properties in a Tiled tileset beside the image: `town.png` has `town.tsj`.
 Press `Ctrl+S` to save both files. In Tiled, use **Map > Add Tileset...** to add the `.tsj` to a map.
@@ -500,7 +500,7 @@ Copy, cut, move, swap, and delete carry tile properties with the pixels.
 A normal paste replaces the destination metadata. **Shift-drag merges pixels and keeps the destination metadata.**
 Tiles with metadata require matching tile sizes for a normal paste. Pixel-only blocks can still use different tile sizes.
 Canvas resizing updates tile IDs without changing cell coordinates. Trim keeps transparent tiles that have metadata.
-Existing maps reference tile IDs. After rearranging a sheet already used in a map, update that map in Tiled.
+Existing maps reference tile IDs. Use [map change recording](#map-change-recording) before rearranging a sheet that maps already use.
 
 Set the grid before assigning properties. Tilepicky refuses grid changes while tiles have metadata, because they could assign metadata to different pixels.
 Remove the metadata first if you need a different grid. Tiled can remove fields that this panel cannot edit.
@@ -515,6 +515,44 @@ Tiled cannot represent negative margins, unequal offsets, or unequal gaps on the
 Tilepicky checks the grid and reads the destination tileset before writing the image.
 An invalid tileset stops the save and remains unchanged. The panel shows the error.
 Each file is replaced atomically. A disk failure can still interrupt a save between files; the error identifies the incomplete write.
+
+## Map change recording
+
+New sheets have no map warnings. When maps start using a sheet, open the **Tiled** side panel and enable **Used in maps**.
+Existing sheets without this setting ask before the first edit that changes tile references.
+
+The warning offers **Record**, **No maps**, and **Cancel**.
+**Record** starts recording and applies the waiting edit. **No maps** turns off **Used in maps** and applies the edit.
+**Cancel** leaves the sheet unchanged. Grid changes cannot be recorded; their warning offers **No maps** and **Cancel** only.
+Removing or overwriting existing artwork gets a separate warning, including while recording.
+
+The **Maps** section of the Tiled side panel contains **Record**, a change count, **Update maps...**, and **Clear**.
+The **Tile properties** section below it edits the selected tiles. Choosing **Record** in the warning opens this side panel.
+Moves, swaps, width changes, and trimming record the final positions of original tile references.
+Empty destination cells also have tile IDs, so moving one tile into an empty cell can change two references.
+Undo and Redo adjust the record. Moving a tile away and back cancels those changes.
+Pixel replacements and Shift-drag merges keep destination references. They do not need a map update unless the sheet width changes.
+Cut records removal; use drag to move tiles when map references must follow them.
+
+Turning **Record** off preserves the record. Protected rearrangements then ask before continuing.
+Turning **Used in maps** off also stops recording. A later unrecorded layout edit marks the retained record incomplete.
+**Clear** asks before discarding the record. It does not undo sheet edits or update maps.
+Undo and Redo stop at the start or clearing of a recording. They never undo a map file update.
+The map-use setting and recording save with the sheet in `tilepicky.json` and return when you reopen it.
+Save As, Duplicate, and imports create sheets marked as unused in maps, with no inherited recording.
+
+Save the sheet, then choose **Update maps...** and select the maps to update.
+Review the map names and affected reference counts, then press **Update**.
+Newly selected maps must use the sheet layout from when recording began.
+Close these maps in Tiled before updating them. Saving the sheet alone never changes maps.
+Each changed map gets a `.bak` file beside it. Update receipts prevent applying a change twice and support later recorded edits.
+A failed map write keeps its backup and receipt so you can retry. A failure after earlier maps were written reports that partial result.
+
+Map updates support Tiled JSON maps with an external `.tsj` tileset and tile data stored as JSON arrays.
+They cover tile layers, nested groups, infinite-map chunks, tile objects, and flip flags.
+They refuse compressed or encoded layers, object templates, deleted tiles still used by a map, and overlapping tileset ID ranges.
+TMX maps and embedded tilesets are not supported. A map changed externally after an update needs review before another update.
+These limits are tracked in [open issues](docs/issues.md#map-update-coverage).
 
 ## Shortcuts
 

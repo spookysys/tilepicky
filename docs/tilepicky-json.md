@@ -45,6 +45,19 @@ caption and the tags are then empty.
 Books from before this format kept island regions under `labels`. The tool
 ignores that key and leaves it out the next time it writes the book.
 
+## Map changes
+
+A sheet's optional `used_in_maps` value is `true` for protected sheets and `false` for sheets declared unused.
+An absent value means unknown. New sheets and copies start with `false`.
+
+The optional `map_changes` record holds a session ID, `enabled`, `complete`, `positions`, and map update receipts.
+Each `positions` index is a tile ID from the recording's initial layout. Its value is the current ID, or `null` after removal.
+Receipts store before/after file hashes and layouts, keyed by a hash of the selected map's canonical path.
+They contain no map paths. They survive Undo because map writes occur outside the sheet's edit history.
+The receipt is saved before replacing its map. Either file hash identifies the correct layout after an interrupted write.
+
+Use the [map recording controls](../README.md#map-change-recording) to change these fields.
+
 ## Color quantization
 
 The project book may hold a `quantize` list. Each group shares one setting

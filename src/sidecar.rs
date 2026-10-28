@@ -130,6 +130,11 @@ pub struct Label {
 /// What the book says about one sheet.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Sidecar {
+    /// Unknown for existing sheets until the first layout edit. New sheets start unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_in_maps: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_changes: Option<crate::map_changes::Recording>,
     /// The sheet's tile size. Absent: the run's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile: Option<Pair>,
@@ -159,7 +164,7 @@ pub struct Sidecar {
 impl Sidecar {
     pub fn is_empty(&self) -> bool {
         self.tile.is_none() && self.gap.is_none() && self.offset.is_none() && self.provenance.is_empty() && self.animations.is_empty()
-            && self.label.is_none()
+            && self.label.is_none() && self.used_in_maps.is_none() && self.map_changes.is_none()
     }
 }
 
@@ -441,11 +446,13 @@ pub fn store_tile(dir: &Path, tile: [u32; 2]) -> Result<(), String> {
 /// sheet.
 pub fn move_entry(dir: &Path, old: &str, new: &str, keep_old: bool) -> Result<(), String> {
     update_book(dir, |book| {
-        if let Some(e) = book.sheets.get(old).cloned() {
-            if !keep_old {
-                book.sheets.remove(old);
-            }
-            book.sheets.insert(new.to_string(), e);
+        if keep_old {
+            let mut entry = book.sheets.get(old).cloned().unwrap_or_default();
+            entry.used_in_maps = Some(false);
+            entry.map_changes = None;
+            book.sheets.insert(new.to_string(), entry);
+        } else if let Some(entry) = book.sheets.remove(old) {
+            book.sheets.insert(new.to_string(), entry);
         }
         relocate_quantize(dir, &mut book.quantize, old, new, keep_old, false)?;
         Ok(())
@@ -650,6 +657,21 @@ pub fn clear_labels(dir: &Path) -> Result<Vec<String>, String> {    update_book(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copies_start_without_map_dependencies_or_recordings() {
+        let folder = crate::storage::tests::Folder::new();
+        let side = Sidecar { used_in_maps: Some(true), map_changes: Some(crate::map_changes::Recording::new(4)), ..Default::default() };
+        store_entry(&folder.0, "used.png", &side).unwrap();
+        move_entry(&folder.0, "used.png", "copy.png", true).unwrap();
+        move_entry(&folder.0, "no-entry.png", "new-copy.png", true).unwrap();
+        let book = load_book(&folder.0).unwrap();
+        assert_eq!(book.sheets["used.png"], side);
+        for rel in ["copy.png", "new-copy.png"] {
+            assert_eq!(book.sheets[rel].used_in_maps, Some(false));
+            assert!(book.sheets[rel].map_changes.is_none());
+        }
+    }
+
     #[test]
     fn old_windows_paths_keep_entries_and_sources() {
         let side = Sidecar { provenance: vec![Provenance { source: r"pack\tree.png".into(), rects: vec![[0, 0, 8, 8]] }],

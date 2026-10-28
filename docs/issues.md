@@ -12,7 +12,25 @@ Animation frame references, Wang sets, and relative file properties need fixture
 
 Check a partial animation copy, moving its frames, resizing its sheet, and copying a file property into another folder.
 Verify the result in Tiled, including referenced tiles and files. Preserve or refuse each unsupported operation explicitly.
-Existing maps also retain their tile IDs when a tilesheet is rearranged. Tilepicky does not update those maps.
+Map reference updates are explicit. See [map update coverage](#map-update-coverage) for the supported subset.
+
+## Map update coverage
+
+Map change recording supports explicit updates of external `.tsj` references in Tiled JSON maps with array tile data.
+The [user guide](../README.md#map-change-recording) defines its controls and supported edits.
+
+The updater refuses TMX, embedded tilesets, compressed or encoded layers, object templates, and tileset ID range collisions.
+It also refuses maps that use deleted tiles or that changed externally after their last update.
+Add fixtures for each format and verify them in Tiled before extending support.
+Tests must retain flip flags, other tilesets, custom data, and backup recovery.
+
+Cut records removal. A later paste does not reconnect the removed tile identity.
+Use drag to relocate tiles while recording. Test clipboard identity across deferred confirmation, repeated pastes, and Undo before adding cut relocation.
+
+The first selection of a map assumes it uses the layout from when recording began; the preview states this requirement.
+Map discovery and external edits cannot establish that relationship automatically.
+Renaming or moving sheet files does not rewrite map paths. Handle those path changes in Tiled.
+Undo stops at recording boundaries; crossing a boundary needs a defined mapping before that restriction can be removed.
 
 ## Saves are atomic per file
 

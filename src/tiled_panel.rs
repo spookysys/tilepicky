@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The tile-properties panel of the project half: the properties of the
-//! selected tiles, edited in place in the Tiled tileset beside the image.
-//! The panel touches nothing on disk; `Sheet::save` writes the file.
+//! The Tiled sidebar: tile properties, map protection, and change recording.
+//! Sheet saves write the tileset and recording. Map writes require an explicit update.
 
 use crate::sheet::Sheet;
 use crate::tileset::{self, Kind, Prop};
@@ -16,16 +15,20 @@ struct NewProp {
 
 /// Draws the panel for the open sheet. A change marks the sheet unsaved.
 pub fn show(ui: &mut egui::Ui, sheet: &mut Sheet, keys: bool) {
-    egui::ScrollArea::vertical().id_salt("tile properties").show(ui, |ui| {
-        ui.heading(crate::title_text("Tile properties", keys));
+    egui::ScrollArea::vertical().id_salt("Tiled integration").show(ui, |ui| {
+        ui.heading(crate::title_text("Tiled", keys));
         if sheet.rel.is_empty() {
             ui.weak("The tileset goes beside the image when you save it.");
         } else {
             let file = tileset::file_name(&sheet.rel);
             ui.weak(file.display().to_string()).on_hover_text("The Tiled tileset beside the image. Tiled reads it; Tilepicky writes it on save.");
         }
-        ui.weak("A turquoise dot marks a tile with properties. Undo restores property edits.");
         ui.separator();
+        sheet.map_controls(ui);
+        ui.separator();
+        ui.strong("Tile properties");
+        ui.weak("A turquoise dot marks a tile with properties. Undo restores property edits.");
+        ui.add_space(4.0);
         // A file this tool cannot read, or a grid Tiled cannot state, leaves
         // nothing to edit: a change could not reach the disk.
         if let Some(error) = &sheet.props_error {
