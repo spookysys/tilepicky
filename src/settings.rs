@@ -48,6 +48,42 @@ impl Default for SearchIn {
     }
 }
 
+/// Which cards the library shows. The three boxes name the files of the
+/// pack: a tileset, an image that a tileset names, and an image that no
+/// tileset names. A card can answer to two of them, and it shows once.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct View {
+    /// The tileset cards: `.tsx` and `.tsj`.
+    #[serde(default = "enabled")]
+    pub tilesets: bool,
+    /// The images that a tileset names, shown as images.
+    #[serde(default)]
+    pub in_tilesets: bool,
+    /// The images that no tileset names.
+    #[serde(default = "enabled")]
+    pub loose: bool,
+}
+
+impl View {
+    /// A view that hides nothing.
+    pub const fn everything() -> Self {
+        View { tilesets: true, in_tilesets: true, loose: true }
+    }
+
+    /// Whether the boxes leave every card in view.
+    pub fn all(self) -> bool {
+        self == Self::everything()
+    }
+}
+
+impl Default for View {
+    /// A pack is a catalogue of tilesets first. The images that a tileset
+    /// names are ingredients, and the person opens them on purpose.
+    fn default() -> Self {
+        View { tilesets: true, in_tilesets: false, loose: true }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Settings {
     #[serde(default)]
@@ -65,6 +101,9 @@ pub struct Settings {
     pub ai: crate::ai::Ai,
     #[serde(default)]
     pub search: SearchIn,
+    /// Which cards the library shows.
+    #[serde(default)]
+    pub view: View,
 }
 
 impl Settings {
@@ -149,6 +188,16 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"search": {"folders": true, "files": true, "captions": true, "tags": true}}"#).unwrap();
         assert!(s.search.embeddings);
         assert_eq!(s.search, SearchIn::default());
+    }
+
+    /// A file from before the view filters shows tilesets and loose images,
+    /// which is the same view the tool offers new.
+    #[test]
+    fn an_old_file_gets_the_view_filters() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.view, View::default());
+        assert!(s.view.tilesets && s.view.loose && !s.view.in_tilesets);
+        assert!(!s.view.all());
     }
 
     #[test]

@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(s.side.map_changes.as_ref().unwrap().changed(), 2);
         s.save().unwrap();
         let side = crate::sidecar::load_book(&dir.0).unwrap().sheets["tiles.png"].clone();
-        let mut reopened = Sheet::open(&ctx, &dir.0, "tiles.png", [8, 8], side).unwrap();
+        let mut reopened = Sheet::open(&ctx, &dir.0, "tiles.png", [8, 8], side, None).unwrap();
         assert!(reopened.side.map_changes.as_ref().unwrap().enabled);
         let from = Sel::rect((1, 0), (1, 0));
         let block = reopened.copy_sel(&from).unwrap();

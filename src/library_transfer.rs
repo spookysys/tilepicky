@@ -9,18 +9,22 @@ pub(super) struct LibraryDrag {
     root: PathBuf,
     rel: String,
     tile: [u32; 2],
+    /// The Tiled tileset that describes this sheet in the library. A copy
+    /// carries it, so that the project gets the tile data as well.
+    tiled: Option<crate::tiled::Tiled>,
 }
 
 pub(super) struct FileCopy {
     root: PathBuf,
-    result: mpsc::Receiver<Result<String, String>>,
+    result: mpsc::Receiver<Result<crate::files::Imported, String>>,
 }
 
 impl App {
     pub(super) fn start_library_drag(&mut self, i: usize) {
-        let Some(entry) = self.library.index.entries.get(i) else { return };
+        let Some(entry) = self.library.index.entries.get(i).filter(|e| e.sheet_rel().is_some()) else { return };
         self.library_drag = Some(LibraryDrag {
             root: self.library.index.root.clone(), rel: entry.rel.clone(), tile: self.library.index.tile,
+            tiled: entry.tiled.clone(),
         });
         self.library_sweep = None;
         self.workspace = Workspace::Build;
@@ -28,8 +32,14 @@ impl App {
     }
 
     pub(super) fn copy_library_sheet(&mut self, ctx: &egui::Context, i: usize) {
-        let Some(entry) = self.library.index.entries.get(i) else { return };
-        let source = LibraryDrag { root: self.library.index.root.clone(), rel: entry.rel.clone(), tile: self.library.index.tile };
+        let Some(entry) = self.library.index.entries.get(i).filter(|e| e.sheet_rel().is_some()) else {
+            self.status = "A Tiled tileset has no image of its own to copy.".into();
+            return;
+        };
+        let source = LibraryDrag {
+            root: self.library.index.root.clone(), rel: entry.rel.clone(), tile: self.library.index.tile,
+            tiled: entry.tiled.clone(),
+        };
         self.begin_sheet_copy(ctx, source, "");
     }
 
@@ -42,7 +52,8 @@ impl App {
         let (sender, result) = mpsc::channel();
         let wake = ctx.clone();
         match std::thread::Builder::new().name("copy library sheet".into()).spawn(move || {
-            let copied = crate::files::import_sheet(&source.root, &destination, &source.rel, &folder, source.tile);
+            let copied = crate::files::import_sheet(&source.root, &destination, &source.rel, &folder,
+                source.tile, source.tiled.as_ref());
             let _ = sender.send(copied);
             wake.request_repaint();
         }) {
@@ -54,7 +65,8 @@ impl App {
     pub(super) fn poll_sheet_copy(&mut self, ctx: &egui::Context) {
         let Some(copy) = self.sheet_copy.take() else { return };
         match copy.result.try_recv() {
-            Ok(Ok(rel)) => {
+            Ok(Ok(copied)) => {
+                let rel = copied.rel;
                 if self.project.index.root == copy.root {
                     self.rescan_project();
                     if let Some(i) = self.project.index.position(&rel) {
@@ -62,7 +74,10 @@ impl App {
                         self.project.scroll = self.project.at.clone();
                     }
                 }
-                self.status = format!("Copied {rel} to {}", copy.root.display());
+                self.status = match &copied.note {
+                    Some(note) => format!("Copied {rel} to {}. {note}", copy.root.display()),
+                    None => format!("Copied {rel} to {}", copy.root.display()),
+                };
             }
             Ok(Err(error)) => self.status = error,
             Err(mpsc::TryRecvError::Empty) => {
@@ -93,17 +108,21 @@ impl App {
         let source = self.library_drag.take().unwrap();
         if let Some(folder) = folder { self.begin_sheet_copy(ctx, source, &folder); }
         else if canvas
-            && let Err(error) = self.place_library_sheet(ctx, &source.root, &source.rel, source.tile, pointer) { self.status = error; }
+            && let Err(error) = self.place_library_sheet(ctx, &source.root, &source.rel, source.tile,
+                source.tiled.as_ref().and_then(|t| t.grid()), pointer) {
+                self.status = error;
+            }
     }
 
     pub(super) fn place_library_sheet(
-        &mut self, ctx: &egui::Context, root: &std::path::Path, rel: &str, tile: [u32; 2], pointer: egui::Pos2,
+        &mut self, ctx: &egui::Context, root: &std::path::Path, rel: &str, tile: [u32; 2],
+        grid: Option<crate::tileset::Grid>, pointer: egui::Pos2,
     ) -> Result<(), String> {
         if !self.project.is_set() { return Err("Open a project folder before placing a sheet.".into()); }
         if self.project_eye { return Err("Turn off Inspect mode before placing tiles.".into()); }
         // Read the source without replacing the open library sheet or its selection.
         let side = crate::sidecar::load_book(root)?.sheets.get(rel).cloned().unwrap_or_default();
-        let mut source = Sheet::open(ctx, root, rel, tile, side)?;
+        let mut source = Sheet::open(ctx, root, rel, tile, side, grid)?;
         source.library = true;
         let selection = Sel::rect((0, 0), (source.cols().saturating_sub(1), source.rows().saturating_sub(1)));
         let block = source.copy_sel(&selection).ok_or("This sheet has no tiles to place.")?;

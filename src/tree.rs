@@ -328,8 +328,11 @@ impl Node {
             let group = v.marked.is_some_and(|m| m.len() > 1 && m.contains(i));
             let count = v.marked.map_or(0, HashSet::len);
             r.context_menu(|ui| {
+                // A tileset that stands alone has no pixels, so the items
+                // that read or copy a sheet do not apply to it.
+                let pixels = v.entries.get(*i).is_none_or(|entry| entry.sheet_rel().is_some());
                 if !v.menus {
-                    if ui.button("Copy sheet to project").clicked() {
+                    if pixels && ui.button("Copy sheet to project").clicked() {
                         action = Some(TreeAction::ImportFile(*i));
                         ui.close();
                     }
@@ -340,10 +343,10 @@ impl Node {
                             ui.close();
                         }
                         ui.separator();
-                    } else if let Some(command) = crate::labels::menu(ui) {
+                    } else if pixels && let Some(command) = crate::labels::menu(ui) {
                         action = Some(TreeAction::Labels(*i, command));
                     }
-                    if ui.button("Generate search embeddings (AI)...").clicked() {
+                    if pixels && ui.button("Generate search embeddings (AI)...").clicked() {
                         action = Some(if marked { TreeAction::EmbeddingsMarked } else { TreeAction::Embeddings(vec![*i]) });
                         ui.close();
                     }

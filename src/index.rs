@@ -2,12 +2,22 @@
 //! Scans a directory of sheets and searches their names, captions, and tags.
 
 use crate::embed;
-use crate::settings::SearchIn;
+use crate::settings::{SearchIn, View};
 use crate::sidecar::{self, Pair, QuantizeGroup, QuantizeTarget, Sidecar};
+use crate::tiled;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The formats the tool reads. It always writes 32 bit RGBA PNG.
 pub const IMAGE_EXTS: [&str; 7] = ["png", "gif", "jpg", "jpeg", "webp", "bmp", "tga"];
+
+/// What a card stands for. An image that a tileset describes can wear either
+/// face; the view filters decide which one shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Card {
+    Image,
+    Tileset,
+}
 
 pub struct Entry {
     pub rel: String,
@@ -19,6 +29,53 @@ pub struct Entry {
     /// The sheet's embedding, when the library has one; see `embed`.
     pub embed: Option<Vec<f32>>,
     pub text_embed: Option<Vec<f32>>,
+    /// The Tiled tileset that describes this image, when one does. Only an
+    /// image tileset fills this: a collection has no image to stand on.
+    pub tiled: Option<tiled::Tiled>,
+    /// Some tileset names this image, as an atlas or as a collection member.
+    pub in_tileset: bool,
+    /// This entry stands for a tileset file, and has no pixels. Every path
+    /// that decodes an image must ask `sheet_rel` first.
+    pub tileset_only: bool,
+    /// Why the tileset of this entry could not be read.
+    pub tiled_error: Option<String>,
+    /// A warning about the tileset: a path whose case differs, an image that
+    /// is not there, or a second tileset for one image.
+    pub tiled_note: Option<String>,
+}
+
+impl Entry {
+    /// The image file, when this entry has pixels at all.
+    pub fn sheet_rel(&self) -> Option<&str> {
+        (!self.tileset_only).then_some(&self.rel)
+    }
+
+    /// Whether this entry carries a Tiled tileset, either its own or one that
+    /// stands on its image.
+    pub fn has_tileset(&self) -> bool {
+        self.tileset_only || self.tiled.is_some()
+    }
+
+    /// Whether the view filters leave this entry in the library.
+    pub fn shows(&self, view: View) -> bool {
+        if self.tileset_only {
+            view.tilesets
+        } else if self.tiled.is_some() {
+            // The same file has two faces here: the tileset that describes it
+            // and the image itself. Either box shows it, and it shows once.
+            view.tilesets || view.in_tilesets
+        } else if self.in_tileset {
+            view.in_tilesets
+        } else {
+            view.loose
+        }
+    }
+
+    /// Which face the card wears. A tileset card wins when both boxes are on,
+    /// because two rows for one file in one folder reads as two files.
+    pub fn card(&self, view: View) -> Card {
+        if self.tileset_only || (self.tiled.is_some() && view.tilesets) { Card::Tileset } else { Card::Image }
+    }
 }
 
 pub struct Index {
@@ -48,7 +105,19 @@ pub struct Index {
 
 impl Index {
     /// Lists every image under `root` that the tool reads, sorted by path.
+    /// This is the project: a tileset beside a sheet belongs to that sheet,
+    /// and the tree shows the sheets alone.
     pub fn scan(root: &Path, default_tile: [u32; 2]) -> Self {
+        Self::scan_folder(root, default_tile, false)
+    }
+
+    /// Lists the images of a pack, and the Tiled tilesets that describe them.
+    /// `docs/tiled-library.md` says how a tileset pairs with its image.
+    pub fn scan_library(root: &Path, default_tile: [u32; 2]) -> Self {
+        Self::scan_folder(root, default_tile, true)
+    }
+
+    fn scan_folder(root: &Path, default_tile: [u32; 2], read_tilesets: bool) -> Self {
         // No folder chosen for this side yet: nothing to list.
         if root.as_os_str().is_empty() {
             return Self {
@@ -70,6 +139,7 @@ impl Index {
             };
         }
         let mut rels: Vec<String> = Vec::new();
+        let mut tiled_files: Vec<String> = Vec::new();
         let mut dirs: Vec<String> = Vec::new();
         for e in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             let Some(rel) = e.path().strip_prefix(root).ok().map(relative_path) else {
@@ -84,10 +154,13 @@ impl Index {
                 let ext = e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
                 if IMAGE_EXTS.contains(&ext.as_str()) {
                     rels.push(rel);
+                } else if read_tilesets && (ext == "tsx" || ext == "tsj") {
+                    tiled_files.push(rel);
                 }
             }
         }
         rels.sort();
+        tiled_files.sort();
         dirs.sort();
         let (mut book, error) = match sidecar::load_book(root) {
             Ok(book) => (book, None), Err(e) => (sidecar::Book::default(), Some(e)),
@@ -98,7 +171,7 @@ impl Index {
         let (text_embeddings, text_embed_error) = match embed::read_mode(root, embed::InputMode::Text) {
             Ok(data) => (data, None), Err(error) => (Default::default(), Some(error)),
         };
-        let entries = rels
+        let mut entries: Vec<Entry> = rels
             .into_iter()
             .map(|rel| {
                 let side = book.sheets.remove(&rel).unwrap_or_default();
@@ -106,9 +179,56 @@ impl Index {
                 let (dir_words, name_words) = (words(dirs), path_words(name));
                 let vector = embed::current_vector(root, &rel, &side, &embeddings, embed::InputMode::Image);
                 let text_embed = embed::current_vector(root, &rel, &side, &text_embeddings, embed::InputMode::Text);
-                Entry { dir_words, name_words, side, rel, embed: vector, text_embed }
+                Entry {
+                    dir_words, name_words, side, rel, embed: vector, text_embed,
+                    tiled: None, in_tileset: false, tileset_only: false, tiled_error: None, tiled_note: None,
+                }
             })
             .collect();
+        // Pair every tileset with the image it names. The image stays the
+        // key of the pair, because the book, the labels, and every transfer
+        // address it by that path. A tileset without an image of its own
+        // stands alone.
+        let at: HashMap<String, usize> = entries.iter().enumerate().map(|(i, e)| (e.rel.clone(), i)).collect();
+        let mut extra = Vec::new();
+        for file in tiled_files {
+            match tiled::read(root, &file) {
+                Err(error) => extra.push(standing(&file, None, Some(error), None)),
+                Ok(t) => match t.image() {
+                    Some(image) => {
+                        let resolved = tiled::resolve(root, &file, image);
+                        let found = resolved.rel.as_deref().and_then(|rel| at.get(rel).copied());
+                        match found {
+                            Some(i) if entries[i].tiled.is_none() => {
+                                entries[i].tiled = Some(t);
+                                entries[i].in_tileset = true;
+                                entries[i].tiled_note = resolved.problem;
+                            }
+                            // A second tileset for one image keeps its own
+                            // card, so that neither file is invisible.
+                            other => {
+                                let note = resolved.problem
+                                    .or_else(|| other.map(|_| "Another tileset stands for this image.".to_string()));
+                                extra.push(standing(&file, Some(t), None, note));
+                            }
+                        }
+                    }
+                    None => {
+                        if let tiled::Shape::Collection { images } = &t.shape {
+                            for source in images {
+                                if let Some(rel) = tiled::resolve(root, &file, source).rel
+                                    && let Some(&i) = at.get(&rel) {
+                                    entries[i].in_tileset = true;
+                                }
+                            }
+                        }
+                        extra.push(standing(&file, Some(t), None, None));
+                    }
+                },
+            }
+        }
+        entries.extend(extra);
+        entries.sort_by(|a, b| a.rel.cmp(&b.rel));
         let tile = book.tile.map(Pair::xy).unwrap_or(default_tile);
         let tag_list = sidecar::tag_list(&book);
         let free_tags = sidecar::free_tags(&book);
@@ -141,7 +261,9 @@ impl Index {
     pub fn quantize_members(&self, target: &QuantizeTarget) -> Vec<String> {
         match target {
             QuantizeTarget::Files(rels) => {
-                let mut out: Vec<String> = rels.iter().filter(|r| self.position(r).is_some()).cloned().collect();
+                let mut out: Vec<String> = rels.iter()
+                    .filter(|r| self.position(r).is_some_and(|i| !self.entries[i].tileset_only))
+                    .cloned().collect();
                 out.sort();
                 out.dedup();
                 out
@@ -149,7 +271,7 @@ impl Index {
             QuantizeTarget::Dir(dir) => self
                 .entries
                 .iter()
-                .filter(|e| dir.is_empty() || e.rel.starts_with(&format!("{dir}/")))
+                .filter(|e| !e.tileset_only && (dir.is_empty() || e.rel.starts_with(&format!("{dir}/"))))
                 .map(|e| e.rel.clone())
                 .collect(),
         }
@@ -173,11 +295,40 @@ impl Index {
         Self::match_scores(e, query, search, embed, text_query).iter().any(Option::is_some)
     }
 
-    pub fn visible(&self, query: &[String], search: SearchIn, embed: Option<&[f32]>, text_query: Option<&[f32]>) -> Option<Vec<bool>> {
-        if query.is_empty() {
+    pub fn visible(
+        &self, query: &[String], search: SearchIn, embed: Option<&[f32]>, text_query: Option<&[f32]>, view: View,
+    ) -> Option<Vec<bool>> {
+        if query.is_empty() && view.all() {
             return None;
         }
-        Some(self.entries.iter().map(|e| Self::entry_matches(e, query, search, embed, text_query)).collect())
+        Some(self.entries.iter().map(|e| {
+            e.shows(view) && (query.is_empty() || Self::entry_matches(e, query, search, embed, text_query))
+        }).collect())
+    }
+
+    /// How many cards each view box would show. An atlas image counts in
+    /// both the first and the second, because it has both faces.
+    pub fn view_counts(&self) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for e in &self.entries {
+            if e.has_tileset() {
+                counts.0 += 1;
+            }
+            if !e.tileset_only && (e.tiled.is_some() || e.in_tileset) {
+                counts.1 += 1;
+            }
+            if !e.has_tileset() && !e.in_tileset {
+                counts.2 += 1;
+            }
+        }
+        counts
+    }
+
+    /// The view this folder can offer. A folder without a tileset has no
+    /// tileset bucket to hide, so its three boxes do not apply. That keeps a
+    /// filter set for one pack from emptying the next one.
+    pub fn effective_view(&self, view: View) -> View {
+        if self.entries.iter().any(Entry::has_tileset) { view } else { View::everything() }
     }
 
     /// Orders matching sheets by reciprocal rank fusion across the three search sources.
@@ -237,6 +388,24 @@ impl Index {
     }
 }
 
+/// An entry that stands for a tileset file, with no image of its own.
+fn standing(file: &str, tiled: Option<tiled::Tiled>, error: Option<String>, note: Option<String>) -> Entry {
+    let (dirs, name) = file.rsplit_once('/').unwrap_or(("", file));
+    Entry {
+        dir_words: words(dirs),
+        name_words: path_words(name),
+        side: Sidecar::default(),
+        rel: file.to_string(),
+        embed: None,
+        text_embed: None,
+        tiled,
+        in_tileset: false,
+        tileset_only: true,
+        tiled_error: error,
+        tiled_note: note,
+    }
+}
+
 /// Lower-case runs of letters and digits, without duplicates.
 pub fn words(s: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -274,7 +443,10 @@ mod tests {
     use super::*;
 
     fn entry(rel: &str, embed: Option<Vec<f32>>) -> Entry {
-        Entry { dir_words: words("props"), name_words: path_words(rel), side: Sidecar::default(), rel: rel.into(), embed, text_embed: None }
+        Entry {
+            dir_words: words("props"), name_words: path_words(rel), side: Sidecar::default(), rel: rel.into(), embed,
+            text_embed: None, tiled: None, in_tileset: false, tileset_only: false, tiled_error: None, tiled_note: None,
+        }
     }
 
     /// The embedding is a sibling of the text fields: a sheet can match by
@@ -303,6 +475,11 @@ mod tests {
             side: Sidecar::default(),
             embed: None,
             text_embed: None,
+            tiled: None,
+            in_tileset: false,
+            tileset_only: false,
+            tiled_error: None,
+            tiled_note: None,
         };
         let index = Index {
             root: PathBuf::new(),
@@ -359,6 +536,54 @@ mod tests {
         assert!(!Index::entry_matches(&letter, &words("b"), search, None, None));
     }
 
+    /// The library scan pairs a tileset with the image it names, and a
+    /// collection gets a card of its own standing on the tileset file. A
+    /// project scan reads images only, so its tree does not change.
+    #[test]
+    fn a_library_scan_pairs_tilesets_with_their_images() {
+        let dir = crate::storage::tests::Folder::new();
+        std::fs::create_dir_all(dir.0.join("Tiles")).unwrap();
+        std::fs::create_dir_all(dir.0.join("Props")).unwrap();
+        for rel in ["Tiles/atlas.png", "Tiles/loose.png", "Props/a.png", "Props/b.png"] {
+            image::RgbaImage::new(4, 4).save(dir.0.join(rel)).unwrap();
+        }
+        std::fs::write(dir.0.join("Tiles/atlas.tsx"),
+            r#"<tileset name="Atlas" tilewidth="4" tileheight="4" columns="1" tilecount="1">
+                 <image source="atlas.png" width="4" height="4"/>
+               </tileset>"#).unwrap();
+        std::fs::write(dir.0.join("Props/props.tsx"),
+            r#"<tileset name="Props" tilewidth="4" tileheight="4" tilecount="2">
+                 <tile id="0"><image source="a.png"/></tile>
+                 <tile id="1"><image source="b.png"/></tile>
+               </tileset>"#).unwrap();
+
+        let index = Index::scan_library(&dir.0, [8, 8]);
+        let at = |rel: &str| index.entries.iter().position(|e| e.rel == rel).unwrap();
+        assert_eq!(index.entries[at("Tiles/atlas.png")].tiled.as_ref().unwrap().name, "Atlas");
+        assert!(index.entries[at("Props/a.png")].in_tileset);
+        assert!(index.entries[at("Props/b.png")].in_tileset);
+        assert!(index.entries[at("Props/props.tsx")].tileset_only);
+        assert_eq!(index.entries[at("Props/props.tsx")].sheet_rel(), None);
+        assert_eq!(index.view_counts(), (2, 3, 1));
+
+        let view = View::default();
+        let shown: Vec<&str> = index.entries.iter().filter(|e| e.shows(view)).map(|e| e.rel.as_str()).collect();
+        assert_eq!(shown, ["Props/props.tsx", "Tiles/atlas.png", "Tiles/loose.png"]);
+        assert_eq!(index.entries[at("Tiles/atlas.png")].card(view), Card::Tileset);
+        let images = View { tilesets: false, in_tilesets: true, loose: false };
+        assert_eq!(index.entries[at("Tiles/atlas.png")].card(images), Card::Image);
+        assert!(!index.entries[at("Tiles/loose.png")].shows(images));
+
+        let project = Index::scan(&dir.0, [8, 8]);
+        assert_eq!(project.entries.len(), 4, "the four images, and no tileset card");
+        assert!(project.entries.iter().all(|e| !e.has_tileset() && !e.in_tileset));
+        // A folder with no tileset ignores the three boxes, so a filter set
+        // for another pack cannot empty it.
+        let empty = View { tilesets: true, in_tilesets: false, loose: false };
+        assert_eq!(project.effective_view(empty), View::everything());
+        assert!(project.entries.iter().all(|e| e.shows(project.effective_view(empty))));
+    }
+
     fn search_index(entries: Vec<Entry>) -> Index {
         let mut index = Index::scan(Path::new(""), [16, 16]);
         index.entries = entries;
@@ -375,7 +600,7 @@ mod tests {
             let search = SearchIn { files: flags & 1 != 0, folders: false, captions: false, tags: false,
                 embeddings: flags & 2 != 0, text_embeddings: flags & 4 != 0, similarity: 0.8 };
             let query = words("tree");
-            let expected: Vec<usize> = index.visible(&query, search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0]))
+            let expected: Vec<usize> = index.visible(&query, search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0]), View::default())
                 .unwrap().iter().enumerate().filter_map(|(i, &visible)| visible.then_some(i)).collect();
             let mut actual = index.ranked(&query, search, Some(&[1.0, 0.0]), Some(&[1.0, 0.0]));
             actual.sort_unstable();

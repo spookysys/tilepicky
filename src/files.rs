@@ -4,8 +4,22 @@
 use crate::sidecar;
 use std::path::Path;
 
+/// The result of a library copy into the project.
+pub struct Imported {
+    /// The image in the project, from the project root.
+    pub rel: String,
+    /// What the copy could not carry, for the status line.
+    pub note: Option<String>,
+}
+
 /// Copies a library sheet and its metadata into an existing project folder.
-pub fn import_sheet(library: &Path, project: &Path, source_rel: &str, target_dir: &str, default_tile: [u32; 2]) -> Result<String, String> {
+/// `tileset` is the Tiled tileset that describes the sheet in the library. A
+/// TSJ travels with the copy, under the copied image's name. Its grid outranks
+/// what the pixels say, and a grid that a person set outranks them both.
+pub fn import_sheet(
+    library: &Path, project: &Path, source_rel: &str, target_dir: &str, default_tile: [u32; 2],
+    tileset: Option<&crate::tiled::Tiled>,
+) -> Result<Imported, String> {
     use std::io::Write;
     let valid = |rel: &str| !rel.is_empty() && !rel.contains(['\\', ':'])
         && rel.split('/').all(|part| !part.is_empty() && part != "." && part != "..");
@@ -26,7 +40,13 @@ pub fn import_sheet(library: &Path, project: &Path, source_rel: &str, target_dir
     let mut side = source_book.sheets.get(source_rel).cloned().unwrap_or_default();
     side.used_in_maps = Some(false);
     side.map_changes = None;
-    if side.tile.is_none() {
+    let person = side.tile.is_some() && !side.read;
+    if !person && let Some(grid) = tileset.and_then(|t| t.grid()) {
+        side.tile = Some(sidecar::Pair::of(grid.tile));
+        side.gap = Some(sidecar::Pair::of(grid.gap));
+        side.offset = Some(sidecar::Pair::of([grid.offset[0].max(0), grid.offset[1].max(0)]));
+        side.read = true;
+    } else if side.tile.is_none() {
         let (x, y) = crate::detect::grid(&image);
         let tile = [if x.tile == 0 { default_tile[0].max(1) } else { x.tile },
             if y.tile == 0 { default_tile[1].max(1) } else { y.tile }];
@@ -38,35 +58,66 @@ pub fn import_sheet(library: &Path, project: &Path, source_rel: &str, target_dir
     if side.provenance.is_empty() {
         side.provenance.push(sidecar::Provenance { source: source_rel.into(), rects: vec![[0, 0, image.width(), image.height()]] });
     }
+    // A TSJ travels, so the project keeps the tile data. A TSX stays behind:
+    // this tool does not convert yet, and two tilesets for one image is the
+    // state it never writes.
+    let carried = tileset.filter(|t| t.format == crate::tiled::Format::Tsj);
+    let carried_bytes = match carried {
+        Some(t) => Some(std::fs::read(library.join(&t.file)).map_err(|e| format!("{}: {e}", t.file))?),
+        None => None,
+    };
+    let note = tileset.filter(|t| t.format == crate::tiled::Format::Tsx).map(|t| format!(
+        "{} is a TSX file, and this tool does not convert it yet, so it stayed in the library.", t.file));
     let name = Path::new(source_rel).file_name().and_then(|n| n.to_str()).ok_or("Invalid sheet name")?;
     let stem = Path::new(name).file_stem().and_then(|n| n.to_str()).ok_or("Invalid sheet name")?;
     let ext = Path::new(name).extension().and_then(|n| n.to_str()).map(|s| format!(".{s}")).unwrap_or_default();
-    let mut created = None;
+    let mut created: Vec<std::path::PathBuf> = Vec::new();
     let result = sidecar::update_book(&project, |book| {
         for number in 0u32.. {
             let name = match number { 0 => name.to_string(), 1 => format!("{stem} copy{ext}"), n => format!("{stem} copy {n}{ext}") };
             let rel = if target_dir.is_empty() { name.clone() } else { format!("{target_dir}/{name}") };
             if book.sheets.contains_key(&rel) { continue; }
             let path = target.join(&name);
+            // The tileset takes the image's name. One already there means the
+            // name is taken: a copy never overwrites a tileset.
+            let tsj = carried.is_some().then(|| project.join(crate::tileset::file_name(&rel)));
+            if tsj.as_ref().is_some_and(|p| p.exists()) { continue; }
             let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.to_string()),
             };
-            created = Some(path);
+            created.push(path.clone());
             file.write_all(&bytes).and_then(|()| file.sync_all()).map_err(|e| e.to_string())?;
+            if let (Some(tsj), Some(bytes)) = (tsj, &carried_bytes) {
+                let mut out = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tsj) {
+                    Ok(out) => out,
+                    // Another program took the pair's name. Try the next one.
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let _ = std::fs::remove_file(&path);
+                        created.pop();
+                        continue;
+                    }
+                    Err(error) => return Err(format!("{}: {error}", tsj.display())),
+                };
+                created.push(tsj.clone());
+                out.write_all(bytes).and_then(|()| out.sync_all()).map_err(|e| format!("{}: {e}", tsj.display()))?;
+                crate::tileset::retarget(&project, &rel)?;
+            }
             book.sheets.insert(rel.clone(), side.clone());
             return Ok(rel);
         }
         Err("No unused sheet name is available.".into())
     });
     if let Err(error) = result {
-        if let Some(path) = created && let Err(rollback) = std::fs::remove_file(path) {
-            return Err(format!("{error}. Cannot remove the incomplete copy: {rollback}"));
+        for path in created {
+            if let Err(rollback) = std::fs::remove_file(&path) {
+                return Err(format!("{error}. Cannot remove the incomplete copy {}: {rollback}", path.display()));
+            }
         }
         return Err(error);
     }
-    result
+    result.map(|rel| Imported { rel, note })
 }
 
 pub fn normalize_name(name: &str, ext: Option<&str>) -> Option<String> {
@@ -231,7 +282,7 @@ mod tests {
         let source_book = std::fs::read(library.0.join(sidecar::BOOK)).unwrap();
         std::fs::write(project.0.join("plants/tree.png"), b"keep").unwrap();
         for expected in ["plants/tree copy.png", "plants/tree copy 2.png"] {
-            assert_eq!(import_sheet(&library.0, &project.0, "pack/tree.png", "plants", [16, 16]).unwrap(), expected);
+            assert_eq!(import_sheet(&library.0, &project.0, "pack/tree.png", "plants", [16, 16], None).unwrap().rel, expected);
             assert_eq!(std::fs::read(project.0.join(expected)).unwrap(), std::fs::read(library.0.join("pack/tree.png")).unwrap());
             let mut copied = sidecar::load_book(&project.0).unwrap().sheets[expected].clone();
             assert_eq!(copied.provenance.remove(0), sidecar::Provenance { source: "pack/tree.png".into(), rects: vec![[0, 0, 16, 16]] });
@@ -248,18 +299,18 @@ mod tests {
         let (library, project) = (Folder::new(), Folder::new());
         import_fixture(&library.0);
         for source in ["../tree.png", "/pack/tree.png", "pack/../tree.png"] {
-            assert!(import_sheet(&library.0, &project.0, source, "", [16, 16]).is_err());
+            assert!(import_sheet(&library.0, &project.0, source, "", [16, 16], None).is_err());
         }
-        assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "../outside", [16, 16]).is_err());
+        assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "../outside", [16, 16], None).is_err());
         for root in [&library.0, &project.0] {
             std::fs::write(root.join(sidecar::BOOK), b"broken").unwrap();
-            assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "", [16, 16]).is_err());
+            assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "", [16, 16], None).is_err());
             assert!(!project.0.join("tree.png").exists());
             std::fs::remove_file(root.join(sidecar::BOOK)).unwrap();
         }
         #[cfg(unix)] {
             std::os::unix::fs::symlink(&library.0, project.0.join("escape")).unwrap();
-            assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "escape", [16, 16]).is_err());
+            assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "escape", [16, 16], None).is_err());
         }
     }
 
@@ -267,10 +318,56 @@ mod tests {
     fn import_detects_missing_grid_without_changing_library() {
         let (library, project) = (Folder::new(), Folder::new());
         import_fixture(&library.0);
-        let rel = import_sheet(&library.0, &project.0, "pack/tree.png", "", [8, 8]).unwrap();
+        let rel = import_sheet(&library.0, &project.0, "pack/tree.png", "", [8, 8], None).unwrap().rel;
         let side = sidecar::load_book(&project.0).unwrap().sheets[&rel].clone();
         assert!(side.read && side.tile.is_some() && side.gap.is_some() && side.offset.is_some());
         assert!(!library.0.join(sidecar::BOOK).exists());
+    }
+
+    /// A TSJ travels with the copy and takes the copied image's name, and the
+    /// grid it states goes into the book. A TSX stays behind with a note.
+    #[test]
+    fn a_copy_carries_its_tsj_and_leaves_a_tsx_behind() {
+        let (library, project) = (Folder::new(), Folder::new());
+        import_fixture(&library.0);
+        std::fs::create_dir_all(library.0.join("Tiles")).unwrap();
+        std::fs::write(library.0.join("Tiles/tree.tsj"), r#"{
+            "type": "tileset", "name": "Tree", "version": "1.10",
+            "tilewidth": 4, "tileheight": 8, "margin": 1, "spacing": 1,
+            "columns": 3, "tilecount": 6, "image": "../pack/tree.png",
+            "imagewidth": 16, "imageheight": 16
+        }"#).unwrap();
+        let tiled = crate::tiled::read(&library.0, "Tiles/tree.tsj").unwrap();
+
+        let first = import_sheet(&library.0, &project.0, "pack/tree.png", "", [8, 8], Some(&tiled)).unwrap();
+        assert_eq!(first.rel, "tree.png");
+        assert!(first.note.is_none());
+        let side = sidecar::load_book(&project.0).unwrap().sheets["tree.png"].clone();
+        assert_eq!((side.tile, side.gap, side.offset),
+            (Some(Pair::of([4, 8])), Some(Pair::One(1)), Some(Pair::of([1, 1]))));
+        assert!(side.read, "a tileset grid is machine-chosen, so a changed tileset still wins");
+        let tsj: serde_json::Value = serde_json::from_slice(&std::fs::read(project.0.join("tree.tsj")).unwrap()).unwrap();
+        assert_eq!(tsj["image"], "tree.png");
+        assert_eq!(tsj["tilewidth"], 4);
+
+        // A second copy takes the next name, so neither the first image nor
+        // its tileset is overwritten.
+        let second = import_sheet(&library.0, &project.0, "pack/tree.png", "", [8, 8], Some(&tiled)).unwrap();
+        assert_eq!(second.rel, "tree copy.png");
+        assert!(project.0.join("tree copy.tsj").is_file());
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(project.0.join("tree.tsj")).unwrap()).unwrap();
+        assert_eq!(kept["image"], "tree.png");
+
+        // An old XML tileset stays in the library, and the copy says so.
+        std::fs::write(library.0.join("Tiles/tree.tsx"),
+            r#"<tileset name="Tree" tilewidth="4" tileheight="8" columns="3" tilecount="6">
+                 <image source="../pack/tree.png" width="16" height="16"/>
+               </tileset>"#).unwrap();
+        let old = crate::tiled::read(&library.0, "Tiles/tree.tsx").unwrap();
+        let third = import_sheet(&library.0, &project.0, "pack/tree.png", "", [8, 8], Some(&old)).unwrap();
+        assert_eq!(third.rel, "tree copy 2.png");
+        assert!(third.note.unwrap().contains("stayed in the library"));
+        assert!(!project.0.join("tree copy 2.tsj").exists());
     }
 
     #[test]
@@ -282,7 +379,7 @@ mod tests {
             let name = format!("{}.{}.{number}.tmp", sidecar::BOOK, std::process::id());
             std::fs::write(project.0.join(name), b"keep temporary file").unwrap();
         }
-        assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "", [16, 16]).is_err());
+        assert!(import_sheet(&library.0, &project.0, "pack/tree.png", "", [16, 16], None).is_err());
         assert!(!project.0.join("tree copy.png").exists());
         assert_eq!(std::fs::read(project.0.join("tree.png")).unwrap(), b"keep");
         assert!(library.0.join("pack/tree.png").exists());

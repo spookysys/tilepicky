@@ -15,6 +15,8 @@ Each file under `src/` opens with a comment that says what it owns.
   checks `src/detect.rs` against `tools/grid-cases.json` and skips every case
   whose file is not on this machine. A case marked `pass` must keep passing;
   turning a `fail` into a `pass` is the work.
+  `the_real_pack_reads_as_it_is` does the same for the Tiled reader in
+  `src/tiled.rs` and `assets/erw`.
 - To grow that suite, set the grid of a sheet in the app, which writes it
   into the folder's book (`tilepicky.json`), and then fold the books into the
   cases:

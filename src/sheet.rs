@@ -4,6 +4,7 @@
 //! differ.
 
 use crate::detect;
+use crate::tileset;
 use crate::sidecar::count_text;
 use image::ImageDecoder;
 use crate::sidecar::{self, Animation, Pair, Provenance, Sidecar};
@@ -710,7 +711,9 @@ fn inside(img: &RgbaImage, (x, y): (i64, i64)) -> Option<(u32, u32)> {
 impl Sheet {
     /// `tile` is the tile size to assume when the entry names none. A gap or
     /// an offset comes from the entry alone; without one, a sheet has none.
-    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], side: Sidecar) -> Result<Self, String> {
+    /// `known` is the grid that a Tiled tileset states for this image. A grid
+    /// a person set outranks it, and it outranks what the pixels say.
+    pub fn open(ctx: &egui::Context, dir: &Path, rel: &str, tile: [u32; 2], mut side: Sidecar, known: Option<tileset::Grid>) -> Result<Self, String> {
         let path = dir.join(rel);
         let (frames, frame_ms) = if rel.to_ascii_lowercase().ends_with(".gif") { decode_gif(&path) } else { (Vec::new(), 0) };
         // A GIF that decoded has its frames already. Anything else, a GIF
@@ -727,7 +730,18 @@ impl Sheet {
                 (image::DynamicImage::from_decoder(decoder).map_err(fail)?.to_rgba8(), kind)
             }
         };
-        let read = side.tile.is_none();
+        // A person's grid wins, then the tileset's, then what the pixels say.
+        // A grid that came from the tileset is marked as machine-chosen, so
+        // that a tileset that changes later still wins over it, and nothing
+        // is written to the book for a grid this tool did not detect.
+        let person = side.tile.is_some() && !side.read;
+        let read = side.tile.is_none() && known.is_none();
+        if !person && let Some(grid) = known {
+            side.tile = Some(Pair::of(grid.tile));
+            side.gap = Some(Pair::of(grid.gap));
+            side.offset = Some(Pair::of([grid.offset[0].max(0), grid.offset[1].max(0)]));
+            side.read = true;
+        }
         let mut sheet = Self::from_image(ctx, dir, rel, tile, img, side);
         sheet.kind = kind;
         sheet.frames = frames;
@@ -2599,10 +2613,10 @@ mod tests {
         });
         img.save(dir.join("flat.png")).unwrap();
 
-        let read = Sheet::open(&ctx, &dir, "flat.png", [8, 8], Sidecar::default()).unwrap();
+        let read = Sheet::open(&ctx, &dir, "flat.png", [8, 8], Sidecar::default(), None).unwrap();
         let after_open = sidecar::load_book(&dir).unwrap().sheets.get("flat.png").cloned();
 
-        let mut chosen = Sheet::open(&ctx, &dir, "flat.png", [8, 8], after_open.clone().unwrap()).unwrap();
+        let mut chosen = Sheet::open(&ctx, &dir, "flat.png", [8, 8], after_open.clone().unwrap(), None).unwrap();
         chosen.side.used_in_maps = Some(false);
         chosen.set_grid(&ctx, [24, 24], [0, 0], [0, 0]);
         chosen.save_entry().unwrap();

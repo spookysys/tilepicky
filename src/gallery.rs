@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! A virtual sheet gallery. A bounded worker decodes the visible thumbnails.
 
+use crate::index::{Card, Entry};
+use crate::settings::View;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -98,6 +100,16 @@ impl Gallery {
     }
 
     fn paint_preview(&mut self, ui: &egui::Ui, index: &crate::index::Index, i: usize, rect: egui::Rect, response: &egui::Response) {
+        let entry = &index.entries[i];
+        if entry.tileset_only {
+            let weak = ui.visuals().weak_text_color();
+            let label = entry.tiled.as_ref().map(|t| t.summary()).unwrap_or_else(|| "The tileset could not be read.".into());
+            ui.painter().text(rect.center() - egui::vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, "Tiled tileset",
+                egui::FontId::proportional(14.0), weak);
+            ui.painter().text(rect.center() + egui::vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, label,
+                egui::FontId::proportional(11.0), weak);
+            return;
+        }
         let path = index.root.join(&index.entries[i].rel);
         let metadata = std::fs::metadata(&path).ok();
         let key = Key { path, modified: metadata.as_ref().and_then(|m| m.modified().ok()),
@@ -130,7 +142,7 @@ impl Gallery {
 
     pub fn show_ordered(
         &mut self, ui: &mut egui::Ui, index: &crate::index::Index, order: &[usize],
-        selected: Option<usize>, marked: &mut HashSet<usize>,
+        selected: Option<usize>, marked: &mut HashSet<usize>, view: View,
     ) -> Option<usize> {
         self.prepare(ui, index);
         let indices = ordered_indices(index.entries.len(), order);
@@ -171,10 +183,15 @@ impl Gallery {
                                         opened = Some(i);
                                     }
                                 });
-                                let summary = entry.side.label.as_ref().map(|label| {
-                                    if label.tags.is_empty() { label.caption.clone() } else { label.tags.join(", ") }
-                                }).unwrap_or_else(|| "No captions or tags".to_string());
-                                ui.add(egui::Label::new(egui::RichText::new(&summary).small().weak()).truncate()).on_hover_text(summary);
+                                let (summary, error) = card_summary(entry, view);
+                                let text = egui::RichText::new(&summary).small();
+                                let text = if error { text.color(ui.visuals().error_fg_color) } else { text.weak() };
+                                let mut hover = summary.clone();
+                                if let Some(note) = &entry.tiled_note {
+                                    hover.push('\n');
+                                    hover.push_str(note);
+                                }
+                                ui.add(egui::Label::new(text).truncate()).on_hover_text(hover);
                             });
                         });
                     }
@@ -184,6 +201,22 @@ impl Gallery {
         if !self.pending.is_empty() { ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)); }
         opened
     }
+}
+
+/// The second line of a card: what the tileset says when the card wears that
+/// face, else the label. The flag marks a tileset this tool could not read.
+fn card_summary(entry: &Entry, view: View) -> (String, bool) {
+    if entry.card(view) == Card::Tileset {
+        if let Some(tiled) = &entry.tiled {
+            let name = tiled.file.rsplit('/').next().unwrap_or(&tiled.file);
+            return (if entry.tileset_only { tiled.summary() } else { format!("{name}  {}", tiled.summary()) }, false);
+        }
+        return (entry.tiled_error.clone().unwrap_or_else(|| "The tileset could not be read.".into()), true);
+    }
+    let summary = entry.side.label.as_ref().map(|label| {
+        if label.tags.is_empty() { label.caption.clone() } else { label.tags.join(", ") }
+    }).unwrap_or_else(|| "No captions or tags".to_string());
+    (summary, false)
 }
 
 #[cfg(test)]

@@ -3,6 +3,10 @@
 The [user guide](../README.md) describes the current app, setup, controls, and export options.
 The [repository guide](../AGENTS.md) describes the source layout and build checks.
 
+## The library
+
+- [Tiled tilesets in the library](tiled-library.md): how the library reads `.tsx` and `.tsj` beside their images, the three view filters, and the plan for the panel and the cross-links.
+
 ## Saved data
 
 - [Metadata format](tilepicky-json.md): grids, labels, animations, quantization groups, and tile depth pins.

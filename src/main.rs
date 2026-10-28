@@ -35,6 +35,7 @@ mod half;
 mod settings;
 mod sheet;
 mod sidecar;
+mod tiled;
 mod tileset;
 mod map_changes;
 mod tree;
@@ -493,7 +494,7 @@ impl App {
     fn new(settings: settings::Settings, damaged: Option<String>) -> Self {
         let root = |s: &Option<PathBuf>| s.clone().unwrap_or_default();
         let cleaned = drop_own_sources(&root(&settings.project.path), &root(&settings.library.path));
-        let library = Index::scan(&root(&settings.library.path), settings.library.tile.map_or(TILE, Pair::xy));
+        let library = Index::scan_library(&root(&settings.library.path), settings.library.tile.map_or(TILE, Pair::xy));
         let mut project = Index::scan(&root(&settings.project.path), settings.project.tile.map_or(TILE, Pair::xy));
         migrate_sidecars(&mut project);
         let (keys, damaged_keys) = ai::Keys::load();
@@ -673,7 +674,8 @@ impl App {
         self.remembered(panel).path = Some(dir.clone());
         let cleaned = if panel == Panel::Project { drop_own_sources(&dir, &self.library.index.root) } else { None };
         let (query, search) = (self.qwords.clone(), self.settings.search);
-        self.half_mut(panel).set_root(&dir, &query, search);
+        let view = if panel == Panel::Library { self.settings.view } else { settings::View::everything() };
+        self.half_mut(panel).set_root(&dir, &query, search, view);
         let index = &self.half(panel).index;
         self.status = index.error.clone().or(cleaned).unwrap_or_else(|| format!("{name}: {}", index.root.display()));
         if let Err(e) = self.settings.save() { self.status = e; }
@@ -713,8 +715,9 @@ impl App {
     /// Filters the trees again after the entries changed. The folders stay
     /// open or closed as they are.
     fn refresh_visible(&mut self) {
-        self.library.refresh_visible(&self.qwords, self.settings.search);
-        self.project.refresh_visible(&self.qwords, self.settings.search);
+        self.library.refresh_visible(&self.qwords, self.settings.search, self.settings.view);
+        // The project lists images only, so the view boxes do not apply.
+        self.project.refresh_visible(&self.qwords, self.settings.search, settings::View::everything());
     }
 
     /// Each search source owns one bounded request and keeps its model identity.
@@ -934,10 +937,12 @@ impl App {
 
     fn marked_library_rels(&self) -> BTreeSet<String> {
         let mut rels: BTreeSet<String> = self.library_marked.iter()
-            .filter_map(|&k| self.library.index.entries.get(k)).map(|e| e.rel.clone()).collect();
+            .filter_map(|&k| self.library.index.entries.get(k)).filter(|e| e.sheet_rel().is_some())
+            .map(|e| e.rel.clone()).collect();
         for dir in &self.library_marked_dirs {
             let prefix = format!("{dir}/");
-            rels.extend(self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()));
+            rels.extend(self.library.index.entries.iter()
+                .filter(|e| e.sheet_rel().is_some() && e.rel.starts_with(&prefix)).map(|e| e.rel.clone()));
         }
         rels
     }
@@ -1187,14 +1192,14 @@ impl App {
         self.library_anchor = None;
         self.library_sweep = None;
         self.library_shift_anchor = None;
-        self.library.rescan(&self.qwords, self.settings.search);
+        self.library.rescan(&self.qwords, self.settings.search, self.settings.view);
         let index = &self.library.index;
         self.status = index.error.clone().unwrap_or_else(|| format!("{} files in the library", index.entries.len()));
     }
 
     fn rescan_project(&mut self) {
         self.marked.clear();
-        self.project.rescan(&self.qwords, self.settings.search);
+        self.project.rescan(&self.qwords, self.settings.search, settings::View::everything());
         if let Some(e) = &self.project.index.error { self.status = e.clone(); }
     }
 
@@ -1346,7 +1351,7 @@ impl App {
     /// Keeps search in step with an edit. Saving is explicit: Ctrl+S.
     fn after_edit(&mut self) {
         self.project.sync_entry();
-        self.project.refresh_visible(&self.qwords, self.settings.search);
+        self.project.refresh_visible(&self.qwords, self.settings.search, settings::View::everything());
     }
 
     fn save(&mut self) {
@@ -2815,8 +2820,8 @@ impl App {
             }
             TreeAction::BatchDir(dir) => {
                 let prefix = format!("{dir}/");
-                let rels: BTreeSet<String> =
-                    self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
+                let rels: BTreeSet<String> = self.library.index.entries.iter()
+                    .filter(|e| e.sheet_rel().is_some() && e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
                 if !rels.is_empty() {
                     let count = rels.len();
                     self.library_batch.choose(rels, format!("{dir} ({count} sheets)"));
@@ -2841,7 +2846,8 @@ impl App {
             }
             TreeAction::EmbeddingsDir(dir) => {
                 let prefix = format!("{dir}/");
-                let rels = self.library.index.entries.iter().filter(|e| e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
+                let rels = self.library.index.entries.iter()
+                    .filter(|e| e.sheet_rel().is_some() && e.rel.starts_with(&prefix)).map(|e| e.rel.clone()).collect();
                 self.select_embedding_sources(Some(rels));
             }
             TreeAction::EmbeddingsMarked => self.select_embedding_sources(Some(self.marked_library_rels().into_iter().collect())),

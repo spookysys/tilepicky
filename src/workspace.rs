@@ -56,7 +56,7 @@ impl App {
     pub(super) fn open_improve(&mut self) {
         self.improve_rels = self.marked_library_rels().into_iter().collect();
         if self.library_marked.is_empty() && self.library_marked_dirs.is_empty() {
-            self.improve_rels = self.library.index.entries.iter().map(|e| e.rel.clone()).collect();
+            self.improve_rels = self.library.index.entries.iter().filter(|e| e.sheet_rel().is_some()).map(|e| e.rel.clone()).collect();
         }
         self.improve_open = true;
     }
@@ -71,6 +71,20 @@ impl App {
                     ui.strong(&entry.rel);
                     ui.add_space(8.0);
                     self.gallery.preview(ui, &self.library.index, i, egui::vec2(ui.available_width(), 210.0));
+                    if let Some(tiled) = &entry.tiled {
+                        ui.separator();
+                        ui.strong("Tiled");
+                        ui.small(&tiled.file);
+                        ui.small(tiled.summary());
+                        if let Some(grid) = tiled.grid() {
+                            ui.small(format!("Grid: {} x {} tiles of {} x {}, gap {}, margin {}",
+                                grid.cols, grid.rows, grid.tile[0], grid.tile[1], grid.gap[0], grid.offset[0]));
+                        }
+                        if let Some(note) = &entry.tiled_note { ui.small(note); }
+                    }
+                    if let Some(error) = &entry.tiled_error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
                     if let Some(label) = &entry.side.label {
                         ui.label(&label.caption);
                         ui.horizontal_wrapped(|ui| { for tag in &label.tags { ui.label(egui::RichText::new(tag).strong()); } });
@@ -79,24 +93,41 @@ impl App {
                         self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
                     if !self.qwords.is_empty() && !sources.is_empty() { ui.small(format!("Matches: {}", sources.join(", "))); }
                     ui.separator();
-                    if ui.button("Use in tilesheet").clicked() {
-                        self.workspace = Workspace::Build;
-                        self.active = Panel::Library;
-                        self.pane = (Panel::Library, Spot::Sheet);
-                        ctx.memory_mut(|m| m.request_focus(crate::library_id()));
-                    }
-                    if ui.button("Copy sheet to project").clicked() { self.copy_library_sheet(&ctx, i); }
-                    if ui.button("Review / generate tags...").clicked() { self.label_action(&ctx, labels::Action::Show); }
-                    if ui.button("Improve this sheet...").clicked() {
-                        self.improve_rels = vec![self.library.index.entries[i].rel.clone()];
-                        self.improve_open = true;
-                    }
+                    let pixels = entry.sheet_rel().is_some();
+                    ui.add_enabled_ui(pixels, |ui| {
+                        if ui.button("Use in tilesheet").clicked() {
+                            self.workspace = Workspace::Build;
+                            self.active = Panel::Library;
+                            self.pane = (Panel::Library, Spot::Sheet);
+                            ctx.memory_mut(|m| m.request_focus(crate::library_id()));
+                        }
+                        if ui.button("Copy sheet to project").clicked() { self.copy_library_sheet(&ctx, i); }
+                        if ui.button("Review / generate tags...").clicked() { self.label_action(&ctx, labels::Action::Show); }
+                        if ui.button("Improve this sheet...").clicked() {
+                            self.improve_rels = vec![self.library.index.entries[i].rel.clone()];
+                            self.improve_open = true;
+                        }
+                    });
                 });
             });
         }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Library");
+                let (tilesets, in_tilesets, loose) = self.library.index.view_counts();
+                // A pack without Tiled files looks as it did before this
+                // feature, so the boxes appear only when one is there.
+                if tilesets > 0 {
+                    let mut view = self.settings.view;
+                    ui.checkbox(&mut view.tilesets, format!("Tilesets ({tilesets})"));
+                    ui.checkbox(&mut view.in_tilesets, format!("Images in tilesets ({in_tilesets})"));
+                    ui.checkbox(&mut view.loose, format!("Images not in tilesets ({loose})"));
+                    if view != self.settings.view {
+                        self.settings.view = view;
+                        if let Err(error) = self.settings.save() { self.status = error; }
+                        self.refresh_visible();
+                    }
+                }
                 ui.checkbox(&mut self.library_without_tags, "Without tags");
                 ui.checkbox(&mut self.compare_search, "Compare search");
                 if !self.library_marked.is_empty() || !self.library_marked_dirs.is_empty() {
@@ -112,10 +143,23 @@ impl App {
                 return;
             }
             if self.compare_search { self.search_comparison(ui); return; }
+            let view = self.library.index.effective_view(self.settings.view);
             let mut order = self.library.index.ranked(&self.qwords, self.settings.search,
                 self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
+            let matched = order.len();
+            order.retain(|i| self.library.index.entries[*i].shows(view));
+            let shown = order.len();
             if self.library_without_tags { order.retain(|i| self.library.index.entries[*i].side.label.is_none()); }
-            ui.weak(format!("{} sheets. Click to inspect; use checkboxes to select a job scope.", order.len()));
+            // A library that the view does not trim keeps the sentence it had
+            // before the tilesets came, so nothing reads differently for a
+            // person who does not use Tiled.
+            if shown == matched {
+                ui.weak(format!("{} sheets. Click to inspect; use checkboxes to select a job scope.", order.len()));
+            } else {
+                let noun = if self.qwords.is_empty() { "entries" } else { "matches" };
+                ui.weak(format!("{} shown of {} {noun}. Click to inspect; use checkboxes to select a job scope.",
+                    order.len(), matched));
+            }
             if !self.qwords.is_empty() && (self.query_embed.is_some() || self.text_query.pending.is_some()) {
                 ui.weak("Meaning search is running. Word matches are available.");
             }
@@ -123,7 +167,8 @@ impl App {
                 ui.colored_label(ui.visuals().error_fg_color, labels::summary(error));
                 if ui.button("Retry meaning search").clicked() { self.query_error = None; self.text_query.error = None; }
             }
-            if let Some(i) = self.gallery.show_ordered(ui, &self.library.index, &order, self.library.sel, &mut self.library_marked) {
+            if let Some(i) = self.gallery.show_ordered(ui, &self.library.index, &order, self.library.sel, &mut self.library_marked,
+                view) {
                 self.open_library(&ctx, i);
             }
             if let Some(i) = self.gallery.take_drag() { self.start_library_drag(i); }
@@ -191,8 +236,9 @@ impl App {
                     }
                     if vector.is_none() { column.weak("Preparing the search query..."); continue; }
                 }
-                let results = self.library.index.ranked(&self.qwords, search,
+                let mut results = self.library.index.ranked(&self.qwords, search,
                     self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
+                results.retain(|i| self.library.index.entries[*i].shows(self.library.index.effective_view(self.settings.view)));
                 column.small(format!("{} matches", results.len()));
                 egui::ScrollArea::vertical().id_salt(title).show(column, |ui| {
                     for i in results {

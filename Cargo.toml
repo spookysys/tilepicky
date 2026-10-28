@@ -36,3 +36,7 @@ walkdir = "2.5.0"
 # and the window lost the frame of the desktop it runs on. Cargo adds up the
 # features of a crate, so asking here reaches the winit that eframe uses.
 winit = "0.30.13"
+# An older Tiled tileset is XML (`foo.tsx`). The library reads it to learn the
+# image and the grid that Tiled wrote. quick-xml reads it without a build step,
+# and `src/tiled.rs` is the only place that calls it.
+quick-xml = "0.42.0"

@@ -3,7 +3,7 @@
 //! The library and the project are the same thing; only the edits differ.
 
 use crate::index::Index;
-use crate::settings::SearchIn;
+use crate::settings::{SearchIn, View};
 use crate::sidecar::Label;
 use crate::sheet::Sheet;
 use crate::tree::{Node, Row};
@@ -58,19 +58,23 @@ impl Half {
     }
 
     /// Reads the folder again. The open sheet keeps its place in the tree.
-    pub fn rescan(&mut self, query: &[String], search: SearchIn) {
+    pub fn rescan(&mut self, query: &[String], search: SearchIn, view: View) {
         let cursor_rel = match &self.at {
             Some(Row::File(i)) => self.index.entries.get(*i).map(|entry| entry.rel.clone()),
             _ => None,
         };
-        let index = Index::scan(&self.index.root, self.index.tile);
+        let index = if self.library {
+            Index::scan_library(&self.index.root, self.index.tile)
+        } else {
+            Index::scan(&self.index.root, self.index.tile)
+        };
         if index.embed_model != self.index.embed_model || index.embed_provider != self.index.embed_provider { self.embed_query = None; }
         if index.text_embed_model != self.index.text_embed_model || index.text_embed_provider != self.index.text_embed_provider {
             self.text_embed_query = None;
         }
         self.index = index;
         self.tree = tree_of(&self.index);
-        self.refresh_visible(query, search);
+        self.refresh_visible(query, search, view);
         self.sel = self.sheet.as_ref().and_then(|s| self.index.position(&s.rel));
         self.at = match &self.at {
             Some(Row::File(_)) => cursor_rel.and_then(|rel| self.index.position(&rel)).map(Row::File),
@@ -82,7 +86,7 @@ impl Half {
     }
 
     /// Points the half at another folder. Nothing stays open.
-    pub fn set_root(&mut self, root: &Path, query: &[String], search: SearchIn) {
+    pub fn set_root(&mut self, root: &Path, query: &[String], search: SearchIn, view: View) {
         self.embed_query = None;
         self.text_embed_query = None;
         self.index.root = root.to_path_buf();
@@ -90,12 +94,13 @@ impl Half {
         self.open_dir = None;
         self.sheet = None;
         self.sel = None;
-        self.rescan(query, search);
+        self.rescan(query, search, view);
     }
 
     /// Filters the tree again after the entries or the query changed.
-    pub fn refresh_visible(&mut self, query: &[String], search: SearchIn) {
-        self.visible = self.index.visible(query, search, self.embed_query.as_deref(), self.text_embed_query.as_deref());
+    pub fn refresh_visible(&mut self, query: &[String], search: SearchIn, view: View) {
+        let view = self.index.effective_view(view);
+        self.visible = self.index.visible(query, search, self.embed_query.as_deref(), self.text_embed_query.as_deref(), view);
     }
 
     /// The tile size to assume for a sheet whose entry names none: the sheet
@@ -108,13 +113,17 @@ impl Half {
     /// and the arrow keys stand on the file.
     pub fn open(&mut self, ctx: &egui::Context, i: usize) -> Result<(), String> {
         let e = &self.index.entries[i];
-        let mut s = Sheet::open(ctx, &self.index.root, &e.rel, self.inherited_tile(), e.side.clone())?;
+        let Some(rel) = e.sheet_rel() else {
+            return Err(format!("{} is a Tiled tileset, not an image, so there is nothing to open.", e.rel));
+        };
+        let known = e.tiled.as_ref().and_then(|t| t.grid());
+        let mut s = Sheet::open(ctx, &self.index.root, rel, self.inherited_tile(), e.side.clone(), known)?;
         s.library = self.library;
         // The Tiled tileset beside a project image holds its tile properties.
         // A file this tool cannot read still opens the sheet: the panel shows
         // the error, and a save leaves that file alone.
         if !self.library {
-            match crate::tileset::load(&self.index.root, &e.rel) {
+            match crate::tileset::load(&self.index.root, rel) {
                 Ok(props) => s.props = props,
                 Err(error) => s.props_error = Some(error),
             }
@@ -180,10 +189,10 @@ mod tests {
         let mut half = Half::new(Index::scan(&folder.0, [8, 8]), true);
         half.at = Some(Row::File(1));
         std::fs::remove_file(folder.0.join("a.png")).unwrap();
-        half.rescan(&[], SearchIn::default());
+        half.rescan(&[], SearchIn::default(), View::default());
         assert_eq!(half.at, Some(Row::File(0)));
         std::fs::remove_file(folder.0.join("b.png")).unwrap();
-        half.rescan(&[], SearchIn::default());
+        half.rescan(&[], SearchIn::default(), View::default());
         assert_eq!(half.at, None);
     }
 
