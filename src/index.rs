@@ -383,7 +383,17 @@ impl Index {
     fn match_scores(e: &Entry, query: &[String], search: SearchIn, image_query: Option<&[f32]>, text_query: Option<&[f32]>) -> [Option<f32>; 3] {
         let mut literal = Vec::new();
         if search.folders { literal.extend(e.dir_words.iter().cloned()); }
-        if search.files { literal.extend(e.name_words.iter().cloned()); }
+        if search.files {
+            literal.extend(e.name_words.iter().cloned());
+            // The extension is a word too. A person who types a whole file
+            // name, `props.tsx`, means that file and not every word in it.
+            // Only a query that names the extension pays for it, so a search
+            // for `p` does not gain every `.png` in the library.
+            if let Some(ext) = Path::new(&e.rel).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase)
+                && query.iter().any(|q| ext.starts_with(q)) {
+                literal.push(ext);
+            }
+        }
         if let Some(label) = &e.side.label {
             if search.captions { literal.extend(words(&label.caption)); }
             if search.tags { literal.extend(words(&label.tags.join(" "))); }
@@ -637,6 +647,18 @@ mod tests {
         let search = SearchIn { folders: false, ..SearchIn::default() };
         assert_eq!(index.ranked(&words("tree"), search, None, None), vec![2, 0, 1]);
         assert_eq!(Index::match_sources(&index.entries[0], &words("tree"), search, None, None), vec!["Words"]);
+    }
+
+    /// A whole file name names one file. The extension is a word only when
+    /// the query asks for it, so `props.tsx` does not find `props.png`.
+    #[test]
+    fn a_whole_file_name_matches_its_extension() {
+        let index = search_index(vec![entry("Props/props.tsx", None), entry("Props/props.png", None)]);
+        let search = SearchIn { folders: false, ..SearchIn::default() };
+        assert_eq!(index.ranked(&words("props.tsx"), search, None, None), vec![0]);
+        assert!(Index::entry_matches(&index.entries[0], &words("props.tsx"), search, None, None));
+        assert!(!Index::entry_matches(&index.entries[1], &words("props.tsx"), search, None, None));
+        assert_eq!(index.ranked(&words("props"), search, None, None).len(), 2, "a bare name still finds both");
     }
 
     #[test]
