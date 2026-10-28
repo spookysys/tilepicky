@@ -1,9 +1,9 @@
 # Tiled tilesets in the library
 
-Status: phase 1 is implemented on 2026-10-28. That is the reader, the
-pairing, the grid precedence, the three filters, and the copy fix. The
-panel, the cross-links, and the project rules are proposals; each section
-below says which one it is.
+Status: phases 1 and 2 are implemented on 2026-10-28. That is the reader,
+the pairing, the grid precedence, the three filters, the copy fix, the
+read-only inspector, and the cross-links. Phase 3 and the later phases are
+proposals; each section below says which one it is.
 
 The library shows the Tiled tilesets of a pack beside the images they use.
 A person can find a tileset, read its data, and copy it to a project.
@@ -136,50 +136,67 @@ that they stop using.
 
 ## The cross-links
 
-Status: phase 2. None of these buttons exist yet.
+Status: phase 2, implemented 2026-10-28.
 
 The hidden images stay one click away. This is what makes hiding safe.
 
-- The image card has a small button `Tileset` that opens the tileset card.
-- The tileset card has a button `Image` that opens the atlas image.
-- A collection card lists its tiles in the panel. Each row links to that
-  sprite.
-- The collection card has one button `Show these N sprites` that turns on
-  `Images in tilesets`.
+- An atlas image and its tileset share one card. The `Sheet | Tiled` tab
+  switches the card between the pixels and the tileset. A separate
+  `Tileset` button would open a card that the model does not have.
+- A collection member shows `Tiled: file [Open]`. `Open` jumps to the
+  collection card.
+- A collection card lists its tiles. Each row opens that sprite.
+- The collection card has one button `Show these N images`. It sits above
+  the tile list and turns on `Images in tilesets`.
 
-A link may open an entry that the filter hides. The filter stays as the
-person left it, and the panel says where the person came from.
+A jump may open an entry that the filter hides. The filter stays as the
+person left it. The inspector starts with `From <origin>` and a `Back`
+button; `Back` restores the origin and the tab it showed. The link keeps one
+step of history: a new jump replaces it, so the chain cannot grow without a
+way out.
 
 Double-click keeps its current meaning, which is to open the card in the
 canvas. A cross-link is a button, because a gesture must be learned.
 
 ## The panel
 
-Status: phase 2. The library inspector shows a read-only summary already:
-the file, its summary line, the grid, and any note. The tab and the blocks
-below are the plan.
+Status: phase 2, implemented 2026-10-28. The blocks below are what the
+library shows now. The items that remain are named after them.
 
-One component, used twice: `Build` edits, `Library` inspects. One code path,
-and an `editable` flag. The library panel writes nothing.
+The library panel is read-only and separate from the `Build` tile-properties
+panel. The two answer different questions: `Build` writes a tile's class and
+properties, and `Library` reports what the file holds. A shared editable flag
+would put write paths in a panel that never takes them. The one button that
+writes, `Use the tileset grid`, asks the app to clear the person's layout
+from the book and then reopens the sheet.
 
-The library inspector gains a tab: `Sheet | Tiled`. The tab appears only
-when the entry has a tileset. Two right panels would press on the gallery.
+The library inspector has a tab: `Sheet | Tiled`. The tab appears only when
+the entry has a tileset. A collection tileset has no image, so its card
+opens on the Tiled face without tabs. Two right panels would press on the
+gallery.
 
-The blocks, in this order, and the reason for the order:
+The blocks, in this order:
 
-1. **Identity**: file, format, atlas or collection, version. A person must
-   know which file they read before they trust it.
-2. **Grid**: tile size, margin, spacing, columns, tile count, image size.
-   Then one line: `agrees with this sheet`, or `differs`. With a button
-   `Use the tileset grid`.
-3. **Data counts**: animations, collision shapes, wangsets, properties, tile
-   classes. With a toggle that marks those cells on the sheet.
-4. **The selected tile**: its properties, its animation, its collision.
-   Read-only, with one button to copy the sheet to the project.
-5. **Tileset-level fields**, collapsed: `properties`, `wangsets`,
-   `terrains`, `transformations`, `editorsettings`.
+1. **Identity**: file, format, atlas or collection, version, class, and the
+   image that the file names when it is not this card. A person must know
+   which file they read before they trust it.
+2. **Grid**: tile size, margin, spacing, columns, rows, image size. Then one
+   line: `agrees with this sheet`, or the sheet's grid and a button
+   `Use the tileset grid`. A collection states that it has no grid.
+3. **Data counts**: animations, collision shapes, wang sets, tile classes,
+   and tiles with properties. Tileset-level properties follow in a closed
+   block.
+4. **Collection**: one button `Show these N images`, then the tiles with an
+   image. A row opens that image. The list stops at 100 rows and says how
+   many remain.
+5. **Atlas tiles with data**: a closed list of the tiles that carry a
+   class, an animation, a collision, or a property. It also stops at 100.
 6. **Health**: the checks below.
-7. **Maps that use it**, on demand: path, `firstgid`, layer names.
+
+The selected-tile block, the overlay marks, the tileset-level fields beyond
+properties, and the map list are not built yet. The collection rows already
+carry the data that a selected-tile block would show. An overlay is a
+separate tool because it changes the sheet view.
 
 The grid is the highest-value block. The tileset is a number that a person
 wrote. Pixel detection is a guess. So the precedence is:
@@ -231,9 +248,10 @@ It works on Windows, where the pack was made, and fails on Linux.
 
 ## Health checks
 
-Phase 1 reports the first and the seventh, as a note on the card. A file
-that cannot be read at all becomes the card's error line. The rest are
-phase 2.
+Phase 1 reports a broken file as the card's error line, and a mismatched
+path as a note on the card. Phase 2 adds the panel's Health block: the
+columns, tile count, tile id, and animation frame checks. The comparison of
+a `.tsx` and a `.tsj` beside one image is not built.
 
 Tiled reports the checks only when a person opens the file, and the library
 is where a person wants to find them first.
@@ -253,7 +271,8 @@ sidecar is wrong.
 
 ## What this does not do
 
-- Edit maps. The panel lists the maps that use a tileset, and no more.
+- Edit maps. The panel does not list the maps that use a tileset yet; that
+  list is a later phase.
 - Edit library tilesets in place. Inspect and copy, never fork a pack.
 - Evaluate wang or terrain rules. Show the data, do not paint with it.
 - Convert a format during a copy, or write a second tileset beside one.
@@ -262,16 +281,17 @@ sidecar is wrong.
 
 ## Phases
 
-1. Done: the TSX reader, the pairing, the grid precedence, the card, the
-   three filters, and the copy fix.
-2. The panel and the cross-links: identity, grid agreement, data counts,
-   selected tile, health, and the buttons that jump between an image and
-   its tileset.
+1. Done (2026-10-28): the TSX reader, the pairing, the grid precedence, the
+   card, the three filters, and the copy fix.
+2. Done (2026-10-28): the inspector tab, grid agreement and `Use the
+   tileset grid`, data counts, the collection tile list and its links, the
+   health block, and the cross-links with one step back.
 3. The rules for a project that has a `.tsx`: convert on request, or report
    why not. The library reads both formats already.
 4. Search words (`animated`, `collision`, `wang`, `collection`, class names,
-   property names), the overlay marks, and the map list.
-5. Collection cards: tile list, link to each sprite, preview contact sheet.
+   property names), the overlay marks, the tileset-level fields, and the map
+   list.
+5. Collection cards: a preview contact sheet.
 
 ### What a copy does
 

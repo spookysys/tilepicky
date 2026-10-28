@@ -34,6 +34,9 @@ pub struct Entry {
     pub tiled: Option<tiled::Tiled>,
     /// Some tileset names this image, as an atlas or as a collection member.
     pub in_tileset: bool,
+    /// The tileset that names this image as one tile of a collection. An
+    /// atlas entry carries that tileset in `tiled` instead.
+    pub tileset_of: Option<String>,
     /// This entry stands for a tileset file, and has no pixels. Every path
     /// that decodes an image must ask `sheet_rel` first.
     pub tileset_only: bool,
@@ -54,6 +57,12 @@ impl Entry {
     /// stands on its image.
     pub fn has_tileset(&self) -> bool {
         self.tileset_only || self.tiled.is_some()
+    }
+
+    /// The tileset file that describes this entry: the atlas that names the
+    /// image, or the collection that holds it as one tile.
+    pub fn tileset_file(&self) -> Option<&str> {
+        self.tiled.as_ref().map(|t| t.file.as_str()).or(self.tileset_of.as_deref())
     }
 
     /// Whether the view filters leave this entry in the library.
@@ -181,7 +190,7 @@ impl Index {
                 let text_embed = embed::current_vector(root, &rel, &side, &text_embeddings, embed::InputMode::Text);
                 Entry {
                     dir_words, name_words, side, rel, embed: vector, text_embed,
-                    tiled: None, in_tileset: false, tileset_only: false, tiled_error: None, tiled_note: None,
+                    tiled: None, in_tileset: false, tileset_of: None, tileset_only: false, tiled_error: None, tiled_note: None,
                 }
             })
             .collect();
@@ -219,6 +228,11 @@ impl Index {
                                 if let Some(rel) = tiled::resolve(root, &file, source).rel
                                     && let Some(&i) = at.get(&rel) {
                                     entries[i].in_tileset = true;
+                                    // The first collection keeps the link when
+                                    // two of them hold the same image.
+                                    if entries[i].tileset_of.is_none() {
+                                        entries[i].tileset_of = Some(file.clone());
+                                    }
                                 }
                             }
                         }
@@ -400,6 +414,7 @@ fn standing(file: &str, tiled: Option<tiled::Tiled>, error: Option<String>, note
         text_embed: None,
         tiled,
         in_tileset: false,
+        tileset_of: None,
         tileset_only: true,
         tiled_error: error,
         tiled_note: note,
@@ -445,7 +460,8 @@ mod tests {
     fn entry(rel: &str, embed: Option<Vec<f32>>) -> Entry {
         Entry {
             dir_words: words("props"), name_words: path_words(rel), side: Sidecar::default(), rel: rel.into(), embed,
-            text_embed: None, tiled: None, in_tileset: false, tileset_only: false, tiled_error: None, tiled_note: None,
+            text_embed: None, tiled: None, in_tileset: false, tileset_of: None, tileset_only: false,
+            tiled_error: None, tiled_note: None,
         }
     }
 
@@ -477,6 +493,7 @@ mod tests {
             text_embed: None,
             tiled: None,
             in_tileset: false,
+            tileset_of: None,
             tileset_only: false,
             tiled_error: None,
             tiled_note: None,
@@ -562,6 +579,11 @@ mod tests {
         assert_eq!(index.entries[at("Tiles/atlas.png")].tiled.as_ref().unwrap().name, "Atlas");
         assert!(index.entries[at("Props/a.png")].in_tileset);
         assert!(index.entries[at("Props/b.png")].in_tileset);
+        assert_eq!(index.entries[at("Props/a.png")].tileset_of.as_deref(), Some("Props/props.tsx"));
+        assert_eq!(index.entries[at("Props/a.png")].tileset_file(), Some("Props/props.tsx"));
+        assert_eq!(index.entries[at("Tiles/atlas.png")].tileset_of, None, "an atlas names its image, not the other way");
+        assert_eq!(index.entries[at("Tiles/atlas.png")].tileset_file(), Some("Tiles/atlas.tsx"));
+        assert_eq!(index.entries[at("Tiles/loose.png")].tileset_file(), None);
         assert!(index.entries[at("Props/props.tsx")].tileset_only);
         assert_eq!(index.entries[at("Props/props.tsx")].sheet_rel(), None);
         assert_eq!(index.view_counts(), (2, 3, 1));

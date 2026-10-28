@@ -2,9 +2,26 @@
 //! Task navigation, the visual library, and scoped search tools.
 
 use crate::{App, Panel, Spot, Index, labels, settings, egui, Id};
+use crate::tiled_inspect;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Workspace { Library, Build }
+
+/// What a click in the library inspector asks the app to do.
+enum Ask {
+    /// Show the image face of the card.
+    Sheet,
+    /// Show the Tiled face of the card.
+    Tiled,
+    /// Return to the entry that the last cross-link came from.
+    Back,
+    /// Open another entry, by its path.
+    Jump(String),
+    /// Drop the person's grid, so that the sheet follows the tileset.
+    UseGrid,
+    /// Turn on the images that the tilesets name.
+    ShowImages,
+}
 
 impl App {
     pub(super) fn workspace_bar(&mut self, ui: &mut egui::Ui) {
@@ -64,52 +81,14 @@ impl App {
     pub(super) fn library_workspace(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if self.library.sel.is_some() {
-            egui::Panel::right("sheet inspector").default_size(250.0).size_range(180.0..=400.0).resizable(true).show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let Some(i) = self.library.sel.filter(|i| *i < self.library.index.entries.len()) else { return };
-                    let entry = &self.library.index.entries[i];
-                    ui.strong(&entry.rel);
-                    ui.add_space(8.0);
-                    self.gallery.preview(ui, &self.library.index, i, egui::vec2(ui.available_width(), 210.0));
-                    if let Some(tiled) = &entry.tiled {
-                        ui.separator();
-                        ui.strong("Tiled");
-                        ui.small(&tiled.file);
-                        ui.small(tiled.summary());
-                        if let Some(grid) = tiled.grid() {
-                            ui.small(format!("Grid: {} x {} tiles of {} x {}, gap {}, margin {}",
-                                grid.cols, grid.rows, grid.tile[0], grid.tile[1], grid.gap[0], grid.offset[0]));
-                        }
-                        if let Some(note) = &entry.tiled_note { ui.small(note); }
-                    }
-                    if let Some(error) = &entry.tiled_error {
-                        ui.colored_label(ui.visuals().error_fg_color, error);
-                    }
-                    if let Some(label) = &entry.side.label {
-                        ui.label(&label.caption);
-                        ui.horizontal_wrapped(|ui| { for tag in &label.tags { ui.label(egui::RichText::new(tag).strong()); } });
-                    } else { ui.weak("No captions or tags yet."); }
-                    let sources = Index::match_sources(entry, &self.qwords, self.settings.search,
-                        self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
-                    if !self.qwords.is_empty() && !sources.is_empty() { ui.small(format!("Matches: {}", sources.join(", "))); }
-                    ui.separator();
-                    let pixels = entry.sheet_rel().is_some();
-                    ui.add_enabled_ui(pixels, |ui| {
-                        if ui.button("Use in tilesheet").clicked() {
-                            self.workspace = Workspace::Build;
-                            self.active = Panel::Library;
-                            self.pane = (Panel::Library, Spot::Sheet);
-                            ctx.memory_mut(|m| m.request_focus(crate::library_id()));
-                        }
-                        if ui.button("Copy sheet to project").clicked() { self.copy_library_sheet(&ctx, i); }
-                        if ui.button("Review / generate tags...").clicked() { self.label_action(&ctx, labels::Action::Show); }
-                        if ui.button("Improve this sheet...").clicked() {
-                            self.improve_rels = vec![self.library.index.entries[i].rel.clone()];
-                            self.improve_open = true;
-                        }
-                    });
-                });
-            });
+            let ask = egui::Panel::right("sheet inspector").default_size(250.0).size_range(180.0..=400.0).resizable(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.library_inspector(ui)).inner
+                })
+                .inner;
+            if let Some(ask) = ask {
+                self.library_ask(&ctx, ask);
+            }
         }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -173,6 +152,98 @@ impl App {
             }
             if let Some(i) = self.gallery.take_drag() { self.start_library_drag(i); }
         });
+    }
+
+    /// The selected card: the sheet, its Tiled tab, or the tileset of a card
+    /// that has no pixels. Returns what a click asks for; the caller owns the
+    /// state and the files.
+    fn library_inspector(&mut self, ui: &mut egui::Ui) -> Option<Ask> {
+        let i = self.library.sel.filter(|i| *i < self.library.index.entries.len())?;
+        let mut ask = None;
+        // A cross-link may open an entry that the filters hide. The panel
+        // says where the person came from, and the filters stay as they are.
+        if let Some((from, _)) = &self.library_from {
+            ui.horizontal_wrapped(|ui| {
+                ui.small(format!("From {from}"));
+                if crate::stopped(ui.button("Back")).clicked() { ask = Some(Ask::Back); }
+            });
+        }
+        let entry = &self.library.index.entries[i];
+        if entry.tiled.is_some() && !entry.tileset_only {
+            ui.horizontal(|ui| {
+                if crate::stopped(ui.selectable_label(!self.library_tiled_tab, "Sheet")).clicked() { ask = Some(Ask::Sheet); }
+                if crate::stopped(ui.selectable_label(self.library_tiled_tab, "Tiled")).clicked() { ask = Some(Ask::Tiled); }
+            });
+            ui.separator();
+        }
+        if entry.tiled.is_some() && (self.library_tiled_tab || entry.tileset_only) {
+            let sheet = self.library.sheet.as_ref().filter(|sheet| sheet.rel == entry.rel);
+            if let Some(action) = tiled_inspect::show(ui, &self.library.index, i, sheet) {
+                ask = Some(match action {
+                    tiled_inspect::Action::Jump(to) => Ask::Jump(to),
+                    tiled_inspect::Action::UseGrid => Ask::UseGrid,
+                    tiled_inspect::Action::ShowImages => Ask::ShowImages,
+                });
+            }
+            return ask;
+        }
+        ui.strong(&entry.rel);
+        ui.add_space(8.0);
+        self.gallery.preview(ui, &self.library.index, i, egui::vec2(ui.available_width(), 210.0));
+        if let Some(file) = entry.tileset_file() {
+            if entry.tiled.is_some() {
+                ui.small(format!("Tiled: {file}"));
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(format!("Tiled: {file}"));
+                    if crate::stopped(ui.link("Open")).clicked() {
+                        ask = Some(Ask::Jump(file.to_string()));
+                    }
+                });
+                ui.small("This image is one tile of that collection.");
+            }
+        }
+        if let Some(note) = &entry.tiled_note { ui.small(note); }
+        if let Some(error) = &entry.tiled_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        if let Some(label) = &entry.side.label {
+            ui.label(&label.caption);
+            ui.horizontal_wrapped(|ui| { for tag in &label.tags { ui.label(egui::RichText::new(tag).strong()); } });
+        } else { ui.weak("No captions or tags yet."); }
+        let sources = Index::match_sources(entry, &self.qwords, self.settings.search,
+            self.library.embed_query.as_deref(), self.library.text_embed_query.as_deref());
+        if !self.qwords.is_empty() && !sources.is_empty() { ui.small(format!("Matches: {}", sources.join(", "))); }
+        ui.separator();
+        let pixels = entry.sheet_rel().is_some();
+        ui.add_enabled_ui(pixels, |ui| {
+            if ui.button("Use in tilesheet").clicked() {
+                self.workspace = Workspace::Build;
+                self.active = Panel::Library;
+                self.pane = (Panel::Library, Spot::Sheet);
+                ui.ctx().memory_mut(|m| m.request_focus(crate::library_id()));
+            }
+            if ui.button("Copy sheet to project").clicked() { self.copy_library_sheet(ui.ctx(), i); }
+            if ui.button("Review / generate tags...").clicked() { self.label_action(ui.ctx(), labels::Action::Show); }
+            if ui.button("Improve this sheet...").clicked() {
+                self.improve_rels = vec![self.library.index.entries[i].rel.clone()];
+                self.improve_open = true;
+            }
+        });
+        ask
+    }
+
+    /// Does what the inspector asked. Only this side changes files; the panel
+    /// itself is read-only.
+    fn library_ask(&mut self, ctx: &egui::Context, ask: Ask) {
+        match ask {
+            Ask::Sheet => self.library_tiled_tab = false,
+            Ask::Tiled => self.library_tiled_tab = true,
+            Ask::Back => self.back_library(ctx),
+            Ask::Jump(to) => self.jump_library(ctx, &to),
+            Ask::UseGrid => self.use_tileset_grid(ctx),
+            Ask::ShowImages => self.show_tileset_images(),
+        }
     }
 
     fn search_comparison(&mut self, ui: &mut egui::Ui) {

@@ -51,6 +51,22 @@ pub struct Counts {
     pub collisions: usize,
 }
 
+/// The data that one tile carries beyond its picture.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tile {
+    /// The class the author gave it. Tiled 1.9 writes `class`, older files
+    /// write `type`.
+    pub class: String,
+    /// The image of a collection tile, as the file words it.
+    pub image: Option<String>,
+    /// The tile ids of its animation, in order.
+    pub frames: Vec<u32>,
+    /// How many collision shapes it holds.
+    pub collisions: usize,
+    /// Name and value, as Tiled shows them.
+    pub properties: Vec<(String, String)>,
+}
+
 /// One tileset, in the terms both formats share.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tiled {
@@ -61,6 +77,8 @@ pub struct Tiled {
     pub name: String,
     /// The Tiled version the file speaks.
     pub version: String,
+    /// The class of the tileset itself, if the author gave one.
+    pub class: String,
     pub tile: [u32; 2],
     pub margin: u32,
     pub spacing: u32,
@@ -70,6 +88,10 @@ pub struct Tiled {
     pub tilecount: u32,
     pub shape: Shape,
     pub counts: Counts,
+    /// Properties of the tileset, not of one tile.
+    pub properties: Vec<(String, String)>,
+    /// The tiles that the file describes, by id.
+    pub tiles: BTreeMap<u32, Tile>,
 }
 
 /// The path of an image, as the library sees it, beside why it is not exact.
@@ -149,6 +171,68 @@ impl Tiled {
         })
     }
 
+    /// The image size that the file states, for an atlas.
+    pub fn declared_size(&self) -> Option<[u32; 2]> {
+        match &self.shape {
+            Shape::Atlas { size: Some(size), .. } => Some(*size),
+            _ => None,
+        }
+    }
+
+    /// Problems that the file shows by itself: a column or tile count that
+    /// the stated image size cannot hold, a tile id past the last tile, and
+    /// an animation frame that is not a tile of this set.
+    pub fn health(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Shape::Atlas { size: Some([width, height]), .. } = self.shape {
+            if self.tile[0] > 0 && self.columns > 0 {
+                let fit = span(width, self.tile[0], self.margin, self.spacing);
+                if fit != self.columns {
+                    out.push(format!("columns says {}, but the image width holds {fit}", self.columns));
+                }
+            }
+            if self.tile[1] > 0 && self.columns > 0 {
+                let rows = span(height, self.tile[1], self.margin, self.spacing);
+                let capacity = self.columns * rows;
+                if self.tilecount > capacity {
+                    out.push(format!("tilecount is {}, but the image holds {capacity} cells", self.tilecount));
+                }
+            }
+        }
+        if let Some(limit) = self.limit()
+            && let Some((&id, _)) = self.tiles.iter().find(|(id, _)| **id >= limit) {
+            out.push(format!("tile {id} is past the last tile, {limit}"));
+        }
+        for (id, tile) in &self.tiles {
+            if let Some(frame) = tile.frames.iter().find(|frame| !self.has_tile(**frame)) {
+                out.push(format!("tile {id} animates to {frame}, which is not a tile here"));
+            }
+        }
+        out
+    }
+
+    /// The first id that is not a tile, when the file says. An atlas without
+    /// a stated count can still derive one from its image size.
+    fn limit(&self) -> Option<u32> {
+        if self.tilecount > 0 {
+            Some(self.tilecount)
+        } else if self.is_collection() {
+            None
+        } else {
+            u32::try_from(self.tile_count()).ok().filter(|count| *count > 0)
+        }
+    }
+
+    /// Whether `id` names a tile. An atlas with no count and no derivable
+    /// grid can hold any id, so that case is not a problem.
+    fn has_tile(&self, id: u32) -> bool {
+        if self.is_collection() {
+            self.tiles.contains_key(&id)
+        } else {
+            self.limit().is_none_or(|limit| id < limit)
+        }
+    }
+
     /// A line for a card: `TSX, 3,087 tiles, 32x32, 12 animated`.
     pub fn summary(&self) -> String {
         let tiles = self.tile_count();
@@ -197,6 +281,42 @@ pub fn read(root: &Path, rel: &str) -> Result<Tiled, String> {
     Ok(tiled)
 }
 
+/// A property value as the panel shows it: a string as itself, anything
+/// else as the JSON text Tiled wrote.
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The `properties` array of a tileset or a tile.
+fn json_properties(value: Option<&Value>) -> Vec<(String, String)> {
+    let Some(list) = value.and_then(Value::as_array) else { return Vec::new() };
+    list.iter().filter_map(|property| {
+        let name = property.get("name")?.as_str()?.to_string();
+        let value = property.get("value").map(value_text).unwrap_or_default();
+        Some((name, value))
+    }).collect()
+}
+
+/// The text of a general reference `&amp;` as an event hands it over: the
+/// bare name, or `#49` for a character reference. An unknown entity keeps
+/// its written form, because this reader does not read the DTD.
+fn entity_text(e: &quick_xml::events::BytesRef) -> Result<String, String> {
+    if let Some(ch) = e.resolve_char_ref().map_err(|error| error.to_string())? {
+        return Ok(ch.to_string());
+    }
+    Ok(match e.as_ref() {
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "amp" => "&".to_string(),
+        "apos" => "'".to_string(),
+        "quot" => "\"".to_string(),
+        name => format!("&{name};"),
+    })
+}
+
 fn from_json(file: &str, text: &str) -> Result<Tiled, String> {
     let root: Value = serde_json::from_str(text).map_err(|e| format!("{file}: {e}"))?;
     let object = root.as_object().ok_or_else(|| format!("{file}: not a Tiled tileset"))?;
@@ -207,6 +327,7 @@ fn from_json(file: &str, text: &str) -> Result<Tiled, String> {
         format: Format::Tsj,
         name: text_of("name"),
         version: text_of("version"),
+        class: object.get("class").or_else(|| object.get("type")).and_then(Value::as_str).unwrap_or_default().to_string(),
         tile: [number("tilewidth"), number("tileheight")],
         margin: number("margin"),
         spacing: number("spacing"),
@@ -214,27 +335,34 @@ fn from_json(file: &str, text: &str) -> Result<Tiled, String> {
         tilecount: number("tilecount"),
         shape: Shape::Collection { images: Vec::new() },
         counts: Counts::default(),
+        properties: json_properties(object.get("properties")),
+        tiles: BTreeMap::new(),
     };
     let tiles = object.get("tiles").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut collection: Vec<String> = Vec::new();
     for tile in &tiles {
-        let mut animated = false;
-        if let Some(frames) = tile.get("animation").and_then(Value::as_array)
-            && !frames.is_empty() {
-            animated = true;
-        }
-        if animated {
+        let id = tile.get("id").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let data = Tile {
+            class: tile.get("class").or_else(|| tile.get("type")).and_then(Value::as_str).unwrap_or_default().to_string(),
+            image: tile.get("image").and_then(Value::as_str).map(str::to_string),
+            frames: tile.get("animation").and_then(Value::as_array).map(|frames| {
+                frames.iter().filter_map(|frame| frame.get("tileid")?.as_u64().map(|id| id as u32)).collect()
+            }).unwrap_or_default(),
+            collisions: tile.get("objectgroup").and_then(|group| group.get("objects")).and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            properties: json_properties(tile.get("properties")),
+        };
+        if !data.frames.is_empty() {
             tiled.counts.animated += 1;
         }
         if let Some(wangsets) = tile.get("wangsets").and_then(Value::as_array) {
             tiled.counts.wangsets += wangsets.len();
         }
-        if let Some(objects) = tile.get("objectgroup").and_then(|g| g.get("objects")).and_then(Value::as_array) {
-            tiled.counts.collisions += objects.len();
+        tiled.counts.collisions += data.collisions;
+        if let Some(image) = &data.image {
+            collection.push(image.clone());
         }
-        if let Some(image) = tile.get("image").and_then(Value::as_str) {
-            collection.push(image.to_string());
-        }
+        tiled.tiles.insert(id, data);
     }
     if let Some(wangsets) = object.get("wangsets").and_then(Value::as_array) {
         tiled.counts.wangsets += wangsets.len();
@@ -251,12 +379,15 @@ fn from_json(file: &str, text: &str) -> Result<Tiled, String> {
 
 fn from_xml(file: &str, text: &str) -> Result<Tiled, String> {
     let mut reader = Reader::from_str(text);
-    reader.config_mut().trim_text(true);
+    // Text keeps its spacing: a property value is the text between its tags,
+    // and `trim_text` would run "soft &amp; damp" into "softdamp".
+    reader.config_mut().trim_text(false);
     let mut tiled = Tiled {
         file: file.to_string(),
         format: Format::Tsx,
         name: String::new(),
         version: String::new(),
+        class: String::new(),
         tile: [0, 0],
         margin: 0,
         spacing: 0,
@@ -264,6 +395,8 @@ fn from_xml(file: &str, text: &str) -> Result<Tiled, String> {
         tilecount: 0,
         shape: Shape::Collection { images: Vec::new() },
         counts: Counts::default(),
+        properties: Vec::new(),
+        tiles: BTreeMap::new(),
     };
     let mut state = State::default();
     loop {
@@ -272,6 +405,23 @@ fn from_xml(file: &str, text: &str) -> Result<Tiled, String> {
             Event::Start(e) => state.element(&mut tiled, &e, true),
             Event::Empty(e) => state.element(&mut tiled, &e, false),
             Event::End(e) => state.close(&mut tiled, e.name().as_ref()),
+            Event::Text(e) => {
+                if let Some((_, value)) = &mut state.property {
+                    let text: &str = &e;
+                    let text = quick_xml::escape::unescape(text).map_err(|error| format!("{file}: {error}"))?;
+                    value.push_str(&text);
+                }
+            }
+            Event::GeneralRef(e) => {
+                if let Some((_, value)) = &mut state.property {
+                    value.push_str(&entity_text(&e)?);
+                }
+            }
+            Event::CData(e) => {
+                if let Some((_, value)) = &mut state.property {
+                    value.push_str(&e);
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -292,6 +442,12 @@ struct State {
     in_objects: bool,
     in_object: bool,
     tile_animated: bool,
+    /// The tile whose children are being read.
+    tile_id: Option<u32>,
+    /// A property whose value is the element text, until `</property>`.
+    property: Option<(String, String)>,
+    /// Whether that property belongs to a tile rather than the tileset.
+    property_in_tile: bool,
 }
 
 impl State {
@@ -307,6 +463,7 @@ impl State {
             "tileset" => {
                 tiled.name = attrs.get("name").cloned().unwrap_or_default();
                 tiled.version = attrs.get("version").cloned().unwrap_or_default();
+                tiled.class = attrs.get("class").or_else(|| attrs.get("type")).cloned().unwrap_or_default();
                 tiled.tile = [number("tilewidth"), number("tileheight")];
                 tiled.columns = number("columns");
                 tiled.tilecount = number("tilecount");
@@ -316,6 +473,9 @@ impl State {
             "image" if !self.in_object => {
                 let source = attrs.get("source").cloned().unwrap_or_default();
                 if self.in_tile {
+                    if let Some(id) = self.tile_id {
+                        tiled.tiles.entry(id).or_default().image = Some(source.clone());
+                    }
                     self.collection.push(source);
                 } else if !source.is_empty() {
                     let size = match (number("width"), number("height")) {
@@ -326,6 +486,17 @@ impl State {
                 }
             }
             "tile" => {
+                let id = attrs.get("id").and_then(|v| v.trim().parse::<u32>().ok());
+                if let Some(id) = id {
+                    let class = attrs.get("class").or_else(|| attrs.get("type")).cloned().unwrap_or_default();
+                    let tile = tiled.tiles.entry(id).or_default();
+                    if !class.is_empty() {
+                        tile.class = class;
+                    }
+                    if open {
+                        self.tile_id = Some(id);
+                    }
+                }
                 if open {
                     self.in_tile = true;
                     self.tile_animated = false;
@@ -335,10 +506,31 @@ impl State {
                 self.tile_animated = true;
                 tiled.counts.animated += 1;
             }
+            "frame" if self.in_tile => {
+                if let (Some(id), Some(frame)) = (self.tile_id, attrs.get("tileid").and_then(|v| v.trim().parse::<u32>().ok())) {
+                    tiled.tiles.entry(id).or_default().frames.push(frame);
+                }
+            }
+            "property" => {
+                let name = attrs.get("name").cloned().unwrap_or_default();
+                if !name.is_empty() {
+                    if let Some(value) = attrs.get("value").cloned() {
+                        self.push_property(tiled, name, value);
+                    } else if open {
+                        self.property = Some((name, String::new()));
+                        self.property_in_tile = self.in_tile;
+                    } else {
+                        self.push_property(tiled, name, String::new());
+                    }
+                }
+            }
             "wangset" => tiled.counts.wangsets += 1,
             "objectgroup" if open && self.in_tile => self.in_objects = true,
             "object" if self.in_objects => {
                 tiled.counts.collisions += 1;
+                if let Some(id) = self.tile_id {
+                    tiled.tiles.entry(id).or_default().collisions += 1;
+                }
                 // A collision shape can carry a picture of its own. That
                 // picture is not a tile, so it does not join the collection.
                 if open {
@@ -349,11 +541,35 @@ impl State {
         }
     }
 
-    fn close(&mut self, _tiled: &mut Tiled, name: &str) {
+    fn push_property(&self, tiled: &mut Tiled, name: String, value: String) {
+        if self.in_tile {
+            if let Some(id) = self.tile_id {
+                tiled.tiles.entry(id).or_default().properties.push((name, value));
+            }
+        } else {
+            tiled.properties.push((name, value));
+        }
+    }
+
+    fn finish_property(&mut self, tiled: &mut Tiled) {
+        let Some((name, value)) = self.property.take() else { return };
+        let value = value.trim().to_string();
+        if self.property_in_tile {
+            if let Some(id) = self.tile_id {
+                tiled.tiles.entry(id).or_default().properties.push((name, value));
+            }
+        } else {
+            tiled.properties.push((name, value));
+        }
+    }
+
+    fn close(&mut self, tiled: &mut Tiled, name: &str) {
         match name {
+            "property" => self.finish_property(tiled),
             "tile" => {
                 self.in_tile = false;
                 self.tile_animated = false;
+                self.tile_id = None;
             }
             "object" => self.in_object = false,
             "objectgroup" => self.in_objects = false,
@@ -490,10 +706,49 @@ mod tests {
         });
         assert_eq!(tiled.counts, Counts { animated: 1, wangsets: 2, collisions: 2 });
         assert_eq!(tiled.summary(), "TSX, 3087 tiles, 32x32, 1 animated, 2 wang sets, 2 collision shapes");
+        assert_eq!(tiled.tiles[&164], Tile::default(), "a tile with only a probability has no data to show");
+        let animated = &tiled.tiles[&200];
+        assert_eq!(animated.frames, [201, 202]);
+        assert_eq!(animated.collisions, 2);
+        assert_eq!(tiled.declared_size(), Some([1568, 2016]));
+        assert!(tiled.health().is_empty(), "this file agrees with itself");
     }
 
-    /// The children of a tile count once for that tile, and only a tile
-    /// with an animation counts as animated.
+    /// A tile keeps what Tiled shows for it: its class, its animation, its
+    /// collision count, and its properties. A property value may be an
+    /// attribute or the element text, and the text is unescaped.
+    #[test]
+    fn an_xml_tile_keeps_its_class_and_properties() {
+        let tiled = parse_xml(r#"<tileset tilewidth="8" tileheight="8" tilecount="2" columns="2">
+            <image source="a.png" width="16" height="8"/>
+            <properties><property name="theme" value="forest"/></properties>
+            <tile id="0" type="Rock">
+                <properties>
+                    <property name="solid" type="bool" value="true"/>
+                    <property name="note">soft &amp; damp</property>
+                </properties>
+            </tile>
+        </tileset>"#);
+        assert_eq!(tiled.properties, [("theme".to_string(), "forest".to_string())]);
+        let tile = &tiled.tiles[&0];
+        assert_eq!(tile.class, "Rock");
+        assert_eq!(tile.properties, [("solid".to_string(), "true".to_string()), ("note".to_string(), "soft & damp".to_string())]);
+    }
+
+    #[test]
+    fn health_reports_a_grid_that_the_image_cannot_hold() {
+        let tiled = parse_xml(r#"<tileset tilewidth="16" tileheight="16" columns="9" tilecount="20">
+            <image source="a.png" width="64" height="32"/>
+            <tile id="0"><animation><frame tileid="99"/></animation></tile>
+            <tile id="20"><image source="b.png"/></tile>
+        </tileset>"#);
+        let issues = tiled.health();
+        assert!(issues.iter().any(|issue| issue.contains("columns says 9, but the image width holds 4")), "{issues:?}");
+        assert!(issues.iter().any(|issue| issue.contains("tilecount is 20, but the image holds 18 cells")), "{issues:?}");
+        assert!(issues.iter().any(|issue| issue.contains("tile 20 is past the last tile, 20")), "{issues:?}");
+        assert!(issues.iter().any(|issue| issue.contains("tile 0 animates to 99")), "{issues:?}");
+    }
+
     #[test]
     fn tile_data_counts_by_tile_not_by_element() {
         let tiled = parse_xml(r#"<tileset tilewidth="8" tileheight="8" tilecount="4" columns="2">
@@ -504,6 +759,8 @@ mod tests {
         assert_eq!(tiled.counts.animated, 1);
         assert_eq!(tiled.counts.collisions, 1);
         assert_eq!(tiled.grid().unwrap().rows, 2);
+        assert_eq!(tiled.tiles[&0].frames, [1, 2]);
+        assert_eq!(tiled.tiles[&1].collisions, 1);
     }
 
     #[test]
@@ -531,21 +788,29 @@ mod tests {
     #[test]
     fn a_json_tileset_reads_the_same_way() {
         let text = r#"{
-            "type": "tileset", "version": "1.10", "name": "Tiles",
+            "type": "tileset", "version": "1.10", "name": "Tiles", "class": "Terrain",
             "tilewidth": 16, "tileheight": 16, "columns": 4, "tilecount": 8,
             "image": "tiles.png", "imagewidth": 64, "imageheight": 32,
+            "properties": [{ "name": "theme", "value": "cave" }],
             "wangsets": [{ "name": "one" }],
             "tiles": [
-                { "id": 3, "animation": [{ "tileid": 4, "duration": 100 }] },
+                { "id": 3, "class": "Rock", "properties": [{ "name": "solid", "type": "bool", "value": true }],
+                  "animation": [{ "tileid": 4, "duration": 100 }] },
                 { "id": 5, "objectgroup": { "objects": [{ "id": 1 }, { "id": 2 }] } }
             ]
         }"#;
         let tiled = from_json("t.tsj", text).unwrap();
         assert_eq!(tiled.format, Format::Tsj);
+        assert_eq!(tiled.class, "Terrain");
+        assert_eq!(tiled.properties, [("theme".to_string(), "cave".to_string())]);
         assert_eq!(tiled.grid().unwrap(), Grid {
             image: [64, 32], tile: [16, 16], gap: [0, 0], offset: [0, 0], cols: 4, rows: 2,
         });
         assert_eq!(tiled.counts, Counts { animated: 1, wangsets: 1, collisions: 2 });
+        assert_eq!(tiled.tiles[&3].class, "Rock");
+        assert_eq!(tiled.tiles[&3].frames, [4]);
+        assert_eq!(tiled.tiles[&3].properties, [("solid".to_string(), "true".to_string())]);
+        assert_eq!(tiled.tiles[&5].collisions, 2);
     }
 
     /// Tiled leaves the column count to the image size when it is zero, and

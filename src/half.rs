@@ -63,6 +63,8 @@ impl Half {
             Some(Row::File(i)) => self.index.entries.get(*i).map(|entry| entry.rel.clone()),
             _ => None,
         };
+        // A tileset card has no sheet, so its selection follows its own path.
+        let selected_rel = self.sel.and_then(|i| self.index.entries.get(i)).map(|entry| entry.rel.clone());
         let index = if self.library {
             Index::scan_library(&self.index.root, self.index.tile)
         } else {
@@ -75,7 +77,8 @@ impl Half {
         self.index = index;
         self.tree = tree_of(&self.index);
         self.refresh_visible(query, search, view);
-        self.sel = self.sheet.as_ref().and_then(|s| self.index.position(&s.rel));
+        self.sel = self.sheet.as_ref().and_then(|s| self.index.position(&s.rel))
+            .or_else(|| selected_rel.and_then(|rel| self.index.position(&rel)));
         self.at = match &self.at {
             Some(Row::File(_)) => cursor_rel.and_then(|rel| self.index.position(&rel)).map(Row::File),
             Some(Row::Dir(dir)) if self.index.dirs.contains(dir) => Some(Row::Dir(dir.clone())),
@@ -110,8 +113,15 @@ impl Half {
     }
 
     /// Opens entry `i`. The zoom carries over from the sheet it replaces,
-    /// and the arrow keys stand on the file.
+    /// and the arrow keys stand on the file. A tileset card has no pixels:
+    /// it is selected, and the inspector shows the tileset.
     pub fn open(&mut self, ctx: &egui::Context, i: usize) -> Result<(), String> {
+        if self.index.entries[i].tileset_only {
+            self.sheet = None;
+            self.sel = Some(i);
+            self.at = Some(Row::File(i));
+            return Ok(());
+        }
         let e = &self.index.entries[i];
         let Some(rel) = e.sheet_rel() else {
             return Err(format!("{} is a Tiled tileset, not an image, so there is nothing to open.", e.rel));

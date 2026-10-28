@@ -27,6 +27,7 @@ mod labels;
 mod quant;
 mod quant_panel;
 mod tiled_panel;
+mod tiled_inspect;
 mod bucket;
 mod batch;
 mod storage;
@@ -272,6 +273,10 @@ struct App {
     library_sweep: Option<usize>,
     /// The visible library files, top to bottom; what a library range runs over.
     library_order: Vec<usize>,
+    /// The library inspector shows the Tiled tab of the selected entry.
+    library_tiled_tab: bool,
+    /// The entry that the last cross-link left, and the tab it stood on.
+    library_from: Option<(String, bool)>,
     /// Files held in the air, waiting for a folder to land in.
     file_drag: Option<Vec<String>>,
     library_drag: Option<library_transfer::LibraryDrag>,
@@ -558,6 +563,8 @@ impl App {
             library_anchor: None,
             library_sweep: None,
             library_order: Vec::new(),
+            library_tiled_tab: false,
+            library_from: None,
             file_drag: None,
             library_drag: None,
             sheet_copy: None,
@@ -664,6 +671,8 @@ impl App {
                 self.library_anchor = None;
                 self.library_sweep = None;
                 self.library_shift_anchor = None;
+                self.library_tiled_tab = false;
+                self.library_from = None;
                 "library"
             }
             Panel::Project => {
@@ -1107,13 +1116,94 @@ impl App {
     }
 
     fn open_library(&mut self, ctx: &egui::Context, i: usize) {
+        // A card that the person chose themselves is a new start, not a
+        // place to come back to.
+        self.library_from = None;
+        self.library_open(ctx, i);
+    }
+
+    /// Opens entry `i`, and shows the face that fits it: a tileset card has no
+    /// sheet, so its inspector opens on the Tiled tab. Returns whether the
+    /// entry opened.
+    fn library_open(&mut self, ctx: &egui::Context, i: usize) -> bool {
         // The keys follow the file, however it was opened. A click that
         // left the cursor behind means the next arrow starts somewhere the
         // eye is not.
+        self.library_tiled_tab = self.library.index.entries.get(i).is_some_and(|e| e.tileset_only);
         match self.library.open(ctx, i) {
-            Ok(()) => self.active = Panel::Library,
-            Err(err) => self.status = err,
+            Ok(()) => { self.active = Panel::Library; true }
+            Err(err) => { self.status = err; false }
         }
+    }
+
+    /// A cross-link: opens `to`, and keeps the entry it came from so that the
+    /// inspector can offer the way back.
+    fn jump_library(&mut self, ctx: &egui::Context, to: &str) {
+        let Some(i) = self.library.sel else { return };
+        let from = self.library.index.entries[i].rel.clone();
+        let from_tiled = self.library_tiled_tab;
+        let Some(j) = self.library.index.position(to) else {
+            self.status = format!("{to} is not in the library");
+            return;
+        };
+        if self.library_open(ctx, j) {
+            self.library_from = Some((from, from_tiled));
+        }
+    }
+
+    /// Goes back to the entry that the last cross-link came from.
+    fn back_library(&mut self, ctx: &egui::Context) {
+        let Some((rel, tiled_tab)) = self.library_from.take() else { return };
+        let Some(i) = self.library.index.position(&rel) else {
+            self.status = format!("{rel} is no longer in the library");
+            return;
+        };
+        if self.library_open(ctx, i) {
+            self.library_tiled_tab = tiled_tab;
+        }
+    }
+
+    /// Drops the grid that a person chose, so that the open sheet follows the
+    /// tileset. The book keeps no grid at all: a tileset that changes later
+    /// must change the sheet.
+    fn use_tileset_grid(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.library.sel else { return };
+        let Some(entry) = self.library.index.entries.get(i) else { return };
+        let Some(rel) = entry.sheet_rel().map(str::to_string) else { return };
+        let Some(grid) = entry.tiled.as_ref().and_then(tiled::Tiled::grid) else {
+            self.status = "The tileset states no grid.".into();
+            return;
+        };
+        let mut side = entry.side.clone();
+        side.tile = None;
+        side.gap = None;
+        side.offset = None;
+        side.read = false;
+        let root = self.library.index.root.clone();
+        match sidecar::store_layout(&root, &rel, &side) {
+            Ok(label) => {
+                side.label = label;
+                self.library.index.entries[i].side = side;
+                if self.library_open(ctx, i) {
+                    self.library_tiled_tab = true;
+                }
+                self.status = format!("{rel} follows the tileset: {} x {} tiles of {} x {}.",
+                    grid.cols, grid.rows, grid.tile[0], grid.tile[1]);
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// Turns on `Images in tilesets`, so that the images behind the tileset
+    /// cards are one click away again.
+    fn show_tileset_images(&mut self) {
+        if !self.settings.view.in_tilesets {
+            self.settings.view.in_tilesets = true;
+            if let Err(error) = self.settings.save() { self.status = error; return; }
+            self.refresh_visible();
+        }
+        let count = self.library.index.view_counts().1;
+        self.status = format!("{count} images in tilesets are shown now.");
     }
 
     fn open_project(&mut self, ctx: &egui::Context, i: usize) {
